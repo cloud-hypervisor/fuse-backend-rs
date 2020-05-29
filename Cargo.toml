@@ -1,0 +1,28 @@
+[package]
+name = "fuse-rs"
+version = "0.1.0"
+description = "A library to support Fuse server and virtio-fs device based on Linux Fuse ABI"
+authors = ["Liu Bo <bo.liu@linux.alibaba.com>", "Liu Jiang <gerry@linux.alibaba.com>", "Peng Tao <bergwolf@hyper.sh>"]
+license = "Apache-2.0 AND BSD-3-Clause"
+edition = "2018"
+
+[dependencies]
+arc-swap = ">=0.4.6"
+bimap = ">=0.4"
+bitflags = ">=1.1.0"
+libc = ">=0.2.68"
+log = ">=0.4.6"
+nix = ">=0.17"
+vm-memory = ">=0.2.0"
+vm-virtio = { git = "https://github.com/rust-vmm/vm-virtio.git", optional = true }
+vhost-rs = { git = "https://github.com/cloud-hypervisor/vhost.git", branch = "dragonball", package = "vhost", optional = true }
+
+[dev-dependencies.vm-memory]
+version = ">=0.2.0"
+features = ["backend-mmap"]
+
+[features]
+fusedev = []
+virtiofs = ["vm-virtio"]
+vhost-user-fs = ["virtiofs", "vhost-rs/vhost-user-slave"]
+
