@@ -222,6 +222,25 @@ impl Vfs {
         &self,
         inode: u64,
     ) -> Result<(Either<&PseudoFs, Arc<BackFileSystem>>, InodeData)> {
+        // ROOT_ID is special, we need to check if we have a mountpoint
+        // on the vfs root
+        if inode == ROOT_ID {
+            if let Some(mnt) = self.mountpoints.load().get(&inode).map(Arc::clone) {
+                let fs = self
+                    .superblocks
+                    .load()
+                    .get(&mnt.super_index)
+                    .map(Arc::clone)
+                    .ok_or_else(|| Error::from_raw_os_error(libc::ENOENT))?;
+                return Ok((
+                    Right(fs),
+                    InodeData {
+                        super_index: mnt.super_index,
+                        ino: inode,
+                    },
+                ));
+            }
+        }
         if inode >> VFS_SUPER_INDEX_SHIFT == 0 {
             Ok((
                 Left(&self.root),
