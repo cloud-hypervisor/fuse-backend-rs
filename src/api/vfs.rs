@@ -179,6 +179,7 @@ impl Vfs {
         let mut superblocks = self.superblocks.load().deref().deref().clone();
         superblocks.insert(index, Arc::new(fs));
         self.superblocks.store(Arc::new(superblocks));
+        trace!("super_index {} inode {}", index, inode);
 
         let mut mountpoints = self.mountpoints.load().deref().deref().clone();
         mountpoints.insert(
@@ -190,6 +191,55 @@ impl Vfs {
             }),
         );
         self.mountpoints.store(Arc::new(mountpoints));
+        Ok(())
+    }
+
+    /// Umount a backend file system at path
+    pub fn umount(&self, path: &str) -> Result<()> {
+        // Serialize mount operations. Do not expect poisoned lock here.
+        let _guard = self.lock.lock().unwrap();
+        let inode = self.root.path_walk(path)?;
+
+        let mut mountpoints = self.mountpoints.load().deref().deref().clone();
+        let fs_super_index = mountpoints
+            .get(&inode)
+            .map(Arc::clone)
+            .map(|x| {
+                self.root.evict_inode(inode);
+                mountpoints.remove(&inode);
+                self.mountpoints.store(Arc::new(mountpoints));
+                x.super_index
+            })
+            .ok_or_else(|| {
+                error!("{} is not a mount point.", path);
+                Error::from_raw_os_error(libc::EINVAL)
+            })?;
+
+        trace!("fs_super_index {}", fs_super_index);
+
+        let inodes: Vec<u64> = self
+            .inodes
+            .read()
+            .unwrap()
+            .iter()
+            .filter(|(_, &idata)| idata.super_index == fs_super_index)
+            .map(|(&a, _)| a)
+            .collect();
+        trace!(
+            "number of inode of index {} is {}",
+            fs_super_index,
+            inodes.len()
+        );
+        let mut vfsinodes = self.inodes.write().unwrap();
+        for inode in inodes.iter() {
+            vfsinodes.remove_by_left(inode);
+        }
+
+        let mut superblocks = self.superblocks.load().deref().deref().clone();
+        let fs = superblocks.get(&fs_super_index).map(Arc::clone).unwrap();
+        fs.destroy();
+        superblocks.remove(&fs_super_index);
+        self.superblocks.store(Arc::new(superblocks));
         Ok(())
     }
 
@@ -316,6 +366,7 @@ impl FileSystem for Vfs {
     fn lookup(&self, ctx: Context, parent: Inode, name: &CStr) -> Result<Entry> {
         match self.get_real_rootfs(parent)? {
             (Left(fs), idata) => {
+                trace!("lookup pseudo ino {} name {:?}", idata.ino, name);
                 let mut entry = fs.lookup(ctx, idata.ino, name)?;
                 match self.mountpoints.load().get(&entry.inode) {
                     Some(mnt) => {
@@ -921,5 +972,20 @@ mod tests {
         let fs2 = FakeFileSystemTwo {};
         assert!(vfs.mount(Box::new(fs1), "/foo").is_ok());
         assert!(vfs.mount(Box::new(fs2), "/bar").is_ok());
+    }
+
+    #[test]
+    fn test_umount() {
+        let vfs = Vfs::new(VfsOptions::default());
+        let fs1 = FakeFileSystemOne {};
+        let fs2 = FakeFileSystemOne {};
+        assert!(vfs.mount(Box::new(fs1), "/foo").is_ok());
+        assert!(vfs.umount("/foo").is_ok());
+
+        assert!(vfs.mount(Box::new(fs2), "/x/y").is_ok());
+        assert_eq!(
+            vfs.umount("/x").unwrap_err().raw_os_error().unwrap(),
+            libc::EINVAL
+        );
     }
 }
