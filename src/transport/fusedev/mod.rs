@@ -184,7 +184,6 @@ impl<'a> Writer<'a> {
     }
 
     fn account_written(&mut self, count: usize) {
-        self.max_size -= count;
         self.bytes_written += count;
     }
 
@@ -198,9 +197,6 @@ impl<'a> Writer<'a> {
         mut count: usize,
         off: u64,
     ) -> io::Result<usize> {
-        if count > self.available_bytes() {
-            count = self.available_bytes();
-        }
         let mut buf = Vec::with_capacity(count);
         count = src.read_vectored_at_volatile(
             // Safe because we have made sure buf has at least count capacity above
