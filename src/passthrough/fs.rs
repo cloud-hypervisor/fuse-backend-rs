@@ -4,6 +4,7 @@
 
 //! Fuse lowlevel passthrough implementation.
 
+use std::any::Any;
 use std::collections::btree_map;
 use std::collections::BTreeMap;
 use std::ffi::{CStr, CString};
@@ -766,6 +767,10 @@ impl BackendFileSystem for PassthroughFs {
     fn mount(&self) -> io::Result<(Entry, u64)> {
         let entry = self.do_lookup(fuse::ROOT_ID, &CString::new(".").unwrap())?;
         Ok((entry, VFS_MAX_INO))
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
     }
 }
 

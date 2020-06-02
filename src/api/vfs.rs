@@ -12,6 +12,7 @@ use std::time::Duration;
 
 use arc_swap::ArcSwap;
 use bimap::hash::BiHashMap;
+use std::any::Any;
 use std::ops::Deref;
 
 use super::pseudo_fs::PseudoFs;
@@ -43,6 +44,11 @@ pub trait BackendFileSystem: FileSystem {
     fn mount(&self) -> Result<(Entry, u64)> {
         Err(Error::from_raw_os_error(libc::ENOSYS))
     }
+
+    /// Provides a reference to the Any trait. This is useful to let
+    /// the caller have access to the underlying type behind the
+    /// trait.
+    fn as_any(&self) -> &dyn Any;
 }
 
 const PSEUDO_FS_SUPER: SuperIndex = 0;
@@ -241,6 +247,29 @@ impl Vfs {
         superblocks.remove(&fs_super_index);
         self.superblocks.store(Arc::new(superblocks));
         Ok(())
+    }
+
+    /// This gets underlying fs instance
+    /// (only updating rafs is supported)
+    pub fn get_rootfs(&self, path: &str) -> Result<Arc<BackFileSystem>> {
+        // Serialize mount operations. Do not expect poisoned lock here.
+        let _guard = self.lock.lock().unwrap();
+        let inode = self.root.path_walk(path)?;
+
+        if let Some(mnt) = self.mountpoints.load().get(&inode).map(Arc::clone) {
+            let fs = self
+                .superblocks
+                .load()
+                .get(&mnt.super_index)
+                .map(Arc::clone)
+                .ok_or_else(|| Error::from_raw_os_error(libc::ENOENT))?;
+
+            trace!("mnt.super_index {} inode {}", mnt.super_index, inode,);
+            Ok(fs)
+        } else {
+            error!("inode {} is not found\n", inode);
+            Err(Error::from_raw_os_error(libc::EINVAL))
+        }
     }
 
     // Inode hashing rules:
