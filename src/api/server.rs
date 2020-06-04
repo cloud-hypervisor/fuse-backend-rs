@@ -118,7 +118,11 @@ impl<F: FileSystem + Sync> Server<F> {
                 w,
             );
         }
-        trace!("new fuse req {:?}", in_header);
+        trace!(
+            "new fuse req {:?}: {:?}",
+            Opcode::from_u32(in_header.opcode),
+            in_header
+        );
         match in_header.opcode {
             x if x == Opcode::Lookup as u32 => self.lookup(in_header, r, w),
             x if x == Opcode::Forget as u32 => self.forget(in_header, r), // No reply.
