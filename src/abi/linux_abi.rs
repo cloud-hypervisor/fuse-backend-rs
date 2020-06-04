@@ -640,10 +640,20 @@ pub enum Opcode {
     CopyFileRange = 47,
     SetupMapping = 48,
     RemoveMapping = 49,
+    MaxOpcode = 50,
 
     /* Reserved opcodes: helpful to detect structure endian-ness in case of e.g. virtiofs */
     CuseInitBswapReserved = 1_048_576, /* CUSE_INIT << 8 */
     InitBswapReserved = 436_207_616,   /* FUSE_INIT << 24 */
+}
+
+impl Opcode {
+    pub fn from_u32(op: u32) -> Opcode {
+        if op >= Opcode::MaxOpcode as u32 {
+            return Opcode::MaxOpcode;
+        }
+        unsafe { mem::transmute(op as u32) }
+    }
 }
 
 #[repr(u32)]
