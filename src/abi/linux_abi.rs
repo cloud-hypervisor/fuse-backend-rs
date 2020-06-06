@@ -17,6 +17,9 @@ pub const KERNEL_VERSION: u32 = 7;
 /// Minor version number of this interface.
 pub const KERNEL_MINOR_VERSION: u32 = 31;
 
+/// Lookup negative dentry using inode number 0
+pub const KERNEL_MINOR_VERSION_LOOKUP_NEGATIVE_ENTRY_ZERO: u32 = 4;
+
 /// The ID of the inode corresponding to the root directory of the file system.
 pub const ROOT_ID: u64 = 1;
 

@@ -199,6 +199,10 @@ impl Vfs {
     //    and can be found directly
     // 3. Other inodes are hashed via (index << 56 | inode)
     fn hash_inode(&self, index: SuperIndex, inode: u64) -> Result<u64> {
+        // Do not hash negative dentry
+        if inode == 0 {
+            return Ok(inode);
+        }
         if inode > VFS_MAX_INO {
             return Err(Error::new(
                 ErrorKind::Other,
