@@ -12,7 +12,9 @@
 use std::ffi::CStr;
 use std::io::{self, IoSlice, Read, Write};
 use std::mem::size_of;
+use std::sync::Arc;
 
+use arc_swap::ArcSwap;
 use vm_memory::ByteValued;
 
 use super::filesystem::{
@@ -71,15 +73,27 @@ impl<'a> io::Write for ZCWriter<'a> {
     }
 }
 
+struct ServerVersion {
+    _major: u32,
+    minor: u32,
+}
+
 /// Fuse Server to handle requests from the Fuse client and vhost user master.
 pub struct Server<F: FileSystem + Sync> {
     fs: F,
+    vers: ArcSwap<ServerVersion>,
 }
 
 impl<F: FileSystem + Sync> Server<F> {
     /// Create a Server instance from a filesystem driver.
     pub fn new(fs: F) -> Server<F> {
-        Server { fs }
+        Server {
+            fs,
+            vers: ArcSwap::new(Arc::new(ServerVersion {
+                _major: KERNEL_VERSION,
+                minor: KERNEL_MINOR_VERSION,
+            })),
+        }
     }
 
     /// Main entrance to handle requests from the transport layer.
@@ -177,6 +191,17 @@ impl<F: FileSystem + Sync> Server<F> {
             .fs
             .lookup(Context::from(in_header), in_header.nodeid.into(), &name)
         {
+            // before ABI 7.4 inode == 0 was invalid, only ENOENT means negative dentry
+            Ok(entry)
+                if self.vers.load().minor < KERNEL_MINOR_VERSION_LOOKUP_NEGATIVE_ENTRY_ZERO
+                    && entry.inode == 0 =>
+            {
+                reply_error(
+                    io::Error::from_raw_os_error(libc::ENOENT),
+                    in_header.unique,
+                    w,
+                )
+            }
             Ok(entry) => {
                 let out = EntryOut::from(entry);
 
@@ -853,7 +878,11 @@ impl<F: FileSystem + Sync> Server<F> {
                     max_pages: MAX_REQ_PAGES, // 1MB
                     ..Default::default()
                 };
-
+                let vers = ServerVersion {
+                    _major: major,
+                    minor,
+                };
+                self.vers.store(Arc::new(vers));
                 reply_ok(Some(out), None, in_header.unique, w)
             }
             Err(e) => reply_error(e, in_header.unique, w),
