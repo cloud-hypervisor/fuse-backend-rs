@@ -1369,11 +1369,19 @@ fn reply_error(e: io::Error, unique: u64, mut w: Writer) -> Result<usize> {
     };
 
     trace!("reply error header {:?}, error {:?}", header, e);
+    if header.error != -libc::ENOSYS {
+        error!("reply error header {:?}, error {:?}", header, e);
+    }
     w.write_all(header.as_slice())
         .map_err(Error::EncodeMessage)?;
 
-    debug_assert_eq!(header.len as usize, w.bytes_written());
-    Ok(w.bytes_written())
+    // Commit header if it is buffered otherwise kernel gets nothing back.
+    w.commit(&[])
+        .and_then(|_| {
+            debug_assert_eq!(header.len as usize, w.bytes_written());
+            Ok(w.bytes_written())
+        })
+        .map_err(Error::EncodeMessage)
 }
 
 fn bytes_to_cstr(buf: &[u8]) -> Result<&CStr> {

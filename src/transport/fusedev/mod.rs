@@ -284,7 +284,12 @@ impl<'a> io::Write for Writer<'a> {
         }
     }
 
+    /// As this writer can associate multiple writers by splitting, `flush()` can't
+    /// flush them all. Disable it!
     fn flush(&mut self) -> io::Result<()> {
-        Ok(())
+        Err(io::Error::new(
+            io::ErrorKind::Other,
+            "Writer does not support flush buffer.",
+        ))
     }
 }
