@@ -91,7 +91,7 @@ impl<'a> Reader<'a> {
 
 /// A writer for fuse request. There are a few special properties to follow:
 /// 1. A fuse device request MUST be written to the fuse device in one shot.
-/// 2. If the writer is splitted, a final commit() MUST be called to issue the
+/// 2. If the writer is split, a final commit() MUST be called to issue the
 ///    device write operation.
 /// 3. Concurrency, caller should not write to the writer concurrently.
 #[derive(Debug, PartialEq, Eq)]
@@ -99,7 +99,7 @@ pub struct Writer<'a> {
     fd: c_int,
     max_size: usize,
     bytes_written: usize,
-    // buf used to support splitted writer.
+    // buf used to support split writer.
     // For split writers, we write to internal buffer upon write and construct
     // use writev write to fd upon flush.
     buf: Option<Vec<u8>>,
