@@ -91,7 +91,7 @@ impl<'a> Reader<'a> {
 
 /// A writer for fuse request. There are a few special properties to follow:
 /// 1. A fuse device request MUST be written to the fuse device in one shot.
-/// 2. If the writer is splitted, a final commit() MUST be called to issue the
+/// 2. If the writer is split, a final commit() MUST be called to issue the
 ///    device write operation.
 /// 3. Concurrency, caller should not write to the writer concurrently.
 #[derive(Debug, PartialEq, Eq)]
@@ -99,7 +99,7 @@ pub struct Writer<'a> {
     fd: c_int,
     max_size: usize,
     bytes_written: usize,
-    // buf used to support splitted writer.
+    // buf used to support split writer.
     // For split writers, we write to internal buffer upon write and construct
     // use writev write to fd upon flush.
     buf: Option<Vec<u8>>,
@@ -184,7 +184,6 @@ impl<'a> Writer<'a> {
     }
 
     fn account_written(&mut self, count: usize) {
-        self.max_size -= count;
         self.bytes_written += count;
     }
 
@@ -198,9 +197,6 @@ impl<'a> Writer<'a> {
         mut count: usize,
         off: u64,
     ) -> io::Result<usize> {
-        if count > self.available_bytes() {
-            count = self.available_bytes();
-        }
         let mut buf = Vec::with_capacity(count);
         count = src.read_vectored_at_volatile(
             // Safe because we have made sure buf has at least count capacity above
@@ -288,7 +284,12 @@ impl<'a> io::Write for Writer<'a> {
         }
     }
 
+    /// As this writer can associate multiple writers by splitting, `flush()` can't
+    /// flush them all. Disable it!
     fn flush(&mut self) -> io::Result<()> {
-        Ok(())
+        Err(io::Error::new(
+            io::ErrorKind::Other,
+            "Writer does not support flush buffer.",
+        ))
     }
 }

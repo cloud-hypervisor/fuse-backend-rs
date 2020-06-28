@@ -47,6 +47,18 @@ impl PseudoInode {
 
         self.children.store(Arc::new(children));
     }
+
+    fn remove_child(&self, child: Arc<PseudoInode>) {
+        let mut children = self.children.load().deref().deref().clone();
+
+        children
+            .iter()
+            .position(|x| x.name == child.name)
+            .map(|pos| children.remove(pos))
+            .unwrap();
+
+        self.children.store(Arc::new(children));
+    }
 }
 
 pub struct PseudoFs {
@@ -129,6 +141,58 @@ impl PseudoFs {
         Ok(inode.ino)
     }
 
+    pub fn path_walk(&self, mountpoint: &str) -> Result<u64> {
+        let path = Path::new(mountpoint);
+        if !path.has_root() {
+            error!(
+                "pseudo fs umount failure: invalid umount path {}",
+                mountpoint
+            );
+            return Err(Error::from_raw_os_error(libc::EINVAL));
+        }
+
+        let inodes = self.inodes.load();
+        let mut inode = &self.root_inode;
+
+        'outer: for component in path.components() {
+            debug!("pseudo fs umount iterate {:?}", component.as_os_str());
+            match component {
+                Component::RootDir => continue,
+                Component::CurDir => continue,
+                Component::ParentDir => inode = inodes.get(&inode.parent).unwrap(),
+                Component::Prefix(_) => panic!("unsupported path: {}", mountpoint),
+                Component::Normal(path) => {
+                    let name = path.to_str().unwrap();
+
+                    // Optimistic check without lock.
+                    for child in inode.children.load().iter() {
+                        if child.name == name {
+                            inode = inodes.get(&child.ino).unwrap();
+                            continue 'outer;
+                        }
+                    }
+
+                    // Double check with writer lock held.
+                    let _guard = self.lock.lock();
+                    for child in inode.children.load().iter() {
+                        if child.name == name {
+                            inode = inodes.get(&child.ino).unwrap();
+                            continue 'outer;
+                        }
+                    }
+
+                    error!("name {} is not found, path is {}", name, mountpoint);
+                    return Err(Error::from_raw_os_error(libc::ENOENT));
+                }
+            }
+        }
+
+        // let _guard = self.lock.lock();
+        // self.evict_inode(&inode);
+        // Now we have all path components exist, return the last one
+        Ok(inode.ino)
+    }
+
     fn new_inode(&self, parent: u64, name: &str) -> Arc<PseudoInode> {
         let ino = self.next_inode.fetch_add(1, Ordering::Relaxed);
 
@@ -157,6 +221,25 @@ impl PseudoFs {
         parent.insert_child(inode.clone());
 
         inode
+    }
+
+    fn remove_inode(&self, inode: &Arc<PseudoInode>) {
+        let mut hashmap = self.inodes.load().deref().deref().clone();
+
+        hashmap.remove(&inode.ino);
+
+        self.inodes.store(Arc::new(hashmap));
+    }
+
+    pub fn evict_inode(&self, ino: u64) {
+        let _guard = self.lock.lock();
+        let inodes = self.inodes.load();
+
+        let inode = inodes.get(&ino).unwrap();
+        let parent = inodes.get(&inode.parent).unwrap();
+        parent.remove_child(inode.clone());
+
+        self.remove_inode(inode);
     }
 
     fn get_entry(&self, ino: u64) -> Entry {
