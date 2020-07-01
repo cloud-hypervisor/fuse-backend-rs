@@ -56,6 +56,7 @@ extern crate vm_memory;
 extern crate vm_virtio;
 
 use std::ffi::FromBytesWithNulError;
+use std::io::ErrorKind;
 use std::{error, fmt, io};
 
 /// Error codes for Fuse related operations.
@@ -107,3 +108,25 @@ pub mod abi;
 pub mod api;
 pub mod passthrough;
 pub mod transport;
+
+/// Convert io::ErrorKind to OS error code.
+/// Reference to libstd/sys/unix/mod.rs => decode_error_kind.
+pub fn encode_io_error_kind(kind: ErrorKind) -> i32 {
+    match kind {
+        ErrorKind::ConnectionRefused => libc::ECONNREFUSED,
+        ErrorKind::ConnectionReset => libc::ECONNRESET,
+        ErrorKind::PermissionDenied => libc::EPERM | libc::EACCES,
+        ErrorKind::BrokenPipe => libc::EPIPE,
+        ErrorKind::NotConnected => libc::ENOTCONN,
+        ErrorKind::ConnectionAborted => libc::ECONNABORTED,
+        ErrorKind::AddrNotAvailable => libc::EADDRNOTAVAIL,
+        ErrorKind::AddrInUse => libc::EADDRINUSE,
+        ErrorKind::NotFound => libc::ENOENT,
+        ErrorKind::Interrupted => libc::EINTR,
+        ErrorKind::InvalidInput => libc::EINVAL,
+        ErrorKind::TimedOut => libc::ETIMEDOUT,
+        ErrorKind::AlreadyExists => libc::EEXIST,
+        ErrorKind::WouldBlock => libc::EWOULDBLOCK,
+        _ => libc::EIO,
+    }
+}

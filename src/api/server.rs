@@ -25,7 +25,7 @@ use crate::abi::linux_abi::*;
 #[cfg(feature = "virtiofs")]
 use crate::abi::virtio_fs::{RemovemappingIn, RemovemappingOne, SetupmappingIn};
 use crate::transport::{FileReadWriteVolatile, FsCacheReqHandler, Reader, Writer};
-use crate::{Error, Result};
+use crate::{encode_io_error_kind, Error, Result};
 
 const MAX_BUFFER_SIZE: u32 = 1 << 20;
 const MAX_REQ_PAGES: u16 = 256; // 1MB
@@ -1361,16 +1361,16 @@ fn reply_ok<T: ByteValued>(
     Ok(w.bytes_written())
 }
 
-fn reply_error(e: io::Error, unique: u64, mut w: Writer) -> Result<usize> {
+fn reply_error(err: io::Error, unique: u64, mut w: Writer) -> Result<usize> {
     let header = OutHeader {
         len: size_of::<OutHeader>() as u32,
-        error: -e.raw_os_error().unwrap_or(libc::EIO),
+        error: -encode_io_error_kind(err.kind()),
         unique,
     };
 
-    trace!("reply error header {:?}, error {:?}", header, e);
+    trace!("reply error header {:?}, error {:?}", header, err);
     if header.error != -libc::ENOSYS {
-        error!("reply error header {:?}, error {:?}", header, e);
+        error!("reply error header {:?}, error {:?}", header, err);
     }
     w.write_all(header.as_slice())
         .map_err(Error::EncodeMessage)?;
