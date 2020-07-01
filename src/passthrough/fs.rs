@@ -735,6 +735,13 @@ fn forget_one(
             // we don't want misbehaving clients to cause integer overflow.
             let new_count = refcount.saturating_sub(count);
 
+            trace!(
+                "passthrough::forget: inode {} refcount {}, count {}, new_count {}",
+                inode,
+                refcount,
+                count,
+                new_count
+            );
             // Synchronizes with the acquire load in `do_lookup`.
             if data
                 .refcount

@@ -859,6 +859,18 @@ impl FileSystem for Vfs {
             (Right(fs), idata) => fs.access(ctx, idata.ino, mask),
         }
     }
+
+    fn forget(&self, ctx: Context, inode: Inode, count: u64) {
+        match self.get_real_rootfs(inode) {
+            Ok(real_rootfs) => match real_rootfs {
+                (Left(fs), idata) => fs.forget(ctx, idata.ino, count),
+                (Right(fs), idata) => fs.forget(ctx, idata.ino, count),
+            },
+            Err(e) => {
+                error!("vfs::forget: failed to get_real_rootfs {:?}", e);
+            }
+        }
+    }
 }
 
 #[cfg(test)]
