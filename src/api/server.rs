@@ -1364,7 +1364,9 @@ fn reply_ok<T: ByteValued>(
 fn reply_error(err: io::Error, unique: u64, mut w: Writer) -> Result<usize> {
     let header = OutHeader {
         len: size_of::<OutHeader>() as u32,
-        error: -encode_io_error_kind(err.kind()),
+        error: -err
+            .raw_os_error()
+            .unwrap_or_else(|| encode_io_error_kind(err.kind())),
         unique,
     };
 
