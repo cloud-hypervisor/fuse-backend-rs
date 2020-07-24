@@ -242,9 +242,9 @@ impl<'a> io::Write for Writer<'a> {
                 return Err(io::Error::from_raw_os_error(libc::EINVAL));
             }
             pwrite(self.fd, data, 0)
-                .and_then(|x| {
+                .map(|x| {
                     self.account_written(x);
-                    Ok(x)
+                    x
                 })
                 .map_err(|e| {
                     error! {"fail to write to fuse device fd {}: {}, {:?}", self.fd, e, data};
@@ -273,9 +273,9 @@ impl<'a> io::Write for Writer<'a> {
                 return Ok(0);
             }
             writev(self.fd, buf.as_slice())
-                .and_then(|x| {
+                .map(|x| {
                     self.account_written(x);
-                    Ok(x)
+                    x
                 })
                 .map_err(|e| {
                     error! {"fail to write to fuse device on commit: {}", e};
