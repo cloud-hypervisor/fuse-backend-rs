@@ -16,6 +16,12 @@ jobs:
 
     steps:
     - uses: actions/checkout@v2
+    - name: clippy and format
+      run: |
+        cargo clippy --features "fusedev" -- -Dclippy::all
+        cargo clippy --features "virtiofs" -- -Dclippy::all
+        cargo clippy --features "vhost-user-fs" -- -Dclippy::all
+        cargo fmt -- --check
     - name: Build fusedev
       run: cargo build --verbose --features "fusedev"
     - name: Build virtiofs
