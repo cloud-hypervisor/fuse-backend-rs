@@ -89,7 +89,6 @@ impl<'a> Reader<'a> {
             desc_chain
         };
         let buffers = chain
-            .into_iter()
             .readable()
             .map(|desc| {
                 // Verify that summing the descriptor sizes does not overflow.
@@ -139,7 +138,6 @@ impl<'a> Writer<'a> {
             desc_chain
         };
         let buffers = chain
-            .into_iter()
             .writable()
             .map(|desc| {
                 // Verify that summing the descriptor sizes does not overflow.
