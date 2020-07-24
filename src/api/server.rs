@@ -1377,9 +1377,9 @@ fn reply_error(err: io::Error, unique: u64, mut w: Writer) -> Result<usize> {
 
     // Commit header if it is buffered otherwise kernel gets nothing back.
     w.commit(&[])
-        .and_then(|_| {
+        .map(|_| {
             debug_assert_eq!(header.len as usize, w.bytes_written());
-            Ok(w.bytes_written())
+            w.bytes_written()
         })
         .map_err(Error::EncodeMessage)
 }
