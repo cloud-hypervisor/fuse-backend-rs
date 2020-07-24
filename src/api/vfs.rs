@@ -933,6 +933,9 @@ mod tests {
                 0,
             ))
         }
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
     }
 
     struct FakeFileSystemTwo {}
@@ -961,6 +964,9 @@ mod tests {
                 },
                 0,
             ))
+        }
+        fn as_any(&self) -> &dyn Any {
+            self
         }
     }
 
