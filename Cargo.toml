@@ -26,4 +26,5 @@ features = ["backend-mmap"]
 fusedev = []
 virtiofs = ["vm-virtio"]
 vhost-user-fs = ["virtiofs", "vhost-rs/vhost-user-slave"]
+with-serde = ["vm-memory/with-serde", "vhost-rs/with-serde"]
 
