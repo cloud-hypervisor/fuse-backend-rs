@@ -236,6 +236,10 @@ impl PseudoFs {
         let inodes = self.inodes.load();
 
         let inode = inodes.get(&ino).unwrap();
+        if ino == inode.parent {
+            return;
+        }
+
         let parent = inodes.get(&inode.parent).unwrap();
         parent.remove_child(inode.clone());
 
