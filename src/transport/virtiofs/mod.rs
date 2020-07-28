@@ -96,10 +96,10 @@ impl<'a> Reader<'a> {
                 // This can happen if a driver tricks a device into reading more data than
                 // fits in a `usize`.
                 total_len = total_len
-                    .checked_add(desc.len as usize)
+                    .checked_add(desc.len() as usize)
                     .ok_or(Error::DescriptorChainOverflow)?;
 
-                mem.get_slice(desc.addr, desc.len as usize)
+                mem.get_slice(desc.addr(), desc.len() as usize)
                     .map_err(Error::GuestMemoryError)
             })
             .collect::<Result<VecDeque<VolatileSlice<'a>>>>()?;
@@ -146,10 +146,10 @@ impl<'a> Writer<'a> {
                 // This can happen if a driver tricks a device into writing more data than
                 // fits in a `usize`.
                 total_len = total_len
-                    .checked_add(desc.len as usize)
+                    .checked_add(desc.len() as usize)
                     .ok_or(Error::DescriptorChainOverflow)?;
 
-                mem.get_slice(desc.addr, desc.len as usize)
+                mem.get_slice(desc.addr(), desc.len() as usize)
                     .map_err(Error::GuestMemoryError)
             })
             .collect::<Result<VecDeque<VolatileSlice<'a>>>>()?;
