@@ -724,6 +724,12 @@ fn forget_one(
     inode: Inode,
     count: u64,
 ) {
+    // ROOT_ID should not be forgotten, or we're not able to access to files any
+    // more.
+    if inode == fuse::ROOT_ID {
+        return;
+    }
+
     if let Some(data) = inodes.get(&inode) {
         // Acquiring the write lock on the inode map prevents new lookups from incrementing the
         // refcount but there is the possibility that a previous lookup already acquired a
