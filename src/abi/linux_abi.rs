@@ -647,8 +647,8 @@ pub enum Opcode {
     InitBswapReserved = 436_207_616,   /* FUSE_INIT << 24 */
 }
 
-impl Opcode {
-    pub fn from_u32(op: u32) -> Opcode {
+impl From<u32> for Opcode {
+    fn from(op: u32) -> Opcode {
         if op >= Opcode::MaxOpcode as u32 {
             return Opcode::MaxOpcode;
         }
