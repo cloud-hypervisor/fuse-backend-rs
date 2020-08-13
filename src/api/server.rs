@@ -120,7 +120,7 @@ impl<F: FileSystem + Sync> Server<F> {
         }
         trace!(
             "new fuse req {:?}: {:?}",
-            Opcode::from_u32(in_header.opcode),
+            Opcode::from(in_header.opcode),
             in_header
         );
         match in_header.opcode {
