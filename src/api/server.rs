@@ -118,7 +118,11 @@ impl<F: FileSystem + Sync> Server<F> {
                 w,
             );
         }
-        trace!("new fuse req {:?}: {:?}", Opcode::from_u32(in_header.opcode), in_header);
+        trace!(
+            "new fuse req {:?}: {:?}",
+            Opcode::from_u32(in_header.opcode),
+            in_header
+        );
         match in_header.opcode {
             x if x == Opcode::Lookup as u32 => self.lookup(in_header, r, w),
             x if x == Opcode::Forget as u32 => self.forget(in_header, r), // No reply.
@@ -1371,7 +1375,11 @@ fn reply_error(err: io::Error, unique: u64, mut w: Writer) -> Result<usize> {
     };
 
     trace!("reply error header {:?}, error {:?}", header, err);
-    if header.error != -libc::ENOSYS && header.error != -libc::ENOENT {
+    if header.error != -libc::ENOSYS
+        && header.error != -libc::ENOENT
+        && header.error != -libc::ENODATA
+        && header.error != -libc::ERANGE
+    {
         error!("reply error header {:?}, error {:?}", header, err);
     }
     w.write_all(header.as_slice())
