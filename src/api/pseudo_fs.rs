@@ -236,6 +236,8 @@ impl PseudoFs {
         let inodes = self.inodes.load();
 
         let inode = inodes.get(&ino).unwrap();
+        // ino == inode.parent means it is pseudo fs root inode.
+        // Do not evict it.
         if ino == inode.parent {
             return;
         }
