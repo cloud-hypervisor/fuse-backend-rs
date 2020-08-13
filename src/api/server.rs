@@ -1375,7 +1375,11 @@ fn reply_error(err: io::Error, unique: u64, mut w: Writer) -> Result<usize> {
     };
 
     trace!("reply error header {:?}, error {:?}", header, err);
-    if header.error != -libc::ENOSYS && header.error != -libc::ENOENT {
+    if header.error != -libc::ENOSYS
+        && header.error != -libc::ENOENT
+        && header.error != -libc::ENODATA
+        && header.error != -libc::ERANGE
+    {
         error!("reply error header {:?}, error {:?}", header, err);
     }
     w.write_all(header.as_slice())
