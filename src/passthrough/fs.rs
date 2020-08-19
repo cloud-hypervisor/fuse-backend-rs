@@ -158,6 +158,21 @@ fn stat(f: &File) -> io::Result<libc::stat64> {
     }
 }
 
+fn open_file(dfd: i32, pathname: &CStr, flags: i32, mode: u32) -> io::Result<File> {
+    let fd = if flags & libc::O_CREAT == libc::O_CREAT {
+        unsafe { libc::openat(dfd, pathname.as_ptr(), flags, mode) }
+    } else {
+        unsafe { libc::openat(dfd, pathname.as_ptr(), flags) }
+    };
+
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+
+    // Safe because we just opened this fd.
+    Ok(unsafe { File::from_raw_fd(fd) })
+}
+
 /// The caching policy that the file system should report to the FUSE client. By default the FUSE
 /// protocol uses close-to-open consistency. This means that any cached contents of the file are
 /// invalidated the next time that file is opened.
@@ -312,21 +327,12 @@ impl PassthroughFs {
     pub fn new(cfg: Config) -> io::Result<PassthroughFs> {
         // Safe because this is a constant value and a valid C string.
         let proc_cstr = unsafe { CStr::from_bytes_with_nul_unchecked(PROC_CSTR) };
-
-        // Safe because this doesn't modify any memory and we check the return value.
-        let fd = unsafe {
-            libc::openat(
-                libc::AT_FDCWD,
-                proc_cstr.as_ptr(),
-                libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-            )
-        };
-        if fd < 0 {
-            return Err(io::Error::last_os_error());
-        }
-
-        // Safe because we just opened this fd.
-        let proc = unsafe { File::from_raw_fd(fd) };
+        let proc = open_file(
+            libc::AT_FDCWD,
+            proc_cstr,
+            libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            0,
+        )?;
 
         Ok(PassthroughFs {
             inodes: RwLock::new(MultikeyBTreeMap::new()),
@@ -346,23 +352,14 @@ impl PassthroughFs {
     /// Insert root inode.
     pub fn import(&self) -> io::Result<()> {
         let root = CString::new(self.cfg.root_dir.as_str()).expect("CString::new failed");
-
-        // Safe because this doesn't modify any memory and we check the return value.
         // We use `O_PATH` because we just want this for traversing the directory tree
         // and not for actually reading the contents.
-        let fd = unsafe {
-            libc::openat(
-                libc::AT_FDCWD,
-                root.as_ptr(),
-                libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-            )
-        };
-        if fd < 0 {
-            return Err(io::Error::last_os_error());
-        }
-
-        // Safe because we just opened this fd above.
-        let f = unsafe { File::from_raw_fd(fd) };
+        let f = open_file(
+            libc::AT_FDCWD,
+            &root,
+            libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            0,
+        )?;
 
         let st = stat(&f)?;
 
@@ -402,6 +399,10 @@ impl PassthroughFs {
         vec![self.proc.as_raw_fd()]
     }
 
+    fn open_proc_file(&self, pathname: &CStr, flags: i32) -> io::Result<File> {
+        open_file(self.proc.as_raw_fd(), pathname, flags, 0)
+    }
+
     fn open_inode(&self, inode: Inode, mut flags: i32) -> io::Result<File> {
         let data = self
             .inodes
@@ -437,19 +438,7 @@ impl PassthroughFs {
         // really check `flags` because if the kernel can't handle poorly specified flags then we
         // have much bigger problems. Also, clear the `O_NOFOLLOW` flag if it is set since we need
         // to follow the `/proc/self/fd` symlink to get the file.
-        let fd = unsafe {
-            libc::openat(
-                self.proc.as_raw_fd(),
-                pathname.as_ptr(),
-                (flags | libc::O_CLOEXEC) & (!libc::O_NOFOLLOW),
-            )
-        };
-        if fd < 0 {
-            return Err(io::Error::last_os_error());
-        }
-
-        // Safe because we just opened this fd.
-        Ok(unsafe { File::from_raw_fd(fd) })
+        self.open_proc_file(&pathname, (flags | libc::O_CLOEXEC) & (!libc::O_NOFOLLOW))
     }
 
     fn do_lookup(&self, parent: Inode, name: &CStr) -> io::Result<Entry> {
@@ -461,20 +450,12 @@ impl PassthroughFs {
             .map(Arc::clone)
             .ok_or_else(ebadf)?;
 
-        // Safe because this doesn't modify any memory and we check the return value.
-        let fd = unsafe {
-            libc::openat(
-                p.file.as_raw_fd(),
-                name.as_ptr(),
-                libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-            )
-        };
-        if fd < 0 {
-            return Err(io::Error::last_os_error());
-        }
-
-        // Safe because we just opened this fd.
-        let f = unsafe { File::from_raw_fd(fd) };
+        let f = open_file(
+            p.file.as_raw_fd(),
+            name,
+            libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            0,
+        )?;
 
         let st = stat(&f)?;
 
@@ -986,23 +967,17 @@ impl FileSystem for PassthroughFs {
         // Safe because this doesn't modify any memory and we check the return value. We don't
         // really check `flags` because if the kernel can't handle poorly specified flags then we
         // have much bigger problems.
-        let fd = unsafe {
-            libc::openat(
-                data.file.as_raw_fd(),
-                name.as_ptr(),
-                flags as i32 | libc::O_CREAT | libc::O_CLOEXEC | libc::O_NOFOLLOW,
-                mode & !(umask & 0o777),
-            )
-        };
-        if fd < 0 {
-            return Err(io::Error::last_os_error());
-        }
+        let file = open_file(
+            data.file.as_raw_fd(),
+            name,
+            flags as i32 | libc::O_CREAT | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+            mode & !(umask & 0o777),
+        )?;
 
         let entry = self.do_lookup(parent, name)?;
 
         let ret_handle = if !self.no_open.load(Ordering::Relaxed) {
-            // Safe because we just opened this fd.
-            let file = RwLock::new(unsafe { File::from_raw_fd(fd) });
+            let file = RwLock::new(file);
 
             let handle = self.next_handle.fetch_add(1, Ordering::Relaxed);
             let data = HandleData {
