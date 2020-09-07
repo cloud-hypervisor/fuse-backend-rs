@@ -1395,9 +1395,21 @@ fn reply_error(err: io::Error, unique: u64, mut w: Writer) -> Result<usize> {
 }
 
 fn bytes_to_cstr(buf: &[u8]) -> Result<&CStr> {
-    // Convert to a `CStr` first so that we can drop the '\0' byte at the end
-    // and make sure there are no interior '\0' bytes.
-    CStr::from_bytes_with_nul(buf).map_err(Error::InvalidCString)
+    // There might be multiple 0s at the end of buf, find & use the first one and trim other zeros.
+    let len = buf.len();
+    let mut n: usize = 0;
+    for c in buf.iter() {
+        if c == &0 {
+            break;
+        }
+        n += 1;
+    }
+    let nul_pos = if n + 1 >= len { len } else { n + 1 };
+    let newbuf = &buf[0..nul_pos];
+
+    // Convert to a `CStr` so that we can drop the '\0' byte at the end and make sure there are no
+    // interior '\0' bytes.
+    CStr::from_bytes_with_nul(newbuf).map_err(Error::InvalidCString)
 }
 
 fn add_dirent(
