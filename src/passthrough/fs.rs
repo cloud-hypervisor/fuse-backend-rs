@@ -910,8 +910,16 @@ impl FileSystem for PassthroughFs {
             // so we'll just skip the checks here.
             let name = unsafe { CStr::from_bytes_with_nul_unchecked(dir_entry.name) };
             let entry = self.do_lookup(inode, name)?;
+            let ino = entry.inode;
 
-            add_entry(dir_entry, entry)
+            add_entry(dir_entry, entry).map(|r| {
+                // true when size is not large enough to hold entry.
+                if r == 0 {
+                    let mut inodes = self.inodes.write().unwrap();
+                    forget_one(&mut inodes, ino, 1);
+                }
+                r
+            })
         })
     }
 
