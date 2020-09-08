@@ -293,7 +293,7 @@ impl Vfs {
         }
         let ino: u64 = ((index as u64) << VFS_SUPER_INDEX_SHIFT) | inode;
         trace!(
-            "vfs hash inode index {:x} inode {:x} fuse ino {:x}",
+            "vfs hash inode index {} inode {} fuse ino {:#x}",
             index,
             inode,
             ino
