@@ -571,7 +571,7 @@ impl<F: FileSystem + Sync> Server<F> {
                 };
 
                 w.write_all(out.as_slice()).map_err(Error::EncodeMessage)?;
-                w.commit(&[&data_writer.0]).map_err(Error::IoError)?;
+                w.commit(&[&data_writer.0]).map_err(Error::EncodeMessage)?;
                 Ok(out.len as usize)
             }
             Err(e) => reply_error(e, in_header.unique, w),
@@ -976,7 +976,7 @@ impl<F: FileSystem + Sync> Server<F> {
             };
 
             w.write_all(out.as_slice()).map_err(Error::EncodeMessage)?;
-            w.commit(&[&cursor]).map_err(Error::IoError)?;
+            w.commit(&[&cursor]).map_err(Error::EncodeMessage)?;
             Ok(out.len as usize)
         }
     }

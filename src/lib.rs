@@ -75,8 +75,6 @@ pub enum Error {
     /// The `size` field of the `SetxattrIn` message does not match the length
     /// of the decoded value.
     InvalidXattrSize((u32, usize)),
-    /// An IO related error has happened.
-    IoError(io::Error),
 }
 
 impl error::Error for Error {}
@@ -96,7 +94,6 @@ impl fmt::Display for Error {
                  decoded value: size = {}, value.len() = {}",
                 size, len
             ),
-            IoError(err) => write!(f, "fail to handle request: {}", err),
         }
     }
 }
