@@ -163,7 +163,9 @@ impl<'a> Writer<'a> {
         if !buf.is_empty() {
             return writev(self.fd, buf.as_slice()).map_err(|e| {
                 error! {"fail to write to fuse device on commit: {}", e};
-                io::Error::new(io::ErrorKind::Other, format!("{}", e))
+                e.as_errno()
+                    .and_then(|r| Some(io::Error::from_raw_os_error(r as i32)))
+                    .unwrap_or_else(|| io::Error::new(io::ErrorKind::Other, format!("{}", e)))
             });
         }
         Ok(0)
