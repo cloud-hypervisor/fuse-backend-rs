@@ -561,6 +561,7 @@ impl PassthroughFs {
         }
 
         let mut rem = &buf[..];
+        let orig_rem_len = rem.len();
         while !rem.is_empty() {
             // We only use debug asserts here because these values are coming from the kernel and we
             // trust them implicitly.
@@ -599,7 +600,12 @@ impl PassthroughFs {
             match res {
                 Ok(0) => break,
                 Ok(_) => rem = &rem[dirent64.d_reclen as usize..],
-                Err(e) => return Err(e),
+                // If there's an error, we can only signal it if we haven't
+                // stored any entries yet - otherwise we'd end up with wrong
+                // lookup counts for the entries that are already in the
+                // buffer. So we return what we've collected until that point.
+                Err(e) if rem.len() == orig_rem_len => return Err(e),
+                Err(_) => return Ok(()),
             }
         }
 
