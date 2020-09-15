@@ -199,7 +199,7 @@ impl FromStr for CachePolicy {
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
-            "never" | "Never" | "NEVER" => Ok(CachePolicy::Never),
+            "never" | "Never" | "NEVER" | "none" | "None" | "NONE" => Ok(CachePolicy::Never),
             "auto" | "Auto" | "AUTO" => Ok(CachePolicy::Auto),
             "always" | "Always" | "ALWAYS" => Ok(CachePolicy::Always),
             _ => Err("invalid cache policy"),
