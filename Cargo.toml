@@ -13,13 +13,13 @@ bitflags = ">=1.1.0"
 libc = ">=0.2.67"
 log = ">=0.4.6"
 nix = "0.17.0"
-vm-memory = { git = "ssh://git@gitlab.alibaba-inc.com/rust-vmm/vm-memory.git", branch = "v5" }
-vm-virtio = { git = "ssh://git@gitlab.alibaba-inc.com/rust-vmm/vm-virtio.git", branch = "v5", optional = true }
-vhost-rs = { git = "ssh://git@gitlab.alibaba-inc.com/rust-vmm/vhost.git", branch = "v5", package = "vhost", optional = true }
+vm-memory = { git = "ssh://git@gitlab.alibaba-inc.com/rust-vmm/vm-memory.git", branch = "master" }
+vm-virtio = { git = "ssh://git@gitlab.alibaba-inc.com/rust-vmm/vm-virtio.git", branch = "master", optional = true }
+vhost-rs = { git = "ssh://git@gitlab.alibaba-inc.com/rust-vmm/vhost.git", branch = "master", package = "vhost", optional = true }
 
 [dev-dependencies.vm-memory]
 git = "ssh://git@gitlab.alibaba-inc.com/rust-vmm/vm-memory.git"
-branch = "v5"
+branch = "master"
 features = ["backend-mmap"]
 
 [features]
