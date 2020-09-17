@@ -391,6 +391,20 @@ impl Vfs {
             ))
         }
     }
+
+    /// Vfs options are negotiated when processing the first fuse `Init` message.
+    /// This method returns the options, so other components can know how the fuse
+    /// session was configured.
+    pub fn get_opts(&self) -> VfsOptions {
+        *self.opts.load().deref().deref()
+    }
+
+    /// Basically, we don't need to and can't change the options during runtime. But for
+    /// live upgrade's sake, we have to set the non-negotiated options with the stored
+    /// configurations. Because, we can't do mount twice when doing live upgrade.
+    pub fn set_opts(&self, opts: VfsOptions) {
+        self.opts.store(Arc::new(opts));
+    }
 }
 
 impl FileSystem for Vfs {
