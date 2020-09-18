@@ -62,21 +62,25 @@ impl<'a> IoBuffers<'a> {
     where
         F: FnOnce(&[VolatileSlice]) -> io::Result<usize>,
     {
-        let mut buflen = 0;
+        let mut rem = count;
         let mut bufs = Vec::with_capacity(self.buffers.len());
         for &buf in &self.buffers {
-            if buflen >= count {
+            if rem == 0 {
                 break;
             }
 
-            bufs.push(buf);
-
-            let rem = count - buflen;
-            if rem < buf.len() {
-                buflen += rem;
+            // If buffer contains more data than `rem`, truncate buffer to `rem`, otherwise
+            // more data is written out and causes data corruption.
+            let local_buf = if buf.len() > rem {
+                // Safe because we just check rem < buf.len()
+                buf.get_subslice(0, rem).unwrap()
             } else {
-                buflen += buf.len() as usize;
-            }
+                buf
+            };
+
+            bufs.push(local_buf);
+            // Don't need check_sub() as we just made sure rem >= local_buf.len()
+            rem -= local_buf.len() as usize;
         }
 
         if bufs.is_empty() {
@@ -94,7 +98,7 @@ impl<'a> IoBuffers<'a> {
                     io::Error::new(io::ErrorKind::InvalidData, Error::DescriptorChainOverflow)
                 })?;
 
-        let mut rem = bytes_consumed;
+        rem = bytes_consumed;
         while let Some(buf) = self.buffers.pop_front() {
             if rem < buf.len() {
                 // Split the slice and push the remainder back into the buffer list. Safe because we
