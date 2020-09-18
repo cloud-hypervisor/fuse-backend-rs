@@ -62,21 +62,25 @@ impl<'a> IoBuffers<'a> {
     where
         F: FnOnce(&[VolatileSlice]) -> io::Result<usize>,
     {
-        let mut buflen = 0;
+        let mut rem = count;
         let mut bufs = Vec::with_capacity(self.buffers.len());
         for &buf in &self.buffers {
-            if buflen >= count {
+            if rem == 0 {
                 break;
             }
 
-            bufs.push(buf);
-
-            let rem = count - buflen;
-            if rem < buf.len() {
-                buflen += rem;
+            // If buffer contains more data than `rem`, truncate buffer to `rem`, otherwise
+            // more data is written out and causes data corruption.
+            let local_buf = if buf.len() > rem {
+                // Safe because we just check rem < buf.len()
+                vm_memory_subslice(&buf, 0, rem).unwrap()
             } else {
-                buflen += buf.len() as usize;
-            }
+                buf
+            };
+
+            bufs.push(local_buf);
+            // Don't need check_sub() as we just made sure rem >= local_buf.len()
+            rem -= local_buf.len() as usize;
         }
 
         if bufs.is_empty() {
@@ -94,7 +98,7 @@ impl<'a> IoBuffers<'a> {
                     io::Error::new(io::ErrorKind::InvalidData, Error::DescriptorChainOverflow)
                 })?;
 
-        let mut rem = bytes_consumed;
+        rem = bytes_consumed;
         while let Some(buf) = self.buffers.pop_front() {
             if rem < buf.len() {
                 // Split the slice and push the remainder back into the buffer list. Safe because we
@@ -270,5 +274,32 @@ impl<'a> io::Read for Reader<'a> {
             }
             Ok(total)
         })
+    }
+}
+
+/// Returns a subslice of this [`VolatileSlice`](struct.VolatileSlice.html) starting at
+/// `offset` with `count` length.
+///
+/// The returned subslice is a copy of this slice with the address increased by `offset` bytes
+/// and the size set to `count` bytes.
+///
+/// TODO: it's a temporary solution and this method should be added to the vm-memory crate.
+/// https://github.com/rust-vmm/vm-memory/pull/128
+fn vm_memory_subslice<'a>(
+    src: &VolatileSlice<'a>,
+    offset: usize,
+    count: usize,
+) -> vm_memory::volatile_memory::Result<VolatileSlice<'a>> {
+    let mem_end = vm_memory::volatile_memory::compute_offset(offset, count)?;
+    if mem_end > src.len() {
+        return Err(vm_memory::volatile_memory::Error::OutOfBounds { addr: mem_end });
+    }
+    unsafe {
+        // This is safe because the pointer is range-checked by compute_end_offset, and
+        // the lifetime is the same as the original slice.
+        Ok(VolatileSlice::new(
+            (src.as_ptr() as usize + offset) as *mut u8,
+            count,
+        ))
     }
 }
