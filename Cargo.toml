@@ -16,6 +16,9 @@ nix = "0.17.0"
 vm-memory = { git = "ssh://git@gitlab.alibaba-inc.com/rust-vmm/vm-memory.git", branch = "master" }
 vm-virtio = { git = "ssh://git@gitlab.alibaba-inc.com/rust-vmm/vm-virtio.git", branch = "master", optional = true }
 vhost-rs = { git = "ssh://git@gitlab.alibaba-inc.com/rust-vmm/vhost.git", branch = "master", package = "vhost", optional = true }
+snapshot = { git = "ssh://git@gitlab.alibaba-inc.com/rust-vmm/snapshot.git", branch = "master" }
+versionize = { git = "ssh://git@gitlab.alibaba-inc.com/rust-vmm/versionize.git", branch = "master" }
+versionize_derive = { git = "ssh://git@gitlab.alibaba-inc.com/rust-vmm/versionize_derive.git", branch = "master" }
 
 [dev-dependencies.vm-memory]
 git = "ssh://git@gitlab.alibaba-inc.com/rust-vmm/vm-memory.git"

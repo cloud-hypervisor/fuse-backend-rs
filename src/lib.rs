@@ -55,6 +55,10 @@ extern crate vm_memory;
 #[cfg(feature = "virtiofs")]
 extern crate vm_virtio;
 
+extern crate snapshot;
+extern crate versionize;
+extern crate versionize_derive;
+
 use std::ffi::FromBytesWithNulError;
 use std::io::ErrorKind;
 use std::{error, fmt, io};

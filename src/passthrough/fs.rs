@@ -17,6 +17,9 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
+use versionize::{VersionMap, Versionize, VersionizeError, VersionizeResult};
+use versionize_derive::Versionize;
+
 use vm_memory::ByteValued;
 
 use super::multikey::MultikeyBTreeMap;
@@ -37,20 +40,20 @@ const PARENT_DIR_CSTR: &[u8] = b"..\0";
 const EMPTY_CSTR: &[u8] = b"\0";
 const PROC_CSTR: &[u8] = b"/proc\0";
 
-type Inode = u64;
+pub(crate) type Inode = u64;
 type Handle = u64;
 
 #[derive(Clone, Copy, PartialOrd, Ord, PartialEq, Eq)]
-struct InodeAltKey {
-    ino: libc::ino64_t,
-    dev: libc::dev_t,
+pub(crate) struct InodeAltKey {
+    pub(crate) ino: libc::ino64_t,
+    pub(crate) dev: libc::dev_t,
 }
 
-struct InodeData {
-    inode: Inode,
+pub(crate) struct InodeData {
+    pub(crate) inode: Inode,
     // Most of these aren't actually files but ¯\_(ツ)_/¯.
-    file: File,
-    refcount: AtomicU64,
+    pub(crate) file: File,
+    pub(crate) refcount: AtomicU64,
 }
 
 struct HandleData {
@@ -134,7 +137,7 @@ fn ebadf() -> io::Error {
     io::Error::from_raw_os_error(libc::EBADF)
 }
 
-fn stat(f: &File) -> io::Result<libc::stat64> {
+pub(crate) fn stat(f: &File) -> io::Result<libc::stat64> {
     let mut st = MaybeUninit::<libc::stat64>::zeroed();
 
     // Safe because this is a constant value and a valid C string.
@@ -176,7 +179,7 @@ fn open_file(dfd: i32, pathname: &CStr, flags: i32, mode: u32) -> io::Result<Fil
 /// The caching policy that the file system should report to the FUSE client. By default the FUSE
 /// protocol uses close-to-open consistency. This means that any cached contents of the file are
 /// invalidated the next time that file is opened.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Versionize)]
 pub enum CachePolicy {
     /// The client should never cache file data and all I/O should be directly forwarded to the
     /// server. This policy must be selected when file contents may change without the knowledge of
@@ -214,7 +217,7 @@ impl Default for CachePolicy {
 }
 
 /// Options that configure the behavior of the file system.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Config {
     /// How long the FUSE client should consider directory entries to be valid. If the contents of a
     /// directory can only be modified by the FUSE client (i.e., the file system has exclusive
@@ -298,8 +301,8 @@ pub struct PassthroughFs {
     // the `O_PATH` option so they cannot be used for reading or writing any data. See the
     // documentation of the `O_PATH` flag in `open(2)` for more details on what one can and cannot
     // do with an fd opened with this flag.
-    inodes: RwLock<MultikeyBTreeMap<Inode, InodeAltKey, Arc<InodeData>>>,
-    next_inode: AtomicU64,
+    pub(crate) inodes: RwLock<MultikeyBTreeMap<Inode, InodeAltKey, Arc<InodeData>>>,
+    pub(crate) next_inode: AtomicU64,
 
     // File descriptors for open files and directories. Unlike the fds in `inodes`, these _can_ be
     // used for reading and writing data.
@@ -310,16 +313,16 @@ pub struct PassthroughFs {
     // `inodes` into one that can go into `handles`. This is accomplished by reading the
     // `self/fd/{}` symlink. We keep an open fd here in case the file system tree that we are meant
     // to be serving doesn't have access to `/proc`.
-    proc: File,
+    pub(crate) proc: File,
 
     // Whether writeback caching is enabled for this directory. This will only be true when
     // `cfg.writeback` is true and `init` was called with `FsOptions::WRITEBACK_CACHE`.
-    writeback: AtomicBool,
+    pub(crate) writeback: AtomicBool,
 
     // Whether no_open is enabled.
-    no_open: AtomicBool,
+    pub(crate) no_open: AtomicBool,
 
-    cfg: Config,
+    pub(crate) cfg: Config,
 }
 
 impl PassthroughFs {

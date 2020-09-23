@@ -15,6 +15,9 @@ use bimap::hash::BiHashMap;
 use std::any::Any;
 use std::ops::Deref;
 
+use versionize::{VersionMap, Versionize, VersionizeResult};
+use versionize_derive::Versionize;
+
 use super::pseudo_fs::PseudoFs;
 use crate::abi::linux_abi::*;
 use crate::api::filesystem::*;
@@ -35,7 +38,8 @@ use Either::*;
 type Inode = u64;
 type Handle = u64;
 type SuperIndex = u8;
-type BackFileSystem = Box<dyn BackendFileSystem<Inode = u64, Handle = u64> + Sync + Send>;
+pub(crate) type BackFileSystem =
+    Box<dyn BackendFileSystem<Inode = u64, Handle = u64> + Sync + Send>;
 
 /// BackendFileSystemType describes all backend file system types under vfs
 pub enum BackendFileSystemType {
@@ -56,7 +60,9 @@ pub trait BackendFileSystem: FileSystem {
     }
 
     /// fstype returns the backend fs type.
-    fn fstype(&self) -> BackendFileSystemType;
+    fn fstype(&self) -> BackendFileSystemType {
+        BackendFileSystemType::PassthroughFs
+    }
 
     /// Provides a reference to the Any trait. This is useful to let
     /// the caller have access to the underlying type behind the
@@ -72,14 +78,14 @@ struct InodeData {
     ino: Inode,
 }
 
-struct MountPointData {
-    super_index: SuperIndex,
+pub(crate) struct MountPointData {
+    pub(crate) super_index: SuperIndex,
     ino: Inode,
     root_entry: Entry,
-    path: String,
+    pub(crate) path: String,
 }
 
-#[derive(Debug, Copy, Clone)]
+#[derive(Debug, Copy, Clone, Versionize)]
 /// vfs init options
 pub struct VfsOptions {
     /// Disable fuse open request handling. When enabled, fuse open
@@ -91,8 +97,8 @@ pub struct VfsOptions {
     /// Disable fuse WRITEBACK_CACHE option so that kernel will not cache
     /// buffer wirtes.
     pub no_writeback: bool,
-    in_opts: FsOptions,
-    out_opts: FsOptions,
+    pub(crate) in_opts: FsOptions,
+    pub(crate) out_opts: FsOptions,
 }
 
 impl Default for VfsOptions {
@@ -121,15 +127,15 @@ impl Default for VfsOptions {
 
 /// A union fs that combines multiple backend file systems.
 pub struct Vfs {
-    next_super: AtomicU8,
+    pub(crate) next_super: AtomicU8,
     root: PseudoFs,
     // inodes maintains mapping between fuse inode and (pseudo fs or mounted fs) inode data
     inodes: RwLock<BiHashMap<Inode, InodeData>>,
     // mountpoints maps from pseudo fs inode to mounted fs mountpoint data
-    mountpoints: ArcSwap<HashMap<Inode, Arc<MountPointData>>>,
+    pub(crate) mountpoints: ArcSwap<HashMap<Inode, Arc<MountPointData>>>,
     // superblocks keeps track of all mounted file systems
-    superblocks: ArcSwap<HashMap<SuperIndex, Arc<BackFileSystem>>>,
-    opts: ArcSwap<VfsOptions>,
+    pub(crate) superblocks: ArcSwap<HashMap<SuperIndex, Arc<BackFileSystem>>>,
+    pub(crate) opts: ArcSwap<VfsOptions>,
     lock: Mutex<()>,
 }
 
