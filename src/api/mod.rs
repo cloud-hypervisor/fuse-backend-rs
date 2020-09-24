@@ -6,6 +6,6 @@
 mod pseudo_fs;
 mod vfs;
 
-pub use vfs::{BackendFileSystem, Vfs, VfsOptions, VFS_MAX_INO};
+pub use vfs::{BackendFileSystem, BackendFileSystemType, Vfs, VfsOptions, VFS_MAX_INO};
 pub mod filesystem;
 pub mod server;
