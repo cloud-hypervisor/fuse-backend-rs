@@ -76,6 +76,7 @@ struct MountPointData {
     super_index: SuperIndex,
     ino: Inode,
     root_entry: Entry,
+    path: String,
 }
 
 #[derive(Debug, Copy, Clone)]
@@ -207,6 +208,7 @@ impl Vfs {
                 super_index: index,
                 ino: ROOT_ID,
                 root_entry: entry,
+                path: path.to_string(),
             }),
         );
         self.mountpoints.store(Arc::new(mountpoints));
