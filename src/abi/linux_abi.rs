@@ -9,6 +9,9 @@
 use std::mem;
 
 use bitflags::bitflags;
+use serde::{Deserialize, Serialize};
+use versionize::{VersionMap, Versionize, VersionizeResult};
+use versionize_derive::Versionize;
 use vm_memory::ByteValued;
 
 /// Version number of this interface.
@@ -166,6 +169,7 @@ const MAP_ALIGNMENT: u32 = 33_554_432;
 bitflags! {
     /// A bitfield passed in as a parameter to and returned from the `init` method of the
     /// `FileSystem` trait.
+    #[derive(Deserialize, Serialize, Versionize)]
     pub struct FsOptions: u32 {
         /// Indicates that the filesystem supports asynchronous read requests.
         ///
