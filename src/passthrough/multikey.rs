@@ -6,6 +6,7 @@
 
 use std::borrow::Borrow;
 use std::collections::BTreeMap;
+use std::collections::btree_map::Iter;
 
 /// A BTreeMap that supports 2 types of keys per value. All the usual restrictions and warnings for
 /// `std::collections::BTreeMap` also apply to this struct. Additionally, there is a 1:1
@@ -113,6 +114,10 @@ where
     pub fn clear(&mut self) {
         self.alt.clear();
         self.main.clear()
+    }
+
+    pub fn iter(&self) -> Iter<'_, K1, (K2, V)> {
+        self.main.iter()
     }
 }
 
