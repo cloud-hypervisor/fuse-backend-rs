@@ -7,7 +7,7 @@ use std::convert::TryInto;
 use std::io;
 use std::io::Error as IoError;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use std::fs::File;
@@ -18,7 +18,7 @@ use versionize::{VersionMap, Versionize, VersionizeResult};
 use versionize_derive::Versionize;
 
 use crate::abi::linux_abi as fuse;
-use crate::passthrough::fs::{stat, Inode, InodeAltKey, InodeData};
+use crate::passthrough::fs::{stat, Handle, HandleData, Inode, InodeAltKey, InodeData};
 use crate::passthrough::{CachePolicy, Config, PassthroughFs};
 
 #[derive(Versionize, PartialEq, Debug)]
@@ -89,11 +89,19 @@ struct InodeDataState {
 }
 
 #[derive(Versionize, Debug, PartialEq)]
+struct HandleDataState {
+    handle: Handle,
+    inode: Inode,
+    fd: RawFd,
+}
+
+#[derive(Versionize, Debug, PartialEq)]
 pub struct PassthroughFsLiveUpgradeState {
     proc: RawFd,
     next_inode: u64,
     inodes: Vec<InodeDataState>,
-    //    next_handle: u64,
+    next_handle: u64,
+    handles: Vec<HandleDataState>,
 }
 
 #[derive(Versionize, Debug, PartialEq)]
@@ -146,6 +154,15 @@ impl Persist<'_> for PassthroughFs {
             });
         }
 
+        let mut handles = Vec::new();
+        for (key, val) in self.handles.read().unwrap().iter() {
+            handles.push(HandleDataState {
+                handle: *key,
+                inode: val.inode,
+                fd: val.file.read().unwrap().save(),
+            });
+        }
+
         PassthroughFsState {
             writeback: self.writeback.load(Ordering::Relaxed),
             no_open: self.no_open.load(Ordering::Relaxed),
@@ -154,6 +171,8 @@ impl Persist<'_> for PassthroughFs {
                 proc: self.proc.save(),
                 next_inode: self.next_inode.load(Ordering::Relaxed),
                 inodes: inodes,
+                next_handle: self.next_handle.load(Ordering::Relaxed),
+                handles: handles,
             }),
         }
     }
@@ -190,6 +209,18 @@ impl Persist<'_> for PassthroughFs {
                     inode: elem.inode,
                     file,
                     refcount: AtomicU64::new(elem.refcount),
+                }),
+            );
+        }
+
+        fs.next_handle
+            .store(live_state.next_handle, Ordering::Relaxed);
+        for elem in live_state.handles.iter() {
+            fs.handles.write().unwrap().insert(
+                elem.handle,
+                Arc::new(HandleData {
+                    inode: elem.inode,
+                    file: RwLock::new(File::restore(elem.fd)),
                 }),
             );
         }

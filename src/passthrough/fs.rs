@@ -41,7 +41,7 @@ const EMPTY_CSTR: &[u8] = b"\0";
 const PROC_CSTR: &[u8] = b"/proc\0";
 
 pub(crate) type Inode = u64;
-type Handle = u64;
+pub(crate) type Handle = u64;
 
 #[derive(Clone, Copy, PartialOrd, Ord, PartialEq, Eq)]
 pub(crate) struct InodeAltKey {
@@ -56,9 +56,9 @@ pub(crate) struct InodeData {
     pub(crate) refcount: AtomicU64,
 }
 
-struct HandleData {
-    inode: Inode,
-    file: RwLock<File>,
+pub(crate) struct HandleData {
+    pub(crate) inode: Inode,
+    pub(crate) file: RwLock<File>,
 }
 
 #[repr(C, packed)]
@@ -306,8 +306,8 @@ pub struct PassthroughFs {
 
     // File descriptors for open files and directories. Unlike the fds in `inodes`, these _can_ be
     // used for reading and writing data.
-    handles: RwLock<BTreeMap<Handle, Arc<HandleData>>>,
-    next_handle: AtomicU64,
+    pub(crate) handles: RwLock<BTreeMap<Handle, Arc<HandleData>>>,
+    pub(crate) next_handle: AtomicU64,
 
     // File descriptor pointing to the `/proc` directory. This is used to convert an fd from
     // `inodes` into one that can go into `handles`. This is accomplished by reading the
