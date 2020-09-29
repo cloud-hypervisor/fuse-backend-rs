@@ -31,9 +31,9 @@ pub struct BackendFsState {
 #[derive(Versionize, PartialEq, Debug)]
 pub struct VfsState {
     opts: VfsOptions,
+    next_super: u8,
     backend_fs: Vec<BackendFsState>,
 }
-
 
 impl Persist<'_> for Vfs {
     type State = VfsState;
@@ -123,6 +123,7 @@ impl Vfs {
 
         VfsState {
             opts: self.opts.load().deref().deref().clone(),
+            next_super: self.next_super.load(Ordering::SeqCst),
             backend_fs: backend_fs_vec,
         }
     }
@@ -142,6 +143,7 @@ impl Vfs {
             vfs.mount(b_fs, fs.path.as_str())?;
         }
 
+        vfs.next_super.store(state.next_super, Ordering::SeqCst);
         Ok(vfs)
     }
 }
