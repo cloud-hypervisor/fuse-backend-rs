@@ -3,6 +3,7 @@
 
 //! Fuse Application Programming Interfaces(API).
 
+#![allow(dead_code)]
 mod pseudo_fs;
 mod vfs;
 mod vfs_persist;

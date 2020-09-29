@@ -136,6 +136,7 @@ pub struct Vfs {
     // superblocks keeps track of all mounted file systems
     pub(crate) superblocks: ArcSwap<HashMap<SuperIndex, Arc<BackFileSystem>>>,
     pub(crate) opts: ArcSwap<VfsOptions>,
+    pub(crate) unmounted_path: Mutex<HashMap<SuperIndex, String>>,
     lock: Mutex<()>,
 }
 
@@ -155,6 +156,7 @@ impl Vfs {
             superblocks: ArcSwap::new(Arc::new(HashMap::new())),
             root: PseudoFs::new(),
             opts: ArcSwap::new(Arc::new(opts)),
+            unmounted_path: Mutex::new(HashMap::new()),
             lock: Mutex::new(()),
         };
 
@@ -232,7 +234,11 @@ impl Vfs {
             .get(&inode)
             .map(Arc::clone)
             .map(|x| {
-                self.root.evict_inode(inode);
+                // Do not remove pseudofs inode. We keep all pseudofs inode so that
+                // 1. they can be reused later on
+                // 2. during live upgrade, it is easier reconstruct pseudofs inodes since
+                //    we do not have to track pseudofs deletions
+                //self.root.evict_inode(inode);
                 mountpoints.remove(&inode);
                 self.mountpoints.store(Arc::new(mountpoints));
                 x.super_index
@@ -267,6 +273,12 @@ impl Vfs {
         fs.destroy();
         superblocks.remove(&fs_super_index);
         self.superblocks.store(Arc::new(superblocks));
+
+        self.unmounted_path
+            .lock()
+            .unwrap()
+            .insert(fs_super_index, path.to_string());
+
         Ok(())
     }
 
@@ -291,6 +303,17 @@ impl Vfs {
             error!("inode {} is not found\n", inode);
             Err(Error::from_raw_os_error(libc::EINVAL))
         }
+    }
+
+    /// Create all components in path as directories in the pseudo file system
+    pub fn mkdir_all(&self, super_index: u8, path: &str) -> Result<()> {
+        self.root.mount(path)?;
+        self.unmounted_path
+            .lock()
+            .unwrap()
+            .insert(super_index, path.to_string());
+        self.next_super.fetch_add(1, Ordering::Relaxed);
+        Ok(())
     }
 
     // Inode hashing rules:

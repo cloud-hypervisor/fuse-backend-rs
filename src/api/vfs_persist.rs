@@ -24,7 +24,7 @@ pub enum BackendFsStateInner {
 #[derive(Versionize, PartialEq, Debug)]
 pub struct BackendFsState {
     super_index: u8,
-    fs_state: BackendFsStateInner,
+    fs_state: Option<BackendFsStateInner>,
     path: String,
 }
 
@@ -103,6 +103,14 @@ impl Vfs {
     {
         let mut backend_fs_vec = Vec::new();
 
+        for (index, path) in self.unmounted_path.lock().unwrap().iter() {
+            backend_fs_vec.push(BackendFsState {
+                super_index: *index,
+                fs_state: None,
+                path: path.to_string(),
+            });
+        }
+
         for (_, val) in self.mountpoints.load().iter() {
             let super_index = val.super_index;
             let fs = self
@@ -114,7 +122,7 @@ impl Vfs {
 
             backend_fs_vec.push(BackendFsState {
                 super_index: super_index,
-                fs_state: save_fn(fs),
+                fs_state: Some(save_fn(fs)),
                 path: val.path.clone(),
             });
         }
@@ -139,8 +147,12 @@ impl Vfs {
         vfs.opts.store(Arc::new(state.opts));
 
         for fs in state.backend_fs.iter() {
-            let b_fs: BackFileSystem = restore_fn(&fs.fs_state)?;
-            vfs.mount(b_fs, fs.path.as_str())?;
+            if let Some(fs_state) = fs.fs_state.as_ref() {
+                let b_fs: BackFileSystem = restore_fn(&fs_state)?;
+                vfs.mount(b_fs, fs.path.as_str())?;
+            } else {
+                vfs.mkdir_all(fs.super_index, &fs.path)?;
+            }
         }
 
         vfs.next_super.store(state.next_super, Ordering::SeqCst);
@@ -160,8 +172,27 @@ impl PartialEq for VfsOptions {
 
 impl PartialEq for Vfs {
     fn eq(&self, other: &Vfs) -> bool {
+        let old_unmounted = self.unmounted_path.lock().unwrap().clone();
+        let new_unmounted = other.unmounted_path.lock().unwrap().clone();
+        let mut old_root_inodes: Vec<u64> =
+            self.mountpoints.load().iter().map(|(&k, _)| k).collect();
+        let mut new_root_inodes: Vec<u64> =
+            other.mountpoints.load().iter().map(|(&k, _)| k).collect();
+        let mut old_super_indexes: Vec<u8> =
+            self.superblocks.load().iter().map(|(&k, _)| k).collect();
+        let mut new_super_indexes: Vec<u8> =
+            self.superblocks.load().iter().map(|(&k, _)| k).collect();
+
+        old_root_inodes.sort();
+        new_root_inodes.sort();
+        old_super_indexes.sort();
+        new_super_indexes.sort();
+
         self.next_super.load(Ordering::Relaxed) == other.next_super.load(Ordering::Relaxed)
             && self.opts.load().deref().deref() == other.opts.load().deref().deref()
+            && old_unmounted == new_unmounted
+            && old_root_inodes == new_root_inodes
+            && old_super_indexes == new_super_indexes
     }
 }
 
@@ -170,7 +201,7 @@ pub(crate) mod tests {
     use super::*;
 
     #[test]
-    fn test_persist_vfs_state() {
+    fn test_persist_vfs() {
         let opts = VfsOptions {
             no_open: false,
             no_writeback: true,
@@ -179,16 +210,31 @@ pub(crate) mod tests {
 
         let vfs = Vfs::new(opts);
 
-        // attach two fs
-        let fs_cfg = Config::default();
-        let fs_a = PassthroughFs::new(fs_cfg.clone()).unwrap();
-        fs_a.import().unwrap();
-        vfs.mount(Box::new(fs_a), "/submnt/mnt_a").unwrap();
+        let mount_fs = |path| {
+            let fs_cfg = Config::default();
+            let fs = PassthroughFs::new(fs_cfg.clone()).unwrap();
+            fs.import().unwrap();
+            vfs.mount(Box::new(fs), path).unwrap();
+        };
 
-        let fs_b = PassthroughFs::new(fs_cfg).unwrap();
-        fs_b.import().unwrap();
-        vfs.mount(Box::new(fs_b), "/submnt/mnt_b").unwrap();
+        mount_fs("/submnt/mnt_a");
+        mount_fs("/submnt/mnt_a");
+        mount_fs("/submnt/mnt_a");
+        vfs.umount("/submnt/mnt_a").unwrap();
+        mount_fs("/submnt/mnt_a");
+        mount_fs("/submnt/mnt_a");
+        mount_fs("/submnt/mnt_b");
+        mount_fs("/submnt/mnt_c");
+        vfs.umount("/submnt/mnt_b").unwrap();
+        mount_fs("/submnt/mnt_d");
+        mount_fs("/submnt/mnt_b/c/d/e");
+        vfs.umount("/submnt/mnt_d").unwrap();
+        mount_fs("/submnt/mnt_e");
+        mount_fs("/submnt/mnt_f");
+        vfs.umount("/submnt/mnt_e").unwrap();
+        mount_fs("/submnt/mnt_d");
 
+        // snapshot
         // save the state
         let mut mem = vec![0; 4096];
         let version_map = VersionMap::new();
@@ -204,29 +250,8 @@ pub(crate) mod tests {
         .unwrap();
 
         assert!(vfs == restored_vfs);
-    }
 
-    #[test]
-    fn test_persist_vfs_state_live_upgrade() {
-        let opts = VfsOptions {
-            no_open: false,
-            no_writeback: true,
-            ..Default::default()
-        };
-
-        let vfs = Vfs::new(opts);
-
-        // attach two fs
-        let fs_cfg = Config::default();
-        let fs_a = PassthroughFs::new(fs_cfg.clone()).unwrap();
-        fs_a.import().unwrap();
-        vfs.mount(Box::new(fs_a), "/submnt/mnt_a").unwrap();
-
-        let fs_b = PassthroughFs::new(fs_cfg).unwrap();
-        fs_b.import().unwrap();
-        vfs.mount(Box::new(fs_b), "/submnt/mnt_b").unwrap();
-
-        // save the state
+        // live upgrade
         let mut mem = vec![0; 4096];
         let version_map = VersionMap::new();
         vfs.live_upgrade_save()
