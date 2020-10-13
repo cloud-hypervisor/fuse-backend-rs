@@ -14,11 +14,13 @@ use versionize_derive::Versionize;
 
 use crate::api::vfs::BackFileSystem;
 use crate::api::{BackendFileSystemType, Vfs, VfsOptions};
-use crate::passthrough::{Config, PassthroughFs, PassthroughFsState};
+use crate::passthrough::{PassthroughFs, PassthroughFsState};
 
 #[derive(Versionize, PartialEq, Debug)]
 pub enum BackendFsStateInner {
     PassthroughFs(PassthroughFsState),
+    // Place holder, not implemented yet
+    Rafs,
 }
 
 #[derive(Versionize, PartialEq, Debug)]
