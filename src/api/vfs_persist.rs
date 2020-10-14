@@ -14,6 +14,7 @@ use versionize_derive::Versionize;
 
 use crate::api::vfs::BackFileSystem;
 use crate::api::{BackendFileSystemType, Vfs, VfsOptions};
+use crate::api::filesystem::FsOptions;
 use crate::passthrough::{PassthroughFs, PassthroughFsState};
 
 #[derive(Versionize, PartialEq, Debug)]
@@ -31,8 +32,47 @@ pub struct BackendFsState {
 }
 
 #[derive(Versionize, PartialEq, Debug)]
+pub struct VfsOptionsState {
+    no_open: bool,
+    no_opendir: bool,
+    no_writeback: bool,
+    in_opts: u32,
+    out_opts: u32,
+}
+
+impl Persist<'_> for VfsOptions {
+    type State = VfsOptionsState;
+    type ConstructorArgs = ();
+    type LiveUpgradeConstructorArgs = ();
+    type Error = ();
+
+    fn save(&self) -> Self::State {
+        Self::State {
+            no_open: self.no_open,
+            no_opendir: self.no_opendir,
+            no_writeback: self.no_writeback,
+            in_opts: self.in_opts.bits(),
+            out_opts: self.out_opts.bits(),
+        }
+    }
+
+    fn restore(
+        _constructor_args: Self::ConstructorArgs,
+        state: &Self::State,
+    ) -> Result<Self, Self::Error> {
+        Ok(Self {
+            no_open: state.no_open,
+            no_opendir: state.no_opendir,
+            no_writeback: state.no_writeback,
+            in_opts: FsOptions::from_bits_truncate(state.in_opts),
+            out_opts: FsOptions::from_bits_truncate(state.out_opts),
+        })
+    }
+}
+
+#[derive(Versionize, PartialEq, Debug)]
 pub struct VfsState {
-    opts: VfsOptions,
+    opts: VfsOptionsState,
     next_super: u8,
     backend_fs: Vec<BackendFsState>,
 }
@@ -132,7 +172,7 @@ impl Vfs {
         backend_fs_vec.sort_by(|a, b| a.super_index.cmp(&b.super_index));
 
         VfsState {
-            opts: self.opts.load().deref().deref().clone(),
+            opts: self.opts.load().deref().deref().save(),
             next_super: self.next_super.load(Ordering::SeqCst),
             backend_fs: backend_fs_vec,
         }
@@ -146,7 +186,7 @@ impl Vfs {
         F: FnOnce(&BackendFsStateInner) -> std::result::Result<BackFileSystem, IoError> + Copy,
     {
         let vfs = Vfs::default();
-        vfs.opts.store(Arc::new(state.opts));
+        vfs.opts.store(Arc::new(VfsOptions::restore((), &state.opts).unwrap()));
 
         for fs in state.backend_fs.iter() {
             if let Some(fs_state) = fs.fs_state.as_ref() {

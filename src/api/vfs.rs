@@ -15,9 +15,6 @@ use bimap::hash::BiHashMap;
 use std::any::Any;
 use std::ops::Deref;
 
-use versionize::{VersionMap, Versionize, VersionizeResult};
-use versionize_derive::Versionize;
-
 use super::pseudo_fs::PseudoFs;
 use crate::abi::linux_abi::*;
 use crate::api::filesystem::*;
@@ -85,7 +82,7 @@ pub(crate) struct MountPointData {
     pub(crate) path: String,
 }
 
-#[derive(Debug, Copy, Clone, Versionize)]
+#[derive(Debug, Copy, Clone)]
 /// vfs init options
 pub struct VfsOptions {
     /// Disable fuse open request handling. When enabled, fuse open
