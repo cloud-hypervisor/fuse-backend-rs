@@ -241,6 +241,7 @@ impl PartialEq for PassthroughFs {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    use std::os::unix::io::AsRawFd;
 
     #[test]
     fn test_persist_passthroughfs_state() {

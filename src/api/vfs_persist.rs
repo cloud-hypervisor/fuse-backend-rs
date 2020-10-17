@@ -241,6 +241,7 @@ impl PartialEq for Vfs {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    use crate::passthrough::{Config, PassthroughFs};
 
     #[test]
     fn test_persist_vfs() {
