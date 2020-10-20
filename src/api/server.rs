@@ -112,10 +112,11 @@ impl<F: FileSystem + Sync> Server<F> {
         let in_header: InHeader = r.read_obj().map_err(Error::DecodeMessage)?;
 
         if in_header.len > MAX_BUFFER_SIZE {
-            return reply_error(
+            return do_reply_error(
                 io::Error::from_raw_os_error(libc::ENOMEM),
                 in_header.unique,
                 w,
+                true,
             );
         }
         trace!(
@@ -535,10 +536,11 @@ impl<F: FileSystem + Sync> Server<F> {
         } = r.read_obj().map_err(Error::DecodeMessage)?;
 
         if size > MAX_BUFFER_SIZE {
-            return reply_error(
+            return do_reply_error(
                 io::Error::from_raw_os_error(libc::ENOMEM),
                 in_header.unique,
                 w,
+                true,
             );
         }
 
@@ -590,10 +592,11 @@ impl<F: FileSystem + Sync> Server<F> {
         } = r.read_obj().map_err(Error::DecodeMessage)?;
 
         if size > MAX_BUFFER_SIZE {
-            return reply_error(
+            return do_reply_error(
                 io::Error::from_raw_os_error(libc::ENOMEM),
                 in_header.unique,
                 w,
+                true,
             );
         }
 
@@ -736,10 +739,11 @@ impl<F: FileSystem + Sync> Server<F> {
         r.read_exact(&mut name).map_err(Error::DecodeMessage)?;
 
         if size > MAX_BUFFER_SIZE {
-            return reply_error(
+            return do_reply_error(
                 io::Error::from_raw_os_error(libc::ENOMEM),
                 in_header.unique,
                 w,
+                true,
             );
         }
 
@@ -766,10 +770,11 @@ impl<F: FileSystem + Sync> Server<F> {
         let GetxattrIn { size, .. } = r.read_obj().map_err(Error::DecodeMessage)?;
 
         if size > MAX_BUFFER_SIZE {
-            return reply_error(
+            return do_reply_error(
                 io::Error::from_raw_os_error(libc::ENOMEM),
                 in_header.unique,
                 w,
+                true,
             );
         }
 
@@ -834,10 +839,11 @@ impl<F: FileSystem + Sync> Server<F> {
 
         if major < KERNEL_VERSION {
             error!("Unsupported fuse protocol version: {}.{}", major, minor);
-            return reply_error(
+            return do_reply_error(
                 io::Error::from_raw_os_error(libc::EPROTO),
                 in_header.unique,
                 w,
+                true,
             );
         }
 
@@ -925,19 +931,21 @@ impl<F: FileSystem + Sync> Server<F> {
         } = r.read_obj().map_err(Error::DecodeMessage)?;
 
         if size > MAX_BUFFER_SIZE {
-            return reply_error(
+            return do_reply_error(
                 io::Error::from_raw_os_error(libc::ENOMEM),
                 in_header.unique,
                 w,
+                true,
             );
         }
 
         let available_bytes = w.available_bytes();
         if available_bytes < size as usize {
-            return reply_error(
+            return do_reply_error(
                 io::Error::from_raw_os_error(libc::ENOMEM),
                 in_header.unique,
                 w,
+                true,
             );
         }
 
@@ -1156,17 +1164,19 @@ impl<F: FileSystem + Sync> Server<F> {
 
         if let Some(size) = (count as usize).checked_mul(size_of::<ForgetOne>()) {
             if size > MAX_BUFFER_SIZE as usize {
-                return reply_error(
+                return do_reply_error(
                     io::Error::from_raw_os_error(libc::ENOMEM),
                     in_header.unique,
                     w,
+                    true,
                 );
             }
         } else {
-            return reply_error(
+            return do_reply_error(
                 io::Error::from_raw_os_error(libc::EOVERFLOW),
                 in_header.unique,
                 w,
+                true,
             );
         }
 
@@ -1261,10 +1271,11 @@ impl<F: FileSystem + Sync> Server<F> {
                 Err(e) => reply_error(e, in_header.unique, w),
             }
         } else {
-            reply_error(
+            do_reply_error(
                 io::Error::from_raw_os_error(libc::EINVAL),
                 in_header.unique,
                 w,
+                true,
             )
         }
     }
@@ -1281,17 +1292,19 @@ impl<F: FileSystem + Sync> Server<F> {
 
             if let Some(size) = (count as usize).checked_mul(size_of::<RemovemappingOne>()) {
                 if size > MAX_BUFFER_SIZE as usize {
-                    return reply_error(
+                    return do_reply_error(
                         io::Error::from_raw_os_error(libc::ENOMEM),
                         in_header.unique,
                         w,
+                        true,
                     );
                 }
             } else {
-                return reply_error(
+                return do_reply_error(
                     io::Error::from_raw_os_error(libc::EOVERFLOW),
                     in_header.unique,
                     w,
+                    true,
                 );
             }
 
@@ -1313,10 +1326,11 @@ impl<F: FileSystem + Sync> Server<F> {
                 Err(e) => reply_error(e, in_header.unique, w),
             }
         } else {
-            reply_error(
+            do_reply_error(
                 io::Error::from_raw_os_error(libc::EINVAL),
                 in_header.unique,
                 w,
+                true,
             )
         }
     }
@@ -1365,7 +1379,7 @@ fn reply_ok<T: ByteValued>(
     Ok(w.bytes_written())
 }
 
-fn reply_error(err: io::Error, unique: u64, mut w: Writer) -> Result<usize> {
+fn do_reply_error(err: io::Error, unique: u64, mut w: Writer, internal_err: bool) -> Result<usize> {
     let header = OutHeader {
         len: size_of::<OutHeader>() as u32,
         error: -err
@@ -1375,11 +1389,7 @@ fn reply_error(err: io::Error, unique: u64, mut w: Writer) -> Result<usize> {
     };
 
     trace!("reply error header {:?}, error {:?}", header, err);
-    if header.error != -libc::ENOSYS
-        && header.error != -libc::ENOENT
-        && header.error != -libc::ENODATA
-        && header.error != -libc::ERANGE
-    {
+    if internal_err {
         error!("reply error header {:?}, error {:?}", header, err);
     }
     w.write_all(header.as_slice())
@@ -1392,6 +1402,12 @@ fn reply_error(err: io::Error, unique: u64, mut w: Writer) -> Result<usize> {
             w.bytes_written()
         })
         .map_err(Error::EncodeMessage)
+}
+
+// reply operation error back to fuse client, don't print error message, as they are not server's
+// internal error, and client could deal with them.
+fn reply_error(err: io::Error, unique: u64, w: Writer) -> Result<usize> {
+    do_reply_error(err, unique, w, false)
 }
 
 fn bytes_to_cstr(buf: &[u8]) -> Result<&CStr> {
