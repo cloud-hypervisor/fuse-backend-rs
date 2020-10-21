@@ -1410,7 +1410,8 @@ fn reply_error(err: io::Error, unique: u64, w: Writer) -> Result<usize> {
     do_reply_error(err, unique, w, false)
 }
 
-fn bytes_to_cstr(buf: &[u8]) -> Result<&CStr> {
+/// trim all trailing nul terminators.
+pub fn bytes_to_cstr(buf: &[u8]) -> Result<&CStr> {
     // There might be multiple 0s at the end of buf, find & use the first one and trim other zeros.
     let len = buf.len();
     let mut n: usize = 0;
