@@ -431,7 +431,7 @@ impl FileSystem for Vfs {
     ) -> Result<(libc::stat64, Duration)> {
         match self.get_real_rootfs(inode)? {
             (Left(fs), idata) => fs.getattr(ctx, idata.ino, handle),
-            (Right(fs), idata) => fs.getattr(ctx, idata.ino, handle.map(|h| h)),
+            (Right(fs), idata) => fs.getattr(ctx, idata.ino, handle),
         }
     }
 
@@ -445,7 +445,7 @@ impl FileSystem for Vfs {
     ) -> Result<(libc::stat64, Duration)> {
         match self.get_real_rootfs(inode)? {
             (Left(fs), idata) => fs.setattr(ctx, idata.ino, attr, handle, valid),
-            (Right(fs), idata) => fs.setattr(ctx, idata.ino, attr, handle.map(|h| h), valid),
+            (Right(fs), idata) => fs.setattr(ctx, idata.ino, attr, handle, valid),
         }
     }
 
@@ -587,7 +587,7 @@ impl FileSystem for Vfs {
                 fs.create(ctx, idata.ino, name, mode, flags, umask)
                     .map(|(mut a, b, c)| {
                         a.inode = self.hash_inode(idata.super_index, a.inode)?;
-                        Ok((a, b.map(|h| h), c))
+                        Ok((a, b, c))
                     })?
             }
         }
