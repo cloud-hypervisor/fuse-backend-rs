@@ -1407,7 +1407,7 @@ fn do_reply_error(err: io::Error, unique: u64, mut w: Writer, internal_err: bool
 // reply operation error back to fuse client, don't print error message, as they are not server's
 // internal error, and client could deal with them.
 fn reply_error(err: io::Error, unique: u64, w: Writer) -> Result<usize> {
-    return do_reply_error(err, unique, w, false);
+    do_reply_error(err, unique, w, false)
 }
 
 /// trim all trailing nul terminators.

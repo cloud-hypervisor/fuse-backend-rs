@@ -12,9 +12,9 @@ use snapshot::Persist;
 use versionize::{VersionMap, Versionize, VersionizeError, VersionizeResult};
 use versionize_derive::Versionize;
 
+use crate::api::filesystem::FsOptions;
 use crate::api::vfs::BackFileSystem;
 use crate::api::{BackendFileSystemType, Vfs, VfsOptions};
-use crate::api::filesystem::FsOptions;
 use crate::passthrough::{PassthroughFs, PassthroughFsState};
 
 #[derive(Versionize, PartialEq, Debug)]
@@ -163,7 +163,7 @@ impl Vfs {
                 .unwrap();
 
             backend_fs_vec.push(BackendFsState {
-                super_index: super_index,
+                super_index,
                 fs_state: Some(save_fn(fs)),
                 path: val.path.clone(),
             });
@@ -186,7 +186,8 @@ impl Vfs {
         F: FnOnce(&BackendFsStateInner) -> std::result::Result<BackFileSystem, IoError> + Copy,
     {
         let vfs = Vfs::default();
-        vfs.opts.store(Arc::new(VfsOptions::restore((), &state.opts).unwrap()));
+        vfs.opts
+            .store(Arc::new(VfsOptions::restore((), &state.opts).unwrap()));
 
         for fs in state.backend_fs.iter() {
             if let Some(fs_state) = fs.fs_state.as_ref() {
@@ -207,8 +208,8 @@ impl PartialEq for VfsOptions {
         self.no_open == other.no_open
             && self.no_opendir == other.no_opendir
             && self.no_writeback == other.no_writeback
-            && self.in_opts == self.in_opts
-            && self.out_opts == self.out_opts
+            && self.in_opts == other.in_opts
+            && self.out_opts == other.out_opts
     }
 }
 

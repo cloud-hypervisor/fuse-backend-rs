@@ -74,10 +74,10 @@ impl Persist<'_> for Config {
     }
 
     fn live_upgrade_restore(
-        constructor_args: Self::ConstructorArgs,
+        _constructor_args: Self::ConstructorArgs,
         state: &Self::State,
     ) -> Result<Self, Self::Error> {
-        Self::restore(constructor_args, state)
+        Self::restore((), state)
     }
 }
 
@@ -170,9 +170,9 @@ impl Persist<'_> for PassthroughFs {
             live_upgrade_state: Some(PassthroughFsLiveUpgradeState {
                 proc: self.proc.save(),
                 next_inode: self.next_inode.load(Ordering::Relaxed),
-                inodes: inodes,
+                inodes,
                 next_handle: self.next_handle.load(Ordering::Relaxed),
-                handles: handles,
+                handles,
             }),
         }
     }
