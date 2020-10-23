@@ -11,6 +11,8 @@ use std::mem;
 use bitflags::bitflags;
 use vm_memory::ByteValued;
 
+use libc::{blksize_t, nlink_t};
+
 /// Version number of this interface.
 pub const KERNEL_VERSION: u32 = 7;
 
@@ -544,11 +546,11 @@ impl Into<libc::stat64> for Attr {
         out.st_mtime_nsec = self.mtimensec as i64;
         out.st_ctime_nsec = self.ctimensec as i64;
         out.st_mode = self.mode;
-        out.st_nlink = self.nlink as u64;
+        out.st_nlink = self.nlink as nlink_t;
         out.st_uid = self.uid;
         out.st_gid = self.gid;
         out.st_rdev = self.rdev as u64;
-        out.st_blksize = self.blksize as i64;
+        out.st_blksize = self.blksize as blksize_t;
 
         out
     }
