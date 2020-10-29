@@ -14,9 +14,6 @@ use std::time::Duration;
 
 use arc_swap::ArcSwap;
 use bimap::hash::BiHashMap;
-use serde::{Deserialize, Serialize};
-use versionize::{VersionMap, Versionize, VersionizeResult};
-use versionize_derive::Versionize;
 
 use super::pseudo_fs::PseudoFs;
 use crate::abi::linux_abi::*;
@@ -85,7 +82,7 @@ pub(crate) struct MountPointData {
     pub(crate) path: String,
 }
 
-#[derive(Debug, Copy, Clone, Deserialize, Serialize, Versionize)]
+#[derive(Debug, Copy, Clone)]
 /// vfs init options
 pub struct VfsOptions {
     /// Disable fuse open request handling. When enabled, fuse open
