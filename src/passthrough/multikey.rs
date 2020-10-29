@@ -5,8 +5,8 @@
 //! Struct MultikeyBTreeMap implementation used by passthrough.
 
 use std::borrow::Borrow;
-use std::collections::BTreeMap;
 use std::collections::btree_map::Iter;
+use std::collections::BTreeMap;
 
 /// A BTreeMap that supports 2 types of keys per value. All the usual restrictions and warnings for
 /// `std::collections::BTreeMap` also apply to this struct. Additionally, there is a 1:1
