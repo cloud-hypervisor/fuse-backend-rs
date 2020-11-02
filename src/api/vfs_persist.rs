@@ -9,27 +9,12 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use snapshot::Persist;
-use versionize::{VersionMap, Versionize, VersionizeError, VersionizeResult};
+use versionize::{VersionMap, Versionize, VersionizeResult};
 use versionize_derive::Versionize;
 
 use crate::api::filesystem::FsOptions;
 use crate::api::vfs::BackFileSystem;
-use crate::api::{BackendFileSystemType, Vfs, VfsOptions};
-use crate::passthrough::{PassthroughFs, PassthroughFsState};
-
-#[derive(Versionize, PartialEq, Debug)]
-pub enum BackendFsStateInner {
-    PassthroughFs(PassthroughFsState),
-    // Place holder, not implemented yet
-    Rafs,
-}
-
-#[derive(Versionize, PartialEq, Debug)]
-pub struct BackendFsState {
-    super_index: u8,
-    fs_state: Option<BackendFsStateInner>,
-    path: String,
-}
+use crate::api::{Vfs, VfsOptions};
 
 #[derive(Versionize, PartialEq, Debug)]
 pub struct VfsOptionsState {
@@ -70,136 +55,109 @@ impl Persist<'_> for VfsOptions {
     }
 }
 
+// VfsState includes all information of a vfs mountpoint except of that of each backend
+// filesystem. At save(), caller should save each backend file system with a proper persist
+// implementation, that can match a backend state with a specified mountpoint. At restore(),
+// it only restores the vfs data structures and backend file system data structures need to
+// be restored via separate calls.
 #[derive(Versionize, PartialEq, Debug)]
 pub struct VfsState {
+    /// Vfs options
     opts: VfsOptionsState,
+    /// next super block index
     next_super: u8,
-    backend_fs: Vec<BackendFsState>,
+    /// backend fs super index, mountpoint and whether it is unmounted
+    backend_fs: Vec<VfsMountpoints>,
 }
 
-impl Persist<'_> for Vfs {
+#[derive(Versionize, PartialEq, Debug)]
+pub struct VfsMountpoints {
+    index: u8,
+    unmounted: bool,
+    path: String,
+}
+
+impl<'a> Persist<'a> for &'a Vfs {
     type State = VfsState;
-    type ConstructorArgs = ();
-    type LiveUpgradeConstructorArgs = ();
+    type ConstructorArgs = &'a Vfs;
+    type LiveUpgradeConstructorArgs = &'a Vfs;
     type Error = IoError;
 
     fn save(&self) -> Self::State {
-        self.persist_save_common(|fs: Arc<BackFileSystem>| match fs.fstype() {
-            BackendFileSystemType::PassthroughFs => BackendFsStateInner::PassthroughFs(
-                fs.deref()
-                    .as_any()
-                    .downcast_ref::<PassthroughFs>()
-                    .unwrap()
-                    .save(),
-            ),
-            _ => unimplemented!(),
-        })
-    }
-
-    fn restore(
-        _constructor_args: Self::ConstructorArgs,
-        state: &Self::State,
-    ) -> Result<Self, Self::Error> {
-        Self::persist_restore_common(state, |fs_state| match fs_state {
-            BackendFsStateInner::PassthroughFs(passthrough_fs_state) => {
-                let passthrough_fs = PassthroughFs::restore((), &passthrough_fs_state)?;
-                passthrough_fs.import()?;
-                Ok(Box::new(passthrough_fs))
-            }
-            _ => unimplemented!(),
-        })
-    }
-
-    fn live_upgrade_save(&self) -> Self::State {
-        self.persist_save_common(|fs: Arc<BackFileSystem>| match fs.fstype() {
-            BackendFileSystemType::PassthroughFs => BackendFsStateInner::PassthroughFs(
-                fs.deref()
-                    .as_any()
-                    .downcast_ref::<PassthroughFs>()
-                    .unwrap()
-                    .live_upgrade_save(),
-            ),
-            _ => unimplemented!(),
-        })
-    }
-    fn live_upgrade_restore(
-        _constructor_args: Self::ConstructorArgs,
-        state: &Self::State,
-    ) -> Result<Self, Self::Error> {
-        Self::persist_restore_common(state, |fs_state| match fs_state {
-            BackendFsStateInner::PassthroughFs(passthrough_fs_state) => {
-                let passthrough_fs =
-                    PassthroughFs::live_upgrade_restore((), &passthrough_fs_state)?;
-                passthrough_fs.import()?;
-                Ok(Box::new(passthrough_fs))
-            }
-            _ => unimplemented!(),
-        })
-    }
-}
-
-impl Vfs {
-    fn persist_save_common<F>(&self, save_fn: F) -> VfsState
-    where
-        F: FnOnce(Arc<BackFileSystem>) -> BackendFsStateInner + Copy,
-    {
-        let mut backend_fs_vec = Vec::new();
+        let mut backend_fs = Vec::new();
 
         for (index, path) in self.unmounted_path.lock().unwrap().iter() {
-            backend_fs_vec.push(BackendFsState {
-                super_index: *index,
-                fs_state: None,
+            backend_fs.push(VfsMountpoints {
+                index: *index,
+                unmounted: true,
                 path: path.to_string(),
             });
         }
 
-        for (_, val) in self.mountpoints.load().iter() {
-            let super_index = val.super_index;
-            let fs = self
-                .superblocks
-                .load()
-                .get(&super_index)
-                .map(Arc::clone)
-                .unwrap();
-
-            backend_fs_vec.push(BackendFsState {
-                super_index,
-                fs_state: Some(save_fn(fs)),
-                path: val.path.clone(),
-            });
+        for (_, mnt) in self.mountpoints.load().iter() {
+            backend_fs.push(VfsMountpoints {
+                index: mnt.super_index,
+                unmounted: false,
+                path: mnt.path.to_string(),
+            })
         }
+
         // store backend fs by 'super_index' order
-        backend_fs_vec.sort_by(|a, b| a.super_index.cmp(&b.super_index));
+        backend_fs.sort_by(|a, b| a.index.cmp(&b.index));
 
         VfsState {
             opts: self.opts.load().deref().deref().save(),
             next_super: self.next_super.load(Ordering::SeqCst),
-            backend_fs: backend_fs_vec,
+            backend_fs,
         }
     }
 
-    fn persist_restore_common<F>(
-        state: &VfsState,
-        restore_fn: F,
-    ) -> std::result::Result<Self, IoError>
-    where
-        F: FnOnce(&BackendFsStateInner) -> std::result::Result<BackFileSystem, IoError> + Copy,
-    {
-        let vfs = Vfs::default();
-        vfs.opts
-            .store(Arc::new(VfsOptions::restore((), &state.opts).unwrap()));
-
-        for fs in state.backend_fs.iter() {
-            if let Some(fs_state) = fs.fs_state.as_ref() {
-                let b_fs: BackFileSystem = restore_fn(&fs_state)?;
-                vfs.mount(b_fs, fs.path.as_str())?;
-            } else {
-                vfs.mkdir_all(fs.super_index, &fs.path)?;
-            }
-        }
+    fn restore(vfs: Self::ConstructorArgs, state: &Self::State) -> Result<Self, Self::Error> {
+        let opts = VfsOptions::restore((), &state.opts).unwrap();
+        vfs.initialized
+            .store(!opts.in_opts.is_empty(), Ordering::Release);
+        vfs.opts.store(Arc::new(opts));
 
         vfs.next_super.store(state.next_super, Ordering::SeqCst);
+
+        for fs in &state.backend_fs {
+            // Create all components in path as directories in the pseudo file system
+            vfs.root.mount(&fs.path)?;
+            if fs.unmounted {
+                vfs.unmounted_path
+                    .lock()
+                    .unwrap()
+                    .insert(fs.index, fs.path.to_string());
+            }
+        }
         Ok(vfs)
+    }
+
+    fn live_upgrade_save(&self) -> Self::State {
+        self.save()
+    }
+    fn live_upgrade_restore(
+        vfs: Self::ConstructorArgs,
+        state: &Self::State,
+    ) -> Result<Self, Self::Error> {
+        Self::restore(vfs, state)
+    }
+}
+
+impl Vfs {
+    pub fn restore_mount(
+        &self,
+        fs: BackFileSystem,
+        path: &str,
+        state: &VfsState,
+    ) -> std::result::Result<(), IoError> {
+        for b_fs in state.backend_fs.iter() {
+            if !b_fs.unmounted && path == b_fs.path {
+                self.restore_backend_fs(fs, b_fs.index, path)?;
+                break;
+            }
+        }
+        Ok(())
     }
 }
 
@@ -215,8 +173,22 @@ impl PartialEq for VfsOptions {
 
 impl PartialEq for Vfs {
     fn eq(&self, other: &Vfs) -> bool {
-        let old_unmounted = self.unmounted_path.lock().unwrap().clone();
-        let new_unmounted = other.unmounted_path.lock().unwrap().clone();
+        let mut old_unmounted: Vec<(u8, String)> = self
+            .unmounted_path
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(k, v)| (*k, v.to_string()))
+            .collect();
+
+        let mut new_unmounted: Vec<(u8, String)> = other
+            .unmounted_path
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(k, v)| (*k, v.to_string()))
+            .collect();
+
         let mut old_root_inodes: Vec<u64> =
             self.mountpoints.load().iter().map(|(&k, _)| k).collect();
         let mut new_root_inodes: Vec<u64> =
@@ -224,12 +196,14 @@ impl PartialEq for Vfs {
         let mut old_super_indexes: Vec<u8> =
             self.superblocks.load().iter().map(|(&k, _)| k).collect();
         let mut new_super_indexes: Vec<u8> =
-            self.superblocks.load().iter().map(|(&k, _)| k).collect();
+            other.superblocks.load().iter().map(|(&k, _)| k).collect();
 
-        old_root_inodes.sort();
-        new_root_inodes.sort();
-        old_super_indexes.sort();
-        new_super_indexes.sort();
+        old_root_inodes.sort_unstable();
+        new_root_inodes.sort_unstable();
+        old_super_indexes.sort_unstable();
+        new_super_indexes.sort_unstable();
+        old_unmounted.sort();
+        new_unmounted.sort();
 
         self.next_super.load(Ordering::Relaxed) == other.next_super.load(Ordering::Relaxed)
             && self.opts.load().deref().deref() == other.opts.load().deref().deref()
@@ -242,6 +216,7 @@ impl PartialEq for Vfs {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    use crate::api::filesystem::FileSystem;
     use crate::passthrough::{Config, PassthroughFs};
 
     #[test]
@@ -252,31 +227,32 @@ pub(crate) mod tests {
             ..Default::default()
         };
 
-        let vfs = Vfs::new(opts);
+        let vfs = &Vfs::new(opts);
+        assert!(!vfs.initialized.load(Ordering::Acquire));
 
-        let mount_fs = |path| {
+        let vfs_mount_fs = |path| {
             let fs_cfg = Config::default();
             let fs = PassthroughFs::new(fs_cfg.clone()).unwrap();
             fs.import().unwrap();
             vfs.mount(Box::new(fs), path).unwrap();
         };
 
-        mount_fs("/submnt/mnt_a");
-        mount_fs("/submnt/mnt_a");
-        mount_fs("/submnt/mnt_a");
+        vfs_mount_fs("/submnt/mnt_a");
+        vfs_mount_fs("/submnt/mnt_a");
+        vfs_mount_fs("/submnt/mnt_a");
         vfs.umount("/submnt/mnt_a").unwrap();
-        mount_fs("/submnt/mnt_a");
-        mount_fs("/submnt/mnt_a");
-        mount_fs("/submnt/mnt_b");
-        mount_fs("/submnt/mnt_c");
+        vfs_mount_fs("/submnt/mnt_a");
+        vfs_mount_fs("/submnt/mnt_a");
+        vfs_mount_fs("/submnt/mnt_b");
+        vfs_mount_fs("/submnt/mnt_c");
         vfs.umount("/submnt/mnt_b").unwrap();
-        mount_fs("/submnt/mnt_d");
-        mount_fs("/submnt/mnt_b/c/d/e");
+        vfs_mount_fs("/submnt/mnt_d");
+        vfs_mount_fs("/submnt/mnt_b/c/d/e");
         vfs.umount("/submnt/mnt_d").unwrap();
-        mount_fs("/submnt/mnt_e");
-        mount_fs("/submnt/mnt_f");
+        vfs_mount_fs("/submnt/mnt_e");
+        vfs_mount_fs("/submnt/mnt_f");
         vfs.umount("/submnt/mnt_e").unwrap();
-        mount_fs("/submnt/mnt_d");
+        vfs_mount_fs("/submnt/mnt_d");
 
         // snapshot
         // save the state
@@ -287,13 +263,28 @@ pub(crate) mod tests {
             .unwrap();
 
         // restore the state
-        let restored_vfs = Vfs::restore(
-            (),
-            &VfsState::deserialize(&mut mem.as_slice(), &version_map, 1).unwrap(),
-        )
-        .unwrap();
+        let restored_vfs = &Vfs::default();
+        let restored_state = VfsState::deserialize(&mut mem.as_slice(), &version_map, 1).unwrap();
+        <&Vfs>::restore(&restored_vfs, &restored_state).unwrap();
+        assert!(!restored_vfs.initialized.load(Ordering::Acquire));
+
+        for b_fs in restored_state.backend_fs.iter() {
+            if b_fs.unmounted {
+                continue;
+            }
+            let fs_cfg = Config::default();
+            let fs = PassthroughFs::new(fs_cfg.clone()).unwrap();
+            fs.import().unwrap();
+            restored_vfs
+                .restore_mount(Box::new(fs), &b_fs.path, &restored_state)
+                .unwrap();
+        }
 
         assert!(vfs == restored_vfs);
+
+        // fake init
+        vfs.init(FsOptions::ASYNC_READ).unwrap();
+        assert!(vfs.initialized.load(Ordering::Acquire));
 
         // live upgrade
         let mut mem = vec![0; 4096];
@@ -303,11 +294,22 @@ pub(crate) mod tests {
             .unwrap();
 
         // restore the state
-        let restored_vfs = Vfs::live_upgrade_restore(
-            (),
-            &VfsState::deserialize(&mut mem.as_slice(), &version_map, 1).unwrap(),
-        )
-        .unwrap();
+        let restored_vfs = &Vfs::default();
+        let restored_state = VfsState::deserialize(&mut mem.as_slice(), &version_map, 1).unwrap();
+        <&Vfs>::live_upgrade_restore(&restored_vfs, &restored_state).unwrap();
+        assert!(restored_vfs.initialized.load(Ordering::Acquire));
+
+        for b_fs in restored_state.backend_fs.iter() {
+            if b_fs.unmounted {
+                continue;
+            }
+            let fs_cfg = Config::default();
+            let fs = PassthroughFs::new(fs_cfg.clone()).unwrap();
+            fs.import().unwrap();
+            restored_vfs
+                .restore_mount(Box::new(fs), &b_fs.path, &restored_state)
+                .unwrap();
+        }
 
         assert!(vfs == restored_vfs);
     }

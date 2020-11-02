@@ -104,7 +104,7 @@ impl Default for VfsOptions {
             no_open: true,
             no_opendir: true,
             no_writeback: false,
-            in_opts: FsOptions::ASYNC_READ,
+            in_opts: FsOptions::empty(),
             out_opts: FsOptions::ASYNC_READ
                 | FsOptions::PARALLEL_DIROPS
                 | FsOptions::BIG_WRITES
@@ -125,7 +125,7 @@ impl Default for VfsOptions {
 /// A union fs that combines multiple backend file systems.
 pub struct Vfs {
     pub(crate) next_super: AtomicU8,
-    root: PseudoFs,
+    pub(crate) root: PseudoFs,
     // inodes maintains mapping between fuse inode and (pseudo fs or mounted fs) inode data
     inodes: RwLock<BiHashMap<Inode, InodeData>>,
     // mountpoints maps from pseudo fs inode to mounted fs mountpoint data
@@ -170,9 +170,71 @@ impl Vfs {
         vfs
     }
 
+    pub(crate) fn restore_backend_fs(
+        &self,
+        fs: BackFileSystem,
+        index: u8,
+        path: &str,
+    ) -> Result<()> {
+        let (entry, ino) = fs.mount()?;
+        if ino > VFS_MAX_INO {
+            return Err(Error::new(
+                ErrorKind::Other,
+                format!(
+                    "Unsupported max inode number, requested {} supported {}",
+                    ino, VFS_MAX_INO
+                ),
+            ));
+        }
+        let _guard = self.lock.lock().unwrap();
+        self.insert_mount_locked(fs, entry, index, path)
+    }
+
+    fn insert_mount_locked(
+        &self,
+        fs: BackFileSystem,
+        mut entry: Entry,
+        index: u8,
+        path: &str,
+    ) -> Result<()> {
+        let inode = self.root.mount(path)?;
+        // hash inode number with index so that we can find the real inode later on
+        entry.inode = self.hash_inode(index, entry.inode)?;
+
+        // TODO: handle over mount on the same mountpoint
+        // right now we don't handle it, and over mount would invalidate previous superblock inodes.
+
+        // The visibility of mountpoints and superblocks:
+        // superblock should be committed first because it won't be accessed until
+        // a lookup returns a cross mountpoint inode.
+        let mut superblocks = self.superblocks.load().deref().deref().clone();
+        let mut mountpoints = self.mountpoints.load().deref().deref().clone();
+
+        // drop old superblock if it is an over mount
+        if let Some(mnt) = mountpoints.get(&inode) {
+            superblocks.remove(&mnt.super_index);
+        }
+        superblocks.insert(index, Arc::new(fs));
+        self.superblocks.store(Arc::new(superblocks));
+        trace!("super_index {} inode {}", index, inode);
+
+        mountpoints.insert(
+            inode,
+            Arc::new(MountPointData {
+                super_index: index,
+                ino: ROOT_ID,
+                root_entry: entry,
+                path: path.to_string(),
+            }),
+        );
+        self.mountpoints.store(Arc::new(mountpoints));
+
+        Ok(())
+    }
+
     /// Mount a backend file system to path
     pub fn mount(&self, fs: BackFileSystem, path: &str) -> Result<()> {
-        let (mut entry, ino) = fs.mount()?;
+        let (entry, ino) = fs.mount()?;
         // TODO: support larger backend fs inode range
         // Just reject it for now
         if ino > VFS_MAX_INO {
@@ -187,7 +249,6 @@ impl Vfs {
 
         // Serialize mount operations. Do not expect poisoned lock here.
         let _guard = self.lock.lock().unwrap();
-        let inode = self.root.mount(path)?;
         let index = self.next_super.fetch_add(1, Ordering::Relaxed);
         if index == PSEUDO_FS_SUPER {
             return Err(Error::new(
@@ -195,31 +256,8 @@ impl Vfs {
                 "vfs maximum mountpoints reached",
             ));
         }
-        // hash inode number with index so that we can find the real inode later on
-        entry.inode = self.hash_inode(index, entry.inode)?;
 
-        // TODO: handle over mount on the same mountpoint
-
-        // The visibility of mountpoints and superblocks:
-        // superblock should be committed first because it won't be accessed until
-        // a lookup returns a cross mountpoint inode.
-        let mut superblocks = self.superblocks.load().deref().deref().clone();
-        superblocks.insert(index, Arc::new(fs));
-        self.superblocks.store(Arc::new(superblocks));
-        trace!("super_index {} inode {}", index, inode);
-
-        let mut mountpoints = self.mountpoints.load().deref().deref().clone();
-        mountpoints.insert(
-            inode,
-            Arc::new(MountPointData {
-                super_index: index,
-                ino: ROOT_ID,
-                root_entry: entry,
-                path: path.to_string(),
-            }),
-        );
-        self.mountpoints.store(Arc::new(mountpoints));
-        Ok(())
+        self.insert_mount_locked(fs, entry, index, path)
     }
 
     /// Umount a backend file system at path
@@ -302,17 +340,6 @@ impl Vfs {
             error!("inode {} is not found\n", inode);
             Err(Error::from_raw_os_error(libc::EINVAL))
         }
-    }
-
-    /// Create all components in path as directories in the pseudo file system
-    pub fn mkdir_all(&self, super_index: u8, path: &str) -> Result<()> {
-        self.root.mount(path)?;
-        self.unmounted_path
-            .lock()
-            .unwrap()
-            .insert(super_index, path.to_string());
-        self.next_super.fetch_add(1, Ordering::Relaxed);
-        Ok(())
     }
 
     // Inode hashing rules:
@@ -1057,7 +1084,7 @@ mod tests {
         assert_eq!(opts.no_open, true);
         assert_eq!(opts.no_opendir, true);
         assert_eq!(opts.no_writeback, false);
-        assert_eq!(opts.in_opts, FsOptions::ASYNC_READ);
+        assert_eq!(opts.in_opts.is_empty(), true);
         assert_eq!(opts.out_opts, out_opts);
 
         vfs.init(FsOptions::ASYNC_READ).unwrap();
