@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use std::ffi::CStr;
 use std::io::{Error, ErrorKind, Result};
 use std::ops::Deref;
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
@@ -135,6 +135,7 @@ pub struct Vfs {
     pub(crate) opts: ArcSwap<VfsOptions>,
     pub(crate) unmounted_path: Mutex<HashMap<SuperIndex, String>>,
     lock: Mutex<()>,
+    pub(crate) initialized: AtomicBool,
 }
 
 impl Default for Vfs {
@@ -155,6 +156,7 @@ impl Vfs {
             opts: ArcSwap::new(Arc::new(opts)),
             unmounted_path: Mutex::new(HashMap::new()),
             lock: Mutex::new(()),
+            initialized: AtomicBool::new(false),
         };
 
         vfs.inodes.write().unwrap().insert(
@@ -404,6 +406,13 @@ impl Vfs {
     /// configurations. Because, we can't do mount twice when doing live upgrade.
     pub fn set_opts(&self, opts: VfsOptions) {
         self.opts.store(Arc::new(opts));
+        self.initialized.store(true, Ordering::Release);
+    }
+
+    /// For sake of live-upgrade, only after negotiation is done, it's safe to persist
+    /// state of vfs.
+    pub fn initialized(&self) -> bool {
+        self.initialized.load(Ordering::Acquire)
     }
 }
 
@@ -424,6 +433,7 @@ impl FileSystem for Vfs {
 
         let out_opts = n_opts.out_opts;
         self.opts.store(Arc::new(n_opts));
+        self.initialized.store(true, Ordering::Release);
 
         Ok(out_opts)
     }
