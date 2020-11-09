@@ -16,6 +16,16 @@ use crate::api::filesystem::FsOptions;
 use crate::api::vfs::BackFileSystem;
 use crate::api::{Vfs, VfsOptions};
 
+// Use version map to mange resource version during serializing/deserializing,
+// here is a default implementation, returns the version map with only one version,
+// If you need to add a version 2 for resource, need to do like this:
+// `VersionMap::new().new_version().set_type_version(Self::type_id(), 2).clone()`
+pub trait VersionMapGetter {
+    fn version_map() -> VersionMap {
+        VersionMap::new()
+    }
+}
+
 #[derive(Versionize, PartialEq, Debug)]
 pub struct VfsOptionsState {
     no_open: bool,
@@ -69,6 +79,8 @@ pub struct VfsState {
     /// backend fs super index, mountpoint and whether it is unmounted
     backend_fs: Vec<VfsMountpoints>,
 }
+
+impl VersionMapGetter for VfsState {}
 
 #[derive(Versionize, PartialEq, Debug)]
 pub struct VfsMountpoints {
