@@ -875,6 +875,10 @@ impl<F: FileSystem + Sync> Server<F> {
         match self.fs.init(capable) {
             Ok(want) => {
                 let enabled = capable & (want | supported);
+                info!(
+                    "FUSE INIT\n in_opts: {:?}\nout_opts: {:?}",
+                    capable, enabled
+                );
 
                 let out = InitOut {
                     major: KERNEL_VERSION,
