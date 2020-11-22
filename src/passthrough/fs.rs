@@ -1093,7 +1093,7 @@ impl FileSystem for PassthroughFs {
 
     fn write(
         &self,
-        ctx: Context,
+        _ctx: Context,
         inode: Inode,
         handle: Handle,
         r: &mut dyn ZeroCopyReader,
@@ -1103,10 +1103,6 @@ impl FileSystem for PassthroughFs {
         _delayed_write: bool,
         _flags: u32,
     ) -> io::Result<usize> {
-        // We need to change credentials during a write so that the kernel will remove setuid or
-        // setgid bits from the file if it was written to by someone other than the owner.
-        let (_uid, _gid) = set_creds(ctx.uid, ctx.gid)?;
-
         let data = self.get_data(handle, inode, libc::O_RDWR)?;
 
         // This is safe because read_to uses pwritev64, so the underlying file descriptor
