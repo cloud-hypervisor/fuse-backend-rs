@@ -91,7 +91,6 @@ impl Default for VfsOptions {
             out_opts: FsOptions::ASYNC_READ
                 | FsOptions::PARALLEL_DIROPS
                 | FsOptions::BIG_WRITES
-                | FsOptions::HANDLE_KILLPRIV
                 | FsOptions::ASYNC_DIO
                 | FsOptions::HAS_IOCTL_DIR
                 | FsOptions::WRITEBACK_CACHE
@@ -977,7 +976,6 @@ mod tests {
         let out_opts = FsOptions::ASYNC_READ
             | FsOptions::PARALLEL_DIROPS
             | FsOptions::BIG_WRITES
-            | FsOptions::HANDLE_KILLPRIV
             | FsOptions::ASYNC_DIO
             | FsOptions::HAS_IOCTL_DIR
             | FsOptions::WRITEBACK_CACHE
