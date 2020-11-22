@@ -18,7 +18,7 @@ use versionize::{VersionMap, Versionize, VersionizeResult};
 use versionize_derive::Versionize;
 
 use crate::abi::linux_abi as fuse;
-use crate::passthrough::fs::{stat, Handle, HandleData, Inode, InodeAltKey, InodeData};
+use crate::passthrough::fs::{Handle, HandleData, Inode, InodeAltKey, InodeData};
 use crate::passthrough::{CachePolicy, Config, PassthroughFs};
 
 #[derive(Versionize, PartialEq, Debug)]
@@ -86,6 +86,7 @@ struct InodeDataState {
     inode: Inode,
     fd: RawFd,
     refcount: u64,
+    inode_alt_key: InodeAltKey,
 }
 
 #[derive(Versionize, Debug, PartialEq)]
@@ -151,6 +152,7 @@ impl Persist<'_> for PassthroughFs {
                 inode: *key,
                 fd: val.1.file.save(),
                 refcount: val.1.refcount.load(Ordering::Relaxed),
+                inode_alt_key: val.0,
             });
         }
 
@@ -198,12 +200,11 @@ impl Persist<'_> for PassthroughFs {
             .store(live_state.next_inode, Ordering::Relaxed);
         for elem in live_state.inodes.iter() {
             let file = File::restore(elem.fd);
-            let st = stat(&file)?;
             fs.inodes.write().unwrap().insert(
                 elem.inode,
                 InodeAltKey {
-                    ino: st.st_ino,
-                    dev: st.st_dev,
+                    ino: elem.inode_alt_key.ino,
+                    dev: elem.inode_alt_key.dev,
                 },
                 Arc::new(InodeData {
                     inode: elem.inode,
