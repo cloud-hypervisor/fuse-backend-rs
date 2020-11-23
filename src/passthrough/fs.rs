@@ -1101,7 +1101,7 @@ impl FileSystem for PassthroughFs {
 
     fn write(
         &self,
-        ctx: Context,
+        _ctx: Context,
         inode: Inode,
         handle: Handle,
         r: &mut dyn ZeroCopyReader,
