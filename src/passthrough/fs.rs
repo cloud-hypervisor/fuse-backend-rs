@@ -44,7 +44,7 @@ const PROC_CSTR: &[u8] = b"/proc\0";
 pub(crate) type Inode = u64;
 pub(crate) type Handle = u64;
 
-#[derive(Clone, Copy, PartialOrd, Ord, PartialEq, Eq, Debug, Versionize)]
+#[derive(Clone, Copy, PartialOrd, Ord, PartialEq, Eq, Debug, Default, Versionize)]
 pub(crate) struct InodeAltKey {
     pub(crate) ino: libc::ino64_t,
     pub(crate) dev: libc::dev_t,

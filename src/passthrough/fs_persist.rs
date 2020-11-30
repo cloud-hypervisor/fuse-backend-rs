@@ -3,6 +3,7 @@
 
 #![allow(missing_docs)]
 
+use std::any::TypeId;
 use std::convert::TryInto;
 use std::io;
 use std::io::Error as IoError;
@@ -20,6 +21,10 @@ use versionize_derive::Versionize;
 use crate::abi::linux_abi as fuse;
 use crate::passthrough::fs::{Handle, HandleData, Inode, InodeAltKey, InodeData};
 use crate::passthrough::{CachePolicy, Config, PassthroughFs};
+
+pub fn get_versions_passthrough_fs(version_map: &mut VersionMap) {
+    version_map.set_type_version(TypeId::of::<InodeDataState>(), 2);
+}
 
 #[derive(Versionize, PartialEq, Debug)]
 pub struct ConfigState {
@@ -86,6 +91,7 @@ struct InodeDataState {
     inode: Inode,
     fd: RawFd,
     refcount: u64,
+    #[version(start = 2)]
     inode_alt_key: InodeAltKey,
 }
 

@@ -8,4 +8,4 @@ mod fs_persist;
 mod multikey;
 
 pub use fs::{CachePolicy, Config, PassthroughFs};
-pub use fs_persist::PassthroughFsState;
+pub use fs_persist::{get_versions_passthrough_fs, PassthroughFsState};
