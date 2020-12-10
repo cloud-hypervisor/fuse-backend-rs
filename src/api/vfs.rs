@@ -972,7 +972,14 @@ impl FileSystem for Vfs {
                 (Right(fs), idata) => fs.forget(ctx, idata.ino, count),
             },
             Err(e) => {
-                error!("vfs::forget: failed to get_real_rootfs {:?}", e);
+                // if error is ENOENT, the inode is already gone, just warn about it
+                if let Some(errno) = e.raw_os_error() {
+                    if errno == libc::ENOENT {
+                        warn!("vfs::forget: failed to get_real_rootfs {:?}", e);
+                    } else {
+                        error!("vfs::forget: failed to get_real_rootfs {:?}", e);
+                    }
+                }
             }
         }
     }
