@@ -324,8 +324,8 @@ pub struct Context {
     pub pid: libc::pid_t,
 }
 
-impl From<fuse::InHeader> for Context {
-    fn from(source: fuse::InHeader) -> Self {
+impl From<&fuse::InHeader> for Context {
+    fn from(source: &fuse::InHeader) -> Self {
         Context {
             uid: source.uid,
             gid: source.gid,
