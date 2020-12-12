@@ -1108,7 +1108,10 @@ impl FileSystem for PassthroughFs {
 
         // This is safe because write_from uses preadv64, so the underlying file descriptor
         // offset is not affected by this operation.
-        let mut f = data.file.read().unwrap().try_clone().unwrap();
+        let mut f = data.file.read().unwrap().try_clone().map_err(|e| {
+            error!("passthrough: read failed {:?}", e);
+            e
+        })?;
         w.write_from(&mut f, size as usize, offset)
     }
 
@@ -1128,7 +1131,10 @@ impl FileSystem for PassthroughFs {
 
         // This is safe because read_to uses pwritev64, so the underlying file descriptor
         // offset is not affected by this operation.
-        let mut f = data.file.read().unwrap().try_clone().unwrap();
+        let mut f = data.file.read().unwrap().try_clone().map_err(|e| {
+            error!("passthrough: write failed {:?}", e);
+            e
+        })?;
         r.read_to(&mut f, size as usize, offset)
     }
 
