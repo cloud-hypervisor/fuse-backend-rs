@@ -1422,20 +1422,15 @@ fn reply_error(err: io::Error, unique: u64, w: Writer) -> Result<usize> {
 /// trim all trailing nul terminators.
 pub fn bytes_to_cstr(buf: &[u8]) -> Result<&CStr> {
     // There might be multiple 0s at the end of buf, find & use the first one and trim other zeros.
-    let len = buf.len();
-    let mut n: usize = 0;
-    for c in buf.iter() {
-        if c == &0 {
-            break;
+    match buf.iter().position(|x| *x == 0) {
+        // Convert to a `CStr` so that we can drop the '\0' byte at the end and make sure
+        // there are no interior '\0' bytes.
+        Some(pos) => CStr::from_bytes_with_nul(&buf[0..=pos]).map_err(Error::InvalidCString),
+        None => {
+            // Invalid input, just call CStr::from_bytes_with_nul() for suitable error code
+            CStr::from_bytes_with_nul(buf).map_err(Error::InvalidCString)
         }
-        n += 1;
     }
-    let nul_pos = if n + 1 >= len { len } else { n + 1 };
-    let newbuf = &buf[0..nul_pos];
-
-    // Convert to a `CStr` so that we can drop the '\0' byte at the end and make sure there are no
-    // interior '\0' bytes.
-    CStr::from_bytes_with_nul(newbuf).map_err(Error::InvalidCString)
 }
 
 fn add_dirent(
@@ -1493,5 +1488,50 @@ fn add_dirent(
         }
 
         Ok(total_len)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_bytes_to_cstr() {
+        assert_eq!(
+            bytes_to_cstr(&[0x1u8, 0x2u8, 0x0]).unwrap(),
+            CStr::from_bytes_with_nul(&[0x1u8, 0x2u8, 0x0]).unwrap()
+        );
+        assert_eq!(
+            bytes_to_cstr(&[0x1u8, 0x2u8, 0x0, 0x0]).unwrap(),
+            CStr::from_bytes_with_nul(&[0x1u8, 0x2u8, 0x0]).unwrap()
+        );
+        assert_eq!(
+            bytes_to_cstr(&[0x1u8, 0x2u8, 0x0, 0x1]).unwrap(),
+            CStr::from_bytes_with_nul(&[0x1u8, 0x2u8, 0x0]).unwrap()
+        );
+        assert_eq!(
+            bytes_to_cstr(&[0x1u8, 0x2u8, 0x0, 0x0, 0x1]).unwrap(),
+            CStr::from_bytes_with_nul(&[0x1u8, 0x2u8, 0x0]).unwrap()
+        );
+        assert_eq!(
+            bytes_to_cstr(&[0x1u8, 0x2u8, 0x0, 0x1, 0x0]).unwrap(),
+            CStr::from_bytes_with_nul(&[0x1u8, 0x2u8, 0x0]).unwrap()
+        );
+
+        assert_eq!(
+            bytes_to_cstr(&[0x0u8, 0x2u8, 0x0]).unwrap(),
+            CStr::from_bytes_with_nul(&[0x0u8]).unwrap()
+        );
+        assert_eq!(
+            bytes_to_cstr(&[0x0u8, 0x0]).unwrap(),
+            CStr::from_bytes_with_nul(&[0x0u8]).unwrap()
+        );
+        assert_eq!(
+            bytes_to_cstr(&[0x0u8]).unwrap(),
+            CStr::from_bytes_with_nul(&[0x0u8]).unwrap()
+        );
+
+        bytes_to_cstr(&[0x1u8]).unwrap_err();
+        bytes_to_cstr(&[0x1u8, 0x1]).unwrap_err();
     }
 }
