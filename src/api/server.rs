@@ -116,7 +116,6 @@ impl<F: FileSystem + Sync> Server<F> {
         vu_req: Option<&mut dyn FsCacheReqHandler>,
     ) -> Result<usize> {
         let in_header: InHeader = r.read_obj().map_err(Error::DecodeMessage)?;
-
         if in_header.len > MAX_BUFFER_SIZE {
             return do_reply_error(
                 io::Error::from_raw_os_error(libc::ENOMEM),
@@ -125,8 +124,9 @@ impl<F: FileSystem + Sync> Server<F> {
                 true,
             );
         }
+
         trace!(
-            "new fuse req {:?}: {:?}",
+            "fuse: new req {:?}: {:?}",
             Opcode::from(in_header.opcode),
             in_header
         );
@@ -1367,8 +1367,8 @@ fn reply_ok<T: ByteValued>(
         unique,
     };
 
-    trace!("new fuse reply {:?}", header);
-    let mut buf = Vec::new();
+    trace!("fuse: new reply {:?}", header);
+    let mut buf = Vec::with_capacity(3);
     buf.push(IoSlice::new(header.as_slice()));
     // Need to write out header->out->data sequentially
     if let Some(out) = out {
@@ -1397,9 +1397,9 @@ fn do_reply_error(err: io::Error, unique: u64, mut w: Writer, internal_err: bool
         unique,
     };
 
-    trace!("reply error header {:?}, error {:?}", header, err);
+    trace!("fuse: reply error header {:?}, error {:?}", header, err);
     if internal_err {
-        error!("reply error header {:?}, error {:?}", header, err);
+        error!("fuse: reply error header {:?}, error {:?}", header, err);
     }
     w.write_all(header.as_slice())
         .map_err(Error::EncodeMessage)?;
