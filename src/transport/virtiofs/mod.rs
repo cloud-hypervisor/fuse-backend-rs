@@ -6,7 +6,37 @@
 //
 // SPDX-License-Identifier: Apache-2.0 AND BSD-3-Clause
 
-//! Traits and Structs to implement the virtiofs transport layer.
+//! Traits and Structs to implement the virtio-fs Fuse transport layer.
+//!
+//! Virtio-fs is a shared file system that lets virtual machines access a directory tree
+//! on the host. Unlike existing approaches, it is designed to offer local file system
+//! semantics and performance. Virtualization allows multiple virtual machines (VMs) to
+//! run on a single physical host. Although VMs are isolated and run separate operating
+//! system instances, their proximity on the physical host allows for fast shared memory
+//! access.
+//!
+//! Virtio-fs uses FUSE as the foundation. FUSE has no dependencies on a networking stack
+//! and exposes a rich native Linux file system interface that allows virtio-fs to act
+//! like a local file system. Both the semantics and the performance of communication of
+//! co-located VMs are different from the networking model for which remote file systems
+//! were designed.
+//!
+//! Unlike traditional FUSE where the file system daemon runs in userspace, the virtio-fs
+//! daemon runs on the host. A VIRTIO device carries FUSE messages and provides extensions
+//! for advanced features not available in traditional FUSE.
+//! The main extension to the FUSE protocol is the virtio-fs DAX Window, which supports
+//! memory mapping the contents of files. The virtio-fs VIRTIO device implements this
+//! as a shared memory region exposed through a PCI/MMIO BAR. This feature is
+//! virtualization-specific and is not available outside of virtio-fs.
+//!
+//! Although virtio-fs uses FUSE as the protocol, it does not function as a new transport
+//! for existing FUSE applications. It is not possible to run existing FUSE file systems
+//! unmodified because virtio-fs has a different security model and extends the FUSE protocol.
+//! Existing FUSE file systems trust the client because it is the kernel. There would be no
+//! reason for the kernel to attack the file system since the kernel already has full control
+//! of the host. In virtio-fs the client is the untrusted VM and the file system daemon must
+//! not trust it. Therefore, virtio-fs server uses a hardened FUSE implementation that does
+//! not trust the client.
 
 use std::cmp;
 use std::collections::VecDeque;
