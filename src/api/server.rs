@@ -188,14 +188,7 @@ impl<F: FileSystem + Sync> Server<F> {
     }
 
     fn lookup(&self, in_header: InHeader, mut r: Reader, w: Writer) -> Result<usize> {
-        let namelen = (in_header.len as usize)
-            .checked_sub(size_of::<InHeader>())
-            .ok_or(Error::InvalidHeaderLength)?;
-
-        let mut buf = vec![0u8; namelen];
-
-        r.read_exact(&mut buf).map_err(Error::DecodeMessage)?;
-
+        let buf = get_message_body(&mut r, &in_header, 0)?;
         let name = bytes_to_cstr(buf.as_ref())?;
 
         match self
@@ -305,35 +298,17 @@ impl<F: FileSystem + Sync> Server<F> {
     }
 
     fn symlink(&self, in_header: InHeader, mut r: Reader, w: Writer) -> Result<usize> {
-        // Unfortunately the name and linkname are encoded one after another and
-        // separated by a nul character.
-        let len = (in_header.len as usize)
-            .checked_sub(size_of::<InHeader>())
-            .ok_or(Error::InvalidHeaderLength)?;
-        let mut buf = vec![0; len];
-
-        r.read_exact(&mut buf).map_err(Error::DecodeMessage)?;
-
-        // We want to include the '\0' byte in the first slice.
-        let split_pos = buf
-            .iter()
-            .position(|c| *c == b'\0')
-            .map(|p| p + 1)
-            .ok_or(Error::MissingParameter)?;
-
-        let (name, linkname) = buf.split_at(split_pos);
+        let buf = get_message_body(&mut r, &in_header, 0)?;
+        // The name and linkname are encoded one after another and separated by a nul character.
+        let (name, linkname) = extract_two_cstrs(&buf)?;
 
         match self.fs.symlink(
             Context::from(in_header),
-            bytes_to_cstr(linkname)?,
+            linkname,
             in_header.nodeid.into(),
-            bytes_to_cstr(name)?,
+            name,
         ) {
-            Ok(entry) => {
-                let out = EntryOut::from(entry);
-
-                reply_ok(Some(out), None, in_header.unique, w)
-            }
+            Ok(entry) => reply_ok(Some(EntryOut::from(entry)), None, in_header.unique, w),
             Err(e) => reply_error(e, in_header.unique, w),
         }
     }
@@ -342,90 +317,60 @@ impl<F: FileSystem + Sync> Server<F> {
         let MknodIn {
             mode, rdev, umask, ..
         } = r.read_obj().map_err(Error::DecodeMessage)?;
-
-        let namelen = (in_header.len as usize)
-            .checked_sub(size_of::<InHeader>())
-            .and_then(|l| l.checked_sub(size_of::<MknodIn>()))
-            .ok_or(Error::InvalidHeaderLength)?;
-        let mut name = vec![0; namelen];
-
-        r.read_exact(&mut name).map_err(Error::DecodeMessage)?;
+        let buf = get_message_body(&mut r, &in_header, size_of::<MknodIn>())?;
+        let name = bytes_to_cstr(buf.as_ref())?;
 
         match self.fs.mknod(
             Context::from(in_header),
             in_header.nodeid.into(),
-            bytes_to_cstr(&name)?,
+            name,
             mode,
             rdev,
             umask,
         ) {
-            Ok(entry) => {
-                let out = EntryOut::from(entry);
-
-                reply_ok(Some(out), None, in_header.unique, w)
-            }
+            Ok(entry) => reply_ok(Some(EntryOut::from(entry)), None, in_header.unique, w),
             Err(e) => reply_error(e, in_header.unique, w),
         }
     }
 
     fn mkdir(&self, in_header: InHeader, mut r: Reader, w: Writer) -> Result<usize> {
         let MkdirIn { mode, umask } = r.read_obj().map_err(Error::DecodeMessage)?;
-
-        let namelen = (in_header.len as usize)
-            .checked_sub(size_of::<InHeader>())
-            .and_then(|l| l.checked_sub(size_of::<MkdirIn>()))
-            .ok_or(Error::InvalidHeaderLength)?;
-        let mut name = vec![0; namelen];
-
-        r.read_exact(&mut name).map_err(Error::DecodeMessage)?;
+        let buf = get_message_body(&mut r, &in_header, size_of::<MkdirIn>())?;
+        let name = bytes_to_cstr(buf.as_ref())?;
 
         match self.fs.mkdir(
             Context::from(in_header),
             in_header.nodeid.into(),
-            bytes_to_cstr(&name)?,
+            name,
             mode,
             umask,
         ) {
-            Ok(entry) => {
-                let out = EntryOut::from(entry);
-
-                reply_ok(Some(out), None, in_header.unique, w)
-            }
+            Ok(entry) => reply_ok(Some(EntryOut::from(entry)), None, in_header.unique, w),
             Err(e) => reply_error(e, in_header.unique, w),
         }
     }
 
     fn unlink(&self, in_header: InHeader, mut r: Reader, w: Writer) -> Result<usize> {
-        let namelen = (in_header.len as usize)
-            .checked_sub(size_of::<InHeader>())
-            .ok_or(Error::InvalidHeaderLength)?;
-        let mut name = vec![0; namelen];
+        let buf = get_message_body(&mut r, &in_header, 0)?;
+        let name = bytes_to_cstr(buf.as_ref())?;
 
-        r.read_exact(&mut name).map_err(Error::DecodeMessage)?;
-
-        match self.fs.unlink(
-            Context::from(in_header),
-            in_header.nodeid.into(),
-            bytes_to_cstr(&name)?,
-        ) {
+        match self
+            .fs
+            .unlink(Context::from(in_header), in_header.nodeid.into(), name)
+        {
             Ok(()) => reply_ok(None::<u8>, None, in_header.unique, w),
             Err(e) => reply_error(e, in_header.unique, w),
         }
     }
 
     fn rmdir(&self, in_header: InHeader, mut r: Reader, w: Writer) -> Result<usize> {
-        let namelen = (in_header.len as usize)
-            .checked_sub(size_of::<InHeader>())
-            .ok_or(Error::InvalidHeaderLength)?;
-        let mut name = vec![0; namelen];
+        let buf = get_message_body(&mut r, &in_header, 0)?;
+        let name = bytes_to_cstr(buf.as_ref())?;
 
-        r.read_exact(&mut name).map_err(Error::DecodeMessage)?;
-
-        match self.fs.rmdir(
-            Context::from(in_header),
-            in_header.nodeid.into(),
-            bytes_to_cstr(&name)?,
-        ) {
+        match self
+            .fs
+            .rmdir(Context::from(in_header), in_header.nodeid.into(), name)
+        {
             Ok(()) => reply_ok(None::<u8>, None, in_header.unique, w),
             Err(e) => reply_error(e, in_header.unique, w),
         }
@@ -440,29 +385,15 @@ impl<F: FileSystem + Sync> Server<F> {
         mut r: Reader,
         w: Writer,
     ) -> Result<usize> {
-        let buflen = (in_header.len as usize)
-            .checked_sub(size_of::<InHeader>())
-            .and_then(|l| l.checked_sub(msg_size))
-            .ok_or(Error::InvalidHeaderLength)?;
-        let mut buf = vec![0; buflen];
-
-        r.read_exact(&mut buf).map_err(Error::DecodeMessage)?;
-
-        // We want to include the '\0' byte in the first slice.
-        let split_pos = buf
-            .iter()
-            .position(|c| *c == b'\0')
-            .map(|p| p + 1)
-            .ok_or(Error::MissingParameter)?;
-
-        let (oldname, newname) = buf.split_at(split_pos);
+        let buf = get_message_body(&mut r, &in_header, msg_size)?;
+        let (oldname, newname) = extract_two_cstrs(&buf)?;
 
         match self.fs.rename(
             Context::from(in_header),
             in_header.nodeid.into(),
-            bytes_to_cstr(oldname)?,
+            oldname,
             newdir.into(),
-            bytes_to_cstr(newname)?,
+            newname,
             flags,
         ) {
             Ok(()) => reply_ok(None::<u8>, None, in_header.unique, w),
@@ -486,26 +417,16 @@ impl<F: FileSystem + Sync> Server<F> {
 
     fn link(&self, in_header: InHeader, mut r: Reader, w: Writer) -> Result<usize> {
         let LinkIn { oldnodeid } = r.read_obj().map_err(Error::DecodeMessage)?;
-
-        let namelen = (in_header.len as usize)
-            .checked_sub(size_of::<InHeader>())
-            .and_then(|l| l.checked_sub(size_of::<LinkIn>()))
-            .ok_or(Error::InvalidHeaderLength)?;
-        let mut name = vec![0; namelen];
-
-        r.read_exact(&mut name).map_err(Error::DecodeMessage)?;
+        let buf = get_message_body(&mut r, &in_header, size_of::<LinkIn>())?;
+        let name = bytes_to_cstr(buf.as_ref())?;
 
         match self.fs.link(
             Context::from(in_header),
             oldnodeid.into(),
             in_header.nodeid.into(),
-            bytes_to_cstr(&name)?,
+            name,
         ) {
-            Ok(entry) => {
-                let out = EntryOut::from(entry);
-
-                reply_ok(Some(out), None, in_header.unique, w)
-            }
+            Ok(entry) => reply_ok(Some(EntryOut::from(entry)), None, in_header.unique, w),
             Err(e) => reply_error(e, in_header.unique, w),
         }
     }
@@ -698,23 +619,14 @@ impl<F: FileSystem + Sync> Server<F> {
 
     fn setxattr(&self, in_header: InHeader, mut r: Reader, w: Writer) -> Result<usize> {
         let SetxattrIn { size, flags } = r.read_obj().map_err(Error::DecodeMessage)?;
+        let buf = get_message_body(&mut r, &in_header, size_of::<SetxattrIn>())?;
 
         // The name and value and encoded one after another and separated by a '\0' character.
-        let len = (in_header.len as usize)
-            .checked_sub(size_of::<InHeader>())
-            .and_then(|l| l.checked_sub(size_of::<SetxattrIn>()))
-            .ok_or(Error::InvalidHeaderLength)?;
-        let mut buf = vec![0; len];
-
-        r.read_exact(&mut buf).map_err(Error::DecodeMessage)?;
-
-        // We want to include the '\0' byte in the first slice.
         let split_pos = buf
             .iter()
             .position(|c| *c == b'\0')
             .map(|p| p + 1)
             .ok_or(Error::MissingParameter)?;
-
         let (name, value) = buf.split_at(split_pos);
 
         if size != value.len() as u32 {
@@ -735,15 +647,6 @@ impl<F: FileSystem + Sync> Server<F> {
 
     fn getxattr(&self, in_header: InHeader, mut r: Reader, w: Writer) -> Result<usize> {
         let GetxattrIn { size, .. } = r.read_obj().map_err(Error::DecodeMessage)?;
-
-        let namelen = (in_header.len as usize)
-            .checked_sub(size_of::<InHeader>())
-            .and_then(|l| l.checked_sub(size_of::<GetxattrIn>()))
-            .ok_or(Error::InvalidHeaderLength)?;
-        let mut name = vec![0; namelen];
-
-        r.read_exact(&mut name).map_err(Error::DecodeMessage)?;
-
         if size > MAX_BUFFER_SIZE {
             return do_reply_error(
                 io::Error::from_raw_os_error(libc::ENOMEM),
@@ -753,10 +656,13 @@ impl<F: FileSystem + Sync> Server<F> {
             );
         }
 
+        let buf = get_message_body(&mut r, &in_header, size_of::<GetxattrIn>())?;
+        let name = bytes_to_cstr(buf.as_ref())?;
+
         match self.fs.getxattr(
             Context::from(in_header),
             in_header.nodeid.into(),
-            bytes_to_cstr(&name)?,
+            name,
             size,
         ) {
             Ok(GetxattrReply::Value(val)) => reply_ok(None::<u8>, Some(&val), in_header.unique, w),
@@ -802,14 +708,7 @@ impl<F: FileSystem + Sync> Server<F> {
     }
 
     fn removexattr(&self, in_header: InHeader, mut r: Reader, w: Writer) -> Result<usize> {
-        let namelen = (in_header.len as usize)
-            .checked_sub(size_of::<InHeader>())
-            .ok_or(Error::InvalidHeaderLength)?;
-
-        let mut buf = vec![0; namelen];
-
-        r.read_exact(&mut buf).map_err(Error::DecodeMessage)?;
-
+        let buf = get_message_body(&mut r, &in_header, 0)?;
         let name = bytes_to_cstr(&buf)?;
 
         match self
@@ -1077,16 +976,7 @@ impl<F: FileSystem + Sync> Server<F> {
         let CreateIn {
             flags, mode, umask, ..
         } = r.read_obj().map_err(Error::DecodeMessage)?;
-
-        let namelen = (in_header.len as usize)
-            .checked_sub(size_of::<InHeader>())
-            .and_then(|l| l.checked_sub(size_of::<CreateIn>()))
-            .ok_or(Error::InvalidHeaderLength)?;
-
-        let mut buf = vec![0; namelen];
-
-        r.read_exact(&mut buf).map_err(Error::DecodeMessage)?;
-
+        let buf = get_message_body(&mut r, &in_header, size_of::<CreateIn>())?;
         let name = bytes_to_cstr(&buf)?;
 
         match self.fs.create(
@@ -1419,6 +1309,32 @@ fn reply_error(err: io::Error, unique: u64, w: Writer) -> Result<usize> {
     do_reply_error(err, unique, w, false)
 }
 
+fn get_message_body(r: &mut Reader, in_header: &InHeader, sub_hdr_sz: usize) -> Result<Vec<u8>> {
+    let len = (in_header.len as usize)
+        .checked_sub(size_of::<InHeader>())
+        .and_then(|l| l.checked_sub(sub_hdr_sz))
+        .ok_or(Error::InvalidHeaderLength)?;
+    let mut buf = vec![0u8; len];
+
+    r.read_exact(&mut buf).map_err(Error::DecodeMessage)?;
+
+    Ok(buf)
+}
+
+fn extract_two_cstrs(buf: &[u8]) -> Result<(&CStr, &CStr)> {
+    if let Some(mut pos) = buf.iter().position(|x| *x == 0) {
+        let first = CStr::from_bytes_with_nul(&buf[0..=pos]).map_err(Error::InvalidCString)?;
+        pos += 1;
+        if pos < buf.len() {
+            return Ok((first, bytes_to_cstr(&buf[pos..])?));
+        }
+    }
+
+    Err(Error::DecodeMessage(std::io::Error::from_raw_os_error(
+        libc::EINVAL,
+    )))
+}
+
 /// trim all trailing nul terminators.
 pub fn bytes_to_cstr(buf: &[u8]) -> Result<&CStr> {
     // There might be multiple 0s at the end of buf, find & use the first one and trim other zeros.
@@ -1533,5 +1449,41 @@ mod tests {
 
         bytes_to_cstr(&[0x1u8]).unwrap_err();
         bytes_to_cstr(&[0x1u8, 0x1]).unwrap_err();
+    }
+
+    #[test]
+    fn test_extract_cstrs() {
+        assert_eq!(
+            extract_two_cstrs(&[0x1u8, 0x2u8, 0x0, 0x3, 0x0]).unwrap(),
+            (
+                CStr::from_bytes_with_nul(&[0x1u8, 0x2u8, 0x0]).unwrap(),
+                CStr::from_bytes_with_nul(&[0x3u8, 0x0]).unwrap(),
+            )
+        );
+        assert_eq!(
+            extract_two_cstrs(&[0x1u8, 0x2u8, 0x0, 0x3, 0x0, 0x0]).unwrap(),
+            (
+                CStr::from_bytes_with_nul(&[0x1u8, 0x2u8, 0x0]).unwrap(),
+                CStr::from_bytes_with_nul(&[0x3u8, 0x0]).unwrap(),
+            )
+        );
+        assert_eq!(
+            extract_two_cstrs(&[0x1u8, 0x2u8, 0x0, 0x3, 0x0, 0x4]).unwrap(),
+            (
+                CStr::from_bytes_with_nul(&[0x1u8, 0x2u8, 0x0]).unwrap(),
+                CStr::from_bytes_with_nul(&[0x3u8, 0x0]).unwrap(),
+            )
+        );
+        assert_eq!(
+            extract_two_cstrs(&[0x1u8, 0x2u8, 0x0, 0x0, 0x4]).unwrap(),
+            (
+                CStr::from_bytes_with_nul(&[0x1u8, 0x2u8, 0x0]).unwrap(),
+                CStr::from_bytes_with_nul(&[0x0]).unwrap(),
+            )
+        );
+
+        extract_two_cstrs(&[0x1u8, 0x2u8, 0x0, 0x3]).unwrap_err();
+        extract_two_cstrs(&[0x1u8, 0x2u8, 0x0]).unwrap_err();
+        extract_two_cstrs(&[0x1u8, 0x2u8]).unwrap_err();
     }
 }
