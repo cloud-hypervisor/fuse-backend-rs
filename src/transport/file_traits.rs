@@ -2,17 +2,17 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE-BSD-3-Clause file.
 
-//! File extension traits to transfer data between File objects and [VolatileSlice] buffers.
+//! File extension traits to transfer data between File objects and [VolatileSlice][2] buffers.
 //!
 //! Fuse filesystem servers use normal memory buffers to transfer data from/to File objects.
 //! For virtio-fs file servers, they need to transfer data between File objects and guest memory.
-//! The guest memory could be accessed through [GuestMemory] or [VolatileSlice] objects. And the
-//! [VolatileSlice] trait could also be used to access normal memory buffers too. So several
-//! [VolatileSlice] based File extension traits are introduced to deal with both guest memory and
-//! normal memory buffers.
+//! The guest memory could be accessed through [GuestMemory][1] or [VolatileSlice][2] objects.
+//! And the [VolatileSlice][2] trait could also be used to access normal memory buffers too.
+//! So several [VolatileSlice][2] based File extension traits are introduced to deal with both
+//! guest memory and normal memory buffers.
 //!
-//! [GuestMemory](https://docs.rs/vm-memory/0.2.0/vm_memory/guest_memory/trait.GuestMemory.html)
-//! [VolatileSlice](https://docs.rs/vm-memory/0.2.0/vm_memory/volatile_memory/struct.VolatileSlice.html)
+//! [1]: https://docs.rs/vm-memory/0.2.0/vm_memory/guest_memory/trait.GuestMemory.html
+//! [2]: https://docs.rs/vm-memory/0.2.0/vm_memory/volatile_memory/struct.VolatileSlice.html
 
 use std::fs::File;
 use std::io::{Error, ErrorKind, Result};

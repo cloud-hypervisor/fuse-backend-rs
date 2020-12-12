@@ -16,7 +16,7 @@ use std::ptr::copy_nonoverlapping;
 
 use vm_memory::{ByteValued, VolatileSlice};
 
-mod file_traits;
+pub mod file_traits;
 pub use file_traits::{FileReadWriteVolatile, FileSetLen};
 
 #[cfg(feature = "virtiofs")]
