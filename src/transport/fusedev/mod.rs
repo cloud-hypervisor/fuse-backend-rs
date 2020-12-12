@@ -1,7 +1,7 @@
 // Copyright (C) 2020 Alibaba Cloud. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Traits and Structs to implement the /dev/fuse transport layer.
+//! Traits and Structs to implement the /dev/fuse Fuse transport layer.
 
 use std::collections::VecDeque;
 use std::fmt;
@@ -143,8 +143,7 @@ impl<'a> Writer<'a> {
     }
 
     /// Commit all internal buffers of self and others
-    /// We need this because the lifetime of others is usually shorter than
-    /// self.
+    /// We need this because the lifetime of others is usually shorter than self.
     pub fn commit(&mut self, others: &[&Writer<'a>]) -> io::Result<usize> {
         if self.buf.is_none() {
             return Ok(0);
@@ -170,6 +169,7 @@ impl<'a> Writer<'a> {
         }
         Ok(0)
     }
+
     /// Returns number of bytes already written to the internal buffer.
     /// Only available after a split.
     pub fn bytes_written(&self) -> usize {

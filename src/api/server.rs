@@ -2,12 +2,18 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE-BSD-3-Clause file.
 
-//! Fuse API Server to connect the transport layers and filesystem drivers.
+//! Fuse API Server to interconnect transport layers with filesystem drivers.
 //!
-//! The Fuse API is the connection between transport layers and file system drivers.
-//! It receives Fuse requests from transport layers, parses the request according to Fuse ABI,
-//! invokes filesystem drivers to server the requests, and eventually send back the result to
-//! the transport layer.
+//! The Fuse API server is a adapter layer between transport layers and file system drivers.
+//! The main functionalities of the Fuse API server is:
+//! * Support different types of transport layers, fusedev, virtio-fs or vhost-user-fs.
+//! * Hide different transport layers details from file system drivers.
+//! * Parse transport messages according to the Fuse ABI to avoid duplicated message decoding
+//!   in every file system driver.
+//! * Invoke file system driver handler to serve each request and send the reply.
+//!
+//! The Fuse API server is performance critical, so it's designed to support multi-threading by
+//! adopting interior-mutability. And the arcswap crate is used to implement interior-mutability.
 
 use std::ffi::CStr;
 use std::io::{self, IoSlice, Read, Write};
@@ -85,7 +91,7 @@ pub struct Server<F: FileSystem + Sync> {
 }
 
 impl<F: FileSystem + Sync> Server<F> {
-    /// Create a Server instance from a filesystem driver.
+    /// Create a Server instance from a filesystem driver object.
     pub fn new(fs: F) -> Server<F> {
         Server {
             fs,
@@ -1461,6 +1467,7 @@ fn add_dirent(
         padded_dirent_len
     };
 
+    // Skip the entry if there's no enough space left.
     if (max as usize).saturating_sub(cursor.bytes_written()) < total_len {
         Ok(0)
     } else {

@@ -1056,6 +1056,18 @@ pub trait FileSystem {
 
     #[cfg(feature = "virtiofs")]
     /// Setup a mapping so that guest can access files in DAX style.
+    ///
+    /// The virtio-fs DAX Window allows bypassing guest page cache and allows mapping host
+    /// page cache directly in guest address space.
+    ///
+    /// When a page of file is needed, guest sends a request to map that page (in host page cache)
+    /// in VMM address space. Inside guest this is a physical memory range controlled by virtiofs
+    /// device. And guest directly maps this physical address range using DAX and hence gets
+    /// access to file data on host.
+    ///
+    /// This can speed up things considerably in many situations. Also this can result in
+    /// substantial memory savings as file data does not have to be copied in guest and it is
+    /// directly accessed from host page cache.
     #[allow(clippy::too_many_arguments)]
     fn setupmapping(
         &self,
