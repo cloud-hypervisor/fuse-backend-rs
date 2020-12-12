@@ -1314,8 +1314,11 @@ fn get_message_body(r: &mut Reader, in_header: &InHeader, sub_hdr_sz: usize) -> 
         .checked_sub(size_of::<InHeader>())
         .and_then(|l| l.checked_sub(sub_hdr_sz))
         .ok_or(Error::InvalidHeaderLength)?;
-    let mut buf = vec![0u8; len];
 
+    // Allocate buffer without zeroing out the content for performance.
+    let mut buf = Vec::<u8>::with_capacity(len);
+    // It's safe because read_exact() is called to fill all the allocated buffer.
+    unsafe { buf.set_len(len) };
     r.read_exact(&mut buf).map_err(Error::DecodeMessage)?;
 
     Ok(buf)
