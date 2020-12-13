@@ -57,9 +57,7 @@ pub trait BackendFileSystem: FileSystem {
     }
 
     /// fstype returns the backend fs type.
-    fn fstype(&self) -> BackendFileSystemType {
-        BackendFileSystemType::PassthroughFs
-    }
+    fn fstype(&self) -> BackendFileSystemType;
 
     /// Provides a reference to the Any trait. This is useful to let
     /// the caller have access to the underlying type behind the
