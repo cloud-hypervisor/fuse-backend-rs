@@ -129,7 +129,7 @@ impl<'a> Writer<'a> {
         }
         // Need to set buf for self for the first split
         if self.buf.is_none() {
-            self.buf = Some(Vec::new());
+            self.buf = Some(Vec::with_capacity(offset));
         }
         let max_size = self.max_size - offset;
         self.max_size = offset;
@@ -137,7 +137,7 @@ impl<'a> Writer<'a> {
             fd: self.fd,
             max_size,
             bytes_written: 0,
-            buf: Some(Vec::new()),
+            buf: Some(Vec::with_capacity(max_size)),
             phantom: PhantomData,
         })
     }
