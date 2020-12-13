@@ -11,7 +11,7 @@ use std::marker::PhantomData;
 use libc::c_int;
 use nix::sys::uio::{pwrite, writev, IoVec};
 
-use vm_memory::{VolatileMemory, VolatileMemoryError, VolatileSlice};
+use vm_memory::{ByteValued, VolatileMemory, VolatileMemoryError, VolatileSlice};
 
 use super::{FileReadWriteVolatile, IoBuffers, Reader};
 
@@ -189,6 +189,39 @@ impl<'a> Writer<'a> {
         self.bytes_written += count;
     }
 
+    /// Writes an object to the writer.
+    pub fn write_obj<T: ByteValued>(&mut self, val: T) -> io::Result<()> {
+        self.write_all(val.as_slice())
+    }
+
+    /// Writes data to the writer from a file descriptor.
+    /// Returns the number of bytes written to the writer.
+    /// The number of bytes written can be less than `count` if
+    /// there isn't enough data in the writer.
+    pub fn write_from<F: FileReadWriteVolatile>(
+        &mut self,
+        mut src: F,
+        count: usize,
+    ) -> io::Result<usize> {
+        let mut buf = Vec::with_capacity(count);
+        let cnt = src.read_vectored_volatile(
+            // Safe because we have made sure buf has at least count capacity above
+            unsafe { &[VolatileSlice::new(buf.as_mut_ptr(), count)] },
+        )?;
+
+        // Safe because we have just allocated larger count
+        unsafe { buf.set_len(cnt) };
+
+        if let Some(data) = &mut self.buf {
+            self.buf = Some([&data[..], &mut buf[..cnt]].concat());
+            self.account_written(cnt);
+        } else {
+            // write to fd
+            return self.write(&buf[..cnt]);
+        }
+        Ok(cnt)
+    }
+
     /// Writes data to the writer from a File at offset `off`.
     /// Returns the number of bytes written to the writer.
     /// The number of bytes written can be less than `count` if
@@ -217,6 +250,29 @@ impl<'a> Writer<'a> {
             return self.write(&buf[..count]);
         }
         Ok(count)
+    }
+
+    /// Writes all data to the writer from a file descriptor.
+    pub fn write_all_from<F: FileReadWriteVolatile>(
+        &mut self,
+        mut src: F,
+        mut count: usize,
+    ) -> io::Result<()> {
+        while count > 0 {
+            match self.write_from(&mut src, count) {
+                Ok(0) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::WriteZero,
+                        "failed to write whole buffer",
+                    ))
+                }
+                Ok(n) => count -= n,
+                Err(ref e) if e.kind() == io::ErrorKind::Interrupted => {}
+                Err(e) => return Err(e),
+            }
+        }
+
+        Ok(())
     }
 }
 
