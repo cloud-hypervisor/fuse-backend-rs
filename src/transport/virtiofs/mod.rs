@@ -49,14 +49,8 @@ use vm_virtio::{DescriptorChain, Error as QueueError};
 
 use super::{FileReadWriteVolatile, IoBuffers, Reader};
 
-#[cfg(feature = "vhost-user-fs")]
 mod fs_cache_req_handler;
-#[cfg(feature = "vhost-user-fs")]
 pub use self::fs_cache_req_handler::FsCacheReqHandler;
-
-#[cfg(not(feature = "vhost-user-fs"))]
-/// Fake trait to simplify implementation when vhost-user-fs is not used.
-pub trait FsCacheReqHandler {}
 
 /// Error codes for Virtio queue related operations.
 #[derive(Debug)]

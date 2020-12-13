@@ -5,12 +5,16 @@
 use std::io;
 use std::os::unix::io::RawFd;
 
+#[cfg(feature = "vhost-user-fs")]
 use vhost_rs::vhost_user::message::{
     VhostUserFSSlaveMsg, VhostUserFSSlaveMsgFlags, VHOST_USER_FS_SLAVE_ENTRIES,
 };
+#[cfg(feature = "vhost-user-fs")]
 use vhost_rs::vhost_user::{SlaveFsCacheReq, VhostUserMasterReqHandler};
 
-use crate::abi::virtio_fs::{RemovemappingOne, SetupmappingFlags};
+use crate::abi::virtio_fs::RemovemappingOne;
+#[cfg(feature = "vhost-user-fs")]
+use crate::abi::virtio_fs::SetupmappingFlags;
 
 /// Trait to support virtio-fs DAX Window operations.
 ///
@@ -40,6 +44,7 @@ pub trait FsCacheReqHandler: Send + Sync + 'static {
     fn unmap(&mut self, requests: Vec<RemovemappingOne>) -> io::Result<()>;
 }
 
+#[cfg(feature = "vhost-user-fs")]
 impl FsCacheReqHandler for SlaveFsCacheReq {
     fn map(
         &mut self,
