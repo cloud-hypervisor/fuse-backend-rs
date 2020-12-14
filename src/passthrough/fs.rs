@@ -1106,8 +1106,6 @@ impl FileSystem for PassthroughFs {
     ) -> io::Result<usize> {
         let data = self.get_data(handle, inode, libc::O_RDONLY)?;
 
-        // This is safe because write_from uses preadv64, so the underlying file descriptor
-        // offset is not affected by this operation.
         let mut f = data.file.read().unwrap().try_clone().map_err(|e| {
             error!("passthrough: read failed {:?}", e);
             e
@@ -1129,8 +1127,6 @@ impl FileSystem for PassthroughFs {
     ) -> io::Result<usize> {
         let data = self.get_data(handle, inode, libc::O_RDWR)?;
 
-        // This is safe because read_to uses pwritev64, so the underlying file descriptor
-        // offset is not affected by this operation.
         let mut f = data.file.read().unwrap().try_clone().map_err(|e| {
             error!("passthrough: write failed {:?}", e);
             e
