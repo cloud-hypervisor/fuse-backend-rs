@@ -314,10 +314,9 @@ impl<'a> io::Write for Writer<'a> {
     // default write_vectored only writes the first non-empty IoSlice. Override it.
     fn write_vectored(&mut self, bufs: &[IoSlice<'_>]) -> io::Result<usize> {
         if let Some(data) = &mut self.buf {
-            let mut count = 0;
-            let _ = bufs.iter().filter(|b| !b.is_empty()).map(|b| {
+            let count = bufs.iter().filter(|b| !b.is_empty()).fold(0, |acc, b| {
                 data.extend_from_slice(b);
-                count += b.len()
+                acc + b.len()
             });
             Ok(count)
         } else {
