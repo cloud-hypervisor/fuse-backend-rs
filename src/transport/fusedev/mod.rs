@@ -359,3 +359,280 @@ impl<'a> io::Write for Writer<'a> {
         ))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    extern crate vmm_sys_util;
+
+    use super::*;
+    use std::io::{Read, Seek, SeekFrom, Write};
+    use std::os::unix::io::AsRawFd;
+    use vmm_sys_util::tempfile::TempFile;
+
+    #[test]
+    fn reader_test_simple_chain() {
+        let mut buf = [0u8; 106];
+        let mut reader = Reader::new(FuseBuf::new(&mut buf)).unwrap();
+
+        assert_eq!(reader.available_bytes(), 106);
+        assert_eq!(reader.bytes_read(), 0);
+
+        let mut buffer = [0 as u8; 64];
+        if let Err(_) = reader.read_exact(&mut buffer) {
+            panic!("read_exact should not fail here");
+        }
+
+        assert_eq!(reader.available_bytes(), 42);
+        assert_eq!(reader.bytes_read(), 64);
+
+        match reader.read(&mut buffer) {
+            Err(_) => panic!("read should not fail here"),
+            Ok(length) => assert_eq!(length, 42),
+        }
+
+        assert_eq!(reader.available_bytes(), 0);
+        assert_eq!(reader.bytes_read(), 106);
+    }
+
+    #[test]
+    fn writer_test_simple_chain() {
+        let file = TempFile::new().unwrap().into_file();
+        let mut writer = Writer::new(file.as_raw_fd(), 106).unwrap();
+
+        assert_eq!(writer.available_bytes(), 106);
+        assert_eq!(writer.bytes_written(), 0);
+
+        let mut buffer = [0 as u8; 64];
+        if let Err(_) = writer.write_all(&mut buffer) {
+            panic!("write_all should not fail here");
+        }
+
+        assert_eq!(writer.available_bytes(), 42);
+        assert_eq!(writer.bytes_written(), 64);
+
+        let mut buffer = [0 as u8; 42];
+        match writer.write(&mut buffer) {
+            Err(_) => panic!("write should not fail here"),
+            Ok(length) => assert_eq!(length, 42),
+        }
+
+        assert_eq!(writer.available_bytes(), 0);
+        assert_eq!(writer.bytes_written(), 106);
+    }
+
+    #[test]
+    fn reader_unexpected_eof() {
+        let mut buf = [0u8; 106];
+        let mut reader = Reader::new(FuseBuf::new(&mut buf)).unwrap();
+
+        let mut buf2 = Vec::with_capacity(1024);
+        buf2.resize(1024, 0);
+
+        assert_eq!(
+            reader
+                .read_exact(&mut buf2[..])
+                .expect_err("read more bytes than available")
+                .kind(),
+            io::ErrorKind::UnexpectedEof
+        );
+    }
+
+    #[test]
+    fn reader_split_border() {
+        let mut buf = [0u8; 128];
+        let mut reader = Reader::new(FuseBuf::new(&mut buf)).unwrap();
+        let other = reader.split_at(32).expect("failed to split Reader");
+
+        assert_eq!(reader.available_bytes(), 32);
+        assert_eq!(other.available_bytes(), 96);
+    }
+
+    #[test]
+    fn reader_split_outofbounds() {
+        let mut buf = [0u8; 128];
+        let mut reader = Reader::new(FuseBuf::new(&mut buf)).unwrap();
+
+        if let Ok(_) = reader.split_at(256) {
+            panic!("successfully split Reader with out of bounds offset");
+        }
+    }
+
+    #[test]
+    fn writer_split_commit_header() {
+        let file = TempFile::new().unwrap().into_file();
+        let mut writer = Writer::new(file.as_raw_fd(), 106).unwrap();
+        let mut other = writer.split_at(4).expect("failed to split Writer");
+
+        assert_eq!(writer.available_bytes(), 4);
+        assert_eq!(other.available_bytes(), 102);
+
+        writer.write(&[0x1u8; 4]).unwrap();
+        assert_eq!(writer.available_bytes(), 0);
+        assert_eq!(writer.bytes_written(), 4);
+
+        let buf = vec![0xdeu8; 64];
+        let slices = [
+            IoSlice::new(&buf[..32]),
+            IoSlice::new(&buf[32..48]),
+            IoSlice::new(&buf[48..]),
+        ];
+        assert_eq!(
+            other
+                .write_vectored(&slices)
+                .expect("failed to write from buffer"),
+            64
+        );
+
+        writer.commit(&[]).unwrap();
+    }
+
+    #[test]
+    fn writer_split_commit_all() {
+        let file = TempFile::new().unwrap().into_file();
+        let mut writer = Writer::new(file.as_raw_fd(), 106).unwrap();
+        let mut other = writer.split_at(4).expect("failed to split Writer");
+
+        assert_eq!(writer.available_bytes(), 4);
+        assert_eq!(other.available_bytes(), 102);
+
+        writer.write(&[0x1u8; 4]).unwrap();
+        assert_eq!(writer.available_bytes(), 0);
+        assert_eq!(writer.bytes_written(), 4);
+
+        let buf = vec![0xdeu8; 64];
+        let slices = [
+            IoSlice::new(&buf[..32]),
+            IoSlice::new(&buf[32..48]),
+            IoSlice::new(&buf[48..]),
+        ];
+        assert_eq!(
+            other
+                .write_vectored(&slices)
+                .expect("failed to write from buffer"),
+            64
+        );
+
+        writer.commit(&[&other]).unwrap();
+    }
+
+    #[test]
+    fn read_full() {
+        let mut buf2 = [0u8; 48];
+        let mut reader = Reader::new(FuseBuf::new(&mut buf2)).unwrap();
+        let mut buf = vec![0u8; 64];
+
+        assert_eq!(
+            reader.read(&mut buf[..]).expect("failed to read to buffer"),
+            48
+        );
+    }
+
+    #[test]
+    fn write_full() {
+        let file = TempFile::new().unwrap().into_file();
+        let mut writer = Writer::new(file.as_raw_fd(), 48).unwrap();
+
+        let buf = vec![0xdeu8; 64];
+        writer.write(&buf[..]).unwrap_err();
+
+        let buf = vec![0xdeu8; 48];
+        assert_eq!(
+            writer.write(&buf[..]).expect("failed to write from buffer"),
+            48
+        );
+    }
+
+    #[test]
+    fn write_vectored() {
+        let file = TempFile::new().unwrap().into_file();
+        let mut writer = Writer::new(file.as_raw_fd(), 48).unwrap();
+
+        let buf = vec![0xdeu8; 48];
+        let slices = [
+            IoSlice::new(&buf[..32]),
+            IoSlice::new(&buf[32..40]),
+            IoSlice::new(&buf[40..]),
+        ];
+        assert_eq!(
+            writer
+                .write_vectored(&slices)
+                .expect("failed to write from buffer"),
+            48
+        );
+    }
+
+    #[test]
+    fn read_exact_to() {
+        let mut buf2 = [0u8; 48];
+        let mut reader = Reader::new(FuseBuf::new(&mut buf2)).unwrap();
+        let mut file = TempFile::new().unwrap().into_file();
+
+        reader
+            .read_exact_to(&mut file, 47)
+            .expect("failed to read to file");
+
+        assert_eq!(reader.available_bytes(), 1);
+        assert_eq!(reader.bytes_read(), 47);
+    }
+
+    #[test]
+    fn read_to_at() {
+        let mut buf2 = [0u8; 48];
+        let mut reader = Reader::new(FuseBuf::new(&mut buf2)).unwrap();
+        let mut file = TempFile::new().unwrap().into_file();
+
+        assert_eq!(
+            reader
+                .read_to_at(&mut file, 48, 16)
+                .expect("failed to read to file"),
+            48
+        );
+        assert_eq!(reader.available_bytes(), 0);
+        assert_eq!(reader.bytes_read(), 48);
+    }
+
+    #[test]
+    fn write_all_from() {
+        let file1 = TempFile::new().unwrap().into_file();
+        let mut writer = Writer::new(file1.as_raw_fd(), 48).unwrap();
+        let mut file = TempFile::new().unwrap().into_file();
+        let buf = vec![0xdeu8; 64];
+
+        file.write_all(&buf).unwrap();
+        file.seek(SeekFrom::Start(0)).unwrap();
+        writer
+            .write_all_from(&mut file, 47)
+            .expect("failed to write from buffer");
+        assert_eq!(writer.available_bytes(), 1);
+        assert_eq!(writer.bytes_written(), 47);
+
+        // Write more data than capacity
+        writer.write_all_from(&mut file, 2).unwrap_err();
+        assert_eq!(writer.available_bytes(), 1);
+        assert_eq!(writer.bytes_written(), 47);
+    }
+
+    #[test]
+    fn write_from_at() {
+        let file1 = TempFile::new().unwrap().into_file();
+        let mut writer = Writer::new(file1.as_raw_fd(), 48).unwrap();
+        let mut file = TempFile::new().unwrap().into_file();
+        let buf = vec![0xdeu8; 64];
+
+        file.write_all(&buf).unwrap();
+        file.seek(SeekFrom::Start(0)).unwrap();
+        assert_eq!(
+            writer
+                .write_from_at(&mut file, 40, 16)
+                .expect("failed to write from buffer"),
+            40
+        );
+        assert_eq!(writer.available_bytes(), 8);
+        assert_eq!(writer.bytes_written(), 40);
+
+        // Write more data than capacity
+        writer.write_from_at(&mut file, 40, 16).unwrap_err();
+        assert_eq!(writer.available_bytes(), 8);
+        assert_eq!(writer.bytes_written(), 40);
+    }
+}

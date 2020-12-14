@@ -20,6 +20,9 @@ snapshot = { git = "ssh://git@gitlab.alibaba-inc.com/rust-vmm/snapshot.git", bra
 versionize = { git = "ssh://git@gitlab.alibaba-inc.com/rust-vmm/versionize.git", branch = "master" }
 versionize_derive = { git = "ssh://git@gitlab.alibaba-inc.com/rust-vmm/versionize_derive.git", branch = "master" }
 
+[dev-dependencies]
+vmm-sys-util = "0.4.0"
+
 [dev-dependencies.vm-memory]
 git = "ssh://git@gitlab.alibaba-inc.com/rust-vmm/vm-memory.git"
 branch = "master"

@@ -321,9 +321,12 @@ impl<'a> io::Write for Writer<'a> {
 
 #[cfg(test)]
 mod tests {
+    extern crate vmm_sys_util;
+
     use super::*;
-    use std::io::{Read, Write};
+    use std::io::{Read, Seek, SeekFrom, Write};
     use vm_memory::{Address, ByteValued, Bytes, GuestAddress, GuestMemoryMmap, Le16, Le32, Le64};
+    use vmm_sys_util::tempfile::TempFile;
 
     const VIRTQ_DESC_F_NEXT: u16 = 0x1;
     const VIRTQ_DESC_F_WRITE: u16 = 0x2;
@@ -462,6 +465,7 @@ mod tests {
         assert_eq!(writer.available_bytes(), 42);
         assert_eq!(writer.bytes_written(), 64);
 
+        let mut buffer = [0 as u8; 42];
         match writer.write(&mut buffer) {
             Err(_) => panic!("write should not fail here"),
             Ok(length) => assert_eq!(length, 42),
@@ -588,9 +592,11 @@ mod tests {
         )
         .expect("create_descriptor_chain failed");
         let mut writer = Writer::new(&memory, chain_writer).expect("failed to create Writer");
+        assert!(writer.flush().is_ok());
         if let Err(_) = writer.write_obj(secret) {
             panic!("write_obj should not fail here");
         }
+        assert!(writer.flush().is_ok());
 
         // Now create new descriptor chain pointing to the same memory and try to read it.
         let chain_reader = create_descriptor_chain(
@@ -824,10 +830,172 @@ mod tests {
         .expect("create_descriptor_chain failed");
         let mut writer = Writer::new(&memory, chain).expect("failed to create Writer");
 
-        let buf = vec![0xdeu8; 64];
+        let buf = vec![0xdeu8; 40];
         assert_eq!(
             writer.write(&buf[..]).expect("failed to write from buffer"),
+            40
+        );
+        assert_eq!(writer.available_bytes(), 8);
+        assert_eq!(writer.bytes_written(), 40);
+
+        // Write more data than capacity
+        writer.write(&buf[..]).unwrap_err();
+        assert_eq!(writer.available_bytes(), 8);
+        assert_eq!(writer.bytes_written(), 40);
+    }
+
+    #[test]
+    fn write_vectored() {
+        use DescriptorType::*;
+
+        let memory_start_addr = GuestAddress(0x0);
+        let memory = GuestMemoryMmap::from_ranges(&vec![(memory_start_addr, 0x10000)]).unwrap();
+
+        let chain = create_descriptor_chain(
+            &memory,
+            GuestAddress(0x0),
+            GuestAddress(0x100),
+            vec![(Writable, 16), (Writable, 16), (Writable, 16)],
+            0,
+        )
+        .expect("create_descriptor_chain failed");
+        let mut writer = Writer::new(&memory, chain).expect("failed to create Writer");
+
+        let buf = vec![0xdeu8; 48];
+        let slices = [
+            IoSlice::new(&buf[..32]),
+            IoSlice::new(&buf[32..40]),
+            IoSlice::new(&buf[40..]),
+        ];
+        assert_eq!(
+            writer
+                .write_vectored(&slices)
+                .expect("failed to write from buffer"),
             48
         );
+        assert_eq!(writer.available_bytes(), 0);
+        assert_eq!(writer.bytes_written(), 48);
+
+        // Write more data than capacity
+        let buf = vec![0xdeu8; 40];
+        writer.write(&buf[..]).unwrap_err();
+        assert_eq!(writer.available_bytes(), 0);
+        assert_eq!(writer.bytes_written(), 48);
+    }
+
+    #[test]
+    fn read_exact_to() {
+        use DescriptorType::*;
+
+        let memory_start_addr = GuestAddress(0x0);
+        let memory = GuestMemoryMmap::from_ranges(&vec![(memory_start_addr, 0x10000)]).unwrap();
+
+        let chain = create_descriptor_chain(
+            &memory,
+            GuestAddress(0x0),
+            GuestAddress(0x100),
+            vec![(Readable, 16), (Readable, 16), (Readable, 16)],
+            0,
+        )
+        .expect("create_descriptor_chain failed");
+        let mut reader = Reader::new(&memory, chain).expect("failed to create Writer");
+
+        let mut file = TempFile::new().unwrap().into_file();
+        reader
+            .read_exact_to(&mut file, 47)
+            .expect("failed to read to file");
+
+        assert_eq!(reader.available_bytes(), 1);
+        assert_eq!(reader.bytes_read(), 47);
+    }
+
+    #[test]
+    fn read_to_at() {
+        use DescriptorType::*;
+
+        let memory_start_addr = GuestAddress(0x0);
+        let memory = GuestMemoryMmap::from_ranges(&vec![(memory_start_addr, 0x10000)]).unwrap();
+
+        let chain = create_descriptor_chain(
+            &memory,
+            GuestAddress(0x0),
+            GuestAddress(0x100),
+            vec![(Readable, 16), (Readable, 16), (Readable, 16)],
+            0,
+        )
+        .expect("create_descriptor_chain failed");
+        let mut reader = Reader::new(&memory, chain).expect("failed to create Writer");
+
+        let mut file = TempFile::new().unwrap().into_file();
+        assert_eq!(
+            reader
+                .read_to_at(&mut file, 48, 16)
+                .expect("failed to read to file"),
+            48
+        );
+
+        assert_eq!(reader.available_bytes(), 0);
+        assert_eq!(reader.bytes_read(), 48);
+    }
+
+    #[test]
+    fn write_all_from() {
+        use DescriptorType::*;
+
+        let memory_start_addr = GuestAddress(0x0);
+        let memory = GuestMemoryMmap::from_ranges(&vec![(memory_start_addr, 0x10000)]).unwrap();
+
+        let chain = create_descriptor_chain(
+            &memory,
+            GuestAddress(0x0),
+            GuestAddress(0x100),
+            vec![(Writable, 16), (Writable, 16), (Writable, 16)],
+            0,
+        )
+        .expect("create_descriptor_chain failed");
+        let mut writer = Writer::new(&memory, chain).expect("failed to create Writer");
+
+        let mut file = TempFile::new().unwrap().into_file();
+        let buf = vec![0xdeu8; 64];
+        file.write_all(&buf).unwrap();
+        file.seek(SeekFrom::Start(0)).unwrap();
+        writer
+            .write_all_from(&mut file, 47)
+            .expect("failed to write from buffer");
+
+        assert_eq!(writer.available_bytes(), 1);
+        assert_eq!(writer.bytes_written(), 47);
+    }
+
+    #[test]
+    fn write_from_at() {
+        use DescriptorType::*;
+
+        let memory_start_addr = GuestAddress(0x0);
+        let memory = GuestMemoryMmap::from_ranges(&vec![(memory_start_addr, 0x10000)]).unwrap();
+
+        let chain = create_descriptor_chain(
+            &memory,
+            GuestAddress(0x0),
+            GuestAddress(0x100),
+            vec![(Writable, 16), (Writable, 16), (Writable, 16)],
+            0,
+        )
+        .expect("create_descriptor_chain failed");
+        let mut writer = Writer::new(&memory, chain).expect("failed to create Writer");
+
+        let mut file = TempFile::new().unwrap().into_file();
+        let buf = vec![0xdeu8; 64];
+        file.write_all(&buf).unwrap();
+        file.seek(SeekFrom::Start(0)).unwrap();
+        assert_eq!(
+            writer
+                .write_from_at(&mut file, 48, 16)
+                .expect("failed to write from buffer"),
+            48
+        );
+
+        assert_eq!(writer.available_bytes(), 0);
+        assert_eq!(writer.bytes_written(), 48);
     }
 }
