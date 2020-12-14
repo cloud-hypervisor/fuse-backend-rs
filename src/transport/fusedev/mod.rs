@@ -196,13 +196,13 @@ impl<'a> Writer<'a> {
 
     /// Writes data to the writer from a file descriptor.
     /// Returns the number of bytes written to the writer.
-    /// The number of bytes written can be less than `count` if
-    /// there isn't enough data in the writer.
     pub fn write_from<F: FileReadWriteVolatile>(
         &mut self,
         mut src: F,
         count: usize,
     ) -> io::Result<usize> {
+        self.check_available_space(count)?;
+
         let mut buf = Vec::with_capacity(count);
         let cnt = src.read_vectored_volatile(
             // Safe because we have made sure buf has at least count capacity above
@@ -224,14 +224,14 @@ impl<'a> Writer<'a> {
 
     /// Writes data to the writer from a File at offset `off`.
     /// Returns the number of bytes written to the writer.
-    /// The number of bytes written can be less than `count` if
-    /// there isn't enough data in the writer.
     pub fn write_from_at<F: FileReadWriteVolatile>(
         &mut self,
         mut src: F,
         mut count: usize,
         off: u64,
     ) -> io::Result<usize> {
+        self.check_available_space(count)?;
+
         let mut buf = Vec::with_capacity(count);
         count = src.read_vectored_at_volatile(
             // Safe because we have made sure buf has at least count capacity above
@@ -258,6 +258,7 @@ impl<'a> Writer<'a> {
         mut src: F,
         mut count: usize,
     ) -> io::Result<()> {
+        self.check_available_space(count)?;
         while count > 0 {
             match self.write_from(&mut src, count) {
                 Ok(0) => {
@@ -274,20 +275,26 @@ impl<'a> Writer<'a> {
 
         Ok(())
     }
+
+    fn check_available_space(&self, sz: usize) -> io::Result<()> {
+        if sz > self.available_bytes() {
+            Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "data out of range, available {} requested {}",
+                    self.available_bytes(),
+                    sz
+                ),
+            ))
+        } else {
+            Ok(())
+        }
+    }
 }
 
 impl<'a> io::Write for Writer<'a> {
     fn write(&mut self, data: &[u8]) -> io::Result<usize> {
-        if data.len() > self.available_bytes() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!(
-                    "data out of range, available {} requested {}",
-                    self.max_size,
-                    data.len()
-                ),
-            ));
-        }
+        self.check_available_space(data.len())?;
         if let Some(buf) = &mut self.buf {
             // write to internal buf
             let len = data.len();
@@ -313,6 +320,8 @@ impl<'a> io::Write for Writer<'a> {
 
     // default write_vectored only writes the first non-empty IoSlice. Override it.
     fn write_vectored(&mut self, bufs: &[IoSlice<'_>]) -> io::Result<usize> {
+        self.check_available_space(bufs.iter().fold(0, |acc, x| acc + x.len()))?;
+
         if let Some(data) = &mut self.buf {
             let count = bufs.iter().filter(|b| !b.is_empty()).fold(0, |acc, b| {
                 data.extend_from_slice(b);
