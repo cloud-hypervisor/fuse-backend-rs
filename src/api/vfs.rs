@@ -87,7 +87,7 @@ impl Default for VfsOptions {
             no_open: true,
             no_opendir: true,
             no_writeback: false,
-            in_opts: FsOptions::ASYNC_READ,
+            in_opts: FsOptions::empty(),
             out_opts: FsOptions::ASYNC_READ
                 | FsOptions::PARALLEL_DIROPS
                 | FsOptions::BIG_WRITES
@@ -990,7 +990,7 @@ mod tests {
         assert_eq!(opts.no_open, true);
         assert_eq!(opts.no_opendir, true);
         assert_eq!(opts.no_writeback, false);
-        assert_eq!(opts.in_opts, FsOptions::ASYNC_READ);
+        assert_eq!(opts.in_opts, FsOptions::empty());
         assert_eq!(opts.out_opts, out_opts);
 
         vfs.init(FsOptions::ASYNC_READ).unwrap();
