@@ -126,6 +126,7 @@ impl<'a> Reader<'a> {
                     .map_err(Error::GuestMemoryError)
             })
             .collect::<Result<VecDeque<VolatileSlice<'a>>>>()?;
+
         Ok(Reader {
             buffers: IoBuffers {
                 buffers,
@@ -191,27 +192,25 @@ impl<'a> Writer<'a> {
 
     /// Writes data to the descriptor chain buffer from a file descriptor.
     /// Returns the number of bytes written to the descriptor chain buffer.
-    /// The number of bytes written can be less than `count` if
-    /// there isn't enough data in the descriptor chain buffer.
     pub fn write_from<F: FileReadWriteVolatile>(
         &mut self,
         mut src: F,
         count: usize,
     ) -> io::Result<usize> {
+        self.check_available_space(count)?;
         self.buffers
             .consume(count, |bufs| src.read_vectored_volatile(bufs))
     }
 
     /// Writes data to the descriptor chain buffer from a File at offset `off`.
     /// Returns the number of bytes written to the descriptor chain buffer.
-    /// The number of bytes written can be less than `count` if
-    /// there isn't enough data in the descriptor chain buffer.
     pub fn write_from_at<F: FileReadWriteVolatile>(
         &mut self,
         mut src: F,
         count: usize,
         off: u64,
     ) -> io::Result<usize> {
+        self.check_available_space(count)?;
         self.buffers
             .consume(count, |bufs| src.read_vectored_at_volatile(bufs, off))
     }
@@ -222,6 +221,7 @@ impl<'a> Writer<'a> {
         mut src: F,
         mut count: usize,
     ) -> io::Result<()> {
+        self.check_available_space(count)?;
         while count > 0 {
             match self.write_from(&mut src, count) {
                 Ok(0) => {
@@ -259,15 +259,33 @@ impl<'a> Writer<'a> {
             .split_at(offset)
             .map(|buffers| Writer { buffers })
     }
+
     /// Commit all internal buffers of self and others
     /// This is provided just to be compatible with fusedev
     pub fn commit(&mut self, _others: &[&Writer<'a>]) -> io::Result<usize> {
         Ok(0)
     }
+
+    fn check_available_space(&self, sz: usize) -> io::Result<()> {
+        if sz > self.available_bytes() {
+            Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "data out of range, available {} requested {}",
+                    self.available_bytes(),
+                    sz
+                ),
+            ))
+        } else {
+            Ok(())
+        }
+    }
 }
 
 impl<'a> io::Write for Writer<'a> {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.check_available_space(buf.len())?;
+
         self.buffers.consume(buf.len(), |bufs| {
             let mut rem = buf;
             let mut total = 0;
@@ -286,6 +304,8 @@ impl<'a> io::Write for Writer<'a> {
     }
 
     fn write_vectored(&mut self, bufs: &[IoSlice<'_>]) -> io::Result<usize> {
+        self.check_available_space(bufs.iter().fold(0, |acc, x| acc + x.len()))?;
+
         let mut count = 0;
         for buf in bufs.iter().filter(|b| !b.is_empty()) {
             count += self.write(buf)?;
