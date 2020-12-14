@@ -40,7 +40,7 @@ const PROC_CSTR: &[u8] = b"/proc\0";
 type Inode = u64;
 type Handle = u64;
 
-#[derive(Clone, Copy, PartialOrd, Ord, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialOrd, Ord, PartialEq, Eq)]
 struct InodeAltKey {
     ino: libc::ino64_t,
     dev: libc::dev_t,
@@ -480,6 +480,7 @@ impl PassthroughFs {
                     format!("max inode number reached: {}", VFS_MAX_INO),
                 ));
             }
+            trace!("do_lookup new inode {} altkey {:?}", inode, altkey);
             self.inodes.write().unwrap().insert(
                 inode,
                 InodeAltKey {
@@ -670,9 +671,21 @@ impl PassthroughFs {
             .unwrap()
             .get(&inode)
             .map(Arc::clone)
-            .ok_or_else(ebadf)?;
+            .ok_or_else(ebadf)
+            .map_err(|e| {
+                error!("do_getattr ino {} Not find err {:?}", inode, e);
+                e
+            })?;
 
-        let st = stat(&data.file)?;
+        let st = stat(&data.file).map_err(|e| {
+            error!(
+                "do_getattr stat failed ino {} fd: {:?} err {:?}",
+                inode,
+                data.file.as_raw_fd(),
+                e
+            );
+            e
+        })?;
 
         Ok((st, self.cfg.attr_timeout))
     }
