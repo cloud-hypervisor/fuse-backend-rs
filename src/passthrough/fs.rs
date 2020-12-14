@@ -1106,10 +1106,16 @@ impl FileSystem for PassthroughFs {
     ) -> io::Result<usize> {
         let data = self.get_data(handle, inode, libc::O_RDONLY)?;
 
-        let mut f = data.file.read().unwrap().try_clone().map_err(|e| {
-            error!("passthrough: read failed {:?}", e);
-            e
-        })?;
+        let mut f = data
+            .file
+            .read()
+            .unwrap()
+            .try_clone()
+            .map_err(|e| {
+                error!("passthrough: read failed {:?}", e);
+                e
+            })
+            .unwrap();
         w.write_from(&mut f, size as usize, offset)
     }
 
@@ -1127,10 +1133,16 @@ impl FileSystem for PassthroughFs {
     ) -> io::Result<usize> {
         let data = self.get_data(handle, inode, libc::O_RDWR)?;
 
-        let mut f = data.file.read().unwrap().try_clone().map_err(|e| {
-            error!("passthrough: write failed {:?}", e);
-            e
-        })?;
+        let mut f = data
+            .file
+            .read()
+            .unwrap()
+            .try_clone()
+            .map_err(|e| {
+                error!("passthrough: write failed {:?}", e);
+                e
+            })
+            .unwrap();
         r.read_to(&mut f, size as usize, offset)
     }
 
