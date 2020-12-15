@@ -108,7 +108,7 @@ impl<'a> Persist<'a> for &'a Vfs {
 
         for (_, mnt) in self.mountpoints.load().iter() {
             backend_fs.push(VfsMountpoints {
-                index: mnt.super_index,
+                index: mnt.fs_idx,
                 unmounted: false,
                 path: mnt.path.to_string(),
             })
@@ -148,6 +148,7 @@ impl<'a> Persist<'a> for &'a Vfs {
     fn live_upgrade_save(&self) -> Self::State {
         self.save()
     }
+
     fn live_upgrade_restore(
         vfs: Self::ConstructorArgs,
         state: &Self::State,
