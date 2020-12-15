@@ -145,23 +145,23 @@ const HANDLE_KILLPRIV: u32 = 0x8_0000;
 const POSIX_ACL: u32 = 0x10_0000;
 
 // Reading the fuse device after abort returns ECONNABORTED
-const ABORT_ERROR: u32 = 2_097_152;
+const ABORT_ERROR: u32 = 0x20_0000;
 
 // INIT response init_out.max_pages contains the max number of req pages
-const MAX_PAGES: u32 = 4_194_304;
+const MAX_PAGES: u32 = 0x40_0000;
 
-// Kernel cachees READLINK responses
-const CACHE_SYMLINKS: u32 = 8_388_608;
+// Kernel caches READLINK responses
+const CACHE_SYMLINKS: u32 = 0x80_0000;
 
 // Kernel supports zero-message opendir
-const NO_OPENDIR_SUPPORT: u32 = 16_777_216;
+const NO_OPENDIR_SUPPORT: u32 = 0x100_0000;
 
 // Only invalidate cached pages on explicit request
-const EXPLICIT_INVAL_DATA: u32 = 33_554_432;
+const EXPLICIT_INVAL_DATA: u32 = 0x200_0000;
 
 // INIT response init_out.map_alignment contains byte alignment for foffset and
 // moffset fields in struct fuse_setupmapping_out and fuse_removemapping_one.
-const MAP_ALIGNMENT: u32 = 33_554_432;
+const MAP_ALIGNMENT: u32 = 0x400_0000;
 
 bitflags! {
     /// A bitfield passed in as a parameter to and returned from the `init` method of the
