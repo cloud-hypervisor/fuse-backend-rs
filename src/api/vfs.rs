@@ -329,15 +329,36 @@ impl Vfs {
     }
 
     fn allocate_fs_idx(&self) -> Result<VfsIndex> {
-        let index = self.next_super.fetch_add(1, Ordering::Relaxed);
-        if index == VFS_PSEUDO_FS_IDX {
-            return Err(Error::new(
-                ErrorKind::Other,
-                "vfs maximum mountpoints reached",
-            ));
+        let superblocks = self.superblocks.load().deref().deref().clone();
+        let start = self.next_super.load(Ordering::SeqCst);
+        let mut found = false;
+
+        loop {
+            let index = self.next_super.fetch_add(1, Ordering::Relaxed);
+            if index == start {
+                if found {
+                    // There's no available file system index
+                    break;
+                } else {
+                    found = true;
+                }
+            }
+            if index == VFS_PSEUDO_FS_IDX {
+                // Skip the pseudo fs index
+                continue;
+            }
+            if superblocks.contains_key(&index) {
+                // Skip if it's allocated
+                continue;
+            } else {
+                return Ok(index);
+            }
         }
 
-        Ok(index)
+        Err(Error::new(
+            ErrorKind::Other,
+            "vfs maximum mountpoints reached",
+        ))
     }
 
     fn get_fs_by_idx(&self, fs_idx: VfsIndex) -> Result<Arc<BackFileSystem>> {
@@ -1182,5 +1203,26 @@ mod tests {
         assert_eq!(inode.ino(), VFS_MAX_INO);
         assert!(!inode.is_pseudo_fs());
         assert_eq!(u64::from(inode), 0x200_0000_0000_0000u64 + VFS_MAX_INO);
+    }
+
+    #[test]
+    fn test_allocate_fs_idx() {
+        let vfs = Vfs::new(VfsOptions::default());
+        let _guard = vfs.lock.lock().unwrap();
+
+        // Test case: allocate all available fs idx
+        for _ in 0..255 {
+            let fs = FakeFileSystemOne {};
+            let index = vfs.allocate_fs_idx().unwrap();
+            let mut superblocks = vfs.superblocks.load().deref().deref().clone();
+
+            superblocks.insert(index, Arc::new(Box::new(fs)));
+            vfs.superblocks.store(Arc::new(superblocks));
+        }
+
+        // Test case: fail to allocate more fs idx if all have been allocated
+        for _ in 0..=256 {
+            vfs.allocate_fs_idx().unwrap_err();
+        }
     }
 }
