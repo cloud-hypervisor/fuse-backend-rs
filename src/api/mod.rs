@@ -17,7 +17,7 @@ mod pseudo_fs;
 pub mod vfs;
 mod vfs_persist;
 
-pub use vfs::{BackendFileSystem, BackendFileSystemType, Vfs, VfsOptions, VFS_MAX_INO};
+pub use vfs::{BackendFileSystem, Vfs, VfsOptions, VFS_MAX_INO};
 pub use vfs_persist::{VersionMapGetter, VfsOptionsState, VfsState};
 pub mod filesystem;
 pub mod server;

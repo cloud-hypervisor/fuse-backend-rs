@@ -32,7 +32,7 @@ use crate::api::filesystem::{
     SetattrValid, ZeroCopyReader, ZeroCopyWriter,
 };
 use crate::api::server;
-use crate::api::{BackendFileSystem, BackendFileSystemType, VFS_MAX_INO};
+use crate::api::{BackendFileSystem, VFS_MAX_INO};
 #[cfg(feature = "vhost-user-fs")]
 use crate::transport::FsCacheReqHandler;
 
@@ -791,10 +791,6 @@ impl BackendFileSystem for PassthroughFs {
     fn mount(&self) -> io::Result<(Entry, u64)> {
         let entry = self.do_lookup(fuse::ROOT_ID, &CString::new(".").unwrap())?;
         Ok((entry, VFS_MAX_INO))
-    }
-
-    fn fstype(&self) -> BackendFileSystemType {
-        BackendFileSystemType::PassthroughFs
     }
 
     fn as_any(&self) -> &dyn Any {

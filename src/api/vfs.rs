@@ -94,16 +94,6 @@ use Either::*;
 pub(crate) type BackFileSystem =
     Box<dyn BackendFileSystem<Inode = u64, Handle = u64> + Sync + Send>;
 
-/// BackendFileSystemType describes all backend file system types under vfs
-pub enum BackendFileSystemType {
-    /// Passthrough fs is used for passing through everything received
-    /// from fuse to the underlying filesystem.
-    PassthroughFs,
-
-    /// Rafs is a filesystem format used for container use case.
-    Rafs,
-}
-
 /// BackendFileSystem abstracts all backend file systems under vfs
 pub trait BackendFileSystem: FileSystem {
     /// mount returns the backend file system root inode entry and
@@ -111,9 +101,6 @@ pub trait BackendFileSystem: FileSystem {
     fn mount(&self) -> Result<(Entry, u64)> {
         Err(Error::from_raw_os_error(libc::ENOSYS))
     }
-
-    /// fstype returns the backend fs type.
-    fn fstype(&self) -> BackendFileSystemType;
 
     /// Provides a reference to the Any trait. This is useful to let
     /// the caller have access to the underlying type behind the
@@ -1050,10 +1037,6 @@ mod tests {
             ))
         }
 
-        fn fstype(&self) -> BackendFileSystemType {
-            BackendFileSystemType::PassthroughFs
-        }
-
         fn as_any(&self) -> &dyn Any {
             self
         }
@@ -1085,9 +1068,6 @@ mod tests {
                 },
                 0,
             ))
-        }
-        fn fstype(&self) -> BackendFileSystemType {
-            BackendFileSystemType::PassthroughFs
         }
         fn as_any(&self) -> &dyn Any {
             self
