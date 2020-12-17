@@ -58,6 +58,51 @@ struct HandleData {
     file: RwLock<File>,
 }
 
+pub(crate) struct HandleMap {
+    handles: RwLock<BTreeMap<Handle, Arc<HandleData>>>,
+}
+
+impl HandleMap {
+    fn new() -> Self {
+        HandleMap {
+            handles: RwLock::new(BTreeMap::new()),
+        }
+    }
+
+    fn clear(&self) {
+        self.handles.write().unwrap().clear();
+    }
+
+    fn insert(&self, handle: Handle, data: HandleData) {
+        self.handles.write().unwrap().insert(handle, Arc::new(data));
+    }
+
+    fn release(&self, handle: Handle, inode: Inode) -> io::Result<()> {
+        let mut handles = self.handles.write().unwrap();
+
+        if let btree_map::Entry::Occupied(e) = handles.entry(handle) {
+            if e.get().inode == inode {
+                // We don't need to close the file here because that will happen automatically when
+                // the last `Arc` is dropped.
+                e.remove();
+                return Ok(());
+            }
+        }
+
+        Err(ebadf())
+    }
+
+    fn get(&self, handle: Handle, inode: Inode) -> io::Result<Arc<HandleData>> {
+        self.handles
+            .read()
+            .unwrap()
+            .get(&handle)
+            .filter(|hd| hd.inode == inode)
+            .map(Arc::clone)
+            .ok_or_else(ebadf)
+    }
+}
+
 #[repr(C, packed)]
 #[derive(Clone, Copy, Debug, Default)]
 struct LinuxDirent64 {
@@ -289,7 +334,9 @@ impl Default for Config {
 }
 
 /// A file system that simply "passes through" all requests it receives to the underlying file
-/// system. To keep the implementation simple it servers the contents of its root directory. Users
+/// system.
+///
+/// To keep the implementation simple it servers the contents of its root directory. Users
 /// that wish to serve only a specific directory should set up the environment so that that
 /// directory ends up as the root of the file system process. One way to accomplish this is via a
 /// combination of mount namespaces and the pivot_root system call.
@@ -303,7 +350,7 @@ pub struct PassthroughFs {
 
     // File descriptors for open files and directories. Unlike the fds in `inodes`, these _can_ be
     // used for reading and writing data.
-    handles: RwLock<BTreeMap<Handle, Arc<HandleData>>>,
+    handle_map: HandleMap,
     next_handle: AtomicU64,
 
     // File descriptor pointing to the `/proc` directory. This is used to convert an fd from
@@ -338,14 +385,14 @@ impl PassthroughFs {
             inodes: RwLock::new(MultikeyBTreeMap::new()),
             next_inode: AtomicU64::new(fuse::ROOT_ID + 1),
 
-            handles: RwLock::new(BTreeMap::new()),
-            next_handle: AtomicU64::new(0),
+            handle_map: HandleMap::new(),
+            next_handle: AtomicU64::new(1),
 
             proc,
 
             writeback: AtomicBool::new(false),
-            cfg,
             no_open: AtomicBool::new(false),
+            cfg,
         })
     }
 
@@ -518,15 +565,7 @@ impl PassthroughFs {
             return Ok(());
         }
 
-        let data = self
-            .handles
-            .read()
-            .unwrap()
-            .get(&handle)
-            .filter(|hd| hd.inode == inode)
-            .map(Arc::clone)
-            .ok_or_else(ebadf)?;
-
+        let data = self.handle_map.get(handle, inode)?;
         let mut buf = vec![0; size as usize];
 
         {
@@ -633,7 +672,7 @@ impl PassthroughFs {
         let handle = self.next_handle.fetch_add(1, Ordering::Relaxed);
         let data = HandleData { inode, file };
 
-        self.handles.write().unwrap().insert(handle, Arc::new(data));
+        self.handle_map.insert(handle, data);
 
         let mut opts = OpenOptions::empty();
         match self.cfg.cache_policy {
@@ -650,18 +689,7 @@ impl PassthroughFs {
     }
 
     fn do_release(&self, inode: Inode, handle: Handle) -> io::Result<()> {
-        let mut handles = self.handles.write().unwrap();
-
-        if let btree_map::Entry::Occupied(e) = handles.entry(handle) {
-            if e.get().inode == inode {
-                // We don't need to close the file here because that will happen automatically when
-                // the last `Arc` is dropped.
-                e.remove();
-                return Ok(());
-            }
-        }
-
-        Err(ebadf())
+        self.handle_map.release(handle, inode)
     }
 
     fn do_getattr(&self, inode: Inode) -> io::Result<(libc::stat64, Duration)> {
@@ -716,15 +744,7 @@ impl PassthroughFs {
     ) -> io::Result<Arc<HandleData>> {
         let no_open = self.no_open.load(Ordering::Relaxed);
         if !no_open {
-            let data = self
-                .handles
-                .read()
-                .unwrap()
-                .get(&handle)
-                .filter(|hd| hd.inode == inode)
-                .map(Arc::clone)
-                .ok_or_else(ebadf)?;
-            Ok(data)
+            self.handle_map.get(handle, inode)
         } else {
             let file = RwLock::new(self.open_inode(inode, flags as i32)?);
             let data = HandleData { inode, file };
@@ -738,8 +758,7 @@ fn forget_one(
     inode: Inode,
     count: u64,
 ) {
-    // ROOT_ID should not be forgotten, or we're not able to access to files any
-    // more.
+    // ROOT_ID should not be forgotten, or we're not able to access to files any more.
     if inode == fuse::ROOT_ID {
         return;
     }
@@ -816,7 +835,7 @@ impl FileSystem for PassthroughFs {
     }
 
     fn destroy(&self) {
-        self.handles.write().unwrap().clear();
+        self.handle_map.clear();
         self.inodes.write().unwrap().clear();
 
         let _r = self.import().map_err(|e| {
@@ -1027,7 +1046,7 @@ impl FileSystem for PassthroughFs {
                 file,
             };
 
-            self.handles.write().unwrap().insert(handle, Arc::new(data));
+            self.handle_map.insert(handle, data);
             Some(handle)
         } else {
             None
@@ -1161,15 +1180,7 @@ impl FileSystem for PassthroughFs {
         } else {
             // If we have a handle then use it otherwise get a new fd from the inode.
             if let Some(handle) = handle {
-                let hd = self
-                    .handles
-                    .read()
-                    .unwrap()
-                    .get(&handle)
-                    .filter(|hd| hd.inode == inode)
-                    .map(Arc::clone)
-                    .ok_or_else(ebadf)?;
-
+                let hd = self.handle_map.get(handle, inode)?;
                 let fd = hd.file.write().unwrap().as_raw_fd();
                 Data::Handle(hd, fd)
             } else {
@@ -1471,14 +1482,7 @@ impl FileSystem for PassthroughFs {
             return Err(io::Error::from_raw_os_error(libc::ENOSYS));
         }
 
-        let data = self
-            .handles
-            .read()
-            .unwrap()
-            .get(&handle)
-            .filter(|hd| hd.inode == inode)
-            .map(Arc::clone)
-            .ok_or_else(ebadf)?;
+        let data = self.handle_map.get(handle, inode)?;
 
         // Since this method is called whenever an fd is closed in the client, we can emulate that
         // behavior by doing the same thing (dup-ing the fd and then immediately closing it). Safe
@@ -1734,15 +1738,7 @@ impl FileSystem for PassthroughFs {
         offset: u64,
         whence: u32,
     ) -> io::Result<u64> {
-        let data = self
-            .handles
-            .read()
-            .unwrap()
-            .get(&handle)
-            .filter(|hd| hd.inode == inode)
-            .map(Arc::clone)
-            .ok_or_else(ebadf)?;
-
+        let data = self.handle_map.get(handle, inode)?;
         let fd = data.file.write().unwrap().as_raw_fd();
 
         // Safe because this doesn't modify any memory and we check the return value.
