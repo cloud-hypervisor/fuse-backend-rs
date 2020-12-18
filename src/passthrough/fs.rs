@@ -607,8 +607,8 @@ impl PassthroughFs {
             return Ok(());
         }
 
+        let mut buf = Vec::<u8>::with_capacity(size as usize);
         let data = self.handle_map.get(handle, inode)?;
-        let mut buf = vec![0; size as usize];
 
         {
             // Since we are going to work with the kernel offset, we have to acquire the file lock
@@ -636,7 +636,9 @@ impl PassthroughFs {
             if res < 0 {
                 return Err(io::Error::last_os_error());
             }
-            buf.resize(res as usize, 0);
+
+            // Safe because we trust the value returned by kernel.
+            unsafe { buf.set_len(res as usize) };
 
             // Explicitly drop the lock so that it's not held while we fill in the fuse buffer.
             mem::drop(dir);
@@ -1404,7 +1406,7 @@ impl FileSystem for PassthroughFs {
     fn readlink(&self, _ctx: Context, inode: Inode) -> io::Result<Vec<u8>> {
         // Safe because this is a constant value and a valid C string.
         let empty = unsafe { CStr::from_bytes_with_nul_unchecked(EMPTY_CSTR) };
-        let mut buf = vec![0; libc::PATH_MAX as usize];
+        let mut buf = Vec::<u8>::with_capacity(libc::PATH_MAX as usize);
         let data = self.inode_map.get(inode)?;
 
         // Safe because this will only modify the contents of `buf` and we check the return value.
@@ -1420,7 +1422,9 @@ impl FileSystem for PassthroughFs {
             return Err(io::Error::last_os_error());
         }
 
-        buf.resize(res as usize, 0);
+        // Safe because we trust the value returned by kernel.
+        unsafe { buf.set_len(res as usize) };
+
         Ok(buf)
     }
 
@@ -1572,8 +1576,7 @@ impl FileSystem for PassthroughFs {
         // The f{set,get,remove,list}xattr functions don't work on an fd opened with `O_PATH` so we
         // need to get a new fd.
         let file = self.open_inode(inode, libc::O_RDONLY | libc::O_NONBLOCK)?;
-
-        let mut buf = vec![0; size as usize];
+        let mut buf = Vec::<u8>::with_capacity(size as usize);
 
         // Safe because this will only modify the contents of `buf`.
         let res = unsafe {
@@ -1591,7 +1594,8 @@ impl FileSystem for PassthroughFs {
         if size == 0 {
             Ok(GetxattrReply::Count(res as u32))
         } else {
-            buf.resize(res as usize, 0);
+            // Safe because we trust the value returned by kernel.
+            unsafe { buf.set_len(res as usize) };
             Ok(GetxattrReply::Value(buf))
         }
     }
@@ -1604,8 +1608,7 @@ impl FileSystem for PassthroughFs {
         // The f{set,get,remove,list}xattr functions don't work on an fd opened with `O_PATH` so we
         // need to get a new fd.
         let file = self.open_inode(inode, libc::O_RDONLY | libc::O_NONBLOCK)?;
-
-        let mut buf = vec![0; size as usize];
+        let mut buf = Vec::<u8>::with_capacity(size as usize);
 
         // Safe because this will only modify the contents of `buf`.
         let res = unsafe {
@@ -1622,7 +1625,8 @@ impl FileSystem for PassthroughFs {
         if size == 0 {
             Ok(ListxattrReply::Count(res as u32))
         } else {
-            buf.resize(res as usize, 0);
+            // Safe because we trust the value returned by kernel.
+            unsafe { buf.set_len(res as usize) };
             Ok(ListxattrReply::Names(buf))
         }
     }
