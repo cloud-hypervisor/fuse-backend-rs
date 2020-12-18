@@ -570,16 +570,35 @@ impl PassthroughFs {
             libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC,
             0,
         )?;
-
         let st = stat(&f)?;
-
         let altkey = InodeAltKey::from_stat(&st);
-        let data = self.inode_map.get_alt(&altkey);
 
-        let inode = if let Some(data) = data {
-            // Matches with the release store in `forget`.
-            data.refcount.fetch_add(1, Ordering::Acquire);
-            data.inode
+        let mut found = None;
+        'search: loop {
+            match self.inode_map.get_alt(&altkey) {
+                // No existing entry found
+                None => break 'search,
+                Some(data) => {
+                    let curr = data.refcount.load(Ordering::Acquire);
+                    // forgot_one() has just destroyed the entry, retry...
+                    if curr == 0 {
+                        continue 'search;
+                    }
+
+                    // Saturating add to avoid integer overflow, it's not realistic to saturate u64.
+                    let new = curr.saturating_add(1);
+
+                    // Synchronizes with the forgot_one()
+                    if data.refcount.compare_and_swap(curr, new, Ordering::AcqRel) == curr {
+                        found = Some(data.inode);
+                        break;
+                    }
+                }
+            }
+        }
+
+        let inode = if let Some(v) = found {
+            v
         } else {
             // There is a possible race here where 2 threads end up adding the same file
             // into the inode list.  However, since each of those will get a unique Inode
@@ -812,31 +831,24 @@ fn forget_one(
         // reference to the inode data and is in the process of updating the refcount so we need
         // to loop here until we can decrement successfully.
         loop {
-            let refcount = data.refcount.load(Ordering::Relaxed);
+            let curr = data.refcount.load(Ordering::Acquire);
 
             // Saturating sub because it doesn't make sense for a refcount to go below zero and
             // we don't want misbehaving clients to cause integer overflow.
-            let new_count = refcount.saturating_sub(count);
+            let new = curr.saturating_sub(count);
 
             trace!(
                 "fuse: forget inode {} refcount {}, count {}, new_count {}",
                 inode,
-                refcount,
+                curr,
                 count,
-                new_count
+                new
             );
+
             // Synchronizes with the acquire load in `do_lookup`.
-            if data
-                .refcount
-                .compare_and_swap(refcount, new_count, Ordering::Release)
-                == refcount
-            {
-                if new_count == 0 {
-                    // We just removed the last refcount for this inode. There's no need for an
-                    // acquire fence here because we hold a write lock on the inode map and any
-                    // thread that is waiting to do a forget on the same inode will have to wait
-                    // until we release the lock. So there's is no other release store for us to
-                    // synchronize with before deleting the entry.
+            if data.refcount.compare_and_swap(curr, new, Ordering::AcqRel) == curr {
+                if new == 0 {
+                    // We just removed the last refcount for this inode.
                     inodes.remove(&inode);
                 }
                 break;
