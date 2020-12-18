@@ -53,6 +53,49 @@ struct InodeData {
     refcount: AtomicU64,
 }
 
+/// Data structures to manage accessed inodes.
+struct InodeMap {
+    inodes: RwLock<MultikeyBTreeMap<Inode, InodeAltKey, Arc<InodeData>>>,
+}
+
+impl InodeMap {
+    fn new() -> Self {
+        InodeMap {
+            inodes: RwLock::new(MultikeyBTreeMap::new()),
+        }
+    }
+
+    fn clear(&self) {
+        self.inodes.write().unwrap().clear();
+    }
+
+    fn get(&self, inode: Inode) -> io::Result<Arc<InodeData>> {
+        self.inodes
+            .read()
+            .unwrap()
+            .get(&inode)
+            .map(Arc::clone)
+            .ok_or_else(ebadf)
+    }
+
+    fn get_alt(&self, altkey: &InodeAltKey) -> Option<Arc<InodeData>> {
+        self.inodes.read().unwrap().get_alt(altkey).map(Arc::clone)
+    }
+
+    fn get_map_mut(
+        &self,
+    ) -> RwLockWriteGuard<MultikeyBTreeMap<Inode, InodeAltKey, Arc<InodeData>>> {
+        self.inodes.write().unwrap()
+    }
+
+    fn insert(&self, inode: Inode, altkey: InodeAltKey, data: InodeData) {
+        self.inodes
+            .write()
+            .unwrap()
+            .insert(inode, altkey, Arc::new(data));
+    }
+}
+
 struct HandleData {
     inode: Inode,
     file: RwLock<File>,
@@ -362,7 +405,7 @@ pub struct PassthroughFs {
     // the `O_PATH` option so they cannot be used for reading or writing any data. See the
     // documentation of the `O_PATH` flag in `open(2)` for more details on what one can and cannot
     // do with an fd opened with this flag.
-    inodes: RwLock<MultikeyBTreeMap<Inode, InodeAltKey, Arc<InodeData>>>,
+    inode_map: InodeMap,
     next_inode: AtomicU64,
 
     // File descriptors for open files and directories. Unlike the fds in `inodes`, these _can_ be
@@ -399,7 +442,7 @@ impl PassthroughFs {
         )?;
 
         Ok(PassthroughFs {
-            inodes: RwLock::new(MultikeyBTreeMap::new()),
+            inode_map: InodeMap::new(),
             next_inode: AtomicU64::new(fuse::ROOT_ID + 1),
 
             handle_map: HandleMap::new(),
@@ -433,17 +476,17 @@ impl PassthroughFs {
         unsafe { libc::umask(0o000) };
 
         // Not sure why the root inode gets a refcount of 2 but that's what libfuse does.
-        self.inodes.write().unwrap().insert(
+        self.inode_map.insert(
             fuse::ROOT_ID,
             InodeAltKey {
                 ino: st.st_ino,
                 dev: st.st_dev,
             },
-            Arc::new(InodeData {
+            InodeData {
                 inode: fuse::ROOT_ID,
                 file: f,
                 refcount: AtomicU64::new(2),
-            }),
+            },
         );
 
         // false indicates we're under Vfs.
@@ -468,13 +511,7 @@ impl PassthroughFs {
     }
 
     fn open_inode(&self, inode: Inode, mut flags: i32) -> io::Result<File> {
-        let data = self
-            .inodes
-            .read()
-            .unwrap()
-            .get(&inode)
-            .map(Arc::clone)
-            .ok_or_else(ebadf)?;
+        let data = self.inode_map.get(inode)?;
 
         let pathname = CString::new(format!("self/fd/{}", data.file.as_raw_fd()))
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
@@ -506,14 +543,7 @@ impl PassthroughFs {
     }
 
     fn do_lookup(&self, parent: Inode, name: &CStr) -> io::Result<Entry> {
-        let p = self
-            .inodes
-            .read()
-            .unwrap()
-            .get(&parent)
-            .map(Arc::clone)
-            .ok_or_else(ebadf)?;
-
+        let p = self.inode_map.get(parent)?;
         let f = open_file(
             p.file.as_raw_fd(),
             name,
@@ -527,7 +557,7 @@ impl PassthroughFs {
             ino: st.st_ino,
             dev: st.st_dev,
         };
-        let data = self.inodes.read().unwrap().get_alt(&altkey).map(Arc::clone);
+        let data = self.inode_map.get_alt(&altkey);
 
         let inode = if let Some(data) = data {
             // Matches with the release store in `forget`.
@@ -545,17 +575,17 @@ impl PassthroughFs {
                 ));
             }
             trace!("do_lookup new inode {} altkey {:?}", inode, altkey);
-            self.inodes.write().unwrap().insert(
+            self.inode_map.insert(
                 inode,
                 InodeAltKey {
                     ino: st.st_ino,
                     dev: st.st_dev,
                 },
-                Arc::new(InodeData {
+                InodeData {
                     inode,
                     file: f,
                     refcount: AtomicU64::new(1),
-                }),
+                },
             );
 
             inode
@@ -709,17 +739,10 @@ impl PassthroughFs {
     }
 
     fn do_getattr(&self, inode: Inode) -> io::Result<(libc::stat64, Duration)> {
-        let data = self
-            .inodes
-            .read()
-            .unwrap()
-            .get(&inode)
-            .map(Arc::clone)
-            .ok_or_else(ebadf)
-            .map_err(|e| {
-                error!("do_getattr ino {} Not find err {:?}", inode, e);
-                e
-            })?;
+        let data = self.inode_map.get(inode).map_err(|e| {
+            error!("do_getattr ino {} Not find err {:?}", inode, e);
+            e
+        })?;
 
         let st = stat(&data.file).map_err(|e| {
             error!(
@@ -735,14 +758,7 @@ impl PassthroughFs {
     }
 
     fn do_unlink(&self, parent: Inode, name: &CStr, flags: libc::c_int) -> io::Result<()> {
-        let data = self
-            .inodes
-            .read()
-            .unwrap()
-            .get(&parent)
-            .map(Arc::clone)
-            .ok_or_else(ebadf)?;
-
+        let data = self.inode_map.get(parent)?;
         // Safe because this doesn't modify any memory and we check the return value.
         let res = unsafe { libc::unlinkat(data.file.as_raw_fd(), name.as_ptr(), flags) };
         if res == 0 {
@@ -851,7 +867,7 @@ impl FileSystem for PassthroughFs {
 
     fn destroy(&self) {
         self.handle_map.clear();
-        self.inodes.write().unwrap().clear();
+        self.inode_map.clear();
 
         let _r = self.import().map_err(|e| {
             error!("destory {:?}", e);
@@ -860,13 +876,7 @@ impl FileSystem for PassthroughFs {
     }
 
     fn statfs(&self, _ctx: Context, inode: Inode) -> io::Result<libc::statvfs64> {
-        let data = self
-            .inodes
-            .read()
-            .unwrap()
-            .get(&inode)
-            .map(Arc::clone)
-            .ok_or_else(ebadf)?;
+        let data = self.inode_map.get(inode)?;
 
         let mut out = MaybeUninit::<libc::statvfs64>::zeroed();
 
@@ -885,13 +895,13 @@ impl FileSystem for PassthroughFs {
     }
 
     fn forget(&self, _ctx: Context, inode: Inode, count: u64) {
-        let mut inodes = self.inodes.write().unwrap();
+        let mut inodes = self.inode_map.get_map_mut();
 
         forget_one(&mut inodes, inode, count)
     }
 
     fn batch_forget(&self, _ctx: Context, requests: Vec<(Inode, u64)>) {
-        let mut inodes = self.inodes.write().unwrap();
+        let mut inodes = self.inode_map.get_map_mut();
 
         for (inode, count) in requests {
             forget_one(&mut inodes, inode, count)
@@ -926,13 +936,7 @@ impl FileSystem for PassthroughFs {
         umask: u32,
     ) -> io::Result<Entry> {
         let (_uid, _gid) = set_creds(ctx.uid, ctx.gid)?;
-        let data = self
-            .inodes
-            .read()
-            .unwrap()
-            .get(&parent)
-            .map(Arc::clone)
-            .ok_or_else(ebadf)?;
+        let data = self.inode_map.get(parent)?;
 
         // Safe because this doesn't modify any memory and we check the return value.
         let res = unsafe { libc::mkdirat(data.file.as_raw_fd(), name.as_ptr(), mode & !umask) };
@@ -983,7 +987,7 @@ impl FileSystem for PassthroughFs {
             add_entry(dir_entry, entry).map(|r| {
                 // true when size is not large enough to hold entry.
                 if r == 0 {
-                    let mut inodes = self.inodes.write().unwrap();
+                    let mut inodes = self.inode_map.get_map_mut();
                     forget_one(&mut inodes, ino, 1);
                 }
                 r
@@ -1032,13 +1036,7 @@ impl FileSystem for PassthroughFs {
         umask: u32,
     ) -> io::Result<(Entry, Option<Handle>, OpenOptions)> {
         let (_uid, _gid) = set_creds(ctx.uid, ctx.gid)?;
-        let data = self
-            .inodes
-            .read()
-            .unwrap()
-            .get(&parent)
-            .map(Arc::clone)
-            .ok_or_else(ebadf)?;
+        let data = self.inode_map.get(parent)?;
 
         // Safe because this doesn't modify any memory and we check the return value. We don't
         // really check `flags` because if the kernel can't handle poorly specified flags then we
@@ -1170,13 +1168,7 @@ impl FileSystem for PassthroughFs {
         handle: Option<Handle>,
         valid: SetattrValid,
     ) -> io::Result<(libc::stat64, Duration)> {
-        let inode_data = self
-            .inodes
-            .read()
-            .unwrap()
-            .get(&inode)
-            .map(Arc::clone)
-            .ok_or_else(ebadf)?;
+        let inode_data = self.inode_map.get(inode)?;
 
         enum Data {
             Handle(Arc<HandleData>, RawFd),
@@ -1312,20 +1304,8 @@ impl FileSystem for PassthroughFs {
         newname: &CStr,
         flags: u32,
     ) -> io::Result<()> {
-        let old_inode = self
-            .inodes
-            .read()
-            .unwrap()
-            .get(&olddir)
-            .map(Arc::clone)
-            .ok_or_else(ebadf)?;
-        let new_inode = self
-            .inodes
-            .read()
-            .unwrap()
-            .get(&newdir)
-            .map(Arc::clone)
-            .ok_or_else(ebadf)?;
+        let old_inode = self.inode_map.get(olddir)?;
+        let new_inode = self.inode_map.get(newdir)?;
 
         // Safe because this doesn't modify any memory and we check the return value.
         // TODO: Switch to libc::renameat2 once https://github.com/rust-lang/libc/pull/1508 lands
@@ -1357,13 +1337,7 @@ impl FileSystem for PassthroughFs {
         umask: u32,
     ) -> io::Result<Entry> {
         let (_uid, _gid) = set_creds(ctx.uid, ctx.gid)?;
-        let data = self
-            .inodes
-            .read()
-            .unwrap()
-            .get(&parent)
-            .map(Arc::clone)
-            .ok_or_else(ebadf)?;
+        let data = self.inode_map.get(parent)?;
 
         // Safe because this doesn't modify any memory and we check the return value.
         let res = unsafe {
@@ -1389,20 +1363,8 @@ impl FileSystem for PassthroughFs {
         newparent: Inode,
         newname: &CStr,
     ) -> io::Result<Entry> {
-        let data = self
-            .inodes
-            .read()
-            .unwrap()
-            .get(&inode)
-            .map(Arc::clone)
-            .ok_or_else(ebadf)?;
-        let new_inode = self
-            .inodes
-            .read()
-            .unwrap()
-            .get(&newparent)
-            .map(Arc::clone)
-            .ok_or_else(ebadf)?;
+        let data = self.inode_map.get(inode)?;
+        let new_inode = self.inode_map.get(newparent)?;
 
         // Safe because this is a constant value and a valid C string.
         let empty = unsafe { CStr::from_bytes_with_nul_unchecked(EMPTY_CSTR) };
@@ -1432,13 +1394,7 @@ impl FileSystem for PassthroughFs {
         name: &CStr,
     ) -> io::Result<Entry> {
         let (_uid, _gid) = set_creds(ctx.uid, ctx.gid)?;
-        let data = self
-            .inodes
-            .read()
-            .unwrap()
-            .get(&parent)
-            .map(Arc::clone)
-            .ok_or_else(ebadf)?;
+        let data = self.inode_map.get(parent)?;
 
         // Safe because this doesn't modify any memory and we check the return value.
         let res =
@@ -1451,14 +1407,7 @@ impl FileSystem for PassthroughFs {
     }
 
     fn readlink(&self, _ctx: Context, inode: Inode) -> io::Result<Vec<u8>> {
-        let data = self
-            .inodes
-            .read()
-            .unwrap()
-            .get(&inode)
-            .map(Arc::clone)
-            .ok_or_else(ebadf)?;
-
+        let data = self.inode_map.get(inode)?;
         let mut buf = vec![0; libc::PATH_MAX as usize];
 
         // Safe because this is a constant value and a valid C string.
@@ -1542,14 +1491,7 @@ impl FileSystem for PassthroughFs {
     }
 
     fn access(&self, ctx: Context, inode: Inode, mask: u32) -> io::Result<()> {
-        let data = self
-            .inodes
-            .read()
-            .unwrap()
-            .get(&inode)
-            .map(Arc::clone)
-            .ok_or_else(ebadf)?;
-
+        let data = self.inode_map.get(inode)?;
         let st = stat(&data.file)?;
         let mode = mask as i32 & (libc::R_OK | libc::W_OK | libc::X_OK);
 
