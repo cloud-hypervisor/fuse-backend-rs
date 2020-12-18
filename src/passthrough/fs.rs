@@ -50,11 +50,30 @@ pub(crate) struct InodeAltKey {
     pub(crate) dev: libc::dev_t,
 }
 
+impl InodeAltKey {
+    fn from_stat(st: &libc::stat64) -> Self {
+        InodeAltKey {
+            ino: st.st_ino,
+            dev: st.st_dev,
+        }
+    }
+}
+
 pub(crate) struct InodeData {
     pub(crate) inode: Inode,
     // Most of these aren't actually files but ¯\_(ツ)_/¯.
     pub(crate) file: File,
     pub(crate) refcount: AtomicU64,
+}
+
+impl InodeData {
+    fn new(inode: Inode, file: File, refcount: u64) -> Self {
+        InodeData {
+            inode,
+            file,
+            refcount: AtomicU64::new(refcount),
+        }
+    }
 }
 
 /// Data structures to manage accessed inodes.
@@ -482,15 +501,8 @@ impl PassthroughFs {
         // Not sure why the root inode gets a refcount of 2 but that's what libfuse does.
         self.inode_map.insert(
             fuse::ROOT_ID,
-            InodeAltKey {
-                ino: st.st_ino,
-                dev: st.st_dev,
-            },
-            InodeData {
-                inode: fuse::ROOT_ID,
-                file: f,
-                refcount: AtomicU64::new(2),
-            },
+            InodeAltKey::from_stat(&st),
+            InodeData::new(fuse::ROOT_ID, f, 2),
         );
 
         // false indicates we're under Vfs.
@@ -557,10 +569,7 @@ impl PassthroughFs {
 
         let st = stat(&f)?;
 
-        let altkey = InodeAltKey {
-            ino: st.st_ino,
-            dev: st.st_dev,
-        };
+        let altkey = InodeAltKey::from_stat(&st);
         let data = self.inode_map.get_alt(&altkey);
 
         let inode = if let Some(data) = data {
@@ -581,15 +590,8 @@ impl PassthroughFs {
             trace!("do_lookup new inode {} altkey {:?}", inode, altkey);
             self.inode_map.insert(
                 inode,
-                InodeAltKey {
-                    ino: st.st_ino,
-                    dev: st.st_dev,
-                },
-                InodeData {
-                    inode,
-                    file: f,
-                    refcount: AtomicU64::new(1),
-                },
+                InodeAltKey::from_stat(&st),
+                InodeData::new(inode, f, 1),
             );
 
             inode
