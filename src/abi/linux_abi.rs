@@ -17,6 +17,12 @@ pub const KERNEL_VERSION: u32 = 7;
 /// Minor version number of this interface.
 pub const KERNEL_MINOR_VERSION: u32 = 31;
 
+/// Init reply size is FUSE_COMPAT_INIT_OUT_SIZE
+pub const KERNEL_MINOR_VERSION_INIT_OUT_SIZE: u32 = 5;
+
+/// Init reply size is FUSE_COMPAT_22_INIT_OUT_SIZE
+pub const KERNEL_MINOR_VERSION_INIT_22_OUT_SIZE: u32 = 23;
+
 /// Lookup negative dentry using inode number 0
 pub const KERNEL_MINOR_VERSION_LOOKUP_NEGATIVE_ENTRY_ZERO: u32 = 4;
 
@@ -468,13 +474,13 @@ pub const FSYNC_FDATASYNC: u32 = 1;
 /// The read buffer is required to be at least 8k, but may be much larger.
 pub const FUSE_MIN_READ_BUFFER: u32 = 8192;
 
-pub const FUSE_COMPAT_ENTRY_OUT_SIZE: u32 = 120;
-pub const FUSE_COMPAT_ATTR_OUT_SIZE: u32 = 96;
-pub const FUSE_COMPAT_MKNOD_IN_SIZE: u32 = 8;
-pub const FUSE_COMPAT_WRITE_IN_SIZE: u32 = 24;
-pub const FUSE_COMPAT_STATFS_SIZE: u32 = 48;
-pub const FUSE_COMPAT_INIT_OUT_SIZE: u32 = 8;
-pub const FUSE_COMPAT_22_INIT_OUT_SIZE: u32 = 24;
+pub const FUSE_COMPAT_ENTRY_OUT_SIZE: usize = 120;
+pub const FUSE_COMPAT_ATTR_OUT_SIZE: usize = 96;
+pub const FUSE_COMPAT_MKNOD_IN_SIZE: usize = 8;
+pub const FUSE_COMPAT_WRITE_IN_SIZE: usize = 24;
+pub const FUSE_COMPAT_STATFS_SIZE: usize = 48;
+pub const FUSE_COMPAT_INIT_OUT_SIZE: usize = 8;
+pub const FUSE_COMPAT_22_INIT_OUT_SIZE: usize = 24;
 
 // Message definitions follow.  It is safe to implement ByteValued for all of these
 // because they are POD types.

@@ -780,8 +780,8 @@ impl<F: FileSystem + Sync> Server<F> {
             Ok(want) => {
                 let enabled = capable & (want | supported);
                 info!(
-                    "FUSE INIT\n in_opts: {:?}\nout_opts: {:?}",
-                    capable, enabled
+                    "FUSE INIT major {} minor {}\n in_opts: {:?}\nout_opts: {:?}",
+                    major, minor, capable, enabled
                 );
 
                 let out = InitOut {
@@ -801,7 +801,28 @@ impl<F: FileSystem + Sync> Server<F> {
                     minor,
                 };
                 self.vers.store(Arc::new(vers));
-                reply_ok(Some(out), None, in_header.unique, w)
+                if minor < KERNEL_MINOR_VERSION_INIT_OUT_SIZE {
+                    reply_ok(
+                        Some(
+                            *<[u8; FUSE_COMPAT_INIT_OUT_SIZE]>::from_slice(out.as_slice()).unwrap(),
+                        ),
+                        None,
+                        in_header.unique,
+                        w,
+                    )
+                } else if minor < KERNEL_MINOR_VERSION_INIT_22_OUT_SIZE {
+                    reply_ok(
+                        Some(
+                            *<[u8; FUSE_COMPAT_22_INIT_OUT_SIZE]>::from_slice(out.as_slice())
+                                .unwrap(),
+                        ),
+                        None,
+                        in_header.unique,
+                        w,
+                    )
+                } else {
+                    reply_ok(Some(out), None, in_header.unique, w)
+                }
             }
             Err(e) => reply_error(e, in_header.unique, w),
         }
