@@ -1,12 +1,12 @@
+// Copyright (C) 2020 Alibaba Cloud. All rights reserved.
 // Copyright 2019 The Chromium OS Authors. All rights reserved.
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE-BSD-3-Clause file.
 
-//! Fuse lowlevel passthrough implementation.
+//! Fuse passthrough file system, mirroring an existing FS hierarchy.
 
 use std::any::Any;
-use std::collections::btree_map;
-use std::collections::BTreeMap;
+use std::collections::{btree_map, BTreeMap};
 use std::ffi::{CStr, CString};
 use std::fs::File;
 use std::io;
@@ -19,20 +19,17 @@ use std::time::Duration;
 
 use versionize::{VersionMap, Versionize, VersionizeError, VersionizeResult};
 use versionize_derive::Versionize;
-
 use vm_memory::ByteValued;
 
 use super::multikey::MultikeyBTreeMap;
 use crate::abi::linux_abi as fuse;
-
 #[cfg(feature = "vhost-user-fs")]
 use crate::abi::virtio_fs;
 use crate::api::filesystem::{
     Context, DirEntry, Entry, FileSystem, FsOptions, GetxattrReply, ListxattrReply, OpenOptions,
     SetattrValid, ZeroCopyReader, ZeroCopyWriter,
 };
-use crate::api::server;
-use crate::api::{BackendFileSystem, VFS_MAX_INO};
+use crate::api::{server, BackendFileSystem, VFS_MAX_INO};
 #[cfg(feature = "vhost-user-fs")]
 use crate::transport::FsCacheReqHandler;
 
@@ -238,7 +235,7 @@ macro_rules! scoped_cred {
                 let res = unsafe { libc::syscall($syscall_nr, -1, 0, -1) };
                 if res < 0 {
                     error!(
-                        "failed to change credentials back to root: {}",
+                        "fuse: failed to change credentials back to root: {}",
                         io::Error::last_os_error(),
                     );
                 }
@@ -263,13 +260,11 @@ fn ebadf() -> io::Error {
 }
 
 pub(crate) fn stat(f: &File) -> io::Result<libc::stat64> {
-    let mut st = MaybeUninit::<libc::stat64>::zeroed();
-
     // Safe because this is a constant value and a valid C string.
     let pathname = unsafe { CStr::from_bytes_with_nul_unchecked(EMPTY_CSTR) };
+    let mut st = MaybeUninit::<libc::stat64>::zeroed();
 
-    // Safe because the kernel will only write data in `st` and we check the return
-    // value.
+    // Safe because the kernel will only write data in `st` and we check the return value.
     let res = unsafe {
         libc::fstatat64(
             f.as_raw_fd(),
@@ -341,7 +336,7 @@ impl Default for CachePolicy {
     }
 }
 
-/// Options that configure the behavior of the file system.
+/// Options that configure the behavior of the passthrough fuse file system.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Config {
     /// How long the FUSE client should consider directory entries to be valid. If the contents of a
@@ -453,7 +448,7 @@ pub struct PassthroughFs {
 }
 
 impl PassthroughFs {
-    /// create a PassthroughFs
+    /// Create a Passthrough file system instance.
     pub fn new(cfg: Config) -> io::Result<PassthroughFs> {
         // Safe because this is a constant value and a valid C string.
         let proc_cstr = unsafe { CStr::from_bytes_with_nul_unchecked(PROC_CSTR) };
@@ -479,7 +474,7 @@ impl PassthroughFs {
         })
     }
 
-    /// Insert root inode.
+    /// Initialize the Passthrough file system.
     pub fn import(&self) -> io::Result<()> {
         let root = CString::new(self.cfg.root_dir.as_str()).expect("CString::new failed");
         // We use `O_PATH` because we just want this for traversing the directory tree
@@ -514,10 +509,11 @@ impl PassthroughFs {
                 self.no_open.store(true, Ordering::Relaxed);
             }
         }
+
         Ok(())
     }
 
-    /// Keep /proc/self/fd alive.
+    /// Get the list of file descriptors which should be reserved across live upgrade.
     pub fn keep_fds(&self) -> Vec<RawFd> {
         vec![self.proc.as_raw_fd()]
     }
@@ -528,7 +524,6 @@ impl PassthroughFs {
 
     fn open_inode(&self, inode: Inode, mut flags: i32) -> io::Result<File> {
         let data = self.inode_map.get(inode)?;
-
         let pathname = CString::new(format!("self/fd/{}", data.file.as_raw_fd()))
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
 
@@ -551,10 +546,9 @@ impl PassthroughFs {
             flags &= !libc::O_APPEND;
         }
 
-        // Safe because this doesn't modify any memory and we check the return value. We don't
-        // really check `flags` because if the kernel can't handle poorly specified flags then we
-        // have much bigger problems. Also, clear the `O_NOFOLLOW` flag if it is set since we need
-        // to follow the `/proc/self/fd` symlink to get the file.
+        // We don't really check `flags` because if the kernel can't handle poorly specified flags
+        // then we have much bigger problems. Also, clear the `O_NOFOLLOW` flag if it is set since
+        // we need to follow the `/proc/self/fd` symlink to get the file.
         self.open_proc_file(&pathname, (flags | libc::O_CLOEXEC) & (!libc::O_NOFOLLOW))
     }
 
@@ -587,12 +581,9 @@ impl PassthroughFs {
                     format!("max inode number reached: {}", VFS_MAX_INO),
                 ));
             }
-            trace!("do_lookup new inode {} altkey {:?}", inode, altkey);
-            self.inode_map.insert(
-                inode,
-                InodeAltKey::from_stat(&st),
-                InodeData::new(inode, f, 1),
-            );
+            trace!("fuse: do_lookup new inode {} altkey {:?}", inode, altkey);
+            self.inode_map
+                .insert(inode, altkey, InodeData::new(inode, f, 1));
 
             inode
         };
@@ -660,16 +651,19 @@ impl PassthroughFs {
             // trust them implicitly.
             debug_assert!(
                 rem.len() >= size_of::<LinuxDirent64>(),
-                "not enough space left in `rem`"
+                "fuse: not enough space left in `rem`"
             );
 
             let (front, back) = rem.split_at(size_of::<LinuxDirent64>());
 
-            let dirent64 =
-                LinuxDirent64::from_slice(front).expect("unable to get LinuxDirent64 from slice");
+            let dirent64 = LinuxDirent64::from_slice(front)
+                .expect("fuse: unable to get LinuxDirent64 from slice");
 
             let namelen = dirent64.d_reclen as usize - size_of::<LinuxDirent64>();
-            debug_assert!(namelen <= back.len(), "back is smaller than `namelen`");
+            debug_assert!(
+                namelen <= back.len(),
+                "fuse: back is smaller than `namelen`"
+            );
 
             let name = &back[..namelen];
             let res = if name.starts_with(CURRENT_DIR_CSTR) || name.starts_with(PARENT_DIR_CSTR) {
@@ -686,7 +680,7 @@ impl PassthroughFs {
                 // path walking.
                 let name = server::bytes_to_cstr(name)
                     .map_err(|e| {
-                        error!("do_readdir: {:?}", e);
+                        error!("fuse: do_readdir: {:?}", e);
                         io::Error::from_raw_os_error(libc::EINVAL)
                     })?
                     .to_bytes();
@@ -701,7 +695,7 @@ impl PassthroughFs {
 
             debug_assert!(
                 rem.len() >= dirent64.d_reclen as usize,
-                "rem is smaller than `d_reclen`"
+                "fuse: rem is smaller than `d_reclen`"
             );
 
             match res {
@@ -746,13 +740,13 @@ impl PassthroughFs {
 
     fn do_getattr(&self, inode: Inode) -> io::Result<(libc::stat64, Duration)> {
         let data = self.inode_map.get(inode).map_err(|e| {
-            error!("do_getattr ino {} Not find err {:?}", inode, e);
+            error!("fuse: do_getattr ino {} Not find err {:?}", inode, e);
             e
         })?;
 
         let st = stat(&data.file).map_err(|e| {
             error!(
-                "do_getattr stat failed ino {} fd: {:?} err {:?}",
+                "fuse: do_getattr stat failed ino {} fd: {:?} err {:?}",
                 inode,
                 data.file.as_raw_fd(),
                 e
@@ -813,7 +807,7 @@ fn forget_one(
             let new_count = refcount.saturating_sub(count);
 
             trace!(
-                "passthrough::forget: inode {} refcount {}, count {}, new_count {}",
+                "fuse: forget inode {} refcount {}, count {}, new_count {}",
                 inode,
                 refcount,
                 count,
@@ -868,6 +862,7 @@ impl FileSystem for PassthroughFs {
             opts |= FsOptions::ZERO_MESSAGE_OPEN;
             self.no_open.store(true, Ordering::Relaxed);
         }
+
         Ok(opts)
     }
 
@@ -875,24 +870,20 @@ impl FileSystem for PassthroughFs {
         self.handle_map.clear();
         self.inode_map.clear();
 
-        let _r = self.import().map_err(|e| {
-            error!("destory {:?}", e);
-            e
-        });
+        if let Err(e) = self.import() {
+            error!("fuse: failed to destroy instance, {:?}", e);
+        };
     }
 
     fn statfs(&self, _ctx: Context, inode: Inode) -> io::Result<libc::statvfs64> {
         let data = self.inode_map.get(inode)?;
-
         let mut out = MaybeUninit::<libc::statvfs64>::zeroed();
 
         // Safe because this will only modify `out` and we check the return value.
-        let res = unsafe { libc::fstatvfs64(data.file.as_raw_fd(), out.as_mut_ptr()) };
-        if res == 0 {
+        match unsafe { libc::fstatvfs64(data.file.as_raw_fd(), out.as_mut_ptr()) } {
             // Safe because the kernel guarantees that `out` has been initialized.
-            Ok(unsafe { out.assume_init() })
-        } else {
-            Err(io::Error::last_os_error())
+            0 => Ok(unsafe { out.assume_init() }),
+            _ => Err(io::Error::last_os_error()),
         }
     }
 
@@ -993,6 +984,7 @@ impl FileSystem for PassthroughFs {
             add_entry(dir_entry, entry).map(|r| {
                 // true when size is not large enough to hold entry.
                 if r == 0 {
+                    // Release the refcount acquired by self.do_lookup().
                     let mut inodes = self.inode_map.get_map_mut();
                     forget_one(&mut inodes, ino, 1);
                 }
@@ -1008,7 +1000,7 @@ impl FileSystem for PassthroughFs {
         flags: u32,
     ) -> io::Result<(Option<Handle>, OpenOptions)> {
         if self.no_open.load(Ordering::Relaxed) {
-            info!("open is not supported.");
+            info!("fuse: open is not supported.");
             Err(io::Error::from_raw_os_error(libc::ENOSYS))
         } else {
             self.do_open(inode, flags)
@@ -1093,7 +1085,7 @@ impl FileSystem for PassthroughFs {
         vu_req: &mut dyn FsCacheReqHandler,
     ) -> io::Result<()> {
         debug!(
-            "setupmapping: ino {:?} foffset {} len {} flags {} moffset {}",
+            "fuse: setupmapping ino {:?} foffset {} len {} flags {} moffset {}",
             inode, foffset, len, flags, moffset
         );
 
@@ -1368,7 +1360,6 @@ impl FileSystem for PassthroughFs {
                 u64::from(rdev),
             )
         };
-
         if res < 0 {
             Err(io::Error::last_os_error())
         } else {
@@ -1427,11 +1418,10 @@ impl FileSystem for PassthroughFs {
     }
 
     fn readlink(&self, _ctx: Context, inode: Inode) -> io::Result<Vec<u8>> {
-        let data = self.inode_map.get(inode)?;
-        let mut buf = vec![0; libc::PATH_MAX as usize];
-
         // Safe because this is a constant value and a valid C string.
         let empty = unsafe { CStr::from_bytes_with_nul_unchecked(EMPTY_CSTR) };
+        let mut buf = vec![0; libc::PATH_MAX as usize];
+        let data = self.inode_map.get(inode)?;
 
         // Safe because this will only modify the contents of `buf` and we check the return value.
         let res = unsafe {
@@ -1492,7 +1482,6 @@ impl FileSystem for PassthroughFs {
                 libc::fsync(fd)
             }
         };
-
         if res == 0 {
             Ok(())
         } else {
@@ -1665,7 +1654,6 @@ impl FileSystem for PassthroughFs {
 
         // Safe because this doesn't modify any memory and we check the return value.
         let res = unsafe { libc::fremovexattr(file.as_raw_fd(), name.as_ptr()) };
-
         if res == 0 {
             Ok(())
         } else {
@@ -1682,9 +1670,10 @@ impl FileSystem for PassthroughFs {
         offset: u64,
         length: u64,
     ) -> io::Result<()> {
+        // Let the Arc<HandleData> in scope, otherwise fd may get invalid.
         let data = self.get_data(handle, inode, libc::O_RDWR)?;
-
         let fd = data.get_raw_fd();
+
         // Safe because this doesn't modify any memory and we check the return value.
         let res = unsafe {
             libc::fallocate64(
@@ -1709,6 +1698,7 @@ impl FileSystem for PassthroughFs {
         offset: u64,
         whence: u32,
     ) -> io::Result<u64> {
+        // Let the Arc<HandleData> in scope, otherwise fd may get invalid.
         let data = self.handle_map.get(handle, inode)?;
         let fd = data.get_raw_fd();
 
