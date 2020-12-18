@@ -10,7 +10,7 @@ use std::collections::{btree_map, BTreeMap};
 use std::ffi::{CStr, CString};
 use std::fs::File;
 use std::io;
-use std::mem::{self, size_of, MaybeUninit};
+use std::mem::{self, size_of, MaybeUninit, ManuallyDrop};
 use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -1147,10 +1147,13 @@ impl FileSystem for PassthroughFs {
     ) -> io::Result<usize> {
         let data = self.get_data(handle, inode, libc::O_RDONLY)?;
 
-        // This is safe because write_from uses preadv64, so the underlying file descriptor
-        // offset is not affected by this operation.
-        let mut f = data.file.read().unwrap().try_clone().unwrap();
-        w.write_from(&mut f, size as usize, offset)
+        // Manually implement File::try_clone() by borrowing fd of data.file instead of dup().
+        // It's safe because the `data` variable's lifetime spans the whole function,
+        // so data.file won't be closed.
+        let f = unsafe { File::from_raw_fd(data.get_raw_fd()) };
+        let mut f =  ManuallyDrop::new(f);
+
+        w.write_from(&mut *f, size as usize, offset)
     }
 
     fn write(
@@ -1167,10 +1170,13 @@ impl FileSystem for PassthroughFs {
     ) -> io::Result<usize> {
         let data = self.get_data(handle, inode, libc::O_RDWR)?;
 
-        // This is safe because read_to uses pwritev64, so the underlying file descriptor
-        // offset is not affected by this operation.
-        let mut f = data.file.read().unwrap().try_clone().unwrap();
-        r.read_to(&mut f, size as usize, offset)
+        // Manually implement File::try_clone() by borrowing fd of data.file instead of dup().
+        // It's safe because the `data` variable's lifetime spans the whole function,
+        // so data.file won't be closed.
+        let f = unsafe { File::from_raw_fd(data.get_raw_fd()) };
+        let mut f = ManuallyDrop::new(f);
+
+        r.read_to(&mut *f, size as usize, offset)
     }
 
     fn getattr(
