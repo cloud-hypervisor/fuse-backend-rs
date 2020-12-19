@@ -14,7 +14,7 @@ use std::mem::{self, size_of, MaybeUninit, ManuallyDrop};
 use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, RwLock, RwLockWriteGuard};
+use std::sync::{Arc, Mutex, MutexGuard, RwLock, RwLockWriteGuard};
 use std::time::Duration;
 
 use versionize::{VersionMap, Versionize, VersionizeError, VersionizeResult};
@@ -126,27 +126,29 @@ impl InodeMap {
 
 pub(crate) struct HandleData {
     pub(crate) inode: Inode,
-    pub(crate) file: RwLock<File>,
+    pub(crate) file: File,
+    lock: Mutex<()>,
 }
 
 impl HandleData {
     fn new(inode: Inode, file: File) -> Self {
         HandleData {
             inode,
-            file: RwLock::new(file),
+            file,
+            lock: Mutex::new(()),
         }
     }
 
-    fn get_file_mut(&self) -> RwLockWriteGuard<File> {
-        self.file.write().unwrap()
+    fn get_file_mut(&self) -> (MutexGuard<()>, &File) {
+        (self.lock.lock().unwrap(), &self.file)
     }
 
     // When making use of the underlying RawFd, the caller must ensure that the Arc<HandleData>
     // object is within scope. Otherwise it may cause race window to access wrong target fd.
     // By introducing this method, we could explicitly audit all callers making use of the
     // underlying RawFd.
-    fn get_raw_fd(&self) -> RawFd {
-        self.file.write().unwrap().as_raw_fd()
+    fn get_handle_raw_fd(&self) -> RawFd {
+        self.file.as_raw_fd()
     }
 }
 
@@ -647,7 +649,7 @@ impl PassthroughFs {
             // Since we are going to work with the kernel offset, we have to acquire the file lock
             // for both the `lseek64` and `getdents64` syscalls to ensure that no other thread
             // changes the kernel offset while we are using it.
-            let dir = data.get_file_mut();
+            let (guard, dir) = data.get_file_mut();
 
             // Safe because this doesn't modify any memory and we check the return value.
             let res =
@@ -674,7 +676,7 @@ impl PassthroughFs {
             unsafe { buf.set_len(res as usize) };
 
             // Explicitly drop the lock so that it's not held while we fill in the fuse buffer.
-            mem::drop(dir);
+            mem::drop(guard);
         }
 
         let mut rem = &buf[..];
@@ -1152,7 +1154,7 @@ impl FileSystem for PassthroughFs {
         // Manually implement File::try_clone() by borrowing fd of data.file instead of dup().
         // It's safe because the `data` variable's lifetime spans the whole function,
         // so data.file won't be closed.
-        let f = unsafe { File::from_raw_fd(data.get_raw_fd()) };
+        let f = unsafe { File::from_raw_fd(data.get_handle_raw_fd()) };
         let mut f =  ManuallyDrop::new(f);
 
         w.write_from(&mut *f, size as usize, offset)
@@ -1175,7 +1177,7 @@ impl FileSystem for PassthroughFs {
         // Manually implement File::try_clone() by borrowing fd of data.file instead of dup().
         // It's safe because the `data` variable's lifetime spans the whole function,
         // so data.file won't be closed.
-        let f = unsafe { File::from_raw_fd(data.get_raw_fd()) };
+        let f = unsafe { File::from_raw_fd(data.get_handle_raw_fd()) };
         let mut f = ManuallyDrop::new(f);
 
         r.read_to(&mut *f, size as usize, offset)
@@ -1213,7 +1215,7 @@ impl FileSystem for PassthroughFs {
             // If we have a handle then use it otherwise get a new fd from the inode.
             if let Some(handle) = handle {
                 let hd = self.handle_map.get(handle, inode)?;
-                let fd = hd.get_raw_fd();
+                let fd = hd.get_handle_raw_fd();
                 Data::Handle(hd, fd)
             } else {
                 let pathname = CString::new(format!("self/fd/{}", inode_data.get_raw_fd()))
@@ -1476,7 +1478,7 @@ impl FileSystem for PassthroughFs {
         // behavior by doing the same thing (dup-ing the fd and then immediately closing it). Safe
         // because this doesn't modify any memory and we check the return values.
         unsafe {
-            let newfd = libc::dup(data.get_raw_fd());
+            let newfd = libc::dup(data.get_handle_raw_fd());
             if newfd < 0 {
                 return Err(io::Error::last_os_error());
             }
@@ -1491,7 +1493,7 @@ impl FileSystem for PassthroughFs {
 
     fn fsync(&self, _ctx: Context, inode: Inode, datasync: bool, handle: Handle) -> io::Result<()> {
         let data = self.get_data(handle, inode, libc::O_RDONLY)?;
-        let fd = data.get_raw_fd();
+        let fd = data.get_handle_raw_fd();
 
         // Safe because this doesn't modify any memory and we check the return value.
         let res = unsafe {
@@ -1691,7 +1693,7 @@ impl FileSystem for PassthroughFs {
     ) -> io::Result<()> {
         // Let the Arc<HandleData> in scope, otherwise fd may get invalid.
         let data = self.get_data(handle, inode, libc::O_RDWR)?;
-        let fd = data.get_raw_fd();
+        let fd = data.get_handle_raw_fd();
 
         // Safe because this doesn't modify any memory and we check the return value.
         let res = unsafe {
@@ -1719,10 +1721,18 @@ impl FileSystem for PassthroughFs {
     ) -> io::Result<u64> {
         // Let the Arc<HandleData> in scope, otherwise fd may get invalid.
         let data = self.handle_map.get(handle, inode)?;
-        let fd = data.get_raw_fd();
+
+        // Acquire the lock to get exclusive access, otherwise it may break do_readdir().
+        let (_guard, file) = data.get_file_mut();
 
         // Safe because this doesn't modify any memory and we check the return value.
-        let res = unsafe { libc::lseek(fd, offset as libc::off64_t, whence as libc::c_int) };
+        let res = unsafe {
+            libc::lseek(
+                file.as_raw_fd(),
+                offset as libc::off64_t,
+                whence as libc::c_int,
+            )
+        };
         if res < 0 {
             Err(io::Error::last_os_error())
         } else {
