@@ -107,7 +107,7 @@ struct MountPointData {
     fs_idx: VfsIndex,
     ino: u64,
     root_entry: Entry,
-    path: String,
+    _path: String,
 }
 
 #[derive(Debug, Copy, Clone)]
@@ -221,7 +221,7 @@ impl Vfs {
                 fs_idx,
                 ino: ROOT_ID,
                 root_entry: entry,
-                path: path.to_string(),
+                _path: path.to_string(),
             }),
         );
         self.mountpoints.store(Arc::new(mountpoints));
