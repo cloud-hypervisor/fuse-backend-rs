@@ -38,13 +38,13 @@ const PARENT_DIR_CSTR: &[u8] = b"..\0";
 const EMPTY_CSTR: &[u8] = b"\0";
 const PROC_CSTR: &[u8] = b"/proc\0";
 
-pub(crate) type Inode = u64;
-pub(crate) type Handle = u64;
+type Inode = u64;
+type Handle = u64;
 
 #[derive(Clone, Copy, PartialOrd, Ord, PartialEq, Eq, Debug, Default, Versionize)]
-pub(crate) struct InodeAltKey {
-    pub(crate) ino: libc::ino64_t,
-    pub(crate) dev: libc::dev_t,
+struct InodeAltKey {
+    ino: libc::ino64_t,
+    dev: libc::dev_t,
 }
 
 impl InodeAltKey {
@@ -56,11 +56,11 @@ impl InodeAltKey {
     }
 }
 
-pub(crate) struct InodeData {
-    pub(crate) inode: Inode,
+struct InodeData {
+    inode: Inode,
     // Most of these aren't actually files but ¯\_(ツ)_/¯.
-    pub(crate) file: File,
-    pub(crate) refcount: AtomicU64,
+    file: File,
+    refcount: AtomicU64,
 }
 
 impl InodeData {
@@ -82,7 +82,7 @@ impl InodeData {
 }
 
 /// Data structures to manage accessed inodes.
-pub(crate) struct InodeMap {
+struct InodeMap {
     inodes: RwLock<MultikeyBTreeMap<Inode, InodeAltKey, Arc<InodeData>>>,
 }
 
@@ -124,9 +124,9 @@ impl InodeMap {
     }
 }
 
-pub(crate) struct HandleData {
-    pub(crate) inode: Inode,
-    pub(crate) file: File,
+struct HandleData {
+    inode: Inode,
+    file: File,
     lock: Mutex<()>,
 }
 
@@ -152,7 +152,7 @@ impl HandleData {
     }
 }
 
-pub(crate) struct HandleMap {
+struct HandleMap {
     handles: RwLock<BTreeMap<Handle, Arc<HandleData>>>,
 }
 
@@ -273,7 +273,7 @@ fn ebadf() -> io::Error {
     io::Error::from_raw_os_error(libc::EBADF)
 }
 
-pub(crate) fn stat(f: &File) -> io::Result<libc::stat64> {
+fn stat(f: &File) -> io::Result<libc::stat64> {
     // Safe because this is a constant value and a valid C string.
     let pathname = unsafe { CStr::from_bytes_with_nul_unchecked(EMPTY_CSTR) };
     let mut st = MaybeUninit::<libc::stat64>::zeroed();
@@ -437,28 +437,28 @@ pub struct PassthroughFs {
     // the `O_PATH` option so they cannot be used for reading or writing any data. See the
     // documentation of the `O_PATH` flag in `open(2)` for more details on what one can and cannot
     // do with an fd opened with this flag.
-    pub(crate) inode_map: InodeMap,
-    pub(crate) next_inode: AtomicU64,
+    inode_map: InodeMap,
+    next_inode: AtomicU64,
 
     // File descriptors for open files and directories. Unlike the fds in `inodes`, these _can_ be
     // used for reading and writing data.
-    pub(crate) handle_map: HandleMap,
-    pub(crate) next_handle: AtomicU64,
+    handle_map: HandleMap,
+    next_handle: AtomicU64,
 
     // File descriptor pointing to the `/proc` directory. This is used to convert an fd from
     // `inodes` into one that can go into `handles`. This is accomplished by reading the
     // `self/fd/{}` symlink. We keep an open fd here in case the file system tree that we are meant
     // to be serving doesn't have access to `/proc`.
-    pub(crate) proc: File,
+    proc: File,
 
     // Whether writeback caching is enabled for this directory. This will only be true when
     // `cfg.writeback` is true and `init` was called with `FsOptions::WRITEBACK_CACHE`.
-    pub(crate) writeback: AtomicBool,
+    writeback: AtomicBool,
 
     // Whether no_open is enabled.
-    pub(crate) no_open: AtomicBool,
+    no_open: AtomicBool,
 
-    pub(crate) cfg: Config,
+    cfg: Config,
 }
 
 impl PassthroughFs {
@@ -1737,6 +1737,319 @@ impl FileSystem for PassthroughFs {
             Err(io::Error::last_os_error())
         } else {
             Ok(res as u64)
+        }
+    }
+}
+
+/// Save and restore data structs for snapshot/template clone/live upgrade/live migration.
+pub mod persist {
+    use std::any::TypeId;
+    use std::convert::TryInto;
+    use std::io;
+    use std::io::Error as IoError;
+
+    use snapshot::{FilePersist, Persist};
+    use versionize::{VersionMap, Versionize, VersionizeResult};
+    use versionize_derive::Versionize;
+
+    use super::*;
+
+    /// Get software version information.
+    pub fn get_versions_passthrough_fs(version_map: &mut VersionMap) {
+        version_map.set_type_version(TypeId::of::<InodeDataState>(), 2);
+    }
+
+    /// Struct to save/restore state of [Config](struct.Config.html) objects.
+    #[derive(Versionize, PartialEq, Debug)]
+    pub struct ConfigState {
+        entry_timeout: u128,
+        attr_timeout: u128,
+        cache_policy: CachePolicy,
+        writeback: bool,
+        root_dir: String,
+        xattr: bool,
+        do_import: bool,
+        no_open: bool,
+    }
+
+    impl Persist<'_> for Config {
+        type State = ConfigState;
+        type ConstructorArgs = ();
+        type LiveUpgradeConstructorArgs = ();
+        type Error = IoError;
+
+        fn save(&self) -> Self::State {
+            ConfigState {
+                entry_timeout: self.entry_timeout.as_nanos(),
+                attr_timeout: self.attr_timeout.as_nanos(),
+                cache_policy: self.cache_policy.clone(),
+                writeback: self.writeback,
+                root_dir: self.root_dir.clone(),
+                xattr: self.xattr,
+                do_import: self.do_import,
+                no_open: self.no_open,
+            }
+        }
+
+        fn restore(
+            _constructor_args: Self::ConstructorArgs,
+            state: &Self::State,
+        ) -> Result<Self, Self::Error> {
+            Ok(Config {
+                entry_timeout: Duration::from_nanos(state.entry_timeout.try_into().unwrap()),
+                attr_timeout: Duration::from_nanos(state.attr_timeout.try_into().unwrap()),
+                cache_policy: state.cache_policy.clone(),
+                writeback: state.writeback,
+                root_dir: state.root_dir.clone(),
+                xattr: state.xattr,
+                do_import: state.do_import,
+                no_open: state.no_open,
+            })
+        }
+
+        fn live_upgrade_save(&self) -> Self::State {
+            self.save()
+        }
+
+        fn live_upgrade_restore(
+            _constructor_args: Self::ConstructorArgs,
+            state: &Self::State,
+        ) -> Result<Self, Self::Error> {
+            Self::restore((), state)
+        }
+    }
+
+    #[derive(Versionize, Debug, PartialEq)]
+    struct InodeDataState {
+        inode: Inode,
+        fd: RawFd,
+        refcount: u64,
+        #[version(start = 2)]
+        inode_alt_key: InodeAltKey,
+    }
+
+    #[derive(Versionize, Debug, PartialEq)]
+    struct HandleDataState {
+        handle: Handle,
+        inode: Inode,
+        fd: RawFd,
+    }
+
+    #[derive(Versionize, Debug, PartialEq)]
+    pub struct PassthroughFsLiveUpgradeState {
+        proc: RawFd,
+        next_inode: u64,
+        inodes: Vec<InodeDataState>,
+        next_handle: u64,
+        handles: Vec<HandleDataState>,
+    }
+
+    /// Struct to save/restore state of [PassthroughFs](struct.PassthroughFs.html) objects.
+    #[derive(Versionize, Debug, PartialEq)]
+    pub struct PassthroughFsState {
+        writeback: bool,
+        no_open: bool,
+        cfg: ConfigState,
+
+        live_upgrade_state: Option<PassthroughFsLiveUpgradeState>,
+    }
+
+    impl Persist<'_> for PassthroughFs {
+        type State = PassthroughFsState;
+        type ConstructorArgs = ();
+        type LiveUpgradeConstructorArgs = ();
+        type Error = IoError;
+
+        fn save(&self) -> Self::State {
+            PassthroughFsState {
+                writeback: self.writeback.load(Ordering::Relaxed),
+                no_open: self.no_open.load(Ordering::Relaxed),
+                cfg: self.cfg.save(),
+                live_upgrade_state: None,
+            }
+        }
+
+        fn restore(
+            _constructor_args: Self::ConstructorArgs,
+            state: &Self::State,
+        ) -> Result<Self, Self::Error> {
+            let cfg = Config::restore((), &state.cfg).unwrap();
+            let fs = PassthroughFs::new(cfg)?;
+
+            fs.no_open.store(state.no_open, Ordering::Relaxed);
+            fs.writeback.store(state.writeback, Ordering::Relaxed);
+
+            Ok(fs)
+        }
+
+        fn live_upgrade_save(&self) -> Self::State {
+            let inode_map = self.inode_map.get_map_mut();
+            let mut inodes = Vec::with_capacity(inode_map.len());
+            for (key, val) in inode_map.iter().filter(|(&key, _)| key != fuse::ROOT_ID) {
+                inodes.push(InodeDataState {
+                    inode: *key,
+                    fd: val.1.file.save(),
+                    refcount: val.1.refcount.load(Ordering::Relaxed),
+                    inode_alt_key: val.0,
+                });
+            }
+
+            let handle_map = self.handle_map.handles.read().unwrap();
+            let mut handles = Vec::with_capacity(handle_map.len());
+            for (key, val) in handle_map.iter() {
+                handles.push(HandleDataState {
+                    handle: *key,
+                    inode: val.inode,
+                    fd: val.file.save(),
+                });
+            }
+
+            PassthroughFsState {
+                writeback: self.writeback.load(Ordering::Relaxed),
+                no_open: self.no_open.load(Ordering::Relaxed),
+                cfg: self.cfg.save(),
+                live_upgrade_state: Some(PassthroughFsLiveUpgradeState {
+                    proc: self.proc.save(),
+                    next_inode: self.next_inode.load(Ordering::Relaxed),
+                    inodes,
+                    next_handle: self.next_handle.load(Ordering::Relaxed),
+                    handles,
+                }),
+            }
+        }
+
+        fn live_upgrade_restore(
+            constructor_args: Self::ConstructorArgs,
+            state: &Self::State,
+        ) -> Result<Self, Self::Error> {
+            let live_state = match state.live_upgrade_state.as_ref() {
+                Some(v) => v,
+                None => {
+                    error!(
+                        "Fs::live_upgrade_restore: no PassthroughFsLiveUpgradeState found in state"
+                    );
+                    return Err(IoError::new(
+                        io::ErrorKind::InvalidInput,
+                        "no PassthroughFsLiveUpgradeState found in PassthroughFsState.",
+                    ));
+                }
+            };
+
+            let mut fs = Self::restore(constructor_args, state)?;
+
+            fs.proc = File::restore(live_state.proc);
+            fs.next_inode
+                .store(live_state.next_inode, Ordering::Relaxed);
+            fs.next_handle
+                .store(live_state.next_handle, Ordering::Relaxed);
+
+            for elem in live_state.inodes.as_slice().iter() {
+                let file = File::restore(elem.fd);
+                let data = InodeData::new(elem.inode, file, elem.refcount);
+                let altkey = InodeAltKey {
+                    ino: elem.inode_alt_key.ino,
+                    dev: elem.inode_alt_key.dev,
+                };
+                fs.inode_map.insert(elem.inode, altkey, data);
+            }
+
+            for elem in live_state.handles.as_slice().iter() {
+                let data = HandleData::new(elem.inode, File::restore(elem.fd));
+                fs.handle_map.insert(elem.handle, data);
+            }
+
+            Ok(fs)
+        }
+    }
+
+    impl PartialEq for PassthroughFs {
+        fn eq(&self, other: &PassthroughFs) -> bool {
+            // TODO: compare more fields
+            self.no_open.load(Ordering::Relaxed) == other.no_open.load(Ordering::Relaxed)
+                && self.writeback.load(Ordering::Relaxed) == other.writeback.load(Ordering::Relaxed)
+                && self.cfg == other.cfg
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use std::os::unix::io::AsRawFd;
+
+        #[test]
+        fn test_persist_passthroughfs_state() {
+            let fs_cfg = Config {
+                writeback: true,
+                do_import: false,
+                no_open: true,
+                ..Default::default()
+            };
+            let fs = PassthroughFs::new(fs_cfg).unwrap();
+            fs.import().unwrap();
+
+            // save the state
+            let mut mem = vec![0; 4096];
+            let version_map = VersionMap::new();
+            fs.save()
+                .serialize(&mut mem.as_mut_slice(), &version_map, 1)
+                .unwrap();
+
+            // restore the state
+            let restored_fs = PassthroughFs::restore(
+                (),
+                &PassthroughFsState::deserialize(&mut mem.as_slice(), &version_map, 1).unwrap(),
+            )
+            .unwrap();
+
+            assert_eq!(restored_fs.writeback.load(Ordering::Relaxed), true);
+            assert_eq!(restored_fs.no_open.load(Ordering::Relaxed), true);
+            println!("fs.proc {:?} {:?}", fs.proc, restored_fs.proc);
+            assert!(fs == restored_fs);
+        }
+
+        #[test]
+        fn test_persist_passthroughfs_state_live_upgrade() {
+            let fs_cfg = Config {
+                writeback: true,
+                do_import: false,
+                no_open: true,
+                ..Default::default()
+            };
+            let fs = PassthroughFs::new(fs_cfg).unwrap();
+            fs.import().unwrap();
+            // TODO: insert a few lookup()s to fs.
+
+            // save the state
+            let mut mem = vec![0; 4096];
+            let version_map = VersionMap::new();
+            fs.live_upgrade_save()
+                .serialize(&mut mem.as_mut_slice(), &version_map, 1)
+                .unwrap();
+
+            // restore the state
+            let restored_fs = PassthroughFs::live_upgrade_restore(
+                (),
+                &PassthroughFsState::deserialize(&mut mem.as_slice(), &version_map, 1).unwrap(),
+            )
+            .unwrap();
+
+            assert!(fs == restored_fs);
+
+            assert_eq!(fs.proc.as_raw_fd(), restored_fs.proc.as_raw_fd());
+            assert_eq!(
+                fs.next_inode.load(Ordering::Relaxed),
+                restored_fs.next_inode.load(Ordering::Relaxed)
+            );
+
+            // let fs_inodes = fs.inodes.read().unwrap();
+            // let fs_root_inode = fs_inodes.get(&fuse::ROOT_ID).unwrap();
+
+            // let restored_inodes = restored_fs.inodes.read().unwrap();
+            // let root_inode = restored_inodes.get(&fuse::ROOT_ID);
+            // assert_eq!(root_inode.is_some(), true);
+
+            // let root_inode = root_inode.unwrap();
+            // assert_eq!(root_inode.file.as_raw_fd(), fs_root_inode.file.as_raw_fd());
         }
     }
 }

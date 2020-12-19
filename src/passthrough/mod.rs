@@ -12,8 +12,7 @@
 //! with heavy modification/enhancements from Alibaba Cloud OS team.
 
 mod fs;
-mod fs_persist;
 mod multikey;
 
+pub use fs::persist::{get_versions_passthrough_fs, ConfigState, PassthroughFsState};
 pub use fs::{CachePolicy, Config, PassthroughFs};
-pub use fs_persist::{get_versions_passthrough_fs, PassthroughFsState};

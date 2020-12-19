@@ -38,6 +38,11 @@ where
         }
     }
 
+    /// Get number of entries in the map.
+    pub fn len(&self) -> usize {
+        self.main.len()
+    }
+
     /// Returns a reference to the value corresponding to the key.
     ///
     /// The key may be any borrowed form of `K1``, but the ordering on the borrowed form must match
