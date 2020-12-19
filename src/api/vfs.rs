@@ -1,15 +1,19 @@
 // Copyright 2020 Ant Financial. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! A union fs that combines multiple backend file systems.
+//! A union file system which combines multiple backend file systems into one.
 //!
-//! It's a simple union file system with limited functionality, which
+//! A simple union file system with limited functionality, which
 //! 1. uses pseudo fs to maintain the directory structures
 //! 2. supports mounting a file system at "/" or and subdirectory
 //! 3. supports mounting multiple file systems at different paths
 //! 4. remounting another file system at the same path will evict the old one
 //! 5. doesn't support recursive mounts. If /a is a mounted file system, you can't
 //!    mount another file systems under /a.
+//!
+//! Its main usage is to avoid virtio-fs device hotplug. With this simple union fs,
+//! a new backend file system could be mounted onto a subdirectory, instead of hot-adding
+//! another virtio-fs device. This is very convenient to manage container images at runtime.
 
 use std::any::Any;
 use std::collections::HashMap;
