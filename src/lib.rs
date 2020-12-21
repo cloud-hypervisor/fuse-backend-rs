@@ -5,7 +5,7 @@
 
 #![deny(missing_docs)]
 
-//! A library to support Fuse server and virtio-fs device based on Linux Fuse ABI.
+//! A rust library for Fuse(filesystem in userspace) servers and virtio-fs devices.
 //!
 //! Filesystem in Userspace [`FUSE`](https://www.kernel.org/doc/html/latest/filesystems/fuse.html)
 //! is a software interface for Unix and Unix-like computer operating systems that lets
@@ -34,17 +34,17 @@
 //! the kernel and userspace is replaced with the virtio-fs device interface.
 //!
 //! The fuse-backend-rs crate includes several subsystems:
+//! * [Fuse API](api/index.html). The Fuse API is the connection between transport layers and file
+//!   system drivers. It receives Fuse requests from transport layers, parses the request
+//!   according to Fuse ABI, invokes filesystem drivers to server the requests, and eventually
+//!   send back the result to the transport layer.
+//! * [Fuse ABI](abi/index.html). Currently only Linux Fuse ABIs since v7.27 are supported.
 //! * [Transport Layer](transport/index.html). The transport layer receives Fuse requests from
 //!   the clients and sends back replies. Currently there are two transport layers are supported:
 //!   Linux Fuse device(/dev/fuse) and virtiofs.
 //! * Filesystem Drivers. Filesystem drivers implement the concrete Fuse filesystem logic,
 //!   at what ever is suitable. A default ["passthrough"](passthrough/index.html) filesystem
 //!   driver is implemented as a sample.
-//! * [Fuse ABI](abi/index.html). Currently only Linux Fuse ABIs since v7.27 are supported.
-//! * [Fuse API](api/index.html). The Fuse API is the connection between transport layers and file
-//!   system drivers. It receives Fuse requests from transport layers, parses the request
-//!   according to Fuse ABI, invokes filesystem drivers to server the requests, and eventually
-//!   send back the result to the transport layer.
 
 extern crate bitflags;
 extern crate libc;
