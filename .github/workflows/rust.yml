@@ -19,18 +19,18 @@ jobs:
     - name: clippy and format
       run: |
         cargo clippy --features "fusedev" -- -Dclippy::all
-        cargo clippy --features "virtiofs" -- -Dclippy::all
-        cargo clippy --features "vhost-user-fs" -- -Dclippy::all
+#        cargo clippy --features "virtiofs" -- -Dclippy::all
+#        cargo clippy --features "vhost-user-fs" -- -Dclippy::all
         cargo fmt -- --check
     - name: Build fusedev
       run: cargo build --verbose --features "fusedev"
-    - name: Build virtiofs
-      run: cargo build --verbose --features "virtiofs"
-    - name: Build vhost-user-fs
-      run: cargo build --verbose --features "vhost-user-fs"
+#    - name: Build virtiofs
+#      run: cargo build --verbose --features "virtiofs"
+#    - name: Build vhost-user-fs
+#      run: cargo build --verbose --features "vhost-user-fs"
     - name: Run tests fusedev
       run: cargo test --verbose --features "fusedev"
-    - name: Run tests virtiofs
-      run: cargo test --verbose --features "virtiofs"
-    - name: Run tests vhost-user-fs
-      run: cargo test --verbose --features "vhost-user-fs"
+#    - name: Run tests virtiofs
+#      run: cargo test --verbose --features "virtiofs"
+#    - name: Run tests vhost-user-fs
+#      run: cargo test --verbose --features "vhost-user-fs"
