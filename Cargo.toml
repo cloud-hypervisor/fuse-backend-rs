@@ -1,10 +1,14 @@
 [package]
 name = "fuse-rs"
 version = "0.1.0"
+keywords = ["fuse", "virtio-fs", "vhost-user-fs"]
+categories = ["filesystem", "os::linux-apis"]
 description = "A library to support Fuse server and virtio-fs device based on Linux Fuse ABI"
 authors = ["Liu Bo <bo.liu@linux.alibaba.com>", "Liu Jiang <gerry@linux.alibaba.com>", "Peng Tao <bergwolf@hyper.sh>"]
 license = "Apache-2.0 AND BSD-3-Clause"
 edition = "2018"
+repository = "https://github.com/cloud-hypervisor/fuse-backend-rs"
+homepage = "https://github.com/cloud-hypervisor/"
 
 [dependencies]
 arc-swap = ">=0.4.6"
