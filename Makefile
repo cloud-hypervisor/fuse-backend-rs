@@ -6,4 +6,4 @@ build:
 check: build
 	cargo fmt -- --check
 	cargo clippy --all-features -- -Dclippy::all
-	cargo test --all-features
+	cargo test --all-features -- --nocapture

@@ -15,9 +15,9 @@
 #![allow(dead_code)]
 mod pseudo_fs;
 pub mod vfs;
-mod vfs_persist;
 
+pub use pseudo_fs::persist::PseudoFsState;
+pub use vfs::persist::{VersionMapGetter, VfsOptionsState, VfsState};
 pub use vfs::{BackendFileSystem, Vfs, VfsOptions, VFS_MAX_INO};
-pub use vfs_persist::{VersionMapGetter, VfsOptionsState, VfsState};
 pub mod filesystem;
 pub mod server;

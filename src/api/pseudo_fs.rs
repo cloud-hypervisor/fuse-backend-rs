@@ -39,6 +39,15 @@ struct PseudoInode {
 }
 
 impl PseudoInode {
+    fn new(ino: u64, parent: u64, name: String) -> Self {
+        PseudoInode {
+            ino,
+            parent,
+            children: ArcSwap::new(Arc::new(Vec::new())),
+            name,
+        }
+    }
+
     // It's protected by Pseudofs.lock.
     fn insert_child(&self, child: Arc<PseudoInode>) {
         let mut children = self.children.load().deref().deref().clone();
@@ -70,12 +79,7 @@ pub struct PseudoFs {
 
 impl PseudoFs {
     pub fn new() -> Self {
-        let root_inode = Arc::new(PseudoInode {
-            ino: ROOT_ID,
-            parent: ROOT_ID,
-            children: ArcSwap::new(Arc::new(Vec::new())),
-            name: String::from("/"),
-        });
+        let root_inode = Arc::new(PseudoInode::new(ROOT_ID, ROOT_ID, String::from("/")));
         let fs = PseudoFs {
             next_inode: AtomicU64::new(PSEUDOFS_NEXT_INODE),
             root_inode: root_inode.clone(),
@@ -109,7 +113,10 @@ impl PseudoFs {
                 Component::RootDir => continue,
                 Component::CurDir => continue,
                 Component::ParentDir => inode = inodes.get(&inode.parent).unwrap(),
-                Component::Prefix(_) => panic!("unsupported path: {}", mountpoint),
+                Component::Prefix(_) => {
+                    error!("unsupported path: {}", mountpoint);
+                    return Err(Error::from_raw_os_error(libc::EINVAL));
+                }
                 Component::Normal(path) => {
                     let name = path.to_str().unwrap();
 
@@ -144,10 +151,7 @@ impl PseudoFs {
     pub fn path_walk(&self, mountpoint: &str) -> Result<u64> {
         let path = Path::new(mountpoint);
         if !path.has_root() {
-            error!(
-                "pseudo fs umount failure: invalid umount path {}",
-                mountpoint
-            );
+            error!("pseudo fs walk failure: invalid path {}", mountpoint);
             return Err(Error::from_raw_os_error(libc::EINVAL));
         }
 
@@ -155,12 +159,15 @@ impl PseudoFs {
         let mut inode = &self.root_inode;
 
         'outer: for component in path.components() {
-            debug!("pseudo fs umount iterate {:?}", component.as_os_str());
+            debug!("pseudo fs iterate {:?}", component.as_os_str());
             match component {
                 Component::RootDir => continue,
                 Component::CurDir => continue,
                 Component::ParentDir => inode = inodes.get(&inode.parent).unwrap(),
-                Component::Prefix(_) => panic!("unsupported path: {}", mountpoint),
+                Component::Prefix(_) => {
+                    error!("unsupported path: {}", mountpoint);
+                    return Err(Error::from_raw_os_error(libc::EINVAL));
+                }
                 Component::Normal(path) => {
                     let name = path.to_str().unwrap();
 
@@ -181,7 +188,7 @@ impl PseudoFs {
                         }
                     }
 
-                    error!("name {} is not found, path is {}", name, mountpoint);
+                    debug!("name {} is not found, path is {}", name, mountpoint);
                     return Err(Error::from_raw_os_error(libc::ENOENT));
                 }
             }
@@ -196,12 +203,7 @@ impl PseudoFs {
     fn new_inode(&self, parent: u64, name: &str) -> Arc<PseudoInode> {
         let ino = self.next_inode.fetch_add(1, Ordering::Relaxed);
 
-        Arc::new(PseudoInode {
-            ino,
-            parent,
-            name: String::from(name),
-            children: ArcSwap::new(Arc::new(Vec::new())),
-        })
+        Arc::new(PseudoInode::new(ino, parent, name.to_owned()))
     }
 
     // Caller must hold PseudoFs.lock.
@@ -536,5 +538,189 @@ mod tests {
         let ctx = create_fuse_context();
 
         fs.access(ctx, a1, 0).unwrap();
+    }
+}
+
+pub mod persist {
+    #![allow(missing_docs)]
+
+    use std::collections::HashMap;
+    use std::io::{Error as IoError, ErrorKind};
+    use std::sync::atomic::Ordering;
+    use std::sync::Arc;
+
+    use snapshot::Persist;
+    use versionize::{VersionMap, Versionize, VersionizeResult};
+    use versionize_derive::Versionize;
+
+    use super::{PseudoFs, PseudoInode};
+    use crate::api::filesystem::ROOT_ID;
+
+    #[derive(Versionize, PartialEq, Debug, Default)]
+    struct PseudoInodeState {
+        ino: u64,
+        parent: u64,
+        name: String,
+    }
+
+    #[derive(Versionize, PartialEq, Debug, Default)]
+    pub struct PseudoFsState {
+        next_inode: u64,
+        inodes: Vec<PseudoInodeState>,
+    }
+
+    impl Persist<'_> for PseudoFs {
+        type State = PseudoFsState;
+        type ConstructorArgs = ();
+        type LiveUpgradeConstructorArgs = ();
+        type Error = IoError;
+
+        fn save(&self) -> Self::State {
+            Self::State {
+                next_inode: self.next_inode.load(Ordering::Relaxed),
+                inodes: self.save_inodes(),
+            }
+        }
+
+        fn restore(
+            _constructor_args: Self::ConstructorArgs,
+            state: &Self::State,
+        ) -> Result<Self, Self::Error> {
+            let fs = Self::new();
+            fs.restore_from_state(&state)?;
+            Ok(fs)
+        }
+
+        fn live_upgrade_save(&self) -> Self::State {
+            self.save()
+        }
+
+        fn live_upgrade_restore(
+            _args: Self::ConstructorArgs,
+            state: &Self::State,
+        ) -> Result<Self, Self::Error> {
+            Self::restore((), state)
+        }
+    }
+
+    impl PseudoFs {
+        fn save_inodes(&self) -> Vec<PseudoInodeState> {
+            let mut state = Vec::new();
+            let inodes = self.inodes.load();
+            for ino in inodes.iter() {
+                // Skip root inode, it can be restored without persistency
+                if ino.1.ino == ROOT_ID {
+                    continue;
+                }
+                state.push(PseudoInodeState {
+                    ino: ino.1.ino,
+                    parent: ino.1.parent,
+                    name: ino.1.name.clone(),
+                });
+            }
+            state.sort_by(|a, b| a.ino.cmp(&b.ino));
+            state
+        }
+
+        pub(crate) fn restore_from_state(&self, state: &PseudoFsState) -> Result<(), IoError> {
+            // For compatibility, state might be empty if upgrading from an older version
+            if state.next_inode != 0 {
+                self.next_inode.store(state.next_inode, Ordering::Relaxed);
+                self.restore_inodes(&state.inodes)
+            } else {
+                Ok(())
+            }
+        }
+
+        fn restore_inodes(&self, inodes: &[PseudoInodeState]) -> Result<(), IoError> {
+            let mut inodemap = HashMap::new();
+
+            // 1. insert root inode
+            inodemap.insert(self.root_inode.ino, self.root_inode.clone());
+
+            // 2. reconstruct all inodes
+            for ino in inodes {
+                inodemap.insert(
+                    ino.ino,
+                    Arc::new(PseudoInode::new(ino.ino, ino.parent, ino.name.clone())),
+                );
+            }
+
+            // 3. connect all inodes
+            for ino in inodes {
+                // we just created the inode so cannot fail to get
+                let child = inodemap.get(&ino.ino).unwrap().clone();
+                let parent = inodemap.get_mut(&ino.parent).ok_or_else(|| {
+                    IoError::new(
+                        ErrorKind::Other,
+                        format!(
+                            "Invalid pseudofs state, cannot find parent for inode {:?}",
+                            ino
+                        ),
+                    )
+                })?;
+                parent.insert_child(child);
+            }
+            self.inodes.store(Arc::new(inodemap));
+
+            Ok(())
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use versionize::VersionMap;
+
+        #[test]
+        fn test_persist_pseudofs_mount() {
+            let fs = PseudoFs::new();
+            fs.mount("/foo/bar/1/").unwrap();
+            fs.mount("/foo/bar/1/2").unwrap();
+            fs.mount("/foo/bar/1/2").unwrap();
+            fs.mount("/foo/bar/1/2").unwrap();
+            fs.mount("/foo").unwrap();
+            fs.mount("/bar/foo/1/2").unwrap();
+            fs.mount("/bar/foo/1/2/3").unwrap();
+
+            let mut mem = vec![0; 4096];
+            let version_map = VersionMap::new();
+            fs.save()
+                .serialize(&mut mem.as_mut_slice(), &version_map, 1)
+                .unwrap();
+
+            // restore the state
+            let restored_state =
+                PseudoFsState::deserialize(&mut mem.as_slice(), &version_map, 1).unwrap();
+            let rfs = PseudoFs::restore((), &restored_state).unwrap();
+            assert_eq!(
+                fs.next_inode.load(Ordering::Relaxed),
+                rfs.next_inode.load(Ordering::Relaxed)
+            );
+            let mut inodes: Vec<PseudoInodeState> = fs
+                .inodes
+                .load()
+                .iter()
+                .map(|(_, v)| PseudoInodeState {
+                    ino: v.ino,
+                    parent: v.parent,
+                    name: v.name.clone(),
+                })
+                .collect();
+            let mut rinodes: Vec<PseudoInodeState> = rfs
+                .inodes
+                .load()
+                .iter()
+                .map(|(_, v)| PseudoInodeState {
+                    ino: v.ino,
+                    parent: v.parent,
+                    name: v.name.clone(),
+                })
+                .collect();
+
+            inodes.sort_by(|a, b| a.ino.cmp(&b.ino));
+            rinodes.sort_by(|a, b| a.ino.cmp(&b.ino));
+            assert_eq!(inodes, rinodes);
+        }
     }
 }
