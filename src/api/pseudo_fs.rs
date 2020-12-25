@@ -39,6 +39,15 @@ struct PseudoInode {
 }
 
 impl PseudoInode {
+    fn new(ino: u64, parent: u64, name: String) -> Self {
+        PseudoInode {
+            ino,
+            parent,
+            children: ArcSwap::new(Arc::new(Vec::new())),
+            name,
+        }
+    }
+
     // It's protected by Pseudofs.lock.
     fn insert_child(&self, child: Arc<PseudoInode>) {
         let mut children = self.children.load().deref().deref().clone();
@@ -70,12 +79,7 @@ pub struct PseudoFs {
 
 impl PseudoFs {
     pub fn new() -> Self {
-        let root_inode = Arc::new(PseudoInode {
-            ino: ROOT_ID,
-            parent: ROOT_ID,
-            children: ArcSwap::new(Arc::new(Vec::new())),
-            name: String::from("/"),
-        });
+        let root_inode = Arc::new(PseudoInode::new(ROOT_ID, ROOT_ID, String::from("/")));
         let fs = PseudoFs {
             next_inode: AtomicU64::new(PSEUDOFS_NEXT_INODE),
             root_inode: root_inode.clone(),
@@ -109,7 +113,10 @@ impl PseudoFs {
                 Component::RootDir => continue,
                 Component::CurDir => continue,
                 Component::ParentDir => inode = inodes.get(&inode.parent).unwrap(),
-                Component::Prefix(_) => panic!("unsupported path: {}", mountpoint),
+                Component::Prefix(_) => {
+                    error!("unsupported path: {}", mountpoint);
+                    return Err(Error::from_raw_os_error(libc::EINVAL));
+                }
                 Component::Normal(path) => {
                     let name = path.to_str().unwrap();
 
@@ -144,10 +151,7 @@ impl PseudoFs {
     pub fn path_walk(&self, mountpoint: &str) -> Result<u64> {
         let path = Path::new(mountpoint);
         if !path.has_root() {
-            error!(
-                "pseudo fs umount failure: invalid umount path {}",
-                mountpoint
-            );
+            error!("pseudo fs walk failure: invalid path {}", mountpoint);
             return Err(Error::from_raw_os_error(libc::EINVAL));
         }
 
@@ -155,12 +159,15 @@ impl PseudoFs {
         let mut inode = &self.root_inode;
 
         'outer: for component in path.components() {
-            debug!("pseudo fs umount iterate {:?}", component.as_os_str());
+            debug!("pseudo fs iterate {:?}", component.as_os_str());
             match component {
                 Component::RootDir => continue,
                 Component::CurDir => continue,
                 Component::ParentDir => inode = inodes.get(&inode.parent).unwrap(),
-                Component::Prefix(_) => panic!("unsupported path: {}", mountpoint),
+                Component::Prefix(_) => {
+                    error!("unsupported path: {}", mountpoint);
+                    return Err(Error::from_raw_os_error(libc::EINVAL));
+                }
                 Component::Normal(path) => {
                     let name = path.to_str().unwrap();
 
@@ -181,7 +188,7 @@ impl PseudoFs {
                         }
                     }
 
-                    error!("name {} is not found, path is {}", name, mountpoint);
+                    debug!("name {} is not found, path is {}", name, mountpoint);
                     return Err(Error::from_raw_os_error(libc::ENOENT));
                 }
             }
@@ -196,12 +203,7 @@ impl PseudoFs {
     fn new_inode(&self, parent: u64, name: &str) -> Arc<PseudoInode> {
         let ino = self.next_inode.fetch_add(1, Ordering::Relaxed);
 
-        Arc::new(PseudoInode {
-            ino,
-            parent,
-            name: String::from(name),
-            children: ArcSwap::new(Arc::new(Vec::new())),
-        })
+        Arc::new(PseudoInode::new(ino, parent, name.to_owned()))
     }
 
     // Caller must hold PseudoFs.lock.
@@ -538,3 +540,4 @@ mod tests {
         fs.access(ctx, a1, 0).unwrap();
     }
 }
+
