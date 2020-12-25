@@ -160,7 +160,6 @@ pub struct Vfs {
     pub(crate) superblocks: ArcSwap<HashMap<VfsIndex, Arc<BackFileSystem>>>,
     pub(crate) unmounted_path: Mutex<HashMap<VfsIndex, String>>,
     pub(crate) opts: ArcSwap<VfsOptions>,
-    pub(crate) orig_opts: VfsOptions,
     pub(crate) initialized: AtomicBool,
     lock: Mutex<()>,
 }
@@ -181,7 +180,6 @@ impl Vfs {
             root: PseudoFs::new(),
             unmounted_path: Mutex::new(HashMap::new()),
             opts: ArcSwap::new(Arc::new(opts)),
-            orig_opts: opts,
             lock: Mutex::new(()),
             initialized: AtomicBool::new(false),
         }
@@ -399,7 +397,11 @@ impl FileSystem for Vfs {
     type Handle = VfsHandle;
 
     fn init(&self, opts: FsOptions) -> Result<FsOptions> {
-        let mut n_opts = self.orig_opts;
+        if self.initialized() {
+            error!("vfs is already initialized");
+            return Err(Error::from_raw_os_error(libc::EINVAL));
+        }
+        let mut n_opts = *self.opts.load().deref().deref();
         if n_opts.no_open {
             n_opts.no_open = !(opts & FsOptions::ZERO_MESSAGE_OPEN).is_empty();
         }
@@ -417,12 +419,15 @@ impl FileSystem for Vfs {
     }
 
     fn destroy(&self) {
-        self.superblocks
-            .load()
-            .iter()
-            .for_each(|(_, f)| f.destroy());
+        if self.initialized() {
+            self.superblocks
+                .load()
+                .iter()
+                .for_each(|(_, f)| f.destroy());
 
-        self.initialized.store(false, Ordering::Release);
+            // Keep initialized true to avoid being attacked by guest
+            // self.initialized.store(false, Ordering::Release);
+        }
     }
 
     fn lookup(&self, ctx: Context, parent: VfsInode, name: &CStr) -> Result<Entry> {
@@ -1076,8 +1081,9 @@ mod tests {
         assert_eq!(opts.no_writeback, false);
 
         vfs.destroy();
-        assert_eq!(vfs.initialized(), false);
+        assert!(vfs.initialized());
 
+        let vfs = Vfs::default();
         vfs.init(
             FsOptions::ASYNC_READ | FsOptions::ZERO_MESSAGE_OPEN | FsOptions::ZERO_MESSAGE_OPENDIR,
         )
