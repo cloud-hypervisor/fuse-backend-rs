@@ -40,7 +40,8 @@ const VFS_INDEX_SHIFT: u8 = 56;
 const VFS_PSEUDO_FS_IDX: VfsIndex = 0;
 
 type VfsHandle = u64;
-type VfsIndex = u8;
+/// Vfs backend file system index
+pub type VfsIndex = u8;
 
 /// Data struct to store inode number for the VFS filesystem.
 #[derive(Clone, Copy, Eq, PartialEq, Hash, Debug)]
@@ -86,8 +87,7 @@ enum Either<A, B> {
 }
 use Either::*;
 
-pub(crate) type BackFileSystem =
-    Box<dyn BackendFileSystem<Inode = u64, Handle = u64> + Sync + Send>;
+type BackFileSystem = Box<dyn BackendFileSystem<Inode = u64, Handle = u64> + Sync + Send>;
 
 /// BackendFileSystem abstracts all backend file systems under vfs
 pub trait BackendFileSystem: FileSystem {
@@ -103,10 +103,11 @@ pub trait BackendFileSystem: FileSystem {
     fn as_any(&self) -> &dyn Any;
 }
 
-pub(crate) struct MountPointData {
-    pub(crate) fs_idx: VfsIndex,
+struct MountPointData {
+    fs_idx: VfsIndex,
     ino: u64,
     root_entry: Entry,
+    path: String,
 }
 
 #[derive(Debug, Copy, Clone)]
@@ -152,15 +153,14 @@ impl Default for VfsOptions {
 
 /// A union fs that combines multiple backend file systems.
 pub struct Vfs {
-    pub(crate) next_super: AtomicU8,
-    pub(crate) root: PseudoFs,
+    next_super: AtomicU8,
+    root: PseudoFs,
     // mountpoints maps from pseudo fs inode to mounted fs mountpoint data
-    pub(crate) mountpoints: ArcSwap<HashMap<u64, Arc<MountPointData>>>,
+    mountpoints: ArcSwap<HashMap<u64, Arc<MountPointData>>>,
     // superblocks keeps track of all mounted file systems
-    pub(crate) superblocks: ArcSwap<HashMap<VfsIndex, Arc<BackFileSystem>>>,
-    pub(crate) unmounted_path: Mutex<HashMap<VfsIndex, String>>,
-    pub(crate) opts: ArcSwap<VfsOptions>,
-    pub(crate) initialized: AtomicBool,
+    superblocks: ArcSwap<HashMap<VfsIndex, Arc<BackFileSystem>>>,
+    opts: ArcSwap<VfsOptions>,
+    initialized: AtomicBool,
     lock: Mutex<()>,
 }
 
@@ -178,7 +178,6 @@ impl Vfs {
             mountpoints: ArcSwap::new(Arc::new(HashMap::new())),
             superblocks: ArcSwap::new(Arc::new(HashMap::new())),
             root: PseudoFs::new(),
-            unmounted_path: Mutex::new(HashMap::new()),
             opts: ArcSwap::new(Arc::new(opts)),
             lock: Mutex::new(()),
             initialized: AtomicBool::new(false),
@@ -222,6 +221,7 @@ impl Vfs {
                 fs_idx,
                 ino: ROOT_ID,
                 root_entry: entry,
+                path: path.to_string(),
             }),
         );
         self.mountpoints.store(Arc::new(mountpoints));
@@ -229,7 +229,7 @@ impl Vfs {
     }
 
     /// Mount a backend file system to path
-    pub fn mount(&self, fs: BackFileSystem, path: &str) -> Result<()> {
+    pub fn mount(&self, fs: BackFileSystem, path: &str) -> Result<VfsIndex> {
         let (entry, ino) = fs.mount()?;
         if ino > VFS_MAX_INO {
             fs.destroy();
@@ -245,8 +245,9 @@ impl Vfs {
         // Serialize mount operations. Do not expect poisoned lock here.
         let _guard = self.lock.lock().unwrap();
         let index = self.allocate_fs_idx()?;
+        self.insert_mount_locked(fs, entry, index, path)?;
 
-        self.insert_mount_locked(fs, entry, index, path)
+        Ok(index)
     }
 
     /// Umount a backend file system at path
@@ -277,11 +278,6 @@ impl Vfs {
         fs.destroy();
         superblocks.remove(&fs_idx);
         self.superblocks.store(Arc::new(superblocks));
-
-        self.unmounted_path
-            .lock()
-            .unwrap()
-            .insert(fs_idx, path.to_string());
 
         Ok(())
     }
