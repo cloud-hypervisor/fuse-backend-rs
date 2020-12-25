@@ -569,6 +569,19 @@ pub mod persist {
         inodes: Vec<PseudoInodeState>,
     }
 
+    impl PseudoFsState {
+        pub(crate) fn new() -> Self {
+            Self {
+                ..Default::default()
+            }
+        }
+
+        pub(crate) fn is_v1(&self) -> bool {
+            // luckily we set next_inode default to non-zero
+            self.next_inode == 0
+        }
+    }
+
     impl Persist<'_> for PseudoFs {
         type State = PseudoFsState;
         type ConstructorArgs = ();
@@ -623,13 +636,8 @@ pub mod persist {
         }
 
         pub(crate) fn restore_from_state(&self, state: &PseudoFsState) -> Result<(), IoError> {
-            // For compatibility, state might be empty if upgrading from an older version
-            if state.next_inode != 0 {
-                self.next_inode.store(state.next_inode, Ordering::Relaxed);
-                self.restore_inodes(&state.inodes)
-            } else {
-                Ok(())
-            }
+            self.next_inode.store(state.next_inode, Ordering::Relaxed);
+            self.restore_inodes(&state.inodes)
         }
 
         fn restore_inodes(&self, inodes: &[PseudoInodeState]) -> Result<(), IoError> {

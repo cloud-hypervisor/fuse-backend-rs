@@ -1391,6 +1391,13 @@ pub mod persist {
         }
 
         fn restore(vfs: Self::ConstructorArgs, state: &Self::State) -> Result<Self, Self::Error> {
+            // state.root is added in v2. So if it is zero, we are upgrading from v1.
+            if state.root.is_v1() {
+                println!("upgrading from v1: {:?}!", state);
+                vfs.restore_from_v1(&state)?;
+                return Ok(vfs);
+            }
+
             let opts = VfsOptions::restore((), &state.opts).unwrap();
             vfs.initialized
                 .store(!opts.in_opts.is_empty(), Ordering::Release);
@@ -1430,6 +1437,22 @@ pub mod persist {
             }
             Ok(())
         }
+
+        // restore vfs from v1 format VfsState
+        fn restore_from_v1(&self, state: &VfsState) -> Result<(), IoError> {
+            let opts = VfsOptions::restore((), &state.opts).unwrap();
+            self.initialized
+                .store(!opts.in_opts.is_empty(), Ordering::Release);
+            self.opts.store(Arc::new(opts));
+
+            self.next_super.store(state.next_super, Ordering::SeqCst);
+
+            for fs in &state.backend_fs {
+                // Create all components in path as directories in the pseudo file system
+                self.root.mount(&fs.path)?;
+            }
+            Ok(())
+        }
     }
 
     impl PartialEq for VfsOptions {
@@ -1462,6 +1485,7 @@ pub mod persist {
                 && self.opts.load().deref().deref() == other.opts.load().deref().deref()
                 && old_root_inodes == new_root_inodes
                 && old_super_indexes == new_super_indexes
+                && self.root.save() == other.root.save()
         }
     }
 
@@ -1560,6 +1584,71 @@ pub mod persist {
             }
 
             assert!(vfs == restored_vfs);
+        }
+
+        // A simulator to save v1 format VfsState
+        fn save_v1_vfsstate(vfs: &Vfs) -> VfsState {
+            let mut backend_fs = Vec::new();
+
+            for (_, mnt) in vfs.mountpoints.load().iter() {
+                backend_fs.push(VfsMountpoints {
+                    index: mnt.fs_idx,
+                    unmounted: false,
+                    path: mnt.path.to_string(),
+                })
+            }
+
+            // store backend fs by 'super_index' order
+            backend_fs.sort_by(|a, b| a.index.cmp(&b.index));
+
+            VfsState {
+                opts: vfs.opts.load().deref().deref().save(),
+                next_super: vfs.next_super.load(Ordering::SeqCst),
+                root: PseudoFsState::new(),
+                backend_fs,
+            }
+        }
+
+        #[test]
+        fn test_vfs_upgrade_v1_to_v2() {
+            let opts = VfsOptions {
+                no_open: false,
+                no_writeback: true,
+                ..Default::default()
+            };
+
+            let vfs = &Vfs::new(opts);
+            assert!(!vfs.initialized.load(Ordering::Acquire));
+
+            let vfs_mount_fs = |path| {
+                let fs_cfg = Config::default();
+                let fs = PassthroughFs::new(fs_cfg.clone()).unwrap();
+                fs.import().unwrap();
+                vfs.mount(Box::new(fs), path).unwrap();
+            };
+
+            vfs_mount_fs("/submnt/mnt_a");
+            vfs_mount_fs("/submnt/mnt_b");
+            vfs_mount_fs("/submnt/mnt_c");
+            let mut mem = vec![0; 4096];
+            let version_map = VfsState::version_map();
+            // save state before umount to get a simulated v1 VfsState
+            save_v1_vfsstate(&vfs)
+                .serialize(&mut mem.as_mut_slice(), &version_map, 1)
+                .unwrap();
+
+            vfs.umount("/submnt/mnt_c").unwrap();
+            vfs.umount("/submnt/mnt_b").unwrap();
+            vfs.umount("/submnt/mnt_a").unwrap();
+
+            let mut restored_vfs = &Vfs::default();
+            let restored_state =
+                VfsState::deserialize(&mut mem.as_slice(), &version_map, 1).unwrap();
+            <&Vfs>::restore(&mut restored_vfs, &restored_state).unwrap();
+            assert!(!restored_vfs.initialized.load(Ordering::Acquire));
+            assert!(vfs == restored_vfs);
+
+            // TODO: test backend fs restore when we support it
         }
     }
 }
