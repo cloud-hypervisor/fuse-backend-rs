@@ -10,7 +10,7 @@ use std::collections::{btree_map, BTreeMap};
 use std::ffi::{CStr, CString};
 use std::fs::File;
 use std::io;
-use std::mem::{self, size_of, MaybeUninit, ManuallyDrop};
+use std::mem::{self, size_of, ManuallyDrop, MaybeUninit};
 use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -1155,7 +1155,7 @@ impl FileSystem for PassthroughFs {
         // It's safe because the `data` variable's lifetime spans the whole function,
         // so data.file won't be closed.
         let f = unsafe { File::from_raw_fd(data.get_handle_raw_fd()) };
-        let mut f =  ManuallyDrop::new(f);
+        let mut f = ManuallyDrop::new(f);
 
         w.write_from(&mut *f, size as usize, offset)
     }
