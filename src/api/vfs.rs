@@ -244,6 +244,9 @@ impl Vfs {
 
         // Serialize mount operations. Do not expect poisoned lock here.
         let _guard = self.lock.lock().unwrap();
+        if self.initialized() {
+            fs.init(self.opts.load().deref().out_opts)?;
+        }
         let index = self.allocate_fs_idx()?;
         self.insert_mount_locked(fs, entry, index, path)?;
 
@@ -407,11 +410,20 @@ impl FileSystem for Vfs {
         }
         n_opts.in_opts = opts;
 
-        let out_opts = n_opts.out_opts;
+        n_opts.out_opts &= opts;
         self.opts.store(Arc::new(n_opts));
-        self.initialized.store(true, Ordering::Release);
 
-        Ok(out_opts)
+        {
+            // Serialize mount operations. Do not expect poisoned lock here.
+            // Ensure that every backend fs only get init()ed once.
+            let _guard = self.lock.lock().unwrap();
+            for (_, fs) in self.superblocks.load().iter() {
+                fs.init(n_opts.out_opts)?;
+            }
+            self.initialized.store(true, Ordering::Release);
+        }
+
+        Ok(n_opts.out_opts)
     }
 
     fn destroy(&self) {
@@ -1080,15 +1092,14 @@ mod tests {
         assert!(vfs.initialized());
 
         let vfs = Vfs::default();
-        vfs.init(
-            FsOptions::ASYNC_READ | FsOptions::ZERO_MESSAGE_OPEN | FsOptions::ZERO_MESSAGE_OPENDIR,
-        )
-        .unwrap();
+        let in_opts =
+            FsOptions::ASYNC_READ | FsOptions::ZERO_MESSAGE_OPEN | FsOptions::ZERO_MESSAGE_OPENDIR;
+        vfs.init(in_opts).unwrap();
         let opts = vfs.opts.load();
         assert_eq!(opts.no_open, true);
         assert_eq!(opts.no_opendir, true);
         assert_eq!(opts.no_writeback, false);
-        assert_eq!(opts.out_opts, out_opts);
+        assert_eq!(opts.out_opts, out_opts & in_opts);
     }
 
     #[test]
