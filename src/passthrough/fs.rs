@@ -408,6 +408,11 @@ pub struct Config {
     ///
     /// The default value for this option is `false`.
     pub no_open: bool,
+
+    /// Control whether no_opendir is allowed.
+    ///
+    /// The default value for this option is `false`.
+    pub no_opendir: bool,
 }
 
 impl Default for Config {
@@ -421,6 +426,7 @@ impl Default for Config {
             xattr: false,
             do_import: true,
             no_open: false,
+            no_opendir: false,
         }
     }
 }
@@ -458,6 +464,9 @@ pub struct PassthroughFs {
     // Whether no_open is enabled.
     no_open: AtomicBool,
 
+    // Whether no_opendir is enabled.
+    no_opendir: AtomicBool,
+
     cfg: Config,
 }
 
@@ -484,6 +493,7 @@ impl PassthroughFs {
 
             writeback: AtomicBool::new(false),
             no_open: AtomicBool::new(false),
+            no_opendir: AtomicBool::new(false),
             cfg,
         })
     }
@@ -513,16 +523,6 @@ impl PassthroughFs {
             InodeAltKey::from_stat(&st),
             InodeData::new(fuse::ROOT_ID, f, 2),
         );
-
-        // false indicates we're under Vfs.
-        if !self.cfg.do_import {
-            if self.cfg.writeback {
-                self.writeback.store(true, Ordering::Relaxed);
-            }
-            if self.cfg.no_open {
-                self.no_open.store(true, Ordering::Relaxed);
-            }
-        }
 
         Ok(())
     }
@@ -643,7 +643,7 @@ impl PassthroughFs {
         }
 
         let mut buf = Vec::<u8>::with_capacity(size as usize);
-        let data = self.handle_map.get(handle, inode)?;
+        let data = self.get_dirdata(handle, inode, libc::O_RDONLY)?;
 
         {
             // Since we are going to work with the kernel offset, we have to acquire the file lock
@@ -803,6 +803,21 @@ impl PassthroughFs {
         }
     }
 
+    fn get_dirdata(
+        &self,
+        handle: Handle,
+        inode: Inode,
+        flags: libc::c_int,
+    ) -> io::Result<Arc<HandleData>> {
+        let no_open = self.no_opendir.load(Ordering::Relaxed);
+        if !no_open {
+            self.handle_map.get(handle, inode)
+        } else {
+            let file = self.open_inode(inode, (flags | libc::O_DIRECTORY) as i32)?;
+            Ok(Arc::new(HandleData::new(inode, file)))
+        }
+    }
+
     fn get_data(
         &self,
         handle: Handle,
@@ -882,13 +897,25 @@ impl FileSystem for PassthroughFs {
         }
 
         let mut opts = FsOptions::DO_READDIRPLUS | FsOptions::READDIRPLUS_AUTO;
-        if self.cfg.writeback && capable.contains(FsOptions::WRITEBACK_CACHE) {
+        // !cfg.do_import means we are under vfs, in which case capable is already
+        // negotiated and must be honored.
+        if (!self.cfg.do_import || self.cfg.writeback)
+            && capable.contains(FsOptions::WRITEBACK_CACHE)
+        {
             opts |= FsOptions::WRITEBACK_CACHE;
             self.writeback.store(true, Ordering::Relaxed);
         }
-        if self.cfg.no_open && capable.contains(FsOptions::ZERO_MESSAGE_OPEN) {
+        if (!self.cfg.do_import || self.cfg.no_open)
+            && capable.contains(FsOptions::ZERO_MESSAGE_OPEN)
+        {
             opts |= FsOptions::ZERO_MESSAGE_OPEN;
             self.no_open.store(true, Ordering::Relaxed);
+        }
+        if (!self.cfg.do_import || self.cfg.no_opendir)
+            && capable.contains(FsOptions::ZERO_MESSAGE_OPENDIR)
+        {
+            opts |= FsOptions::ZERO_MESSAGE_OPENDIR;
+            self.no_opendir.store(true, Ordering::Relaxed);
         }
 
         Ok(opts)
@@ -939,7 +966,12 @@ impl FileSystem for PassthroughFs {
         inode: Inode,
         flags: u32,
     ) -> io::Result<(Option<Handle>, OpenOptions)> {
-        self.do_open(inode, flags | (libc::O_DIRECTORY as u32))
+        if self.no_opendir.load(Ordering::Relaxed) {
+            info!("fuse: opendir is not supported.");
+            Err(io::Error::from_raw_os_error(libc::ENOSYS))
+        } else {
+            self.do_open(inode, flags | (libc::O_DIRECTORY as u32))
+        }
     }
 
     fn releasedir(
@@ -1756,7 +1788,10 @@ pub mod persist {
 
     /// Get software version information.
     pub fn get_versions_passthrough_fs(version_map: &mut VersionMap) {
-        version_map.set_type_version(TypeId::of::<InodeDataState>(), 2);
+        version_map
+            .set_type_version(TypeId::of::<InodeDataState>(), 2)
+            .set_type_version(TypeId::of::<PassthroughFsState>(), 3)
+            .set_type_version(TypeId::of::<ConfigState>(), 3);
     }
 
     /// Struct to save/restore state of [Config](struct.Config.html) objects.
@@ -1770,6 +1805,8 @@ pub mod persist {
         xattr: bool,
         do_import: bool,
         no_open: bool,
+        #[version(start = 2)]
+        no_opendir: bool,
     }
 
     impl Persist<'_> for Config {
@@ -1788,6 +1825,7 @@ pub mod persist {
                 xattr: self.xattr,
                 do_import: self.do_import,
                 no_open: self.no_open,
+                no_opendir: self.no_opendir,
             }
         }
 
@@ -1804,6 +1842,7 @@ pub mod persist {
                 xattr: state.xattr,
                 do_import: state.do_import,
                 no_open: state.no_open,
+                no_opendir: state.no_opendir,
             })
         }
 
@@ -1852,6 +1891,8 @@ pub mod persist {
         cfg: ConfigState,
 
         live_upgrade_state: Option<PassthroughFsLiveUpgradeState>,
+        #[version(start = 2)]
+        no_opendir: bool,
     }
 
     impl Persist<'_> for PassthroughFs {
@@ -1861,12 +1902,14 @@ pub mod persist {
         type Error = IoError;
 
         fn save(&self) -> Self::State {
-            PassthroughFsState {
+            let s = PassthroughFsState {
                 writeback: self.writeback.load(Ordering::Relaxed),
                 no_open: self.no_open.load(Ordering::Relaxed),
+                no_opendir: self.no_opendir.load(Ordering::Relaxed),
                 cfg: self.cfg.save(),
                 live_upgrade_state: None,
-            }
+            };
+            s
         }
 
         fn restore(
@@ -1877,6 +1920,7 @@ pub mod persist {
             let fs = PassthroughFs::new(cfg)?;
 
             fs.no_open.store(state.no_open, Ordering::Relaxed);
+            fs.no_opendir.store(state.no_opendir, Ordering::Relaxed);
             fs.writeback.store(state.writeback, Ordering::Relaxed);
 
             Ok(fs)
@@ -1907,6 +1951,7 @@ pub mod persist {
             PassthroughFsState {
                 writeback: self.writeback.load(Ordering::Relaxed),
                 no_open: self.no_open.load(Ordering::Relaxed),
+                no_opendir: self.no_opendir.load(Ordering::Relaxed),
                 cfg: self.cfg.save(),
                 live_upgrade_state: Some(PassthroughFsLiveUpgradeState {
                     proc: self.proc.save(),
@@ -1966,6 +2011,8 @@ pub mod persist {
         fn eq(&self, other: &PassthroughFs) -> bool {
             // TODO: compare more fields
             self.no_open.load(Ordering::Relaxed) == other.no_open.load(Ordering::Relaxed)
+                && self.no_opendir.load(Ordering::Relaxed)
+                    == other.no_opendir.load(Ordering::Relaxed)
                 && self.writeback.load(Ordering::Relaxed) == other.writeback.load(Ordering::Relaxed)
                 && self.cfg == other.cfg
         }
@@ -2001,8 +2048,9 @@ pub mod persist {
             )
             .unwrap();
 
-            assert_eq!(restored_fs.writeback.load(Ordering::Relaxed), true);
-            assert_eq!(restored_fs.no_open.load(Ordering::Relaxed), true);
+            assert_eq!(restored_fs.writeback.load(Ordering::Relaxed), false);
+            assert_eq!(restored_fs.no_open.load(Ordering::Relaxed), false);
+            assert_eq!(restored_fs.no_opendir.load(Ordering::Relaxed), false);
             println!("fs.proc {:?} {:?}", fs.proc, restored_fs.proc);
             assert!(fs == restored_fs);
         }
