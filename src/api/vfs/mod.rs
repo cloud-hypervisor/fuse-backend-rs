@@ -329,9 +329,9 @@ impl<D: AsyncDrive> Vfs<D> {
         trace!("fs_idx {}", fs_idx);
 
         let mut superblocks = self.superblocks.load().deref().deref().clone();
-        let fs = superblocks.get(&fs_idx).map(Arc::clone).unwrap();
-        fs.destroy();
-        superblocks.remove(&fs_idx);
+        if let Some(fs) = superblocks.remove(&fs_idx) {
+            fs.destroy();
+        }
         self.superblocks.store(Arc::new(superblocks));
 
         Ok(())

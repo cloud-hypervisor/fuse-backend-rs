@@ -227,11 +227,11 @@ impl<'a> Writer<'a> {
         if let Some(data) = &mut self.buf {
             self.buf = Some([&data[..], &mut buf[..cnt]].concat());
             self.account_written(cnt);
+            Ok(cnt)
         } else {
             // write to fd
-            return self.write(&buf[..cnt]);
+            self.write(&buf[..cnt])
         }
-        Ok(cnt)
     }
 
     /// Writes data to the writer from a File at offset `off`.
@@ -257,11 +257,11 @@ impl<'a> Writer<'a> {
         if let Some(data) = &mut self.buf {
             self.buf = Some([&data[..], &mut buf[..count]].concat());
             self.account_written(count);
+            Ok(count)
         } else {
             // write to fd
-            return self.write(&buf[..count]);
+            self.write(&buf[..count])
         }
-        Ok(count)
     }
 
     /// Writes all data to the writer from a file descriptor.

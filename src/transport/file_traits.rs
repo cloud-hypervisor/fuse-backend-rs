@@ -99,8 +99,8 @@ pub trait FileReadWriteVolatile {
             if bytes_written == 0 {
                 return Err(Error::from(ErrorKind::WriteZero));
             }
-            // Will panic if read_volatile read more bytes than we gave it, which would be worthy of
-            // a panic.
+            // Will panic if write_volatile read more bytes than we gave it, which would be worthy
+            // of a panic.
             slice = slice.offset(bytes_written).unwrap();
         }
         Ok(())
@@ -130,6 +130,8 @@ pub trait FileReadWriteVolatile {
             match self.read_at_volatile(slice, offset) {
                 Ok(0) => return Err(Error::from(ErrorKind::UnexpectedEof)),
                 Ok(n) => {
+                    // Will panic if read_at_volatile read more bytes than we gave it, which would
+                    // be worthy of a panic.
                     slice = slice.offset(n).unwrap();
                     offset = offset.checked_add(n as u64).unwrap();
                 }
@@ -164,6 +166,8 @@ pub trait FileReadWriteVolatile {
             match self.write_at_volatile(slice, offset) {
                 Ok(0) => return Err(Error::from(ErrorKind::WriteZero)),
                 Ok(n) => {
+                    // Will panic if write_at_volatile read more bytes than we gave it, which would
+                    // be worthy of a panic.
                     slice = slice.offset(n).unwrap();
                     offset = offset.checked_add(n as u64).unwrap();
                 }
