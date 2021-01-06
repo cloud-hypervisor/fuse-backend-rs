@@ -56,7 +56,7 @@ extern crate vm_memory;
 #[cfg(feature = "virtiofs")]
 extern crate vm_virtio;
 
-use std::ffi::FromBytesWithNulError;
+use std::ffi::{CStr, FromBytesWithNulError};
 use std::io::ErrorKind;
 use std::{error, fmt, io};
 
@@ -126,5 +126,64 @@ pub fn encode_io_error_kind(kind: ErrorKind) -> i32 {
         ErrorKind::AlreadyExists => libc::EEXIST,
         ErrorKind::WouldBlock => libc::EWOULDBLOCK,
         _ => libc::EIO,
+    }
+}
+
+/// trim all trailing nul terminators.
+pub fn bytes_to_cstr(buf: &[u8]) -> Result<&CStr> {
+    // There might be multiple 0s at the end of buf, find & use the first one and trim other zeros.
+    match buf.iter().position(|x| *x == 0) {
+        // Convert to a `CStr` so that we can drop the '\0' byte at the end and make sure
+        // there are no interior '\0' bytes.
+        Some(pos) => CStr::from_bytes_with_nul(&buf[0..=pos]).map_err(Error::InvalidCString),
+        None => {
+            // Invalid input, just call CStr::from_bytes_with_nul() for suitable error code
+            CStr::from_bytes_with_nul(buf).map_err(Error::InvalidCString)
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_bytes_to_cstr() {
+        assert_eq!(
+            bytes_to_cstr(&[0x1u8, 0x2u8, 0x0]).unwrap(),
+            CStr::from_bytes_with_nul(&[0x1u8, 0x2u8, 0x0]).unwrap()
+        );
+        assert_eq!(
+            bytes_to_cstr(&[0x1u8, 0x2u8, 0x0, 0x0]).unwrap(),
+            CStr::from_bytes_with_nul(&[0x1u8, 0x2u8, 0x0]).unwrap()
+        );
+        assert_eq!(
+            bytes_to_cstr(&[0x1u8, 0x2u8, 0x0, 0x1]).unwrap(),
+            CStr::from_bytes_with_nul(&[0x1u8, 0x2u8, 0x0]).unwrap()
+        );
+        assert_eq!(
+            bytes_to_cstr(&[0x1u8, 0x2u8, 0x0, 0x0, 0x1]).unwrap(),
+            CStr::from_bytes_with_nul(&[0x1u8, 0x2u8, 0x0]).unwrap()
+        );
+        assert_eq!(
+            bytes_to_cstr(&[0x1u8, 0x2u8, 0x0, 0x1, 0x0]).unwrap(),
+            CStr::from_bytes_with_nul(&[0x1u8, 0x2u8, 0x0]).unwrap()
+        );
+
+        assert_eq!(
+            bytes_to_cstr(&[0x0u8, 0x2u8, 0x0]).unwrap(),
+            CStr::from_bytes_with_nul(&[0x0u8]).unwrap()
+        );
+        assert_eq!(
+            bytes_to_cstr(&[0x0u8, 0x0]).unwrap(),
+            CStr::from_bytes_with_nul(&[0x0u8]).unwrap()
+        );
+        assert_eq!(
+            bytes_to_cstr(&[0x0u8]).unwrap(),
+            CStr::from_bytes_with_nul(&[0x0u8]).unwrap()
+        );
+
+        bytes_to_cstr(&[0x1u8]).unwrap_err();
+        bytes_to_cstr(&[0x1u8, 0x1]).unwrap_err();
     }
 }
