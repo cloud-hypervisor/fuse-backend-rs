@@ -1,107 +1,27 @@
+// Copyright (C) 2021 Alibaba Cloud. All rights reserved.
 // Copyright 2019 The Chromium OS Authors. All rights reserved.
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE-BSD-3-Clause file.
 
-//! Fuse API Server to interconnect transport layers with filesystem drivers.
-//!
-//! The Fuse API server is a adapter layer between transport layers and file system drivers.
-//! The main functionalities of the Fuse API server is:
-//! * Support different types of transport layers, fusedev, virtio-fs or vhost-user-fs.
-//! * Hide different transport layers details from file system drivers.
-//! * Parse transport messages according to the Fuse ABI to avoid duplicated message decoding
-//!   in every file system driver.
-//! * Invoke file system driver handler to serve each request and send the reply.
-//!
-//! The Fuse API server is performance critical, so it's designed to support multi-threading by
-//! adopting interior-mutability. And the arcswap crate is used to implement interior-mutability.
-
-use std::ffi::CStr;
-use std::io::{self, IoSlice, Read, Write};
+use std::io::{self, IoSlice, Write};
 use std::mem::size_of;
 use std::sync::Arc;
+use std::time::Duration;
 
-use arc_swap::ArcSwap;
 use vm_memory::ByteValued;
 
-use super::filesystem::{
-    Context, DirEntry, Entry, FileSystem, GetxattrReply, ListxattrReply, ZeroCopyReader,
-    ZeroCopyWriter,
+use super::{
+    Server, ServerUtil, ServerVersion, ZCReader, ZCWriter, DIRENT_PADDING, MAX_BUFFER_SIZE,
+    MAX_REQ_PAGES,
 };
 use crate::abi::linux_abi::*;
 #[cfg(feature = "virtiofs")]
 use crate::abi::virtio_fs::{RemovemappingIn, RemovemappingOne, SetupmappingIn};
-use crate::transport::{FileReadWriteVolatile, FsCacheReqHandler, Reader, Writer};
-use crate::{encode_io_error_kind, Error, Result};
-
-const MAX_BUFFER_SIZE: u32 = 1 << 20;
-const MAX_REQ_PAGES: u16 = 256; // 1MB
-const DIRENT_PADDING: [u8; 8] = [0; 8];
-
-struct ZCReader<'a>(Reader<'a>);
-
-impl<'a> ZeroCopyReader for ZCReader<'a> {
-    fn read_to(
-        &mut self,
-        f: &mut dyn FileReadWriteVolatile,
-        count: usize,
-        off: u64,
-    ) -> io::Result<usize> {
-        self.0.read_to_at(f, count, off)
-    }
-}
-
-impl<'a> io::Read for ZCReader<'a> {
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        self.0.read(buf)
-    }
-}
-
-struct ZCWriter<'a>(Writer<'a>);
-
-impl<'a> ZeroCopyWriter for ZCWriter<'a> {
-    fn write_from(
-        &mut self,
-        f: &mut dyn FileReadWriteVolatile,
-        count: usize,
-        off: u64,
-    ) -> io::Result<usize> {
-        self.0.write_from_at(f, count, off)
-    }
-}
-
-impl<'a> io::Write for ZCWriter<'a> {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        self.0.write(buf)
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        self.0.flush()
-    }
-}
-
-struct ServerVersion {
-    _major: u32,
-    minor: u32,
-}
-
-/// Fuse Server to handle requests from the Fuse client and vhost user master.
-pub struct Server<F: FileSystem + Sync> {
-    fs: F,
-    vers: ArcSwap<ServerVersion>,
-}
+use crate::api::filesystem::{Context, DirEntry, Entry, FileSystem, GetxattrReply, ListxattrReply};
+use crate::transport::{FsCacheReqHandler, Reader, Writer};
+use crate::{bytes_to_cstr, encode_io_error_kind, Error, Result};
 
 impl<F: FileSystem + Sync> Server<F> {
-    /// Create a Server instance from a filesystem driver object.
-    pub fn new(fs: F) -> Server<F> {
-        Server {
-            fs,
-            vers: ArcSwap::new(Arc::new(ServerVersion {
-                _major: KERNEL_VERSION,
-                minor: KERNEL_MINOR_VERSION,
-            })),
-        }
-    }
-
     /// Main entrance to handle requests from the transport layer.
     ///
     /// It receives Fuse requests from transport layers, parses the request according to Fuse ABI,
@@ -188,16 +108,17 @@ impl<F: FileSystem + Sync> Server<F> {
     }
 
     fn lookup(&self, in_header: &InHeader, mut r: Reader, w: Writer) -> Result<usize> {
-        let buf = get_message_body(&mut r, in_header, 0)?;
+        let buf = ServerUtil::get_message_body(&mut r, in_header, 0)?;
         let name = bytes_to_cstr(buf.as_ref())?;
-
-        match self
+        let version = self.vers.load();
+        let result = self
             .fs
-            .lookup(Context::from(in_header), in_header.nodeid.into(), &name)
-        {
+            .lookup(Context::from(in_header), in_header.nodeid.into(), &name);
+
+        match result {
             // before ABI 7.4 inode == 0 was invalid, only ENOENT means negative dentry
             Ok(entry)
-                if self.vers.load().minor < KERNEL_MINOR_VERSION_LOOKUP_NEGATIVE_ENTRY_ZERO
+                if version.minor < KERNEL_MINOR_VERSION_LOOKUP_NEGATIVE_ENTRY_ZERO
                     && entry.inode == 0 =>
             {
                 reply_error(
@@ -227,61 +148,36 @@ impl<F: FileSystem + Sync> Server<F> {
 
     fn getattr(&self, in_header: &InHeader, mut r: Reader, w: Writer) -> Result<usize> {
         let GetattrIn { flags, fh, .. } = r.read_obj().map_err(Error::DecodeMessage)?;
-
         let handle = if (flags & GETATTR_FH) != 0 {
             Some(fh.into())
         } else {
             None
         };
-
-        match self
+        let result = self
             .fs
-            .getattr(Context::from(in_header), in_header.nodeid.into(), handle)
-        {
-            Ok((st, timeout)) => {
-                let out = AttrOut {
-                    attr_valid: timeout.as_secs(),
-                    attr_valid_nsec: timeout.subsec_nanos(),
-                    dummy: 0,
-                    attr: st.into(),
-                };
-                reply_ok(Some(out), None, in_header.unique, w)
-            }
-            Err(e) => reply_error(e, in_header.unique, w),
-        }
+            .getattr(Context::from(in_header), in_header.nodeid.into(), handle);
+
+        handle_attr_result(in_header, w, result)
     }
 
     fn setattr(&self, in_header: &InHeader, mut r: Reader, w: Writer) -> Result<usize> {
         let setattr_in: SetattrIn = r.read_obj().map_err(Error::DecodeMessage)?;
-
         let handle = if setattr_in.valid & FATTR_FH != 0 {
             Some(setattr_in.fh.into())
         } else {
             None
         };
-
         let valid = SetattrValid::from_bits_truncate(setattr_in.valid);
-
         let st: libc::stat64 = setattr_in.into();
-
-        match self.fs.setattr(
+        let result = self.fs.setattr(
             Context::from(in_header),
             in_header.nodeid.into(),
             st,
             handle,
             valid,
-        ) {
-            Ok((st, timeout)) => {
-                let out = AttrOut {
-                    attr_valid: timeout.as_secs(),
-                    attr_valid_nsec: timeout.subsec_nanos(),
-                    dummy: 0,
-                    attr: st.into(),
-                };
-                reply_ok(Some(out), None, in_header.unique, w)
-            }
-            Err(e) => reply_error(e, in_header.unique, w),
-        }
+        );
+
+        handle_attr_result(in_header, w, result)
     }
 
     fn readlink(&self, in_header: &InHeader, w: Writer) -> Result<usize> {
@@ -298,9 +194,9 @@ impl<F: FileSystem + Sync> Server<F> {
     }
 
     fn symlink(&self, in_header: &InHeader, mut r: Reader, w: Writer) -> Result<usize> {
-        let buf = get_message_body(&mut r, in_header, 0)?;
+        let buf = ServerUtil::get_message_body(&mut r, in_header, 0)?;
         // The name and linkname are encoded one after another and separated by a nul character.
-        let (name, linkname) = extract_two_cstrs(&buf)?;
+        let (name, linkname) = ServerUtil::extract_two_cstrs(&buf)?;
 
         match self.fs.symlink(
             Context::from(in_header),
@@ -317,7 +213,7 @@ impl<F: FileSystem + Sync> Server<F> {
         let MknodIn {
             mode, rdev, umask, ..
         } = r.read_obj().map_err(Error::DecodeMessage)?;
-        let buf = get_message_body(&mut r, in_header, size_of::<MknodIn>())?;
+        let buf = ServerUtil::get_message_body(&mut r, in_header, size_of::<MknodIn>())?;
         let name = bytes_to_cstr(buf.as_ref())?;
 
         match self.fs.mknod(
@@ -335,7 +231,7 @@ impl<F: FileSystem + Sync> Server<F> {
 
     fn mkdir(&self, in_header: &InHeader, mut r: Reader, w: Writer) -> Result<usize> {
         let MkdirIn { mode, umask } = r.read_obj().map_err(Error::DecodeMessage)?;
-        let buf = get_message_body(&mut r, in_header, size_of::<MkdirIn>())?;
+        let buf = ServerUtil::get_message_body(&mut r, in_header, size_of::<MkdirIn>())?;
         let name = bytes_to_cstr(buf.as_ref())?;
 
         match self.fs.mkdir(
@@ -351,7 +247,7 @@ impl<F: FileSystem + Sync> Server<F> {
     }
 
     fn unlink(&self, in_header: &InHeader, mut r: Reader, w: Writer) -> Result<usize> {
-        let buf = get_message_body(&mut r, in_header, 0)?;
+        let buf = ServerUtil::get_message_body(&mut r, in_header, 0)?;
         let name = bytes_to_cstr(buf.as_ref())?;
 
         match self
@@ -364,7 +260,7 @@ impl<F: FileSystem + Sync> Server<F> {
     }
 
     fn rmdir(&self, in_header: &InHeader, mut r: Reader, w: Writer) -> Result<usize> {
-        let buf = get_message_body(&mut r, in_header, 0)?;
+        let buf = ServerUtil::get_message_body(&mut r, in_header, 0)?;
         let name = bytes_to_cstr(buf.as_ref())?;
 
         match self
@@ -385,8 +281,8 @@ impl<F: FileSystem + Sync> Server<F> {
         mut r: Reader,
         w: Writer,
     ) -> Result<usize> {
-        let buf = get_message_body(&mut r, in_header, msg_size)?;
-        let (oldname, newname) = extract_two_cstrs(&buf)?;
+        let buf = ServerUtil::get_message_body(&mut r, in_header, msg_size)?;
+        let (oldname, newname) = ServerUtil::extract_two_cstrs(&buf)?;
 
         match self.fs.rename(
             Context::from(in_header),
@@ -417,7 +313,7 @@ impl<F: FileSystem + Sync> Server<F> {
 
     fn link(&self, in_header: &InHeader, mut r: Reader, w: Writer) -> Result<usize> {
         let LinkIn { oldnodeid } = r.read_obj().map_err(Error::DecodeMessage)?;
-        let buf = get_message_body(&mut r, in_header, size_of::<LinkIn>())?;
+        let buf = ServerUtil::get_message_body(&mut r, in_header, size_of::<LinkIn>())?;
         let name = bytes_to_cstr(buf.as_ref())?;
 
         match self.fs.link(
@@ -619,7 +515,7 @@ impl<F: FileSystem + Sync> Server<F> {
 
     fn setxattr(&self, in_header: &InHeader, mut r: Reader, w: Writer) -> Result<usize> {
         let SetxattrIn { size, flags } = r.read_obj().map_err(Error::DecodeMessage)?;
-        let buf = get_message_body(&mut r, in_header, size_of::<SetxattrIn>())?;
+        let buf = ServerUtil::get_message_body(&mut r, in_header, size_of::<SetxattrIn>())?;
 
         // The name and value and encoded one after another and separated by a '\0' character.
         let split_pos = buf
@@ -656,7 +552,7 @@ impl<F: FileSystem + Sync> Server<F> {
             );
         }
 
-        let buf = get_message_body(&mut r, in_header, size_of::<GetxattrIn>())?;
+        let buf = ServerUtil::get_message_body(&mut r, in_header, size_of::<GetxattrIn>())?;
         let name = bytes_to_cstr(buf.as_ref())?;
 
         match self.fs.getxattr(
@@ -708,7 +604,7 @@ impl<F: FileSystem + Sync> Server<F> {
     }
 
     fn removexattr(&self, in_header: &InHeader, mut r: Reader, w: Writer) -> Result<usize> {
-        let buf = get_message_body(&mut r, in_header, 0)?;
+        let buf = ServerUtil::get_message_body(&mut r, in_header, 0)?;
         let name = bytes_to_cstr(&buf)?;
 
         match self
@@ -997,7 +893,7 @@ impl<F: FileSystem + Sync> Server<F> {
         let CreateIn {
             flags, mode, umask, ..
         } = r.read_obj().map_err(Error::DecodeMessage)?;
-        let buf = get_message_body(&mut r, in_header, size_of::<CreateIn>())?;
+        let buf = ServerUtil::get_message_body(&mut r, in_header, size_of::<CreateIn>())?;
         let name = bytes_to_cstr(&buf)?;
 
         match self.fs.create(
@@ -1330,46 +1226,22 @@ fn reply_error(err: io::Error, unique: u64, w: Writer) -> Result<usize> {
     do_reply_error(err, unique, w, false)
 }
 
-fn get_message_body(r: &mut Reader, in_header: &InHeader, sub_hdr_sz: usize) -> Result<Vec<u8>> {
-    let len = (in_header.len as usize)
-        .checked_sub(size_of::<InHeader>())
-        .and_then(|l| l.checked_sub(sub_hdr_sz))
-        .ok_or(Error::InvalidHeaderLength)?;
-
-    // Allocate buffer without zeroing out the content for performance.
-    let mut buf = Vec::<u8>::with_capacity(len);
-    // It's safe because read_exact() is called to fill all the allocated buffer.
-    unsafe { buf.set_len(len) };
-    r.read_exact(&mut buf).map_err(Error::DecodeMessage)?;
-
-    Ok(buf)
-}
-
-fn extract_two_cstrs(buf: &[u8]) -> Result<(&CStr, &CStr)> {
-    if let Some(mut pos) = buf.iter().position(|x| *x == 0) {
-        let first = CStr::from_bytes_with_nul(&buf[0..=pos]).map_err(Error::InvalidCString)?;
-        pos += 1;
-        if pos < buf.len() {
-            return Ok((first, bytes_to_cstr(&buf[pos..])?));
+fn handle_attr_result(
+    in_header: &InHeader,
+    w: Writer,
+    result: io::Result<(libc::stat64, Duration)>,
+) -> Result<usize> {
+    match result {
+        Ok((st, timeout)) => {
+            let out = AttrOut {
+                attr_valid: timeout.as_secs(),
+                attr_valid_nsec: timeout.subsec_nanos(),
+                dummy: 0,
+                attr: st.into(),
+            };
+            reply_ok(Some(out), None, in_header.unique, w)
         }
-    }
-
-    Err(Error::DecodeMessage(std::io::Error::from_raw_os_error(
-        libc::EINVAL,
-    )))
-}
-
-/// trim all trailing nul terminators.
-pub fn bytes_to_cstr(buf: &[u8]) -> Result<&CStr> {
-    // There might be multiple 0s at the end of buf, find & use the first one and trim other zeros.
-    match buf.iter().position(|x| *x == 0) {
-        // Convert to a `CStr` so that we can drop the '\0' byte at the end and make sure
-        // there are no interior '\0' bytes.
-        Some(pos) => CStr::from_bytes_with_nul(&buf[0..=pos]).map_err(Error::InvalidCString),
-        None => {
-            // Invalid input, just call CStr::from_bytes_with_nul() for suitable error code
-            CStr::from_bytes_with_nul(buf).map_err(Error::InvalidCString)
-        }
+        Err(e) => reply_error(e, in_header.unique, w),
     }
 }
 
@@ -1428,86 +1300,5 @@ fn add_dirent(
         }
 
         Ok(total_len)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_bytes_to_cstr() {
-        assert_eq!(
-            bytes_to_cstr(&[0x1u8, 0x2u8, 0x0]).unwrap(),
-            CStr::from_bytes_with_nul(&[0x1u8, 0x2u8, 0x0]).unwrap()
-        );
-        assert_eq!(
-            bytes_to_cstr(&[0x1u8, 0x2u8, 0x0, 0x0]).unwrap(),
-            CStr::from_bytes_with_nul(&[0x1u8, 0x2u8, 0x0]).unwrap()
-        );
-        assert_eq!(
-            bytes_to_cstr(&[0x1u8, 0x2u8, 0x0, 0x1]).unwrap(),
-            CStr::from_bytes_with_nul(&[0x1u8, 0x2u8, 0x0]).unwrap()
-        );
-        assert_eq!(
-            bytes_to_cstr(&[0x1u8, 0x2u8, 0x0, 0x0, 0x1]).unwrap(),
-            CStr::from_bytes_with_nul(&[0x1u8, 0x2u8, 0x0]).unwrap()
-        );
-        assert_eq!(
-            bytes_to_cstr(&[0x1u8, 0x2u8, 0x0, 0x1, 0x0]).unwrap(),
-            CStr::from_bytes_with_nul(&[0x1u8, 0x2u8, 0x0]).unwrap()
-        );
-
-        assert_eq!(
-            bytes_to_cstr(&[0x0u8, 0x2u8, 0x0]).unwrap(),
-            CStr::from_bytes_with_nul(&[0x0u8]).unwrap()
-        );
-        assert_eq!(
-            bytes_to_cstr(&[0x0u8, 0x0]).unwrap(),
-            CStr::from_bytes_with_nul(&[0x0u8]).unwrap()
-        );
-        assert_eq!(
-            bytes_to_cstr(&[0x0u8]).unwrap(),
-            CStr::from_bytes_with_nul(&[0x0u8]).unwrap()
-        );
-
-        bytes_to_cstr(&[0x1u8]).unwrap_err();
-        bytes_to_cstr(&[0x1u8, 0x1]).unwrap_err();
-    }
-
-    #[test]
-    fn test_extract_cstrs() {
-        assert_eq!(
-            extract_two_cstrs(&[0x1u8, 0x2u8, 0x0, 0x3, 0x0]).unwrap(),
-            (
-                CStr::from_bytes_with_nul(&[0x1u8, 0x2u8, 0x0]).unwrap(),
-                CStr::from_bytes_with_nul(&[0x3u8, 0x0]).unwrap(),
-            )
-        );
-        assert_eq!(
-            extract_two_cstrs(&[0x1u8, 0x2u8, 0x0, 0x3, 0x0, 0x0]).unwrap(),
-            (
-                CStr::from_bytes_with_nul(&[0x1u8, 0x2u8, 0x0]).unwrap(),
-                CStr::from_bytes_with_nul(&[0x3u8, 0x0]).unwrap(),
-            )
-        );
-        assert_eq!(
-            extract_two_cstrs(&[0x1u8, 0x2u8, 0x0, 0x3, 0x0, 0x4]).unwrap(),
-            (
-                CStr::from_bytes_with_nul(&[0x1u8, 0x2u8, 0x0]).unwrap(),
-                CStr::from_bytes_with_nul(&[0x3u8, 0x0]).unwrap(),
-            )
-        );
-        assert_eq!(
-            extract_two_cstrs(&[0x1u8, 0x2u8, 0x0, 0x0, 0x4]).unwrap(),
-            (
-                CStr::from_bytes_with_nul(&[0x1u8, 0x2u8, 0x0]).unwrap(),
-                CStr::from_bytes_with_nul(&[0x0]).unwrap(),
-            )
-        );
-
-        extract_two_cstrs(&[0x1u8, 0x2u8, 0x0, 0x3]).unwrap_err();
-        extract_two_cstrs(&[0x1u8, 0x2u8, 0x0]).unwrap_err();
-        extract_two_cstrs(&[0x1u8, 0x2u8]).unwrap_err();
     }
 }
