@@ -1272,6 +1272,7 @@ mod tests {
 pub mod persist {
     #![allow(missing_docs)]
 
+    use std::any::TypeId;
     use std::io::Error as IoError;
     use std::ops::Deref;
     use std::sync::atomic::Ordering;
@@ -1293,6 +1294,18 @@ pub mod persist {
         fn version_map() -> VersionMap {
             VersionMap::new()
         }
+    }
+
+    pub fn get_versions_vfs(sem_ver: &str) -> Vec<(TypeId, u16)> {
+        let mut versions = Vec::new();
+        match sem_ver {
+            "0.0.2" => {
+                versions.push((TypeId::of::<VfsState>(), 2));
+                versions.push((TypeId::of::<VfsMountpoints>(), 2));
+            }
+            _ => {}
+        }
+        versions
     }
 
     #[derive(Versionize, PartialEq, Debug, Default)]

@@ -1787,11 +1787,17 @@ pub mod persist {
     use super::*;
 
     /// Get software version information.
-    pub fn get_versions_passthrough_fs(version_map: &mut VersionMap) {
-        version_map
-            .set_type_version(TypeId::of::<InodeDataState>(), 2)
-            .set_type_version(TypeId::of::<PassthroughFsState>(), 3)
-            .set_type_version(TypeId::of::<ConfigState>(), 3);
+    pub fn get_versions_passthrough_fs(sem_ver: &str) -> Vec<(TypeId, u16)> {
+        let mut versions = Vec::new();
+        match sem_ver {
+            "0.0.1" => versions.push((TypeId::of::<InodeDataState>(), 2)),
+            "0.0.2" => {
+                versions.push((TypeId::of::<PassthroughFsState>(), 2));
+                versions.push((TypeId::of::<ConfigState>(), 2));
+            }
+            _ => {}
+        }
+        versions
     }
 
     /// Struct to save/restore state of [Config](struct.Config.html) objects.

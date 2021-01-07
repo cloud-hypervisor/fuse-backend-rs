@@ -110,6 +110,7 @@ pub mod abi;
 pub mod api;
 pub mod passthrough;
 pub mod transport;
+pub mod version_manager;
 
 /// Convert io::ErrorKind to OS error code.
 /// Reference to libstd/sys/unix/mod.rs => decode_error_kind.
