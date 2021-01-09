@@ -87,7 +87,19 @@ fn set_creds(
     ScopedGid::new(gid).and_then(|gid| Ok((ScopedUid::new(uid)?, gid)))
 }
 
-impl PassthroughFs {
+#[cfg(not(feature = "async-io"))]
+impl<D: 'static> BackendFileSystem for PassthroughFs<D> {
+    fn mount(&self) -> io::Result<(Entry, u64)> {
+        let entry = self.do_lookup(fuse::ROOT_ID, &CString::new(".").unwrap())?;
+        Ok((entry, VFS_MAX_INO))
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+}
+
+impl<D> PassthroughFs<D> {
     fn open_proc_file(&self, pathname: &CStr, flags: i32) -> io::Result<File> {
         Self::open_file(self.proc.as_raw_fd(), pathname, flags, 0)
     }
@@ -322,7 +334,7 @@ impl PassthroughFs {
     }
 }
 
-impl FileSystem for PassthroughFs {
+impl<D> FileSystem for PassthroughFs<D> {
     type Inode = Inode;
     type Handle = Handle;
 

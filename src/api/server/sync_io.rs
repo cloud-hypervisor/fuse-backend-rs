@@ -153,7 +153,7 @@ impl<F: FileSystem + Sync> Server<F> {
         }
     }
 
-    fn forget(&self, in_header: &InHeader, mut r: Reader) -> Result<usize> {
+    pub(super) fn forget(&self, in_header: &InHeader, mut r: Reader) -> Result<usize> {
         let ForgetIn { nlookup } = r.read_obj().map_err(Error::DecodeMessage)?;
 
         self.fs
@@ -197,7 +197,7 @@ impl<F: FileSystem + Sync> Server<F> {
         handle_attr_result(in_header, w, result)
     }
 
-    fn readlink(&self, in_header: &InHeader, w: Writer) -> Result<usize> {
+    pub(super) fn readlink(&self, in_header: &InHeader, w: Writer) -> Result<usize> {
         match self
             .fs
             .readlink(Context::from(in_header), in_header.nodeid.into())
@@ -210,7 +210,7 @@ impl<F: FileSystem + Sync> Server<F> {
         }
     }
 
-    fn symlink(&self, in_header: &InHeader, mut r: Reader, w: Writer) -> Result<usize> {
+    pub(super) fn symlink(&self, in_header: &InHeader, mut r: Reader, w: Writer) -> Result<usize> {
         let buf = ServerUtil::get_message_body(&mut r, in_header, 0)?;
         // The name and linkname are encoded one after another and separated by a nul character.
         let (name, linkname) = ServerUtil::extract_two_cstrs(&buf)?;
@@ -226,7 +226,7 @@ impl<F: FileSystem + Sync> Server<F> {
         }
     }
 
-    fn mknod(&self, in_header: &InHeader, mut r: Reader, w: Writer) -> Result<usize> {
+    pub(super) fn mknod(&self, in_header: &InHeader, mut r: Reader, w: Writer) -> Result<usize> {
         let MknodIn {
             mode, rdev, umask, ..
         } = r.read_obj().map_err(Error::DecodeMessage)?;
@@ -246,7 +246,7 @@ impl<F: FileSystem + Sync> Server<F> {
         }
     }
 
-    fn mkdir(&self, in_header: &InHeader, mut r: Reader, w: Writer) -> Result<usize> {
+    pub(super) fn mkdir(&self, in_header: &InHeader, mut r: Reader, w: Writer) -> Result<usize> {
         let MkdirIn { mode, umask } = r.read_obj().map_err(Error::DecodeMessage)?;
         let buf = ServerUtil::get_message_body(&mut r, in_header, size_of::<MkdirIn>())?;
         let name = bytes_to_cstr(buf.as_ref())?;
@@ -263,7 +263,7 @@ impl<F: FileSystem + Sync> Server<F> {
         }
     }
 
-    fn unlink(&self, in_header: &InHeader, mut r: Reader, w: Writer) -> Result<usize> {
+    pub(super) fn unlink(&self, in_header: &InHeader, mut r: Reader, w: Writer) -> Result<usize> {
         let buf = ServerUtil::get_message_body(&mut r, in_header, 0)?;
         let name = bytes_to_cstr(buf.as_ref())?;
 
@@ -276,7 +276,7 @@ impl<F: FileSystem + Sync> Server<F> {
         }
     }
 
-    fn rmdir(&self, in_header: &InHeader, mut r: Reader, w: Writer) -> Result<usize> {
+    pub(super) fn rmdir(&self, in_header: &InHeader, mut r: Reader, w: Writer) -> Result<usize> {
         let buf = ServerUtil::get_message_body(&mut r, in_header, 0)?;
         let name = bytes_to_cstr(buf.as_ref())?;
 
@@ -289,7 +289,7 @@ impl<F: FileSystem + Sync> Server<F> {
         }
     }
 
-    fn do_rename(
+    pub(super) fn do_rename(
         &self,
         in_header: &InHeader,
         msg_size: usize,
@@ -314,13 +314,13 @@ impl<F: FileSystem + Sync> Server<F> {
         }
     }
 
-    fn rename(&self, in_header: &InHeader, mut r: Reader, w: Writer) -> Result<usize> {
+    pub(super) fn rename(&self, in_header: &InHeader, mut r: Reader, w: Writer) -> Result<usize> {
         let RenameIn { newdir } = r.read_obj().map_err(Error::DecodeMessage)?;
 
         self.do_rename(in_header, size_of::<RenameIn>(), newdir, 0, r, w)
     }
 
-    fn rename2(&self, in_header: &InHeader, mut r: Reader, w: Writer) -> Result<usize> {
+    pub(super) fn rename2(&self, in_header: &InHeader, mut r: Reader, w: Writer) -> Result<usize> {
         let Rename2In { newdir, flags, .. } = r.read_obj().map_err(Error::DecodeMessage)?;
 
         let flags = flags & (libc::RENAME_EXCHANGE | libc::RENAME_NOREPLACE) as u32;
@@ -328,7 +328,7 @@ impl<F: FileSystem + Sync> Server<F> {
         self.do_rename(in_header, size_of::<Rename2In>(), newdir, flags, r, w)
     }
 
-    fn link(&self, in_header: &InHeader, mut r: Reader, w: Writer) -> Result<usize> {
+    pub(super) fn link(&self, in_header: &InHeader, mut r: Reader, w: Writer) -> Result<usize> {
         let LinkIn { oldnodeid } = r.read_obj().map_err(Error::DecodeMessage)?;
         let buf = ServerUtil::get_message_body(&mut r, in_header, size_of::<LinkIn>())?;
         let name = bytes_to_cstr(buf.as_ref())?;
@@ -471,7 +471,7 @@ impl<F: FileSystem + Sync> Server<F> {
         }
     }
 
-    fn statfs(&self, in_header: &InHeader, w: Writer) -> Result<usize> {
+    pub(super) fn statfs(&self, in_header: &InHeader, w: Writer) -> Result<usize> {
         match self
             .fs
             .statfs(Context::from(in_header), in_header.nodeid.into())
@@ -481,7 +481,7 @@ impl<F: FileSystem + Sync> Server<F> {
         }
     }
 
-    fn release(&self, in_header: &InHeader, mut r: Reader, w: Writer) -> Result<usize> {
+    pub(super) fn release(&self, in_header: &InHeader, mut r: Reader, w: Writer) -> Result<usize> {
         let ReleaseIn {
             fh,
             flags,
@@ -528,7 +528,7 @@ impl<F: FileSystem + Sync> Server<F> {
         }
     }
 
-    fn setxattr(&self, in_header: &InHeader, mut r: Reader, w: Writer) -> Result<usize> {
+    pub(super) fn setxattr(&self, in_header: &InHeader, mut r: Reader, w: Writer) -> Result<usize> {
         let SetxattrIn { size, flags } = r.read_obj().map_err(Error::DecodeMessage)?;
         let buf = ServerUtil::get_message_body(&mut r, in_header, size_of::<SetxattrIn>())?;
 
@@ -556,7 +556,7 @@ impl<F: FileSystem + Sync> Server<F> {
         }
     }
 
-    fn getxattr(&self, in_header: &InHeader, mut r: Reader, w: Writer) -> Result<usize> {
+    pub(super) fn getxattr(&self, in_header: &InHeader, mut r: Reader, w: Writer) -> Result<usize> {
         let GetxattrIn { size, .. } = r.read_obj().map_err(Error::DecodeMessage)?;
         if size > MAX_BUFFER_SIZE {
             return reply_error_explicit(
@@ -588,7 +588,12 @@ impl<F: FileSystem + Sync> Server<F> {
         }
     }
 
-    fn listxattr(&self, in_header: &InHeader, mut r: Reader, w: Writer) -> Result<usize> {
+    pub(super) fn listxattr(
+        &self,
+        in_header: &InHeader,
+        mut r: Reader,
+        w: Writer,
+    ) -> Result<usize> {
         let GetxattrIn { size, .. } = r.read_obj().map_err(Error::DecodeMessage)?;
 
         if size > MAX_BUFFER_SIZE {
@@ -616,7 +621,12 @@ impl<F: FileSystem + Sync> Server<F> {
         }
     }
 
-    fn removexattr(&self, in_header: &InHeader, mut r: Reader, w: Writer) -> Result<usize> {
+    pub(super) fn removexattr(
+        &self,
+        in_header: &InHeader,
+        mut r: Reader,
+        w: Writer,
+    ) -> Result<usize> {
         let buf = ServerUtil::get_message_body(&mut r, in_header, 0)?;
         let name = bytes_to_cstr(&buf)?;
 
@@ -629,7 +639,7 @@ impl<F: FileSystem + Sync> Server<F> {
         }
     }
 
-    fn flush(&self, in_header: &InHeader, mut r: Reader, w: Writer) -> Result<usize> {
+    pub(super) fn flush(&self, in_header: &InHeader, mut r: Reader, w: Writer) -> Result<usize> {
         let FlushIn { fh, lock_owner, .. } = r.read_obj().map_err(Error::DecodeMessage)?;
 
         match self.fs.flush(
@@ -643,7 +653,7 @@ impl<F: FileSystem + Sync> Server<F> {
         }
     }
 
-    fn init(&self, in_header: &InHeader, mut r: Reader, w: Writer) -> Result<usize> {
+    pub(super) fn init(&self, in_header: &InHeader, mut r: Reader, w: Writer) -> Result<usize> {
         let InitIn {
             major,
             minor,
@@ -736,7 +746,7 @@ impl<F: FileSystem + Sync> Server<F> {
         }
     }
 
-    fn opendir(&self, in_header: &InHeader, mut r: Reader, w: Writer) -> Result<usize> {
+    pub(super) fn opendir(&self, in_header: &InHeader, mut r: Reader, w: Writer) -> Result<usize> {
         let OpenIn { flags, .. } = r.read_obj().map_err(Error::DecodeMessage)?;
 
         match self
@@ -824,15 +834,20 @@ impl<F: FileSystem + Sync> Server<F> {
         }
     }
 
-    fn readdir(&self, in_header: &InHeader, r: Reader, w: Writer) -> Result<usize> {
+    pub(super) fn readdir(&self, in_header: &InHeader, r: Reader, w: Writer) -> Result<usize> {
         self.do_readdir(in_header, r, w, false)
     }
 
-    fn readdirplus(&self, in_header: &InHeader, r: Reader, w: Writer) -> Result<usize> {
+    pub(super) fn readdirplus(&self, in_header: &InHeader, r: Reader, w: Writer) -> Result<usize> {
         self.do_readdir(in_header, r, w, true)
     }
 
-    fn releasedir(&self, in_header: &InHeader, mut r: Reader, w: Writer) -> Result<usize> {
+    pub(super) fn releasedir(
+        &self,
+        in_header: &InHeader,
+        mut r: Reader,
+        w: Writer,
+    ) -> Result<usize> {
         let ReleaseIn { fh, flags, .. } = r.read_obj().map_err(Error::DecodeMessage)?;
 
         match self.fs.releasedir(
@@ -863,7 +878,7 @@ impl<F: FileSystem + Sync> Server<F> {
         }
     }
 
-    fn getlk(&self, in_header: &InHeader, mut _r: Reader, w: Writer) -> Result<usize> {
+    pub(super) fn getlk(&self, in_header: &InHeader, mut _r: Reader, w: Writer) -> Result<usize> {
         if let Err(e) = self.fs.getlk() {
             reply_error(e, in_header.unique, w)
         } else {
@@ -871,7 +886,7 @@ impl<F: FileSystem + Sync> Server<F> {
         }
     }
 
-    fn setlk(&self, in_header: &InHeader, mut _r: Reader, w: Writer) -> Result<usize> {
+    pub(super) fn setlk(&self, in_header: &InHeader, mut _r: Reader, w: Writer) -> Result<usize> {
         if let Err(e) = self.fs.setlk() {
             reply_error(e, in_header.unique, w)
         } else {
@@ -879,7 +894,7 @@ impl<F: FileSystem + Sync> Server<F> {
         }
     }
 
-    fn setlkw(&self, in_header: &InHeader, mut _r: Reader, w: Writer) -> Result<usize> {
+    pub(super) fn setlkw(&self, in_header: &InHeader, mut _r: Reader, w: Writer) -> Result<usize> {
         if let Err(e) = self.fs.setlkw() {
             reply_error(e, in_header.unique, w)
         } else {
@@ -887,7 +902,7 @@ impl<F: FileSystem + Sync> Server<F> {
         }
     }
 
-    fn access(&self, in_header: &InHeader, mut r: Reader, w: Writer) -> Result<usize> {
+    pub(super) fn access(&self, in_header: &InHeader, mut r: Reader, w: Writer) -> Result<usize> {
         let AccessIn { mask, .. } = r.read_obj().map_err(Error::DecodeMessage)?;
 
         match self
@@ -942,11 +957,11 @@ impl<F: FileSystem + Sync> Server<F> {
         }
     }
 
-    fn interrupt(&self, _in_header: &InHeader) -> Result<usize> {
+    pub(super) fn interrupt(&self, _in_header: &InHeader) -> Result<usize> {
         Ok(0)
     }
 
-    fn bmap(&self, in_header: &InHeader, mut _r: Reader, w: Writer) -> Result<usize> {
+    pub(super) fn bmap(&self, in_header: &InHeader, mut _r: Reader, w: Writer) -> Result<usize> {
         if let Err(e) = self.fs.bmap() {
             reply_error(e, in_header.unique, w)
         } else {
@@ -954,14 +969,14 @@ impl<F: FileSystem + Sync> Server<F> {
         }
     }
 
-    fn destroy(&self) -> Result<usize> {
+    pub(super) fn destroy(&self) -> Result<usize> {
         // No reply to this function.
         self.fs.destroy();
 
         Ok(0)
     }
 
-    fn ioctl(&self, in_header: &InHeader, _r: Reader, w: Writer) -> Result<usize> {
+    pub(super) fn ioctl(&self, in_header: &InHeader, _r: Reader, w: Writer) -> Result<usize> {
         if let Err(e) = self.fs.ioctl() {
             reply_error(e, in_header.unique, w)
         } else {
@@ -969,7 +984,7 @@ impl<F: FileSystem + Sync> Server<F> {
         }
     }
 
-    fn poll(&self, in_header: &InHeader, mut _r: Reader, w: Writer) -> Result<usize> {
+    pub(super) fn poll(&self, in_header: &InHeader, mut _r: Reader, w: Writer) -> Result<usize> {
         if let Err(e) = self.fs.poll() {
             reply_error(e, in_header.unique, w)
         } else {
@@ -977,7 +992,12 @@ impl<F: FileSystem + Sync> Server<F> {
         }
     }
 
-    fn notify_reply(&self, in_header: &InHeader, mut _r: Reader, w: Writer) -> Result<usize> {
+    pub(super) fn notify_reply(
+        &self,
+        in_header: &InHeader,
+        mut _r: Reader,
+        w: Writer,
+    ) -> Result<usize> {
         if let Err(e) = self.fs.notify_reply() {
             reply_error(e, in_header.unique, w)
         } else {
@@ -985,7 +1005,12 @@ impl<F: FileSystem + Sync> Server<F> {
         }
     }
 
-    fn batch_forget(&self, in_header: &InHeader, mut r: Reader, w: Writer) -> Result<usize> {
+    pub(super) fn batch_forget(
+        &self,
+        in_header: &InHeader,
+        mut r: Reader,
+        w: Writer,
+    ) -> Result<usize> {
         let BatchForgetIn { count, .. } = r.read_obj().map_err(Error::DecodeMessage)?;
 
         if let Some(size) = (count as usize).checked_mul(size_of::<ForgetOne>()) {
@@ -1041,7 +1066,7 @@ impl<F: FileSystem + Sync> Server<F> {
         }
     }
 
-    fn lseek(&self, in_header: &InHeader, mut r: Reader, w: Writer) -> Result<usize> {
+    pub(super) fn lseek(&self, in_header: &InHeader, mut r: Reader, w: Writer) -> Result<usize> {
         let LseekIn {
             fh, offset, whence, ..
         } = r.read_obj().map_err(Error::DecodeMessage)?;
@@ -1065,7 +1090,7 @@ impl<F: FileSystem + Sync> Server<F> {
 
 #[cfg(feature = "virtiofs")]
 impl<F: FileSystem + Sync> Server<F> {
-    fn setupmapping(
+    pub(super) fn setupmapping(
         &self,
         in_header: &InHeader,
         mut r: Reader,
@@ -1103,7 +1128,7 @@ impl<F: FileSystem + Sync> Server<F> {
         }
     }
 
-    fn removemapping(
+    pub(super) fn removemapping(
         &self,
         in_header: &InHeader,
         mut r: Reader,

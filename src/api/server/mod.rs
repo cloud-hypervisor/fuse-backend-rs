@@ -28,6 +28,8 @@ use crate::abi::linux_abi::*;
 use crate::transport::{FileReadWriteVolatile, Reader, Writer};
 use crate::{bytes_to_cstr, Error, Result};
 
+#[cfg(feature = "async-io")]
+mod async_io;
 mod sync_io;
 pub use sync_io::MetricsHook;
 
