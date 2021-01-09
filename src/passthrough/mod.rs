@@ -16,6 +16,7 @@ use std::collections::{btree_map, BTreeMap};
 use std::ffi::{CStr, CString};
 use std::fs::File;
 use std::io;
+use std::marker::PhantomData;
 use std::mem::MaybeUninit;
 use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
 use std::str::FromStr;
@@ -29,10 +30,14 @@ use crate::abi::linux_abi as fuse;
 use crate::api::filesystem::Entry;
 use crate::api::{BackendFileSystem, VFS_MAX_INO};
 
+#[cfg(feature = "async-io")]
+mod async_io;
 mod sync_io;
 
 mod multikey;
 use multikey::MultikeyBTreeMap;
+
+use crate::async_util::AsyncDrive;
 
 const CURRENT_DIR_CSTR: &[u8] = b".\0";
 const PARENT_DIR_CSTR: &[u8] = b"..\0";
@@ -336,7 +341,7 @@ impl Default for Config {
 /// that wish to serve only a specific directory should set up the environment so that that
 /// directory ends up as the root of the file system process. One way to accomplish this is via a
 /// combination of mount namespaces and the pivot_root system call.
-pub struct PassthroughFs {
+pub struct PassthroughFs<D> {
     // File descriptors for various points in the file system tree. These fds are always opened with
     // the `O_PATH` option so they cannot be used for reading or writing any data. See the
     // documentation of the `O_PATH` flag in `open(2)` for more details on what one can and cannot
@@ -366,11 +371,13 @@ pub struct PassthroughFs {
     no_opendir: AtomicBool,
 
     cfg: Config,
+
+    phantom: PhantomData<D>,
 }
 
-impl PassthroughFs {
+impl<D: AsyncDrive> PassthroughFs<D> {
     /// Create a Passthrough file system instance.
-    pub fn new(cfg: Config) -> io::Result<PassthroughFs> {
+    pub fn new(cfg: Config) -> io::Result<PassthroughFs<D>> {
         // Safe because this is a constant value and a valid C string.
         let proc_cstr = unsafe { CStr::from_bytes_with_nul_unchecked(PROC_CSTR) };
         let proc = Self::open_file(
@@ -393,6 +400,8 @@ impl PassthroughFs {
             no_open: AtomicBool::new(false),
             no_opendir: AtomicBool::new(false),
             cfg,
+
+            phantom: PhantomData,
         })
     }
 
@@ -575,6 +584,18 @@ impl PassthroughFs {
 
     fn do_release(&self, inode: Inode, handle: Handle) -> io::Result<()> {
         self.handle_map.release(handle, inode)
+    }
+}
+
+#[cfg(not(feature = "async-io"))]
+impl<D: AsyncDrive> BackendFileSystem<D> for PassthroughFs<D> {
+    fn mount(&self) -> io::Result<(Entry, u64)> {
+        let entry = self.do_lookup(fuse::ROOT_ID, &CString::new(".").unwrap())?;
+        Ok((entry, VFS_MAX_INO))
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
     }
 }
 

@@ -20,7 +20,6 @@ use crate::async_util::AsyncDrive;
 /// in an intermediate buffer in asynchronous mode.
 #[async_trait]
 pub trait AsyncZeroCopyReader<D: AsyncDrive>: ZeroCopyReader {
-    /// Copies at most `count` bytes from `f` at offset `off` directly into `self` without storing
     /// Copies at most `count` bytes from `self` directly into `f` at offset `off` without storing
     /// it in any intermediate buffers. If the return value is `Ok(n)` then it must be guaranteed
     /// that `0 <= n <= count`. If `n` is `0`, then it can indicate one of 3 possibilities:

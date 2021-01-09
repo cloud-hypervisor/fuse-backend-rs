@@ -91,7 +91,7 @@ impl<'a> IoBuffers<'a> {
             // more data is written out and causes data corruption.
             let local_buf = if buf.len() > rem {
                 // Safe because we just check rem < buf.len()
-                buf.get_subslice(0, rem).unwrap()
+                buf.subslice(0, rem).unwrap()
             } else {
                 buf
             };
@@ -122,7 +122,7 @@ impl<'a> IoBuffers<'a> {
             // more data is written out and causes data corruption.
             let local_buf = if buf.len() > rem {
                 // Safe because we just check rem < buf.len()
-                buf.get_subslice(0, rem).unwrap()
+                buf.subslice(0, rem).unwrap()
             } else {
                 buf
             };
