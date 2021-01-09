@@ -11,12 +11,23 @@ use std::mem::ManuallyDrop;
 use std::ops::Deref;
 use std::os::unix::io::RawFd;
 
-use nix::fcntl::OFlag;
-use nix::sys::stat::{mode_t, Mode};
+use futures::{
+    executor::LocalPool,
+    ready,
+    task::{LocalSpawnExt, SpawnError},
+};
+use iou::{CompletionQueue, IoUring, Registrar, SQEs, SetupFeatures, SetupFlags, SubmissionQueue};
+use nix::{
+    fcntl::{FallocateFlags, OFlag},
+    sys::stat::{mode_t, Mode},
+};
 use ringbahn::{
-    event::{OpenAt, ReadVectored, Write, WriteVectored},
+    drive::{complete, Completion},
+    event::{Fallocate, Fsync, OpenAt, Read, ReadVectored, Write, WriteVectored},
     Drive,
 };
+
+use iou::sqe::FsyncFlags;
 use vm_memory::VolatileSlice;
 
 pub use ringbahn::{drive::demo::DemoDriver as AsyncDriver, Submission};
@@ -60,6 +71,57 @@ impl<D: AsyncDrive> AsyncUtil<D> {
         result
     }
 
+    /// Asynchronously fsync on a file descriptor `fd`.
+    pub async fn fsync(drive: D, fd: i32, datasync: bool) -> io::Result<()> {
+        let flags = if datasync {
+            FsyncFlags::FSYNC_DATASYNC
+        } else {
+            FsyncFlags::empty()
+        };
+        let event = Fsync { fd, flags };
+
+        let (_event, result) = Submission::new(event, drive).await;
+
+        result.map(|_| ())
+    }
+
+    /// Asynchronously read data into buffer from the file.
+    pub async fn read(drive: D, fd: RawFd, data: &mut [u8], offset: u64) -> io::Result<usize> {
+        // Safe because we just transform the interface to access the underlying data buffers.
+        let buf = unsafe { Box::from_raw(data as *const [u8] as *mut [u8]) };
+
+        let event = Read { fd, buf, offset };
+        let (Read { buf, .. }, result) = Submission::new(event, drive).await;
+
+        // Manually tear down the fake [Box<[u8]> object, otherwise it will cause double-free.
+        let _ = ManuallyDrop::new(buf);
+
+        result.map(|v| v as usize)
+    }
+
+    /// Asynchronously fallocate on a file descriptor.
+    pub async fn fallocate(
+        drive: D,
+        fd: i32,
+        offset: u64,
+        size: u64,
+        flags: u32,
+    ) -> io::Result<()> {
+        let flags = FallocateFlags::from_bits(flags as i32);
+        let flags = flags.ok_or(io::Error::from_raw_os_error(libc::EINVAL))?;
+
+        let event = Fallocate {
+            fd,
+            offset,
+            size,
+            flags,
+        };
+
+        let (_event, result) = Submission::new(event, drive).await;
+
+        result.map(|_| ())
+    }
+
     /// Asynchronously read from the file into vectored data buffers.
     pub async fn read_vectored(
         drive: D,
@@ -85,7 +147,7 @@ impl<D: AsyncDrive> AsyncUtil<D> {
         result.map(|v| v as usize)
     }
 
-    /// Asynchronously write out vectored data buffers to the file.
+    /// Asynchronously read from the file into vectored data buffers.
     pub async fn read_to_volatile_slices(
         drive: D,
         fd: RawFd,

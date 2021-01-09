@@ -21,6 +21,7 @@ use crate::api::filesystem::{
     Context, DirEntry, Entry, FileSystem, FsOptions, GetxattrReply, ListxattrReply, OpenOptions,
     SetattrValid, ZeroCopyReader, ZeroCopyWriter,
 };
+use crate::async_util::AsyncDrive;
 use crate::bytes_to_cstr;
 #[cfg(feature = "vhost-user-fs")]
 use crate::transport::FsCacheReqHandler;
@@ -28,7 +29,7 @@ use crate::transport::FsCacheReqHandler;
 macro_rules! scoped_cred {
     ($name:ident, $ty:ty, $syscall_nr:expr) => {
         #[derive(Debug)]
-        struct $name;
+        pub(crate) struct $name;
 
         impl $name {
             // Changes the effective uid/gid of the current thread to `val`.  Changes
@@ -78,7 +79,7 @@ macro_rules! scoped_cred {
 scoped_cred!(ScopedUid, libc::uid_t, libc::SYS_setresuid);
 scoped_cred!(ScopedGid, libc::gid_t, libc::SYS_setresgid);
 
-fn set_creds(
+pub(crate) fn set_creds(
     uid: libc::uid_t,
     gid: libc::gid_t,
 ) -> io::Result<(Option<ScopedUid>, Option<ScopedGid>)> {
@@ -87,19 +88,7 @@ fn set_creds(
     ScopedGid::new(gid).and_then(|gid| Ok((ScopedUid::new(uid)?, gid)))
 }
 
-#[cfg(not(feature = "async-io"))]
-impl<D: 'static> BackendFileSystem for PassthroughFs<D> {
-    fn mount(&self) -> io::Result<(Entry, u64)> {
-        let entry = self.do_lookup(fuse::ROOT_ID, &CString::new(".").unwrap())?;
-        Ok((entry, VFS_MAX_INO))
-    }
-
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-}
-
-impl<D> PassthroughFs<D> {
+impl<D: AsyncDrive> PassthroughFs<D> {
     fn open_proc_file(&self, pathname: &CStr, flags: i32) -> io::Result<File> {
         Self::open_file(self.proc.as_raw_fd(), pathname, flags, 0)
     }
@@ -334,7 +323,7 @@ impl<D> PassthroughFs<D> {
     }
 }
 
-impl<D> FileSystem for PassthroughFs<D> {
+impl<D: AsyncDrive> FileSystem for PassthroughFs<D> {
     type Inode = Inode;
     type Handle = Handle;
 
