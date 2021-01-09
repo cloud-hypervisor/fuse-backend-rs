@@ -107,6 +107,22 @@ pub mod api;
 pub mod passthrough;
 pub mod transport;
 
+#[cfg(feature = "async-io")]
+pub mod async_util;
+
+#[cfg(not(feature = "async-io"))]
+/// This provides async_utils generaic type declaration.
+pub mod async_util {
+    /// A helper trait to simplify generic type declaration
+    pub trait AsyncDrive: Clone + Send + 'static {}
+
+    impl<T: Clone + Send + 'static> AsyncDrive for T {}
+
+    /// Fake type of asynchronous event drive.
+    #[allow(dead_code)]
+    pub type AsyncDriver = ();
+}
+
 /// Convert io::ErrorKind to OS error code.
 /// Reference to libstd/sys/unix/mod.rs => decode_error_kind.
 pub fn encode_io_error_kind(kind: ErrorKind) -> i32 {
