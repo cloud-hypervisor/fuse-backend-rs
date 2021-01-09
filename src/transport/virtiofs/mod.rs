@@ -42,6 +42,8 @@ use std::cmp;
 use std::collections::VecDeque;
 use std::fmt;
 use std::io::{self, IoSlice, Write};
+#[cfg(feature = "async-io")]
+use std::os::unix::io::RawFd;
 use std::ptr::copy_nonoverlapping;
 
 use vm_memory::{ByteValued, GuestMemory, GuestMemoryError, VolatileMemoryError, VolatileSlice};
@@ -51,6 +53,9 @@ use super::{FileReadWriteVolatile, IoBuffers, Reader};
 
 mod fs_cache_req_handler;
 pub use self::fs_cache_req_handler::FsCacheReqHandler;
+
+#[cfg(feature = "async-io")]
+use crate::async_util::{AsyncDrive, AsyncUtil};
 
 /// Error codes for Virtio queue related operations.
 #[derive(Debug)]
@@ -316,6 +321,96 @@ impl<'a> io::Write for Writer<'a> {
     fn flush(&mut self) -> io::Result<()> {
         // Nothing to flush since the writes go straight into the buffer.
         Ok(())
+    }
+}
+
+// For virtio-fs, the output is written to memory buffer, so need for async io.
+// Just relay the operation to corresponding sync io handler.
+#[cfg(feature = "async-io")]
+mod async_io {
+    use super::*;
+
+    impl<'a> Reader<'a> {
+        /// Reads data from the descriptor chain buffer into a File at offset `off`.
+        /// Returns the number of bytes read from the descriptor chain buffer.
+        /// The number of bytes read can be less than `count` if there isn't
+        /// enough data in the descriptor chain buffer.
+        pub async fn async_read_to_at<D: AsyncDrive>(
+            &mut self,
+            drive: D,
+            dst: RawFd,
+            count: usize,
+            off: u64,
+        ) -> io::Result<usize> {
+            let bufs = self.buffers.allocate_io_slice(count);
+            if bufs.is_empty() {
+                Ok(0)
+            } else {
+                let result = AsyncUtil::write_vectored(drive, dst, &bufs, off).await?;
+                self.buffers.mark_used(result)?;
+                Ok(result)
+            }
+        }
+    }
+
+    impl<'a> Writer<'a> {
+        /// Write data from a buffer into this writer in asynchronous mode.
+        pub async fn async_write<D: AsyncDrive>(
+            &mut self,
+            _drive: D,
+            data: &[u8],
+        ) -> io::Result<usize> {
+            self.write(data)
+        }
+
+        /// Write data from a group of buffers into this writer in asynchronous mode, skipping empty
+        /// buffers.
+        pub async fn async_write_vectored<D: AsyncDrive>(
+            &mut self,
+            _drive: D,
+            bufs: &[IoSlice<'_>],
+        ) -> io::Result<usize> {
+            self.write_vectored(bufs)
+        }
+
+        /// Attempts to write an entire buffer into this writer in asynchronous mode.
+        pub async fn async_write_all<D: AsyncDrive>(
+            &mut self,
+            _drive: D,
+            buf: &[u8],
+        ) -> io::Result<()> {
+            self.write_all(buf)
+        }
+
+        /// Writes data to the descriptor chain buffer from a File at offset `off`.
+        /// Returns the number of bytes written to the descriptor chain buffer.
+        pub async fn async_write_from_at<D: AsyncDrive>(
+            &mut self,
+            drive: D,
+            src: RawFd,
+            count: usize,
+            off: u64,
+        ) -> io::Result<usize> {
+            self.check_available_space(count)?;
+            let bufs = self.buffers.allocate_mut_io_slice(count);
+            if bufs.is_empty() {
+                Ok(0)
+            } else {
+                let result = AsyncUtil::read_vectored(drive, src, &bufs, off).await?;
+                self.buffers.mark_used(count)?;
+                Ok(result)
+            }
+        }
+
+        /// Commit all internal buffers of self and others
+        /// We need this because the lifetime of others is usually shorter than self.
+        pub async fn async_commit<D: AsyncDrive>(
+            &mut self,
+            _drive: D,
+            others: &[&Writer<'a>],
+        ) -> io::Result<usize> {
+            self.commit(others)
+        }
     }
 }
 

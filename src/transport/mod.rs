@@ -11,6 +11,8 @@
 use std::cmp;
 use std::collections::VecDeque;
 use std::io::{self, Read};
+#[cfg(feature = "async-io")]
+use std::io::{IoSlice, IoSliceMut};
 use std::mem::{size_of, MaybeUninit};
 use std::ptr::copy_nonoverlapping;
 
@@ -49,21 +51,10 @@ impl<'a> IoBuffers<'a> {
         self.bytes_consumed
     }
 
-    /// Consumes at most `count` bytes from the `DescriptorChain`. Callers must provide a function
-    /// that takes a `&[VolatileSlice]` and returns the total number of bytes consumed. This
-    /// function guarantees that the combined length of all the slices in the `&[VolatileSlice]` is
-    /// less than or equal to `count`.
-    ///
-    /// # Errors
-    ///
-    /// If the provided function returns any error then no bytes are consumed from the buffer and
-    /// the error is returned to the caller.
-    fn consume<F>(&mut self, count: usize, f: F) -> io::Result<usize>
-    where
-        F: FnOnce(&[VolatileSlice]) -> io::Result<usize>,
-    {
+    fn allocate_volatile_slice(&self, count: usize) -> Vec<VolatileSlice> {
         let mut rem = count;
         let mut bufs = Vec::with_capacity(self.buffers.len());
+
         for &buf in &self.buffers {
             if rem == 0 {
                 break;
@@ -77,18 +68,77 @@ impl<'a> IoBuffers<'a> {
             } else {
                 buf
             };
-
             bufs.push(local_buf);
+
             // Don't need check_sub() as we just made sure rem >= local_buf.len()
             rem -= local_buf.len() as usize;
         }
 
-        if bufs.is_empty() {
-            return Ok(0);
+        bufs
+    }
+
+    #[cfg(feature = "async-io")]
+    fn allocate_io_slice(&self, count: usize) -> Vec<IoSlice> {
+        let mut rem = count;
+        let mut bufs = Vec::with_capacity(self.buffers.len());
+
+        for &buf in &self.buffers {
+            if rem == 0 {
+                break;
+            }
+
+            // If buffer contains more data than `rem`, truncate buffer to `rem`, otherwise
+            // more data is written out and causes data corruption.
+            let local_buf = if buf.len() > rem {
+                // Safe because we just check rem < buf.len()
+                buf.get_subslice(0, rem).unwrap()
+            } else {
+                buf
+            };
+            // Safe because we just change the interface to access underlying buffers.
+            bufs.push(IoSlice::new(unsafe {
+                std::slice::from_raw_parts(local_buf.as_ptr(), local_buf.len())
+            }));
+
+            // Don't need check_sub() as we just made sure rem >= local_buf.len()
+            rem -= local_buf.len() as usize;
         }
 
-        let bytes_consumed = f(&*bufs)?;
+        bufs
+    }
 
+    #[cfg(feature = "async-io")]
+    #[allow(dead_code)]
+    fn allocate_mut_io_slice(&self, count: usize) -> Vec<IoSliceMut> {
+        let mut rem = count;
+        let mut bufs = Vec::with_capacity(self.buffers.len());
+
+        for &buf in &self.buffers {
+            if rem == 0 {
+                break;
+            }
+
+            // If buffer contains more data than `rem`, truncate buffer to `rem`, otherwise
+            // more data is written out and causes data corruption.
+            let local_buf = if buf.len() > rem {
+                // Safe because we just check rem < buf.len()
+                buf.get_subslice(0, rem).unwrap()
+            } else {
+                buf
+            };
+            // Safe because we just change the interface to access underlying buffers.
+            bufs.push(IoSliceMut::new(unsafe {
+                std::slice::from_raw_parts_mut(local_buf.as_ptr(), local_buf.len())
+            }));
+
+            // Don't need check_sub() as we just made sure rem >= local_buf.len()
+            rem -= local_buf.len() as usize;
+        }
+
+        bufs
+    }
+
+    fn mark_used(&mut self, bytes_consumed: usize) -> io::Result<()> {
         // This can happen if a driver tricks a device into reading/writing more data than
         // fits in a `usize`.
         let total_bytes_consumed =
@@ -98,7 +148,7 @@ impl<'a> IoBuffers<'a> {
                     io::Error::new(io::ErrorKind::InvalidData, Error::DescriptorChainOverflow)
                 })?;
 
-        rem = bytes_consumed;
+        let mut rem = bytes_consumed;
         while let Some(buf) = self.buffers.pop_front() {
             if rem < buf.len() {
                 // Split the slice and push the remainder back into the buffer list. Safe because we
@@ -114,7 +164,30 @@ impl<'a> IoBuffers<'a> {
 
         self.bytes_consumed = total_bytes_consumed;
 
-        Ok(bytes_consumed)
+        Ok(())
+    }
+
+    /// Consumes at most `count` bytes from the `DescriptorChain`. Callers must provide a function
+    /// that takes a `&[VolatileSlice]` and returns the total number of bytes consumed. This
+    /// function guarantees that the combined length of all the slices in the `&[VolatileSlice]` is
+    /// less than or equal to `count`.
+    ///
+    /// # Errors
+    ///
+    /// If the provided function returns any error then no bytes are consumed from the buffer and
+    /// the error is returned to the caller.
+    fn consume<F>(&mut self, count: usize, f: F) -> io::Result<usize>
+    where
+        F: FnOnce(&[VolatileSlice]) -> io::Result<usize>,
+    {
+        let bufs = self.allocate_volatile_slice(count);
+        if bufs.is_empty() {
+            Ok(0)
+        } else {
+            let bytes_consumed = f(&*bufs)?;
+            self.mark_used(bytes_consumed)?;
+            Ok(bytes_consumed)
+        }
     }
 
     fn split_at(&mut self, offset: usize) -> Result<IoBuffers<'a>> {
