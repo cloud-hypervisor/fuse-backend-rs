@@ -2,8 +2,9 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::*;
+use crate::async_util::AsyncDrive;
 
-impl FileSystem for Vfs {
+impl<D: AsyncDrive> FileSystem for Vfs<D> {
     type Inode = VfsInode;
     type Handle = VfsHandle;
 
