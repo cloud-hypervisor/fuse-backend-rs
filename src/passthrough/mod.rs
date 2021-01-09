@@ -578,17 +578,6 @@ impl PassthroughFs {
     }
 }
 
-impl BackendFileSystem for PassthroughFs {
-    fn mount(&self) -> io::Result<(Entry, u64)> {
-        let entry = self.do_lookup(fuse::ROOT_ID, &CString::new(".").unwrap())?;
-        Ok((entry, VFS_MAX_INO))
-    }
-
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-}
-
 fn ebadf() -> io::Error {
     io::Error::from_raw_os_error(libc::EBADF)
 }
