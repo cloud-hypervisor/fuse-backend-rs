@@ -49,7 +49,7 @@ impl<F: FileSystem + Sync> Server<F> {
         Server {
             fs,
             vers: ArcSwap::new(Arc::new(ServerVersion {
-                _major: KERNEL_VERSION,
+                major: KERNEL_VERSION,
                 minor: KERNEL_MINOR_VERSION,
             })),
         }
@@ -99,7 +99,7 @@ impl<'a> io::Write for ZCWriter<'a> {
 }
 
 struct ServerVersion {
-    _major: u32,
+    major: u32,
     minor: u32,
 }
 

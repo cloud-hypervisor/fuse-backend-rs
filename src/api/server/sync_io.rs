@@ -714,10 +714,7 @@ impl<F: FileSystem + Sync> Server<F> {
                     max_pages: MAX_REQ_PAGES, // 1MB
                     ..Default::default()
                 };
-                let vers = ServerVersion {
-                    _major: major,
-                    minor,
-                };
+                let vers = ServerVersion { major, minor };
                 self.vers.store(Arc::new(vers));
                 if minor < KERNEL_MINOR_VERSION_INIT_OUT_SIZE {
                     reply_ok(

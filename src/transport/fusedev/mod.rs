@@ -8,6 +8,8 @@ use std::collections::VecDeque;
 use std::fmt;
 use std::io::{self, IoSlice, Write};
 use std::marker::PhantomData;
+#[cfg(feature = "async-io")]
+use std::os::unix::io::RawFd;
 
 use libc::c_int;
 use nix::sys::uio::{pwrite, writev, IoVec};
@@ -15,6 +17,9 @@ use nix::sys::uio::{pwrite, writev, IoVec};
 use vm_memory::{ByteValued, VolatileMemory, VolatileMemoryError, VolatileSlice};
 
 use super::{FileReadWriteVolatile, IoBuffers, Reader};
+
+#[cfg(feature = "async-io")]
+use crate::async_util::{AsyncDrive, AsyncUtil};
 
 mod session;
 pub use session::*;
@@ -364,6 +369,186 @@ impl<'a> io::Write for Writer<'a> {
             io::ErrorKind::Other,
             "Writer does not support flush buffer.",
         ))
+    }
+}
+
+#[cfg(feature = "async-io")]
+mod async_io {
+    use super::*;
+    use futures::io::IoSliceMut;
+
+    impl<'a> Reader<'a> {
+        /// Reads data from the descriptor chain buffer into a File at offset `off`.
+        /// Returns the number of bytes read from the descriptor chain buffer.
+        /// The number of bytes read can be less than `count` if there isn't
+        /// enough data in the descriptor chain buffer.
+        pub async fn async_read_to_at<D: AsyncDrive>(
+            &mut self,
+            drive: D,
+            dst: RawFd,
+            count: usize,
+            off: u64,
+        ) -> io::Result<usize> {
+            let bufs = self.buffers.allocate_io_slice(count);
+            if bufs.is_empty() {
+                Ok(0)
+            } else {
+                let result = AsyncUtil::write_vectored(drive, dst, &bufs, off).await?;
+                self.buffers.mark_used(result)?;
+                Ok(result)
+            }
+        }
+    }
+
+    impl<'a> Writer<'a> {
+        /// Write data from a buffer into this writer in asynchronous mode.
+        pub async fn async_write<D: AsyncDrive>(
+            &mut self,
+            drive: D,
+            data: &[u8],
+        ) -> io::Result<usize> {
+            self.check_available_space(data.len())?;
+
+            if let Some(buf) = &mut self.buf {
+                // write to internal buf
+                let len = data.len();
+                buf.extend_from_slice(data);
+                self.account_written(len);
+                Ok(len)
+            } else {
+                // write to fd, can only happen once per instance
+                if self.fd <= 0 {
+                    return Err(io::Error::from_raw_os_error(libc::EINVAL));
+                }
+                AsyncUtil::write(drive, self.fd, data, 0)
+                    .await
+                    .map(|x| {
+                        self.account_written(x);
+                        x
+                    })
+                    .map_err(|e| {
+                        error! {"fail to write to fuse device fd {}: {}, {:?}", self.fd, e, data};
+                        io::Error::new(io::ErrorKind::Other, format!("{}", e))
+                    })
+            }
+        }
+
+        /// Write data from a group of buffers into this writer in asynchronous mode, skipping empty
+        /// buffers.
+        pub async fn async_write_vectored<D: AsyncDrive>(
+            &mut self,
+            drive: D,
+            bufs: &[IoSlice<'_>],
+        ) -> io::Result<usize> {
+            self.check_available_space(bufs.iter().fold(0, |acc, x| acc + x.len()))?;
+
+            if let Some(data) = &mut self.buf {
+                let count = bufs.iter().filter(|b| !b.is_empty()).fold(0, |acc, b| {
+                    data.extend_from_slice(b);
+                    acc + b.len()
+                });
+                Ok(count)
+            } else {
+                if bufs.is_empty() {
+                    Ok(0)
+                } else {
+                    AsyncUtil::write_vectored(drive, self.fd, bufs, 0)
+                        .await
+                        .map(|x| {
+                            self.account_written(x);
+                            x
+                        })
+                        .map_err(|e| {
+                            error! {"fail to write to fuse device on commit: {}", e};
+                            io::Error::new(io::ErrorKind::Other, format!("{}", e))
+                        })
+                }
+            }
+        }
+
+        /// Attempts to write an entire buffer into this writer in asynchronous mode.
+        pub async fn async_write_all<D: AsyncDrive>(
+            &mut self,
+            drive: D,
+            mut buf: &[u8],
+        ) -> io::Result<()> {
+            while !buf.is_empty() {
+                match self.async_write(drive.clone(), buf).await {
+                    Ok(0) => {
+                        return Err(io::Error::new(
+                            io::ErrorKind::WriteZero,
+                            "failed to write whole buffer",
+                        ));
+                    }
+                    Ok(n) => buf = &buf[n..],
+                    Err(ref e) if e.kind() == io::ErrorKind::Interrupted => {}
+                    Err(e) => return Err(e),
+                }
+            }
+
+            Ok(())
+        }
+
+        /// Writes data to the descriptor chain buffer from a File at offset `off`.
+        /// Returns the number of bytes written to the descriptor chain buffer.
+        pub async fn async_write_from_at<D: AsyncDrive>(
+            &mut self,
+            drive: D,
+            src: RawFd,
+            count: usize,
+            off: u64,
+        ) -> io::Result<usize> {
+            self.check_available_space(count)?;
+
+            let drive2 = drive.clone();
+            let mut buf = Vec::with_capacity(count);
+            // safe because capacity is @count.
+            unsafe { buf.set_len(count) };
+
+            let count =
+                AsyncUtil::read_vectored(drive2, src, &[IoSliceMut::new(&mut buf)], off).await?;
+
+            // Safe because we have just allocated larger count
+            unsafe { buf.set_len(count) };
+
+            if let Some(data) = &mut self.buf {
+                self.buf = Some([&data[..], &mut buf[..count]].concat());
+                self.account_written(count);
+                Ok(count)
+            } else {
+                // write to fd
+                AsyncUtil::write(drive, self.fd, &buf[..count], 0).await
+            }
+        }
+
+        /// Commit all internal buffers of self and others
+        /// We need this because the lifetime of others is usually shorter than self.
+        pub async fn async_commit<D: AsyncDrive>(
+            &mut self,
+            drive: D,
+            others: &[&Writer<'a>],
+        ) -> io::Result<usize> {
+            if self.buf.is_none() {
+                return Ok(0);
+            }
+
+            // TODO: remove one extra Vec allocation. One here, another in AsyncUtil::write_vectored().
+            let mut bufs = Vec::new();
+            if let Some(data) = self.buf.as_ref() {
+                bufs.push(IoSlice::new(data))
+            }
+            for other in others {
+                if let Some(data) = &other.buf {
+                    bufs.push(IoSlice::new(data))
+                }
+            }
+
+            if !bufs.is_empty() {
+                AsyncUtil::write_vectored(drive, self.fd, &bufs, 0).await
+            } else {
+                Ok(0)
+            }
+        }
     }
 }
 
