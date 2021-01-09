@@ -541,7 +541,12 @@ impl<D: AsyncDrive, F: AsyncFileSystem> AsyncContext<D, F> {
     }
 
     fn context(&self) -> Context {
-        Context::from(&self.in_header)
+        let mut ctx = Context::from(&self.in_header);
+
+        // Safe because the AsyncContext has longer lifetime than Context object.
+        unsafe { ctx.set_drive(&self.drive) };
+
+        ctx
     }
 
     fn unique(&self) -> u64 {

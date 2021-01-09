@@ -323,6 +323,10 @@ pub struct Context {
 
     /// The thread group ID of the calling process.
     pub pid: libc::pid_t,
+
+    #[cfg(feature = "async-io")]
+    /// Asynchronous event drive
+    pub drive: usize,
 }
 
 impl From<&fuse::InHeader> for Context {
@@ -331,6 +335,38 @@ impl From<&fuse::InHeader> for Context {
             uid: source.uid,
             gid: source.gid,
             pid: source.pid as i32,
+            #[cfg(feature = "async-io")]
+            drive: 0,
+        }
+    }
+}
+
+// The design is very ugly, but it helps to avoid adding a generic type parameter "D: AsyncDrive"
+// to the FileSystem trait.
+#[cfg(feature = "async-io")]
+impl Context {
+    /// Set the asynchronous event drive.
+    ///
+    /// ## Safety
+    /// The caller must ensure that the the referenced `drive` has a longer lifetime than the
+    /// `Context` object.
+    pub(crate) unsafe fn set_drive<D: crate::async_util::AsyncDrive>(&mut self, drive: &D) {
+        // The generic type `D` has bound as "Clone + Send". `D` is Send, then `&D` is Sync,
+        // so it's safe to call drive.clone() in get_drive() only if the caller ensures `drive`
+        // has longer lifetime than this `Context` object.
+        self.drive = drive as *const D as *const u8 as usize;
+    }
+
+    /// Get an asynchronous event drive.
+    ///
+    /// If `get_drive()` returns None, it means async io has been disabled for the associated
+    /// fuse request.
+    pub fn get_drive<D: crate::async_util::AsyncDrive>(&self) -> Option<D> {
+        if self.drive == 0 {
+            None
+        } else {
+            let drive = unsafe { &*(self.drive as *const u8 as *const D) };
+            Some(drive.clone())
         }
     }
 }
