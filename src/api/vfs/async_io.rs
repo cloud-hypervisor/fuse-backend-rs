@@ -211,6 +211,7 @@ mod tests {
             uid: 0,
             gid: 0,
             pid: 0,
+            drive: 0,
         };
         let executor = futures::executor::ThreadPool::new().unwrap();
 

@@ -403,6 +403,8 @@ mod tests {
             uid: 0,
             gid: 0,
             pid: 0,
+            #[cfg(feature = "async-io")]
+            drive: 0,
         }
     }
 
