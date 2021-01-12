@@ -1478,7 +1478,7 @@ impl FileSystem for PassthroughFs {
                 data.get_raw_fd(),
                 empty.as_ptr(),
                 buf.as_mut_ptr() as *mut libc::c_char,
-                buf.len(),
+                libc::PATH_MAX as usize,
             )
         };
         if res < 0 {
