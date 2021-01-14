@@ -586,7 +586,7 @@ pub mod fusedev {
 mod tests {
     use super::*;
 
-    use std::io::{Read, Seek};
+    use std::io::{Read, Seek, Write};
     use std::os::unix::io::AsRawFd;
 
     use futures::executor::{block_on, ThreadPool};
@@ -594,6 +594,35 @@ mod tests {
     use futures::task::SpawnExt;
     use ringbahn::drive::demo::DemoDriver;
     use vmm_sys_util::tempfile::TempFile;
+
+    #[test]
+    fn test_async_read() {}
+
+    #[test]
+    fn test_async_read_vectored() {
+        let file = vmm_sys_util::tempfile::TempFile::new().unwrap();
+        let buf = [
+            0x1u8, 0x1u8, 0x2u8, 0x3u8, 0x4u8, 0x5u8, 0x6u8, 0x7u8, 0x8u8, 0x9u8, 0x1u8, 0x2u8,
+            0x3u8, 0x4u8, 0x5u8, 0x6u8, 0x7u8, 0x8u8, 0x9u8,
+        ];
+        file.as_file().write(&buf).unwrap();
+        let fd = file.as_file().as_raw_fd();
+
+        let executor = ThreadPool::new().unwrap();
+
+        let handle = executor
+            .spawn_with_handle(async move {
+                let mut bufs = [0u8; 18];
+
+                let drive = DemoDriver::default();
+                AsyncUtil::read_vectored(drive, fd, &[IoSliceMut::new(&mut bufs)], 1).await
+
+                //task.await
+            })
+            .unwrap();
+        let result = block_on(handle).unwrap();
+        assert_eq!(result, 18);
+    }
 
     #[test]
     fn test_async_write() {
