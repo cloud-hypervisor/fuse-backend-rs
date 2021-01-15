@@ -588,7 +588,8 @@ impl<D: AsyncDrive> PassthroughFs<D> {
 }
 
 #[cfg(not(feature = "async-io"))]
-impl<D: AsyncDrive> BackendFileSystem<D> for PassthroughFs<D> {
+impl<D: AsyncDrive> BackendFileSystem for PassthroughFs<D> {
+    type D = D;
     fn mount(&self) -> io::Result<(Entry, u64)> {
         let entry = self.do_lookup(fuse::ROOT_ID, &CString::new(".").unwrap())?;
         Ok((entry, VFS_MAX_INO))

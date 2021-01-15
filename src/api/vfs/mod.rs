@@ -116,11 +116,16 @@ enum Either<A, B> {
 use Either::*;
 
 /// Type that implements BackendFileSystem and Sync and Send
-pub type BackFileSystem<D> = Box<dyn BackendFileSystem<D, Inode = u64, Handle = u64> + Sync + Send>;
+/// D refers to the type of asynchronous event driver
+pub type BackFileSystem<D> =
+    Box<dyn BackendFileSystem<Inode = u64, Handle = u64, D = D> + Sync + Send>;
 
 #[cfg(not(feature = "async-io"))]
 /// BackendFileSystem abstracts all backend file systems under vfs
-pub trait BackendFileSystem<D: AsyncDrive>: FileSystem {
+pub trait BackendFileSystem: FileSystem {
+    /// placeholder for async driver
+    type D;
+
     /// mount returns the backend file system root inode entry and
     /// the largest inode number it has.
     fn mount(&self) -> Result<(Entry, u64)> {
@@ -135,7 +140,7 @@ pub trait BackendFileSystem<D: AsyncDrive>: FileSystem {
 
 #[cfg(feature = "async-io")]
 /// BackendFileSystem abstracts all backend file systems under vfs
-pub trait BackendFileSystem<D: AsyncDrive>: AsyncFileSystem<D = D> {
+pub trait BackendFileSystem: AsyncFileSystem {
     /// mount returns the backend file system root inode entry and
     /// the largest inode number it has.
     fn mount(&self) -> Result<(Entry, u64)> {
@@ -621,7 +626,30 @@ mod tests {
         }
     }
 
-    impl BackendFileSystem<AsyncDriver> for FakeFileSystemOne {
+    #[cfg(feature = "async-io")]
+    impl BackendFileSystem for FakeFileSystemOne {
+        fn mount(&self) -> Result<(Entry, u64)> {
+            Ok((
+                Entry {
+                    inode: 1,
+                    generation: 0,
+                    attr: Attr::default().into(),
+                    attr_timeout: Duration::new(0, 0),
+                    entry_timeout: Duration::new(0, 0),
+                },
+                0,
+            ))
+        }
+
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+    }
+
+    #[cfg(not(feature = "async-io"))]
+    impl BackendFileSystem for FakeFileSystemOne {
+        type D = AsyncDriver;
+
         fn mount(&self) -> Result<(Entry, u64)> {
             Ok((
                 Entry {
@@ -773,7 +801,29 @@ mod tests {
         }
     }
 
-    impl BackendFileSystem<AsyncDriver> for FakeFileSystemTwo {
+    #[cfg(feature = "async-io")]
+    impl BackendFileSystem for FakeFileSystemTwo {
+        fn mount(&self) -> Result<(Entry, u64)> {
+            Ok((
+                Entry {
+                    inode: 1,
+                    generation: 0,
+                    attr: Attr::default().into(),
+                    attr_timeout: Duration::new(0, 0),
+                    entry_timeout: Duration::new(0, 0),
+                },
+                0,
+            ))
+        }
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+    }
+
+    #[cfg(not(feature = "async-io"))]
+    impl BackendFileSystem for FakeFileSystemTwo {
+        type D = AsyncDriver;
+
         fn mount(&self) -> Result<(Entry, u64)> {
             Ok((
                 Entry {

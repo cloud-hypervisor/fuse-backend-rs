@@ -14,7 +14,7 @@ use crate::async_util::{AsyncDrive, AsyncUtil};
 
 //use crate::passthrough::sync_io::set_creds;
 
-impl<D: AsyncDrive + Sync> BackendFileSystem<D> for PassthroughFs<D> {
+impl<D: AsyncDrive + Sync> BackendFileSystem for PassthroughFs<D> {
     fn mount(&self) -> io::Result<(Entry, u64)> {
         let entry = self.do_lookup(fuse::ROOT_ID, &CString::new(".").unwrap())?;
         Ok((entry, VFS_MAX_INO))
