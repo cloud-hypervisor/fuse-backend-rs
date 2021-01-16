@@ -559,6 +559,13 @@ mod tests {
     use std::os::unix::io::AsRawFd;
     use vmm_sys_util::tempfile::TempFile;
 
+    #[cfg(feature = "async-io")]
+    use futures::executor::{block_on, ThreadPool};
+    #[cfg(feature = "async-io")]
+    use futures::task::SpawnExt;
+    #[cfg(feature = "async-io")]
+    use ringbahn::drive::demo::DemoDriver;
+
     #[test]
     fn reader_test_simple_chain() {
         let mut buf = [0u8; 106];
@@ -951,5 +958,152 @@ mod tests {
         writer.write_from_at(&mut file, 40, 16).unwrap_err();
         assert_eq!(writer.available_bytes(), 8);
         assert_eq!(writer.bytes_written(), 40);
+    }
+
+    #[cfg(feature = "async-io")]
+    #[test]
+    fn async_read_to_at() {
+        let file = TempFile::new().unwrap().into_file();
+        let fd = file.as_raw_fd();
+
+        let executor = ThreadPool::new().unwrap();
+        let handle = executor
+            .spawn_with_handle(async move {
+                let mut buf2 = [0u8; 48];
+                let mut reader = Reader::new(FuseBuf::new(&mut buf2)).unwrap();
+
+                let drive = DemoDriver::default();
+                reader.async_read_to_at(drive, fd, 48, 16).await
+            })
+            .unwrap();
+
+        let result = block_on(handle).unwrap();
+        assert_eq!(result, 48);
+        // assert_eq!(reader.available_bytes(), 0);
+        // assert_eq!(reader.bytes_read(), 48);
+    }
+
+    #[cfg(feature = "async-io")]
+    #[test]
+    fn async_write() {
+        let file = TempFile::new().unwrap().into_file();
+        let mut writer = Writer::new(file.as_raw_fd(), 48).unwrap();
+
+        let executor = ThreadPool::new().unwrap();
+        let handle = executor
+            .spawn_with_handle(async move {
+                let drive = DemoDriver::default();
+
+                let buf = vec![0xdeu8; 64];
+                writer.async_write(drive, &buf[..]).await
+            })
+            .unwrap();
+
+        // expect errors
+        block_on(handle).unwrap_err();
+
+
+        let mut writer2 = Writer::new(file.as_raw_fd(), 48).unwrap();
+        let handle = executor
+            .spawn_with_handle(async move {
+                let drive = DemoDriver::default();
+
+                let buf = vec![0xdeu8; 48];
+                writer2.async_write(drive, &buf[..]).await
+            })
+            .unwrap();
+
+        let result = block_on(handle).unwrap();
+        assert_eq!(result, 48);
+    }
+
+    #[cfg(feature = "async-io")]
+    #[test]
+    fn async_write_vectored() {
+        let file = TempFile::new().unwrap().into_file();
+        let mut writer = Writer::new(file.as_raw_fd(), 48).unwrap();
+
+        let executor = ThreadPool::new().unwrap();
+        let handle = executor
+            .spawn_with_handle(async move {
+                let drive = DemoDriver::default();
+
+                let buf = vec![0xdeu8; 48];
+                let slices = [
+                    IoSlice::new(&buf[..32]),
+                    IoSlice::new(&buf[32..40]),
+                    IoSlice::new(&buf[40..]),
+                ];
+
+                writer.async_write_vectored(drive, &slices).await
+            })
+            .unwrap();
+
+        let result = block_on(handle).unwrap();
+        assert_eq!(result, 48);
+    }
+
+    #[cfg(feature = "async-io")]
+    #[test]
+    fn async_write_from_at() {
+        let file1 = TempFile::new().unwrap().into_file();
+        let mut writer = Writer::new(file1.as_raw_fd(), 48).unwrap();
+        let mut file = TempFile::new().unwrap().into_file();
+        let buf = vec![0xdeu8; 64];
+
+        file.write_all(&buf).unwrap();
+        file.seek(SeekFrom::Start(0)).unwrap();
+        let fd = file.as_raw_fd();
+
+        let executor = ThreadPool::new().unwrap();
+        let handle = executor
+            .spawn_with_handle(async move {
+                let drive = DemoDriver::default();
+
+                writer.async_write_from_at(drive, fd, 40, 16).await
+            })
+            .unwrap();
+
+        let result = block_on(handle).unwrap();
+        assert_eq!(result, 40);
+    }
+
+    #[cfg(feature = "async-io")]
+    #[test]
+    fn async_writer_split_commit_all() {
+        let file = TempFile::new().unwrap().into_file();
+        let mut writer = Writer::new(file.as_raw_fd(), 106).unwrap();
+        let mut other = writer.split_at(4).expect("failed to split Writer");
+
+        assert_eq!(writer.available_bytes(), 4);
+        assert_eq!(other.available_bytes(), 102);
+
+        writer.write(&[0x1u8; 4]).unwrap();
+        assert_eq!(writer.available_bytes(), 0);
+        assert_eq!(writer.bytes_written(), 4);
+
+        let buf = vec![0xdeu8; 64];
+        let slices = [
+            IoSlice::new(&buf[..32]),
+            IoSlice::new(&buf[32..48]),
+            IoSlice::new(&buf[48..]),
+        ];
+        assert_eq!(
+            other
+                .write_vectored(&slices)
+                .expect("failed to write from buffer"),
+            64
+        );
+
+        let executor = ThreadPool::new().unwrap();
+        let handle = executor
+            .spawn_with_handle(async move {
+                let drive = DemoDriver::default();
+
+                writer.async_commit(drive, &[&other]).await
+            })
+            .unwrap();
+
+        let _result = block_on(handle).unwrap();
     }
 }
