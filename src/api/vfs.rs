@@ -295,7 +295,7 @@ impl Vfs {
             trace!("mnt.fs_idx {} inode {}", mnt.fs_idx, inode);
             self.get_fs_by_idx(mnt.fs_idx)
         } else {
-            error!("inode {} is not found\n", inode);
+            debug!("inode {} is not found\n", inode);
             Err(Error::from_raw_os_error(libc::EINVAL))
         }
     }
