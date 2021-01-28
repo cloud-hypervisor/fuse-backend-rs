@@ -21,7 +21,7 @@ async-trait = { version = "0.1.42", optional = true }
 bitflags = ">=1.1.0"
 epoll = { version = "4.0", optional = true }
 futures = { version = "0.3", optional = true }
-iou = "0.3.3"
+iou = { version = "0.3.3", optional = true }
 libc = ">=0.2.68"
 log = ">=0.4.6"
 nix = "0.18.0"
@@ -42,7 +42,7 @@ features = ["backend-mmap"]
 
 [features]
 default = ["fusedev"]
-async-io = ["async-trait", "futures", "ringbahn", "fusedev"]
+async-io = ["async-trait", "futures", "iou", "ringbahn"]
 fusedev = ["vmm-sys-util", "epoll"]
 #virtiofs = ["vm-virtio"]
 #vhost-user-fs = ["virtiofs", "vhost-rs/vhost-user-slave"]
