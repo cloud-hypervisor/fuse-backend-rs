@@ -328,3 +328,46 @@ impl From<&fuse::InHeader> for Context {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::abi::linux_abi::Attr;
+
+    #[test]
+    fn test_from_fuse_header() {
+        let fuse_header = &fuse::InHeader {
+            len: 16,
+            opcode: 0,
+            unique: 1,
+            nodeid: 2,
+            uid: 3,
+            gid: 4,
+            pid: 5,
+            padding: 0,
+        };
+        let header: Context = fuse_header.into();
+
+        assert_eq!(header.uid, 3);
+        assert_eq!(header.gid, 4);
+        assert_eq!(header.pid, 5);
+    }
+
+    #[test]
+    fn test_into_fuse_entry() {
+        let attr = Attr {
+            ..Default::default()
+        };
+        let entry = Entry {
+            inode: 1,
+            generation: 2,
+            attr: attr.into(),
+            attr_timeout: Default::default(),
+            entry_timeout: Default::default(),
+        };
+        let fuse_entry: fuse::EntryOut = entry.into();
+
+        assert_eq!(fuse_entry.nodeid, 1);
+        assert_eq!(fuse_entry.generation, 2);
+    }
+}
