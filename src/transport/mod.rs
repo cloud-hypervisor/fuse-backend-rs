@@ -303,3 +303,49 @@ fn vm_memory_subslice<'a>(
         ))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use crate::transport::IoBuffers;
+    use std::collections::VecDeque;
+    use vm_memory::VolatileSlice;
+
+    #[test]
+    fn test_io_buffers() {
+        let mut buf1 = vec![0x0u8; 16];
+        let mut buf2 = vec![0x0u8; 16];
+        let mut bufs = VecDeque::new();
+        unsafe {
+            bufs.push_back(VolatileSlice::new(buf1.as_mut_ptr(), buf1.len()));
+            bufs.push_back(VolatileSlice::new(buf2.as_mut_ptr(), buf2.len()));
+        }
+        let mut buffers = IoBuffers {
+            buffers: bufs,
+            bytes_consumed: 0,
+        };
+
+        assert_eq!(buffers.available_bytes(), 32);
+        assert_eq!(buffers.bytes_consumed(), 0);
+
+        assert_eq!(buffers.consume(2, |buf| Ok(buf[0].len())).unwrap(), 2);
+        assert_eq!(buffers.available_bytes(), 30);
+        assert_eq!(buffers.bytes_consumed(), 2);
+
+        let mut buffers2 = buffers.split_at(10).unwrap();
+        assert_eq!(buffers.available_bytes(), 10);
+        assert_eq!(buffers.bytes_consumed(), 2);
+        assert_eq!(buffers2.available_bytes(), 20);
+        assert_eq!(buffers2.bytes_consumed(), 0);
+
+        assert_eq!(
+            buffers2
+                .consume(10, |buf| Ok(buf[0].len() + buf[1].len()))
+                .unwrap(),
+            10
+        );
+        assert_eq!(buffers2.consume(20, |buf| Ok(buf[0].len())).unwrap(), 10);
+
+        let _buffers3 = buffers2.split_at(0).unwrap();
+        assert!(buffers2.split_at(1).is_err());
+    }
+}

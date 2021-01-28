@@ -440,6 +440,8 @@ mod tests {
         let b1 = fs.mount("/a/b").unwrap();
         assert_eq!(c1, c1_i.ino);
         assert_eq!(c1_i.parent, b1);
+
+        let _e1 = fs.mount("/a/b/c/d/e").unwrap();
     }
 
     #[test]
@@ -499,6 +501,15 @@ mod tests {
         assert!(fs
             .lookup(create_fuse_context(), b1, &CString::new("c_no").unwrap())
             .is_err());
+
+        assert_eq!(fs.path_walk("/a").unwrap(), Some(a1));
+        assert_eq!(fs.path_walk("/a/b").unwrap(), Some(b1));
+        assert_eq!(fs.path_walk("/a/b/c").unwrap(), Some(c1));
+        assert_eq!(fs.path_walk("/a/b/d").unwrap(), None);
+        assert_eq!(fs.path_walk("/a/b/c/d").unwrap(), None);
+
+        fs.evict_inode(b1);
+        fs.evict_inode(a1);
     }
 
     #[test]
@@ -509,6 +520,9 @@ mod tests {
         fs.getattr(create_fuse_context(), ROOT_ID, None).unwrap();
         fs.getattr(create_fuse_context(), a1, None).unwrap();
         assert!(fs.getattr(create_fuse_context(), 0x1000, None).is_err());
+
+        fs.evict_inode(a1);
+        fs.evict_inode(ROOT_ID);
     }
 
     #[test]
@@ -531,6 +545,29 @@ mod tests {
             .unwrap();
         assert!(fs
             .readdir(create_fuse_context(), 0x1000, 0, 3, 0, &mut |_| Ok(1))
+            .is_err());
+    }
+
+    #[test]
+    fn test_pseudofs_readdir_plus() {
+        let fs = PseudoFs::new();
+        let _ = fs.mount("/a").unwrap();
+        let _ = fs.mount("/b").unwrap();
+
+        fs.readdirplus(create_fuse_context(), ROOT_ID, 0, 0, 0, &mut |_, _| Ok(1))
+            .unwrap();
+        fs.readdirplus(create_fuse_context(), ROOT_ID, 0, 1, 0, &mut |_, _| Ok(1))
+            .unwrap();
+        fs.readdirplus(create_fuse_context(), ROOT_ID, 0, 1, 1, &mut |_, _| Ok(1))
+            .unwrap();
+        fs.readdirplus(create_fuse_context(), ROOT_ID, 0, 2, 0, &mut |_, _| Ok(1))
+            .unwrap();
+        fs.readdirplus(create_fuse_context(), ROOT_ID, 0, 3, 0, &mut |_, _| Ok(1))
+            .unwrap();
+        fs.readdirplus(create_fuse_context(), ROOT_ID, 0, 3, 3, &mut |_, _| Ok(1))
+            .unwrap();
+        assert!(fs
+            .readdirplus(create_fuse_context(), 0x1000, 0, 3, 0, &mut |_, _| Ok(1))
             .is_err());
     }
 

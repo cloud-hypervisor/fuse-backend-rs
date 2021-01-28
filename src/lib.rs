@@ -186,4 +186,16 @@ mod tests {
         bytes_to_cstr(&[0x1u8]).unwrap_err();
         bytes_to_cstr(&[0x1u8, 0x1]).unwrap_err();
     }
+
+    #[test]
+    fn test_encode_io_error_kind() {
+        assert_eq!(encode_io_error_kind(ErrorKind::NotFound), libc::ENOENT);
+        assert_eq!(encode_io_error_kind(ErrorKind::Interrupted), libc::EINTR);
+        assert_eq!(encode_io_error_kind(ErrorKind::AlreadyExists), libc::EEXIST);
+        assert_eq!(
+            encode_io_error_kind(ErrorKind::WouldBlock),
+            libc::EWOULDBLOCK
+        );
+        assert_eq!(encode_io_error_kind(ErrorKind::TimedOut), libc::EIO);
+    }
 }

@@ -13,8 +13,9 @@
 //!   backend file systems.
 
 mod pseudo_fs;
-pub mod vfs;
 
+pub mod vfs;
 pub use vfs::{BackendFileSystem, Vfs, VfsOptions, VFS_MAX_INO};
+
 pub mod filesystem;
 pub mod server;

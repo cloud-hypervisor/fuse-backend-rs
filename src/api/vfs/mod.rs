@@ -629,10 +629,10 @@ mod tests {
         assert!(vfs.umount("/foo").is_ok());
 
         assert!(vfs.mount(Box::new(fs2), "/x/y").is_ok());
-        if let Err(VfsError::NotFound(e)) = vfs.umount("/x") {
-            println!("{}", e)
-        } else {
-            panic!()
+
+        match vfs.umount("/x") {
+            Err(VfsError::NotFound(_e)) => {}
+            _ => panic!("expect VfsError::NotFound(/x)"),
         }
     }
 
@@ -652,10 +652,10 @@ mod tests {
 
         assert!(vfs.umount("/x/y/z").is_ok());
         assert!(vfs.umount("/x/y").is_ok());
-        if let Err(VfsError::NotFound(e)) = vfs.umount("/x/y/z") {
-            println!("{}", e)
-        } else {
-            panic!()
+
+        match vfs.umount("/x/y/z") {
+            Err(VfsError::NotFound(_e)) => {}
+            _ => panic!("expect VfsError::NotFound(/x/y/z)"),
         }
     }
 
@@ -672,10 +672,10 @@ mod tests {
         assert!(m1.as_any().is::<FakeFileSystemTwo>());
 
         assert!(vfs.umount("/x/y").is_ok());
-        if let Err(VfsError::NotFound(e)) = vfs.umount("/x/y") {
-            println!("{}", e)
-        } else {
-            panic!()
+
+        match vfs.umount("/x/y") {
+            Err(VfsError::NotFound(_e)) => {}
+            _ => panic!("expect VfsError::NotFound(/x/y)"),
         }
     }
 
