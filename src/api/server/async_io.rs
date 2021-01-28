@@ -670,7 +670,7 @@ impl<D: AsyncDrive, F: AsyncFileSystem> AsyncContext<D, F> {
 mod tests {
     use super::*;
     use crate::api::Vfs;
-    use crate::async_util::{AsyncDrive, AsyncDriver};
+    use crate::async_util::{AsyncDriver, AsyncExecutor};
     use crate::transport::FuseBuf;
 
     use futures::executor::block_on;
@@ -678,14 +678,17 @@ mod tests {
 
     #[test]
     fn test_vfs_async_invalid_header() {
-        let vfs = Vfs::default();
+        let vfs = Vfs::<AsyncDriver>::default();
         let server = Server::new(vfs);
         let mut r_buf = [0u8];
         let r = Reader::new(FuseBuf::new(&mut r_buf)).unwrap();
         let file = vmm_sys_util::tempfile::TempFile::new().unwrap();
         let w = Writer::new(file.as_file().as_raw_fd(), 0x1000).unwrap();
-        let drive = AsyncDriver::default();
 
+        let executor = AsyncExecutor::new(32);
+        executor.setup().unwrap();
+
+        let drive = AsyncDriver::default();
         let result = block_on(unsafe { server.async_handle_message(drive, r, w, None) });
         assert!(result.is_err());
     }
