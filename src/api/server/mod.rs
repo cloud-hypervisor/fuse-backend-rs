@@ -29,6 +29,7 @@ use crate::transport::{FileReadWriteVolatile, Reader, Writer};
 use crate::{bytes_to_cstr, Error, Result};
 
 mod sync_io;
+pub use sync_io::MetricsHook;
 
 const MAX_BUFFER_SIZE: u32 = 1 << 20;
 const MAX_REQ_PAGES: u16 = 256; // 1MB
