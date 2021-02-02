@@ -49,6 +49,27 @@ pub type VfsIndex = u8;
 #[derive(Clone, Copy, Eq, PartialEq, Hash, Debug)]
 pub struct VfsInode(u64);
 
+/// Vfs error definition
+pub enum VfsError {
+    /// Operation not supported
+    Unsupported,
+    /// Mount backend filesystem
+    Mount(Error),
+    /// Illegal inode index is used
+    InodeIndex(String),
+    /// Filesystem index related. For example, an index can't be allocated.
+    FsIndex(Error),
+    /// Error happened when walking path
+    PathWalk(Error),
+    /// Entry can't be found
+    NotFound(String),
+    /// File system can't ba initialized
+    Initialize(String),
+}
+
+/// Vfs result
+pub type VfsResult<T> = std::result::Result<T, VfsError>;
+
 impl VfsInode {
     fn new(fs_idx: VfsIndex, ino: u64) -> Self {
         assert_eq!(ino & !VFS_MAX_INO, 0);
@@ -231,35 +252,36 @@ impl Vfs {
     }
 
     /// Mount a backend file system to path
-    pub fn mount(&self, fs: BackFileSystem, path: &str) -> Result<VfsIndex> {
-        let (entry, ino) = fs.mount()?;
+    pub fn mount(&self, fs: BackFileSystem, path: &str) -> VfsResult<VfsIndex> {
+        let (entry, ino) = fs.mount().map_err(VfsError::Mount)?;
         if ino > VFS_MAX_INO {
             fs.destroy();
-            return Err(Error::new(
-                ErrorKind::Other,
-                format!(
-                    "Unsupported max inode number, requested {} supported {}",
-                    ino, VFS_MAX_INO
-                ),
-            ));
+            return Err(VfsError::InodeIndex(format!(
+                "Unsupported max inode number, requested {} supported {}",
+                ino, VFS_MAX_INO
+            )));
         }
 
         // Serialize mount operations. Do not expect poisoned lock here.
         let _guard = self.lock.lock().unwrap();
         if self.initialized() {
-            fs.init(self.opts.load().deref().out_opts)?;
+            let opts = self.opts.load().deref().out_opts;
+            fs.init(opts).map_err(|e| {
+                VfsError::Initialize(format!("Can't initialize with opts {:?}, {:?}", opts, e))
+            })?;
         }
-        let index = self.allocate_fs_idx()?;
-        self.insert_mount_locked(fs, entry, index, path)?;
+        let index = self.allocate_fs_idx().map_err(VfsError::FsIndex)?;
+        self.insert_mount_locked(fs, entry, index, path)
+            .map_err(VfsError::Mount)?;
 
         Ok(index)
     }
 
     /// Umount a backend file system at path
-    pub fn umount(&self, path: &str) -> Result<()> {
+    pub fn umount(&self, path: &str) -> VfsResult<()> {
         // Serialize mount operations. Do not expect poisoned lock here.
         let _guard = self.lock.lock().unwrap();
-        let inode = self.root.path_walk(path)?;
+        let inode = self.root.path_walk(path).map_err(VfsError::PathWalk)?;
 
         let mut mountpoints = self.mountpoints.load().deref().deref().clone();
         let fs_idx = mountpoints
@@ -273,7 +295,7 @@ impl Vfs {
             })
             .ok_or_else(|| {
                 error!("{} is not a mount point.", path);
-                Error::from_raw_os_error(libc::EINVAL)
+                VfsError::NotFound(path.to_string())
             })?;
 
         trace!("fs_idx {}", fs_idx);
@@ -288,13 +310,15 @@ impl Vfs {
     }
 
     /// Get the mounted backend file system alongside the path if there's one.
-    pub fn get_rootfs(&self, path: &str) -> Result<Option<Arc<BackFileSystem>>> {
+    pub fn get_rootfs(&self, path: &str) -> VfsResult<Option<Arc<BackFileSystem>>> {
         // Serialize mount operations. Do not expect poisoned lock here.
         let _guard = self.lock.lock().unwrap();
-        let inode = self.root.path_walk(path)?;
+        let inode = self.root.path_walk(path).map_err(VfsError::PathWalk)?;
 
         if let Some(mnt) = self.mountpoints.load().get(&inode) {
-            Ok(Some(self.get_fs_by_idx(mnt.fs_idx)?))
+            Ok(Some(self.get_fs_by_idx(mnt.fs_idx).map_err(|e| {
+                VfsError::NotFound(format!("fs index {}, {:?}", mnt.fs_idx, e))
+            })?))
         } else {
             Ok(None)
         }
