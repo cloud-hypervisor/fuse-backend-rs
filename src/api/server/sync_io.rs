@@ -21,6 +21,14 @@ use crate::api::filesystem::{Context, DirEntry, Entry, FileSystem, GetxattrReply
 use crate::transport::{FsCacheReqHandler, Reader, Writer};
 use crate::{bytes_to_cstr, encode_io_error_kind, Error, Result};
 
+/// Provide concrete backend filesystem a way to catch information/metrics from fuse.
+pub trait MetricsHook {
+    /// `collect()` will be invoked before the real request is processed
+    fn collect(&self, ih: &InHeader);
+    /// `release()` will be invoked after the real request is processed
+    fn release(&self, ih: &InHeader);
+}
+
 impl<F: FileSystem + Sync> Server<F> {
     /// Main entrance to handle requests from the transport layer.
     ///
@@ -34,6 +42,7 @@ impl<F: FileSystem + Sync> Server<F> {
         mut r: Reader,
         w: Writer,
         vu_req: Option<&mut dyn FsCacheReqHandler>,
+        hook: Option<&dyn MetricsHook>,
     ) -> Result<usize> {
         let in_header: &InHeader = &r.read_obj().map_err(Error::DecodeMessage)?;
         if in_header.len > MAX_BUFFER_SIZE {
@@ -50,7 +59,10 @@ impl<F: FileSystem + Sync> Server<F> {
             Opcode::from(in_header.opcode),
             in_header
         );
-        match in_header.opcode {
+
+        hook.map_or((), |h| h.collect(&in_header));
+
+        let r = match in_header.opcode {
             x if x == Opcode::Lookup as u32 => self.lookup(in_header, r, w),
             x if x == Opcode::Forget as u32 => self.forget(in_header, r), // No reply.
             x if x == Opcode::Getattr as u32 => self.getattr(in_header, r, w),
@@ -104,7 +116,11 @@ impl<F: FileSystem + Sync> Server<F> {
                 in_header.unique,
                 w,
             ),
-        }
+        };
+
+        hook.map_or((), |h| h.release(&in_header));
+
+        r
     }
 
     fn lookup(&self, in_header: &InHeader, mut r: Reader, w: Writer) -> Result<usize> {
