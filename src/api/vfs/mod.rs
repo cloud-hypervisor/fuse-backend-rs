@@ -288,17 +288,15 @@ impl Vfs {
     }
 
     /// Get the mounted backend file system alongside the path if there's one.
-    pub fn get_rootfs(&self, path: &str) -> Result<Arc<BackFileSystem>> {
+    pub fn get_rootfs(&self, path: &str) -> Result<Option<Arc<BackFileSystem>>> {
         // Serialize mount operations. Do not expect poisoned lock here.
         let _guard = self.lock.lock().unwrap();
         let inode = self.root.path_walk(path)?;
 
-        if let Some(mnt) = self.mountpoints.load().get(&inode).map(Arc::clone) {
-            trace!("mnt.fs_idx {} inode {}", mnt.fs_idx, inode);
-            self.get_fs_by_idx(mnt.fs_idx)
+        if let Some(mnt) = self.mountpoints.load().get(&inode) {
+            Ok(Some(self.get_fs_by_idx(mnt.fs_idx)?))
         } else {
-            debug!("inode {} is not found\n", inode);
-            Err(Error::from_raw_os_error(libc::EINVAL))
+            Ok(None)
         }
     }
 
