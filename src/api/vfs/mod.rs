@@ -50,6 +50,7 @@ pub type VfsIndex = u8;
 pub struct VfsInode(u64);
 
 /// Vfs error definition
+#[derive(Debug)]
 pub enum VfsError {
     /// Operation not supported
     Unsupported,
@@ -619,10 +620,11 @@ mod tests {
         assert!(vfs.umount("/foo").is_ok());
 
         assert!(vfs.mount(Box::new(fs2), "/x/y").is_ok());
-        assert_eq!(
-            vfs.umount("/x").unwrap_err().raw_os_error().unwrap(),
-            libc::EINVAL
-        );
+        if let Err(VfsError::NotFound(e)) = vfs.umount("/x") {
+            println!("{}", e)
+        } else {
+            panic!()
+        }
     }
 
     #[test]
@@ -634,17 +636,18 @@ mod tests {
         assert!(vfs.mount(Box::new(fs1), "/x/y/z").is_ok());
         assert!(vfs.mount(Box::new(fs2), "/x/y").is_ok());
 
-        let m1 = vfs.get_rootfs("/x/y/z").unwrap();
+        let m1 = vfs.get_rootfs("/x/y/z").unwrap().unwrap();
         assert!(m1.as_any().is::<FakeFileSystemOne>());
-        let m2 = vfs.get_rootfs("/x/y").unwrap();
+        let m2 = vfs.get_rootfs("/x/y").unwrap().unwrap();
         assert!(m2.as_any().is::<FakeFileSystemTwo>());
 
         assert!(vfs.umount("/x/y/z").is_ok());
         assert!(vfs.umount("/x/y").is_ok());
-        assert_eq!(
-            vfs.umount("/x/y/z").unwrap_err().raw_os_error().unwrap(),
-            libc::ENOENT
-        );
+        if let Err(VfsError::NotFound(e)) = vfs.umount("/x/y/z") {
+            println!("{}", e)
+        } else {
+            panic!()
+        }
     }
 
     #[test]
@@ -656,14 +659,15 @@ mod tests {
         assert!(vfs.mount(Box::new(fs1), "/x/y").is_ok());
         assert!(vfs.mount(Box::new(fs2), "/x/y").is_ok());
 
-        let m1 = vfs.get_rootfs("/x/y").unwrap();
+        let m1 = vfs.get_rootfs("/x/y").unwrap().unwrap();
         assert!(m1.as_any().is::<FakeFileSystemTwo>());
 
         assert!(vfs.umount("/x/y").is_ok());
-        assert_eq!(
-            vfs.umount("/x/y").unwrap_err().raw_os_error().unwrap(),
-            libc::ENOENT
-        );
+        if let Err(VfsError::NotFound(e)) = vfs.umount("/x/y") {
+            println!("{}", e)
+        } else {
+            panic!()
+        }
     }
 
     #[test]
