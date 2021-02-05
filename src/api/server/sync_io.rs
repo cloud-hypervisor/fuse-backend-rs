@@ -26,7 +26,7 @@ pub trait MetricsHook {
     /// `collect()` will be invoked before the real request is processed
     fn collect(&self, ih: &InHeader);
     /// `release()` will be invoked after the real request is processed
-    fn release(&self, ih: &InHeader);
+    fn release(&self, oh: Option<&OutHeader>);
 }
 
 impl<F: FileSystem + Sync> Server<F> {
@@ -116,8 +116,10 @@ impl<F: FileSystem + Sync> Server<F> {
                 w,
             ),
         };
-
-        hook.map_or((), |h| h.release(&in_header));
+        // Pass `None` because current API handler's design does not allow us to catch
+        // the `out_header`. Hopefully, we can reach to `out_header` after some
+        // refactoring work someday.
+        hook.map_or((), |h| h.release(None));
 
         r
     }
