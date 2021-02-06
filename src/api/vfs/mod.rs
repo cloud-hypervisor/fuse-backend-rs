@@ -282,7 +282,11 @@ impl Vfs {
     pub fn umount(&self, path: &str) -> VfsResult<()> {
         // Serialize mount operations. Do not expect poisoned lock here.
         let _guard = self.lock.lock().unwrap();
-        let inode = self.root.path_walk(path).map_err(VfsError::PathWalk)?;
+        let inode = self
+            .root
+            .path_walk(path)
+            .map_err(VfsError::PathWalk)?
+            .ok_or_else(|| VfsError::NotFound(path.to_string()))?;
 
         let mut mountpoints = self.mountpoints.load().deref().deref().clone();
         let fs_idx = mountpoints
@@ -314,13 +318,18 @@ impl Vfs {
     pub fn get_rootfs(&self, path: &str) -> VfsResult<Option<Arc<BackFileSystem>>> {
         // Serialize mount operations. Do not expect poisoned lock here.
         let _guard = self.lock.lock().unwrap();
-        let inode = self.root.path_walk(path).map_err(VfsError::PathWalk)?;
+        let inode = match self.root.path_walk(path).map_err(VfsError::PathWalk)? {
+            Some(i) => i,
+            None => return Ok(None),
+        };
 
         if let Some(mnt) = self.mountpoints.load().get(&inode) {
             Ok(Some(self.get_fs_by_idx(mnt.fs_idx).map_err(|e| {
                 VfsError::NotFound(format!("fs index {}, {:?}", mnt.fs_idx, e))
             })?))
         } else {
+            // Pseudo fs dir inode exists, but that no backend is ever mounted
+            // is a normal case.
             Ok(None)
         }
     }

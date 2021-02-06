@@ -148,7 +148,7 @@ impl PseudoFs {
         Ok(inode.ino)
     }
 
-    pub fn path_walk(&self, mountpoint: &str) -> Result<u64> {
+    pub fn path_walk(&self, mountpoint: &str) -> Result<Option<u64>> {
         let path = Path::new(mountpoint);
         if !path.has_root() {
             error!("pseudo fs walk failure: invalid path {}", mountpoint);
@@ -169,6 +169,9 @@ impl PseudoFs {
                     return Err(Error::from_raw_os_error(libc::EINVAL));
                 }
                 Component::Normal(path) => {
+                    // FIXME: Only UTF-8 string can be converted safely.
+                    // Unwrap here is not reliable. To fix this, we have to change
+                    // `PseudoInode::name` type.
                     let name = path.to_str().unwrap();
 
                     // Optimistic check without lock.
@@ -189,7 +192,7 @@ impl PseudoFs {
                     }
 
                     debug!("name {} is not found, path is {}", name, mountpoint);
-                    return Err(Error::from_raw_os_error(libc::ENOENT));
+                    return Ok(None);
                 }
             }
         }
@@ -197,7 +200,7 @@ impl PseudoFs {
         // let _guard = self.lock.lock();
         // self.evict_inode(&inode);
         // Now we have all path components exist, return the last one
-        Ok(inode.ino)
+        Ok(Some(inode.ino))
     }
 
     fn new_inode(&self, parent: u64, name: &str) -> Arc<PseudoInode> {
