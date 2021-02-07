@@ -169,10 +169,10 @@ impl PseudoFs {
                     return Err(Error::from_raw_os_error(libc::EINVAL));
                 }
                 Component::Normal(path) => {
-                    // FIXME: Only UTF-8 string can be converted safely.
-                    // Unwrap here is not reliable. To fix this, we have to change
-                    // `PseudoInode::name` type.
-                    let name = path.to_str().unwrap();
+                    let name = path.to_str().ok_or_else(|| {
+                        error!("Path {:?} can't be converted safely", path);
+                        Error::from_raw_os_error(libc::EINVAL)
+                    })?;
 
                     // Optimistic check without lock.
                     for child in inode.children.load().iter() {
