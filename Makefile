@@ -5,5 +5,7 @@ build:
 
 check: build
 	cargo fmt -- --check
-	cargo clippy --all-features -- -Dclippy::all
-	cargo test --all-features -- --nocapture
+	cargo clippy --features="fusedev" -- -Dclippy::all
+	cargo clippy --features="virtiofs" -- -Dclippy::all
+	cargo test --features="fusedev" -- --nocapture
+	cargo test --features="virtiofs" -- --nocapture
