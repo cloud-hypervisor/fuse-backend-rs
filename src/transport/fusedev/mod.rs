@@ -1,4 +1,5 @@
 // Copyright (C) 2020 Alibaba Cloud. All rights reserved.
+//
 // SPDX-License-Identifier: Apache-2.0
 
 //! Traits and Structs to implement the /dev/fuse Fuse transport layer.
@@ -15,6 +16,9 @@ use vm_memory::{ByteValued, VolatileMemory, VolatileMemoryError, VolatileSlice};
 
 use super::{FileReadWriteVolatile, IoBuffers, Reader};
 
+mod session;
+pub use session::*;
+
 /// Error codes for Virtio queue related operations.
 #[derive(Debug)]
 pub enum Error {
@@ -30,6 +34,8 @@ pub enum Error {
     SplitOutOfBounds(usize),
     /// Failed to access volatile memory.
     VolatileMemoryError(VolatileMemoryError),
+    /// Session errors
+    SessionFailure(String),
 }
 
 impl fmt::Display for Error {
@@ -46,6 +52,7 @@ impl fmt::Display for Error {
             IoError(e) => write!(f, "descriptor I/O error: {}", e),
             SplitOutOfBounds(off) => write!(f, "`DescriptorChain` split is out of bounds: {}", off),
             VolatileMemoryError(e) => write!(f, "volatile memory error: {}", e),
+            SessionFailure(e) => write!(f, "fuse session failure: {}", e),
         }
     }
 }
@@ -362,8 +369,6 @@ impl<'a> io::Write for Writer<'a> {
 
 #[cfg(test)]
 mod tests {
-    extern crate vmm_sys_util;
-
     use super::*;
     use std::io::{Read, Seek, SeekFrom, Write};
     use std::os::unix::io::AsRawFd;

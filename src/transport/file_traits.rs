@@ -416,8 +416,6 @@ volatile_impl!(File);
 
 #[cfg(test)]
 mod tests {
-    extern crate vmm_sys_util;
-
     use super::*;
     use std::io::{Seek, SeekFrom, Write};
     use vm_memory::VolatileSlice;

@@ -13,22 +13,24 @@ homepage = "https://github.com/cloud-hypervisor/"
 [dependencies]
 arc-swap = ">=0.4.6"
 bitflags = ">=1.1.0"
+epoll = { version = "4.0", optional = true }
 libc = ">=0.2.68"
 log = ">=0.4.6"
-nix = ">=0.17"
-vm-memory = ">=0.2.0"
+nix = "0.17.0"
+vmm-sys-util = { version = "0.4", optional = true }
+vm-memory = "0.4"
 vm-virtio = { git = "https://github.com/cloud-hypervisor/vm-virtio.git", branch = "dragonball", optional = true }
 vhost-rs = { git = "https://github.com/cloud-hypervisor/vhost.git", branch = "dragonball", package = "vhost", optional = true }
 
 [dev-dependencies]
-vmm-sys-util = "0.4.0"
+vmm-sys-util = "0.4"
 
 [dev-dependencies.vm-memory]
-version = ">=0.2.0"
+version = "0.4"
 features = ["backend-mmap"]
 
 [features]
-fusedev = []
+fusedev = ["vmm-sys-util", "epoll"]
 virtiofs = ["vm-virtio"]
 vhost-user-fs = ["virtiofs", "vhost-rs/vhost-user-slave"]
 

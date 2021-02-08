@@ -321,8 +321,6 @@ impl<'a> io::Write for Writer<'a> {
 
 #[cfg(test)]
 mod tests {
-    extern crate vmm_sys_util;
-
     use super::*;
     use std::io::{Read, Seek, SeekFrom, Write};
     use vm_memory::{Address, ByteValued, Bytes, GuestAddress, GuestMemoryMmap, Le16, Le32, Le64};
