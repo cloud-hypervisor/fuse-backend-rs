@@ -25,9 +25,9 @@ pub mod virtiofs;
 pub use self::virtiofs::{Error, FsCacheReqHandler, Result, Writer};
 
 #[cfg(all(feature = "fusedev", not(feature = "virtiofs")))]
-mod fusedev;
+pub mod fusedev;
 #[cfg(all(feature = "fusedev", not(feature = "virtiofs")))]
-pub use self::fusedev::{Error, FsCacheReqHandler, FuseBuf, Result, Writer};
+pub use self::fusedev::{Error, FsCacheReqHandler, FuseBuf, FuseSession, Result, Writer};
 
 #[derive(Clone)]
 struct IoBuffers<'a> {
