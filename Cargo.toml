@@ -24,6 +24,7 @@ vhost-rs = { git = "https://github.com/cloud-hypervisor/vhost.git", branch = "dr
 
 [dev-dependencies]
 vmm-sys-util = "0.4"
+stderrlog = "0.4"
 
 [dev-dependencies.vm-memory]
 version = "0.4"
