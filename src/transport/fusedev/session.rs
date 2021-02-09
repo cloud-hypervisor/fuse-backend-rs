@@ -162,10 +162,9 @@ impl FuseChannel {
 
         register_event(epoll_fd, fd, Events::EPOLLIN, FUSE_DEV_EVENT)
             .map_err(|e| SessionFailure(format!("epoll register session fd: {}", e)))?;
-        let exit_evtfd = evtfd.try_clone().unwrap();
         register_event(
             epoll_fd,
-            exit_evtfd.as_raw_fd(),
+            evtfd.as_raw_fd(),
             Events::EPOLLIN,
             EXIT_FUSE_EVENT,
         )
@@ -257,7 +256,7 @@ impl FuseChannel {
                         }
                     }
                     x if (Events::EPOLLERR | Events::EPOLLHUP).contains(x) => {
-                        warn!("Seems file was already closed!");
+                        info!("FUSE channel already closed!");
                         return Err(SessionFailure("epoll error".to_string()));
                     }
                     _ => {
