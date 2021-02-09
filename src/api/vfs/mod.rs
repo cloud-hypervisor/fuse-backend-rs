@@ -45,6 +45,8 @@ pub const VFS_MAX_INO: u64 = 0xff_ffff_ffff_ffff;
 const VFS_INDEX_SHIFT: u8 = 56;
 const VFS_PSEUDO_FS_IDX: VfsIndex = 0;
 
+type ArcBackFs<DR> = Arc<BackFileSystem<DR>>;
+
 type VfsHandle = u64;
 /// Vfs backend file system index
 pub type VfsIndex = u8;
@@ -435,7 +437,7 @@ impl<D: AsyncDrive> Vfs<D> {
     fn get_real_rootfs(
         &self,
         inode: VfsInode,
-    ) -> Result<(Either<&PseudoFs, Arc<BackFileSystem<D>>>, VfsInode)> {
+    ) -> Result<(Either<&PseudoFs, ArcBackFs<D>>, VfsInode)> {
         // ROOT_ID is special, we need to check if we have a mountpoint on the vfs root
         if inode.is_pseudo_fs() && inode.ino() == ROOT_ID {
             if let Some(mnt) = self.mountpoints.load().get(&inode.ino()).map(Arc::clone) {

@@ -840,6 +840,13 @@ pub trait AsyncFileSystem: FileSystem {
     */
 }
 
+type AttrFuture<'async_trait> =
+    Box<dyn Future<Output = io::Result<(libc::stat64, Duration)>> + Send + 'async_trait>;
+type OpenFuture<'async_trait, H> =
+    Box<dyn Future<Output = io::Result<(Option<H>, OpenOptions)>> + Send + 'async_trait>;
+type CreateFuture<'async_trait, H> =
+    Box<dyn Future<Output = io::Result<(Entry, Option<H>, OpenOptions)>> + Send + 'async_trait>;
+
 impl<FS: AsyncFileSystem> AsyncFileSystem for Arc<FS> {
     type D = <FS as AsyncFileSystem>::D;
 
@@ -862,7 +869,7 @@ impl<FS: AsyncFileSystem> AsyncFileSystem for Arc<FS> {
         ctx: Context,
         inode: Self::Inode,
         handle: Option<Self::Handle>,
-    ) -> Pin<Box<dyn Future<Output = io::Result<(libc::stat64, Duration)>> + Send + 'async_trait>>
+    ) -> Pin<AttrFuture<'async_trait>>
     where
         'a: 'async_trait,
         Self: 'async_trait,
@@ -877,7 +884,7 @@ impl<FS: AsyncFileSystem> AsyncFileSystem for Arc<FS> {
         attr: libc::stat64,
         handle: Option<Self::Handle>,
         valid: SetattrValid,
-    ) -> Pin<Box<dyn Future<Output = io::Result<(libc::stat64, Duration)>> + Send + 'async_trait>>
+    ) -> Pin<AttrFuture<'async_trait>>
     where
         'a: 'async_trait,
         Self: 'async_trait,
@@ -890,13 +897,7 @@ impl<FS: AsyncFileSystem> AsyncFileSystem for Arc<FS> {
         ctx: Context,
         inode: Self::Inode,
         flags: u32,
-    ) -> Pin<
-        Box<
-            dyn Future<Output = io::Result<(Option<Self::Handle>, OpenOptions)>>
-                + Send
-                + 'async_trait,
-        >,
-    >
+    ) -> Pin<OpenFuture<'async_trait, Self::Handle>>
     where
         'a: 'async_trait,
         Self: 'async_trait,
@@ -912,13 +913,7 @@ impl<FS: AsyncFileSystem> AsyncFileSystem for Arc<FS> {
         mode: u32,
         flags: u32,
         umask: u32,
-    ) -> Pin<
-        Box<
-            dyn Future<Output = io::Result<(Entry, Option<Self::Handle>, OpenOptions)>>
-                + Send
-                + 'async_trait,
-        >,
-    >
+    ) -> Pin<CreateFuture<'async_trait, Self::Handle>>
     where
         'a: 'async_trait,
         'b: 'async_trait,

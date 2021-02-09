@@ -448,21 +448,19 @@ mod async_io {
                     acc + b.len()
                 });
                 Ok(count)
+            } else if bufs.is_empty() {
+                Ok(0)
             } else {
-                if bufs.is_empty() {
-                    Ok(0)
-                } else {
-                    AsyncUtil::write_vectored(drive, self.fd, bufs, 0)
-                        .await
-                        .map(|x| {
-                            self.account_written(x);
-                            x
-                        })
-                        .map_err(|e| {
-                            error! {"fail to write to fuse device on commit: {}", e};
-                            io::Error::new(io::ErrorKind::Other, format!("{}", e))
-                        })
-                }
+                AsyncUtil::write_vectored(drive, self.fd, bufs, 0)
+                    .await
+                    .map(|x| {
+                        self.account_written(x);
+                        x
+                    })
+                    .map_err(|e| {
+                        error! {"fail to write to fuse device on commit: {}", e};
+                        io::Error::new(io::ErrorKind::Other, format!("{}", e))
+                    })
             }
         }
 
@@ -1001,7 +999,6 @@ mod tests {
 
         // expect errors
         block_on(handle).unwrap_err();
-
 
         let mut writer2 = Writer::new(file.as_raw_fd(), 48).unwrap();
         let handle = executor

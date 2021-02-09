@@ -35,7 +35,7 @@ impl<D: AsyncDrive> PassthroughFs<D> {
     ) -> io::Result<File> {
         let drive = ctx
             .get_drive::<D>()
-            .ok_or(io::Error::from_raw_os_error(libc::EINVAL))?;
+            .ok_or_else(|| io::Error::from_raw_os_error(libc::EINVAL))?;
 
         AsyncUtil::open_at(drive, dfd, pathname, flags, mode)
             .await
@@ -459,6 +459,7 @@ impl<D: AsyncDrive + Sync> AsyncFileSystem for PassthroughFs<D> {
         // Ok((entry, ret_handle, opts))
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn async_read(
         &self,
         ctx: Context,
@@ -475,12 +476,13 @@ impl<D: AsyncDrive + Sync> AsyncFileSystem for PassthroughFs<D> {
             .await?;
         let drive = ctx
             .get_drive::<D>()
-            .ok_or(io::Error::from_raw_os_error(libc::EINVAL))?;
+            .ok_or_else(|| io::Error::from_raw_os_error(libc::EINVAL))?;
 
         w.async_write_from(drive, data.get_handle_raw_fd(), size as usize, offset)
             .await
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn async_write(
         &self,
         ctx: Context,
@@ -498,7 +500,7 @@ impl<D: AsyncDrive + Sync> AsyncFileSystem for PassthroughFs<D> {
             .await?;
         let drive = ctx
             .get_drive::<D>()
-            .ok_or(io::Error::from_raw_os_error(libc::EINVAL))?;
+            .ok_or_else(|| io::Error::from_raw_os_error(libc::EINVAL))?;
 
         r.async_read_to(drive, data.get_handle_raw_fd(), size as usize, offset)
             .await
@@ -517,7 +519,7 @@ impl<D: AsyncDrive + Sync> AsyncFileSystem for PassthroughFs<D> {
 
         let drive = ctx
             .get_drive::<D>()
-            .ok_or(io::Error::from_raw_os_error(libc::EINVAL))?;
+            .ok_or_else(|| io::Error::from_raw_os_error(libc::EINVAL))?;
 
         AsyncUtil::fsync(drive, data.get_handle_raw_fd(), datasync).await
     }
@@ -538,7 +540,7 @@ impl<D: AsyncDrive + Sync> AsyncFileSystem for PassthroughFs<D> {
 
         let drive = ctx
             .get_drive::<D>()
-            .ok_or(io::Error::from_raw_os_error(libc::EINVAL))?;
+            .ok_or_else(|| io::Error::from_raw_os_error(libc::EINVAL))?;
 
         AsyncUtil::fallocate(drive, data.get_handle_raw_fd(), offset, length, mode).await
     }
