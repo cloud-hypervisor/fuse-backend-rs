@@ -34,12 +34,22 @@ mod fusedev_tests {
             return false;
         }
 
-        let src_md5 =
-            exec(format!("cd {}; git ls-files | xargs md5sum; cd - > /dev/null", src).as_str())
-                .unwrap();
-        let dest_md5 =
-            exec(format!("cd {}; git ls-files | xargs md5sum; cd - > /dev/null", dest).as_str())
-                .unwrap();
+        let src_md5 = exec(
+            format!(
+                "cd {}; git ls-files --recurse-submodules | xargs md5sum; cd - > /dev/null",
+                src
+            )
+            .as_str(),
+        )
+        .unwrap();
+        let dest_md5 = exec(
+            format!(
+                "cd {}; git ls-files --recurse-submodules | xargs md5sum; cd - > /dev/null",
+                dest
+            )
+            .as_str(),
+        )
+        .unwrap();
         if src_md5 != dest_md5 {
             error!("src {}:\n{}\ndest {}:\n{}", src, src_md5, dest, dest_md5,);
             return false;
@@ -80,6 +90,7 @@ mod fusedev_tests {
     }
 
     #[test]
+    #[ignore] // it depends on privileged mode to pass through /dev/fuse
     fn integration_test_tree_gitrepo() -> Result<()> {
         // test the fuse-rs repository
         let src = Path::new(".").canonicalize().unwrap();
