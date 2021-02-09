@@ -99,6 +99,7 @@ impl<D: AsyncDrive + Sync> AsyncFileSystem for Vfs<D> {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn async_read(
         &self,
         ctx: Context,
@@ -119,6 +120,7 @@ impl<D: AsyncDrive + Sync> AsyncFileSystem for Vfs<D> {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn async_write(
         &self,
         ctx: Context,

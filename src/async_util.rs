@@ -64,9 +64,9 @@ impl<D: AsyncDrive> AsyncUtil<D> {
         } else {
             Mode::from_bits(mode as mode_t)
         };
-        let mode = mode.ok_or(io::Error::from_raw_os_error(libc::EINVAL))?;
+        let mode = mode.ok_or_else(|| io::Error::from_raw_os_error(libc::EINVAL))?;
         let flags = OFlag::from_bits(flags);
-        let flags = flags.ok_or(io::Error::from_raw_os_error(libc::EINVAL))?;
+        let flags = flags.ok_or_else(|| io::Error::from_raw_os_error(libc::EINVAL))?;
 
         let event = OpenAt {
             path: pathname.to_owned(),
@@ -102,7 +102,7 @@ impl<D: AsyncDrive> AsyncUtil<D> {
         flags: u32,
     ) -> io::Result<()> {
         let flags = FallocateFlags::from_bits(flags as i32);
-        let flags = flags.ok_or(io::Error::from_raw_os_error(libc::EINVAL))?;
+        let flags = flags.ok_or_else(|| io::Error::from_raw_os_error(libc::EINVAL))?;
 
         let event = Fallocate {
             fd,
@@ -310,6 +310,7 @@ impl Default for AsyncDriver {
 }
 
 /// Single-threaded asynchronous IO executor based on Linux io_uring.
+#[allow(dead_code)]
 pub struct AsyncExecutor {
     executor: LocalPool,
     ring: *const IoUring,
@@ -398,8 +399,15 @@ impl Drop for AsyncExecutor {
 #[derive(Clone)]
 pub struct AsyncExecutorState(Arc<AtomicU32>);
 
+impl Default for AsyncExecutorState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl AsyncExecutorState {
     /// Create a new state object.
+
     pub fn new() -> Self {
         AsyncExecutorState(Arc::new(AtomicU32::new(0)))
     }
