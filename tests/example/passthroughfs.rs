@@ -9,9 +9,9 @@ use std::thread;
 
 use vmm_sys_util::eventfd::EventFd;
 
-use fuse_rs::api::{server::Server, Vfs, VfsOptions};
-use fuse_rs::passthrough::{Config, PassthroughFs};
-use fuse_rs::transport::fusedev;
+use fuse_backend_rs::api::{server::Server, Vfs, VfsOptions};
+use fuse_backend_rs::passthrough::{Config, PassthroughFs};
+use fuse_backend_rs::transport::fusedev::{FuseChannel, FuseSession};
 
 /// A fusedev daemon example
 pub struct Daemon {
@@ -19,7 +19,7 @@ pub struct Daemon {
     server: Arc<Server<Arc<Vfs>>>,
     thread_cnt: u32,
     event_fd: EventFd,
-    session: Option<fusedev::FuseSession>,
+    session: Option<FuseSession>,
 }
 
 impl Daemon {
@@ -54,8 +54,7 @@ impl Daemon {
     /// Mounts a fusedev daemon to the mountpoint, then start service threads to handle
     /// FUSE requests.
     pub fn mount(&mut self) -> Result<()> {
-        let mut se =
-            fusedev::FuseSession::new(Path::new(&self.mountpoint), "passthru_example", "").unwrap();
+        let mut se = FuseSession::new(Path::new(&self.mountpoint), "passthru_example", "").unwrap();
         se.mount().unwrap();
         for _ in 0..self.thread_cnt {
             let server = FuseServer {
@@ -93,15 +92,12 @@ impl Drop for Daemon {
 
 struct FuseServer {
     server: Arc<Server<Arc<Vfs>>>,
-    ch: fusedev::FuseChannel,
+    ch: FuseChannel,
 }
 
 impl FuseServer {
     fn svc_loop(&self) -> Result<()> {
-        let mut buf = Vec::with_capacity(1024 * 1024);
-        unsafe {
-            buf.set_len(1024 * 1024);
-        }
+        let mut buf = vec![0x0u8; 1024 * 1024];
 
         // Given error EBADF, it means kernel has shut down this session.
         let _ebadf = std::io::Error::from_raw_os_error(libc::EBADF);
@@ -117,7 +113,7 @@ impl FuseServer {
                     .map_err(|_| std::io::Error::from_raw_os_error(libc::EINVAL))?;
                 if let Err(e) = self.server.handle_message(reader, writer, None, None) {
                     match e {
-                        fuse_rs::Error::EncodeMessage(_ebadf) => {
+                        fuse_backend_rs::Error::EncodeMessage(_ebadf) => {
                             break;
                         }
                         _ => {

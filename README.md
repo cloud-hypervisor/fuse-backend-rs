@@ -1,8 +1,8 @@
-# Fuse-rs
+# Fuse-backend-rs
 
 ## Design
 
-The Fuse-rs crate is an rust library to implement Fuse daemons based on the
+The fuse-backend-rs crate is an rust library to implement Fuse daemons based on the
 [Linux FUSE device (/dev/fuse)](https://www.kernel.org/doc/html/latest/filesystems/fuse.html)
 or the [virtiofs](https://stefanha.github.io/virtio/virtio-fs.html#x1-41500011) draft specification.
 
@@ -23,16 +23,55 @@ So the fuse-rs crate is a library to communicate with the Linux FUSE clients, wh
 
 ## Usage
 
-TODO: This section describes how the crate is used.
+Please refer to [dragonflyoss/image-service](https://github.com/dragonflyoss/image-service/blob/master/src/bin/nydusd/fusedev.rs)
+for an example to use the fusedev framework.
 
 ## Examples
 
-TODO: Usage examples.
-
 ```rust
-use fuse_rs;
+use fuse_backend_rs::api::{server::Server, Vfs, VfsOptions};
+use fuse_backend_rs::transport::fusedev::{FuseSession, FuseChannel};
 
-...
+struct FuseServer {
+    server: Arc<Server<Arc<Vfs>>>,
+    ch: FuseChannel,
+}
+
+impl FuseServer {
+    fn svc_loop(&self) -> Result<()> {
+        let mut buf = vec![0x0u8; 1024 * 1024];
+
+        // Given error EBADF, it means kernel has shut down this session.
+        let _ebadf = std::io::Error::from_raw_os_error(libc::EBADF);
+        loop {
+            if let Some(reader) = self
+                .ch
+                .get_reader(&mut buf)
+                .map_err(|_| std::io::Error::from_raw_os_error(libc::EINVAL))?
+            {
+                let writer = self
+                    .ch
+                    .get_writer()
+                    .map_err(|_| std::io::Error::from_raw_os_error(libc::EINVAL))?;
+                if let Err(e) = self.server.handle_message(reader, writer, None, None) {
+                    match e {
+                        fuse_backend_rs::Error::EncodeMessage(_ebadf) => {
+                            break;
+                        }
+                        _ => {
+                            error!("Handling fuse message failed");
+                            continue;
+                        }
+                    }
+                }
+            } else {
+                info!("fuse server exits");
+                break;
+            }
+        }
+        Ok(())
+    }
+}
 ```
 
 ## License
