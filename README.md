@@ -23,10 +23,29 @@ So the fuse-rs crate is a library to communicate with the Linux FUSE clients, wh
 
 ## Usage
 
-Please refer to [dragonflyoss/image-service](https://github.com/dragonflyoss/image-service/blob/master/src/bin/nydusd/fusedev.rs)
-for an example to use the fusedev framework.
+### Fuse Servers
+Please refer to
+- [Dragonfly Image Service fusedev Server](https://github.com/dragonflyoss/image-service/blob/master/src/bin/nydusd/fusedev.rs)
+for an example of implementing a fuse server based on the
+[fuse-backend-rs](https://crates.io/crates/fuse-backend-rs) crate.
+- [Dragonfly Image Service vhost-user-fs Server](https://github.com/dragonflyoss/image-service/blob/master/src/bin/nydusd/virtiofs.rs)
+  for an example of implementing vhost-user-fs server based on the
+  [fuse-backend-rs](https://crates.io/crates/fuse-backend-rs) crate.
+### Filesystem Drivers
+Please refer to 
+- [Virtual File System](https://github.com/cloud-hypervisor/fuse-backend-rs/tree/master/src/api/vfs)
+  for an example of union file system.
+- [Pseudo File System](https://github.com/cloud-hypervisor/fuse-backend-rs/blob/master/src/api/pseudo_fs.rs)
+  for an example of pseudo file system.
+- [Passthrough File System](https://github.com/cloud-hypervisor/fuse-backend-rs/tree/master/src/passthrough)
+  for an example of passthrough(stacked) file system.
+- [Registry Accelerated File System](https://github.com/dragonflyoss/image-service/tree/master/rafs)
+  for an example of readonly file system for container images.
 
 ## Examples
+
+### Fuse Server and Main Service Loop
+A sample fuse server based on the Linux Fuse device (/dev/fuse):
 
 ```rust
 use fuse_backend_rs::api::{server::Server, Vfs, VfsOptions};
