@@ -1,13 +1,12 @@
 // Copyright 2020-2021 Ant Group. All rights reserved.
 //
 // SPDX-License-Identifier: Apache-2.0
-//
-// FUSE session management. A FUSE session is a connection from a FUSE
-// mountpoint to a FUSE server daemon. A FUSE channel is a FUSE request
-// handling context that takes care of handling FUSE requests sequentially.
-// A FUSE session can have multiple FUSE channels so that FUSE requests are
-// handled in parallel.
-//
+
+//! FUSE session management.
+//!
+//! A FUSE channel is a FUSE request handling context that takes care of handling FUSE requests
+//! sequentially. A FUSE session is a connection from a FUSE mountpoint to a FUSE server daemon.
+//! A FUSE session can have multiple FUSE channels so that FUSE requests are handled in parallel.
 
 use std::cell::RefCell;
 use std::fs::{File, OpenOptions};
@@ -29,7 +28,7 @@ use nix::fcntl::{fcntl, FcntlArg, OFlag};
 use super::{Error::SessionFailure, FuseBuf, Reader, Result, Writer};
 use vmm_sys_util::eventfd::EventFd;
 
-/// These follows definition from libfuse
+// These follows definition from libfuse.
 const FUSE_KERN_BUF_SIZE: usize = 256;
 const FUSE_HEADER_SIZE: usize = 0x1000;
 
@@ -39,7 +38,7 @@ const FUSE_FSTYPE: &str = "fuse";
 const FUSE_DEV_EVENT: u64 = 0;
 const EXIT_FUSE_EVENT: u64 = 1;
 
-/// A fuse session representation
+/// A fuse session manager to manage the connection with the in kernel fuse driver.
 pub struct FuseSession {
     mountpoint: PathBuf,
     fsname: String,
@@ -49,7 +48,7 @@ pub struct FuseSession {
 }
 
 impl FuseSession {
-    /// Create a new fuse session without mounting
+    /// Create a new fuse session, without mounting/connecting to the in kernel fuse driver.
     pub fn new(mountpoint: &Path, fsname: &str, subtype: &str) -> Result<FuseSession> {
         let dest = mountpoint
             .canonicalize()
@@ -67,7 +66,7 @@ impl FuseSession {
         })
     }
 
-    /// Mount the fuse mountpoint
+    /// Mount the fuse mountpoint, building connection with the in kernel fuse driver.
     pub fn mount(&mut self) -> Result<()> {
         let flags =
             MsFlags::MS_NOSUID | MsFlags::MS_NODEV | MsFlags::MS_NOATIME | MsFlags::MS_RDONLY;
@@ -80,21 +79,21 @@ impl FuseSession {
         Ok(())
     }
 
-    /// Expose the associated fuse session file descriptor
-    /// Does not transfer FUSE session fd. Caller MUST NOT close
-    /// the fd after getting it.
+    /// Expose the associated fuse session file descriptor.
+    ///
+    /// Does not transfer FUSE session fd. Caller MUST NOT close the fd after getting it.
     pub fn get_fuse_fd(&mut self) -> Option<RawFd> {
         self.file.as_ref().map(|file| file.as_raw_fd())
     }
 
     /// Force setting the associated FUSE session file descriptor.
-    /// Takes ownership of the fd. Caller MUST NOT close the fd
-    /// after setting it.
+    ///
+    /// Takes ownership of the fd. Caller MUST NOT close the fd after setting it.
     pub fn set_fuse_fd(&mut self, fd: RawFd) {
         self.file = Some(unsafe { File::from_raw_fd(fd) });
     }
 
-    /// destroy a fuse session
+    /// Destroy a fuse session.
     pub fn umount(&mut self) -> Result<()> {
         if let Some(file) = self.file.take() {
             // safe to unwrap as mountpoint was valid string otherwise mount fails
@@ -104,27 +103,27 @@ impl FuseSession {
         }
     }
 
-    /// return the mountpoint
+    /// Get the mountpoint of the session.
     pub fn mountpoint(&self) -> &Path {
         &self.mountpoint
     }
 
-    /// return the fsname
+    /// Get the file system name of the session.
     pub fn fsname(&self) -> &str {
         &self.fsname
     }
 
-    /// return the subtype
+    /// Get the subtype of the session.
     pub fn subtype(&self) -> &str {
         &self.subtype
     }
 
-    /// return the default buffer size
+    /// Get the default buffer size of the session.
     pub fn bufsize(&self) -> usize {
         self.bufsize
     }
 
-    /// create a new fuse message channel
+    /// Create a new fuse message channel.
     pub fn new_channel(&self, evtfd: EventFd) -> Result<FuseChannel> {
         if let Some(file) = &self.file {
             FuseChannel::new(file.as_raw_fd(), evtfd, self.bufsize)
@@ -142,7 +141,7 @@ impl Drop for FuseSession {
 
 /// A fuse channel abstruction. Each session can hold multiple channels.
 pub struct FuseChannel {
-    fd: c_int,
+    fd: RawFd,
     epoll_fd: RawFd,
     bufsize: usize,
     events: RefCell<Vec<Event>>,
@@ -155,7 +154,7 @@ fn register_event(epoll_fd: c_int, fd: RawFd, evt: Events, data: u64) -> Result<
 }
 
 impl FuseChannel {
-    fn new(fd: c_int, evtfd: EventFd, bufsize: usize) -> Result<Self> {
+    fn new(fd: RawFd, evtfd: EventFd, bufsize: usize) -> Result<Self> {
         const EPOLL_EVENTS_LEN: usize = 100;
         let epoll_fd =
             epoll::create(true).map_err(|e| SessionFailure(format!("epoll create: {}", e)))?;
@@ -327,21 +326,17 @@ fn fuse_kern_mount(mountpoint: &Path, fsname: &str, subtype: &str, flags: MsFlag
         Some(opts.deref()),
     )
     .map_err(|e| SessionFailure(format!("failed to mount {:?}: {}", mountpoint, e)))?;
+
     Ok(file)
 }
 
 /// Umount a fuse file system
 fn fuse_kern_umount(mountpoint: &str, file: File) -> Result<()> {
     let mut fds = [PollFd::new(file.as_raw_fd(), PollFlags::empty())];
-    let res = poll(&mut fds, 0);
 
-    // Drop to close fuse session fd, otherwise synchronous umount
-    // can recurse into filesystem and deadlock.
-    drop(file);
-
-    if res.is_ok() {
+    if poll(&mut fds, 0).is_ok() {
         // POLLERR means the file system is already umounted,
-        // or the connection was severed via /sys/fs/fuse/connections/NNN/abort
+        // or the connection has been aborted via /sys/fs/fuse/connections/NNN/abort
         if let Some(event) = fds[0].revents() {
             if event == PollFlags::POLLERR {
                 return Ok(());
@@ -349,6 +344,9 @@ fn fuse_kern_umount(mountpoint: &str, file: File) -> Result<()> {
         }
     }
 
+    // Drop to close fuse session fd, otherwise synchronous umount can recurse into filesystem and
+    // cause deadlock.
+    drop(file);
     umount2(mountpoint, MntFlags::MNT_DETACH)
         .map_err(|e| SessionFailure(format!("failed to umount {}: {}", mountpoint, e)))
 }
