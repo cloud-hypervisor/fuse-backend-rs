@@ -143,6 +143,7 @@ impl Drop for FuseSession {
 pub struct FuseChannel {
     fd: RawFd,
     epoll_fd: RawFd,
+    buf: Vec<u8>,
     bufsize: usize,
     events: RefCell<Vec<Event>>,
 }
@@ -172,13 +173,19 @@ impl FuseChannel {
         Ok(FuseChannel {
             fd: dup(fd).map_err(|e| SessionFailure(format!("dup fd: {}", e)))?,
             epoll_fd,
+            buf: vec![0x0u8; bufsize],
             bufsize,
             events: RefCell::new(vec![Event::new(Events::empty(), 0); EPOLL_EVENTS_LEN]),
         })
     }
 
-    /// Return a channel reader that waits and reads from /dev/fuse for a single FUSE request
-    pub fn get_reader<'b>(&self, buf: &'b mut Vec<u8>) -> Result<Option<Reader<'b>>> {
+    /// Get next available FUSE request from the underlying fuse device file.
+    ///
+    /// Returns:
+    /// - Ok(None): signal has pending on the exiting event channel
+    /// - Ok(Some((reader, writer))): reader to receive request and writer to send reply
+    /// - Err(e): error message
+    pub fn get_request(&mut self) -> Result<Option<(Reader, Writer)>> {
         loop {
             let num_events = epoll::wait(self.epoll_fd, -1, &mut self.events.borrow_mut())
                 .map_err(|e| SessionFailure(format!("epoll wait: {}", e)))?;
@@ -197,26 +204,26 @@ impl FuseChannel {
                     Events::EPOLLIN => {
                         match event.data {
                             EXIT_FUSE_EVENT => {
-                                // Directly return from here is reliable as we handle only one epoll event
-                                // which is `Read` or `Exit` once this function is called.
-                                // One more trick is we don't read the event fd so as to make all fuse threads exit.
-                                // That is because we configure this event fd as LEVEL triggered.
+                                // Directly returning from here is reliable as we handle only one
+                                // epoll event which is `Read` or `Exit`.
+                                // One more trick, we don't read the event fd so as to make all
+                                // fuse threads exit. It relies on a LEVEL triggered event fd.
                                 info!("Will exit from fuse service");
                                 return Ok(None);
                             }
                             FUSE_DEV_EVENT => {
-                                match read(self.fd, buf.as_mut_slice()) {
+                                match read(self.fd, &mut self.buf) {
                                     Ok(len) => {
-                                        return Ok(Some(
-                                            Reader::new(FuseBuf::new(&mut buf[..len])).map_err(
-                                                |e| {
+                                        let reader =
+                                            Reader::new(FuseBuf::new(&mut self.buf[..len]))
+                                                .map_err(|e| {
                                                     SessionFailure(format!(
                                                         "new read buffer: {}",
                                                         e
                                                     ))
-                                                },
-                                            )?,
-                                        ));
+                                                })?;
+                                        let writer = Writer::new(self.fd, self.bufsize).unwrap();
+                                        return Ok(Some((reader, writer)));
                                     }
                                     Err(nixError::Sys(e)) => match e {
                                         Errno::ENOENT => {
@@ -225,12 +232,12 @@ impl FuseChannel {
                                             trace!("restart reading");
                                             continue;
                                         }
+                                        Errno::EAGAIN | Errno::EINTR => {
+                                            continue;
+                                        }
                                         Errno::ENODEV => {
                                             info!("fuse filesystem umounted");
                                             return Ok(None);
-                                        }
-                                        Errno::EAGAIN => {
-                                            continue;
                                         }
                                         e => {
                                             warn! {"read fuse dev failed on fd {}: {}", self.fd, e};
@@ -265,11 +272,6 @@ impl FuseChannel {
                 }
             }
         }
-    }
-
-    /// Return a channel writer to write a single FUSE reply
-    pub fn get_writer(&self) -> Result<Writer> {
-        Ok(Writer::new(self.fd, self.bufsize).unwrap())
     }
 }
 

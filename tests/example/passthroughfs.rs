@@ -58,7 +58,7 @@ impl Daemon {
         let mut se = FuseSession::new(Path::new(&self.mountpoint), "passthru_example", "").unwrap();
         se.mount().unwrap();
         for _ in 0..self.thread_cnt {
-            let server = FuseServer {
+            let mut server = FuseServer {
                 server: self.server.clone(),
                 ch: se.new_channel(self.event_fd.try_clone().unwrap()).unwrap(),
             };
@@ -97,21 +97,15 @@ struct FuseServer {
 }
 
 impl FuseServer {
-    fn svc_loop(&self) -> Result<()> {
-        let mut buf = vec![0x0u8; 1024 * 1024];
-
+    fn svc_loop(&mut self) -> Result<()> {
         // Given error EBADF, it means kernel has shut down this session.
         let _ebadf = std::io::Error::from_raw_os_error(libc::EBADF);
         loop {
-            if let Some(reader) = self
+            if let Some((reader, writer)) = self
                 .ch
-                .get_reader(&mut buf)
+                .get_request()
                 .map_err(|_| std::io::Error::from_raw_os_error(libc::EINVAL))?
             {
-                let writer = self
-                    .ch
-                    .get_writer()
-                    .map_err(|_| std::io::Error::from_raw_os_error(libc::EINVAL))?;
                 if let Err(e) = self.server.handle_message(reader, writer, None, None) {
                     match e {
                         fuse_backend_rs::Error::EncodeMessage(_ebadf) => {

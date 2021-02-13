@@ -58,37 +58,31 @@ struct FuseServer {
 
 impl FuseServer {
     fn svc_loop(&self) -> Result<()> {
-        let mut buf = vec![0x0u8; 1024 * 1024];
-
-        // Given error EBADF, it means kernel has shut down this session.
-        let _ebadf = std::io::Error::from_raw_os_error(libc::EBADF);
-        loop {
-            if let Some(reader) = self
+      // Given error EBADF, it means kernel has shut down this session.
+      let _ebadf = std::io::Error::from_raw_os_error(libc::EBADF);
+      loop {
+        if let Some((reader, writer)) = self
                 .ch
-                .get_reader(&mut buf)
+                .get_request()
                 .map_err(|_| std::io::Error::from_raw_os_error(libc::EINVAL))?
-            {
-                let writer = self
-                    .ch
-                    .get_writer()
-                    .map_err(|_| std::io::Error::from_raw_os_error(libc::EINVAL))?;
-                if let Err(e) = self.server.handle_message(reader, writer, None, None) {
-                    match e {
-                        fuse_backend_rs::Error::EncodeMessage(_ebadf) => {
-                            break;
-                        }
-                        _ => {
-                            error!("Handling fuse message failed");
-                            continue;
-                        }
-                    }
-                }
-            } else {
-                info!("fuse server exits");
+        {
+          if let Err(e) = self.server.handle_message(reader, writer, None, None) {
+            match e {
+              fuse_backend_rs::Error::EncodeMessage(_ebadf) => {
                 break;
+              }
+              _ => {
+                error!("Handling fuse message failed");
+                continue;
+              }
             }
+          }
+        } else {
+          info!("fuse server exits");
+          break;
         }
-        Ok(())
+      }
+      Ok(())
     }
 }
 ```
