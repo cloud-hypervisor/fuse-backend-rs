@@ -12,21 +12,20 @@ use std::cell::RefCell;
 use std::fs::{File, OpenOptions};
 use std::ops::Deref;
 use std::os::unix::fs::PermissionsExt;
-use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
+use std::os::unix::io::{AsRawFd, RawFd};
 use std::path::{Path, PathBuf};
 
+use epoll::{ControlOptions, Event, Events};
 use libc::{c_int, sysconf, _SC_PAGESIZE};
 use nix::errno::Errno;
+use nix::fcntl::{fcntl, FcntlArg, OFlag};
 use nix::mount::{mount, umount2, MntFlags, MsFlags};
 use nix::poll::{poll, PollFd, PollFlags};
 use nix::unistd::{close, dup, getgid, getuid, read};
 use nix::Error as nixError;
-
-use epoll::{ControlOptions, Event, Events};
-use nix::fcntl::{fcntl, FcntlArg, OFlag};
+use vmm_sys_util::eventfd::EventFd;
 
 use super::{Error::SessionFailure, FuseBuf, Reader, Result, Writer};
-use vmm_sys_util::eventfd::EventFd;
 
 // These follows definition from libfuse.
 const FUSE_KERN_BUF_SIZE: usize = 256;
@@ -70,8 +69,8 @@ impl FuseSession {
     pub fn mount(&mut self) -> Result<()> {
         let flags =
             MsFlags::MS_NOSUID | MsFlags::MS_NODEV | MsFlags::MS_NOATIME | MsFlags::MS_RDONLY;
-
         let file = fuse_kern_mount(&self.mountpoint, &self.fsname, &self.subtype, flags)?;
+
         fcntl(file.as_raw_fd(), FcntlArg::F_SETFL(OFlag::O_NONBLOCK))
             .map_err(|e| SessionFailure(format!("set fd nonblocking: {}", e)))?;
         self.file = Some(file);
@@ -79,18 +78,14 @@ impl FuseSession {
         Ok(())
     }
 
-    /// Expose the associated fuse session file descriptor.
-    ///
-    /// Does not transfer FUSE session fd. Caller MUST NOT close the fd after getting it.
-    pub fn get_fuse_fd(&mut self) -> Option<RawFd> {
-        self.file.as_ref().map(|file| file.as_raw_fd())
+    /// Expose the associated FUSE session file.
+    pub fn get_fuse_file(&mut self) -> Option<&File> {
+        self.file.as_ref()
     }
 
-    /// Force setting the associated FUSE session file descriptor.
-    ///
-    /// Takes ownership of the fd. Caller MUST NOT close the fd after setting it.
-    pub fn set_fuse_fd(&mut self, fd: RawFd) {
-        self.file = Some(unsafe { File::from_raw_fd(fd) });
+    /// Force setting the associated FUSE session file.
+    pub fn set_fuse_file(&mut self, file: File) {
+        self.file = Some(file);
     }
 
     /// Destroy a fuse session.
