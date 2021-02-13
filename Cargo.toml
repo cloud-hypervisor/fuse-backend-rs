@@ -19,7 +19,6 @@ homepage = "https://github.com/cloud-hypervisor/"
 arc-swap = ">=0.4.6"
 #async-trait = { version = "0.1.42", optional = true }
 bitflags = ">=1.1.0"
-epoll = { version = "4.0", optional = true }
 #futures = { version = "0.3", optional = true }
 #iou = { version = "0.3.3", optional = true }
 libc = ">=0.2.68"
@@ -43,7 +42,7 @@ features = ["backend-mmap"]
 [features]
 default = ["fusedev"]
 #async-io = ["async-trait", "futures", "iou", "ringbahn"]
-fusedev = ["vmm-sys-util", "epoll"]
+fusedev = ["vmm-sys-util"]
 #virtiofs = ["vm-virtio"]
 #vhost-user-fs = ["virtiofs", "vhost-rs/vhost-user-slave"]
 
