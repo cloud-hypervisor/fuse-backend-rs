@@ -8,22 +8,21 @@
 //! sequentially. A FUSE session is a connection from a FUSE mountpoint to a FUSE server daemon.
 //! A FUSE session can have multiple FUSE channels so that FUSE requests are handled in parallel.
 
-use std::cell::RefCell;
 use std::fs::{File, OpenOptions};
 use std::ops::Deref;
 use std::os::unix::fs::PermissionsExt;
-use std::os::unix::io::{AsRawFd, RawFd};
+use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 
-use epoll::{ControlOptions, Event, Events};
-use libc::{c_int, sysconf, _SC_PAGESIZE};
+use libc::{sysconf, _SC_PAGESIZE};
 use nix::errno::Errno;
 use nix::fcntl::{fcntl, FcntlArg, OFlag};
 use nix::mount::{mount, umount2, MntFlags, MsFlags};
 use nix::poll::{poll, PollFd, PollFlags};
-use nix::unistd::{close, dup, getgid, getuid, read};
+use nix::unistd::{getgid, getuid, read};
 use nix::Error as nixError;
 use vmm_sys_util::eventfd::EventFd;
+use vmm_sys_util::poll::{PollContext, WatchingEvents};
 
 use super::{Error::SessionFailure, FuseBuf, Reader, Result, Writer};
 
@@ -34,8 +33,8 @@ const FUSE_HEADER_SIZE: usize = 0x1000;
 const FUSE_DEVICE: &str = "/dev/fuse";
 const FUSE_FSTYPE: &str = "fuse";
 
-const FUSE_DEV_EVENT: u64 = 0;
-const EXIT_FUSE_EVENT: u64 = 1;
+const FUSE_DEV_EVENT: u32 = 0;
+const EXIT_FUSE_EVENT: u32 = 1;
 
 /// A fuse session manager to manage the connection with the in kernel fuse driver.
 pub struct FuseSession {
@@ -121,7 +120,10 @@ impl FuseSession {
     /// Create a new fuse message channel.
     pub fn new_channel(&self, evtfd: EventFd) -> Result<FuseChannel> {
         if let Some(file) = &self.file {
-            FuseChannel::new(file.as_raw_fd(), evtfd, self.bufsize)
+            let file = file
+                .try_clone()
+                .map_err(|e| SessionFailure(format!("dup fd: {}", e)))?;
+            FuseChannel::new(file, evtfd, self.bufsize)
         } else {
             Err(SessionFailure("invalid fuse session".to_string()))
         }
@@ -136,41 +138,29 @@ impl Drop for FuseSession {
 
 /// A fuse channel abstruction. Each session can hold multiple channels.
 pub struct FuseChannel {
-    fd: RawFd,
-    epoll_fd: RawFd,
-    buf: Vec<u8>,
+    file: File,
+    poll_ctx: PollContext<u32>,
     bufsize: usize,
-    events: RefCell<Vec<Event>>,
-}
-
-fn register_event(epoll_fd: c_int, fd: RawFd, evt: Events, data: u64) -> Result<()> {
-    let event = Event::new(evt, data);
-    epoll::ctl(epoll_fd, ControlOptions::EPOLL_CTL_ADD, fd, event)
-        .map_err(|e| SessionFailure(format!("epoll add error: {}", e)))
+    buf: Vec<u8>,
 }
 
 impl FuseChannel {
-    fn new(fd: RawFd, evtfd: EventFd, bufsize: usize) -> Result<Self> {
-        const EPOLL_EVENTS_LEN: usize = 100;
-        let epoll_fd =
-            epoll::create(true).map_err(|e| SessionFailure(format!("epoll create: {}", e)))?;
+    fn new(file: File, evtfd: EventFd, bufsize: usize) -> Result<Self> {
+        let poll_ctx =
+            PollContext::new().map_err(|e| SessionFailure(format!("epoll create: {}", e)))?;
 
-        register_event(epoll_fd, fd, Events::EPOLLIN, FUSE_DEV_EVENT)
+        poll_ctx
+            .add_fd_with_events(&file, WatchingEvents::empty().set_read(), FUSE_DEV_EVENT)
             .map_err(|e| SessionFailure(format!("epoll register session fd: {}", e)))?;
-        register_event(
-            epoll_fd,
-            evtfd.as_raw_fd(),
-            Events::EPOLLIN,
-            EXIT_FUSE_EVENT,
-        )
-        .map_err(|e| SessionFailure(format!("epoll register exit fd: {}", e)))?;
+        poll_ctx
+            .add_fd_with_events(&evtfd, WatchingEvents::empty().set_read(), EXIT_FUSE_EVENT)
+            .map_err(|e| SessionFailure(format!("epoll register exit fd: {}", e)))?;
 
         Ok(FuseChannel {
-            fd: dup(fd).map_err(|e| SessionFailure(format!("dup fd: {}", e)))?,
-            epoll_fd,
-            buf: vec![0x0u8; bufsize],
+            file,
+            poll_ctx,
             bufsize,
-            events: RefCell::new(vec![Event::new(Events::empty(), 0); EPOLL_EVENTS_LEN]),
+            buf: vec![0x0u8; bufsize],
         })
     }
 
@@ -182,97 +172,73 @@ impl FuseChannel {
     /// - Err(e): error message
     pub fn get_request(&mut self) -> Result<Option<(Reader, Writer)>> {
         loop {
-            let num_events = epoll::wait(self.epoll_fd, -1, &mut self.events.borrow_mut())
+            let events = self
+                .poll_ctx
+                .wait()
                 .map_err(|e| SessionFailure(format!("epoll wait: {}", e)))?;
 
-            for event in self.events.borrow().iter().take(num_events) {
-                let evset = match epoll::Events::from_bits(event.events) {
-                    Some(evset) => evset,
-                    None => {
-                        let evbits = event.events;
-                        warn!("epoll: ignoring unknown event set: 0x{:x}", evbits);
-                        continue;
-                    }
-                };
-
-                match evset {
-                    Events::EPOLLIN => {
-                        match event.data {
-                            EXIT_FUSE_EVENT => {
-                                // Directly returning from here is reliable as we handle only one
-                                // epoll event which is `Read` or `Exit`.
-                                // One more trick, we don't read the event fd so as to make all
-                                // fuse threads exit. It relies on a LEVEL triggered event fd.
-                                info!("Will exit from fuse service");
-                                return Ok(None);
-                            }
-                            FUSE_DEV_EVENT => {
-                                match read(self.fd, &mut self.buf) {
-                                    Ok(len) => {
-                                        let reader =
-                                            Reader::new(FuseBuf::new(&mut self.buf[..len]))
-                                                .map_err(|e| {
-                                                    SessionFailure(format!(
-                                                        "new read buffer: {}",
-                                                        e
-                                                    ))
-                                                })?;
-                                        let writer = Writer::new(self.fd, self.bufsize).unwrap();
-                                        return Ok(Some((reader, writer)));
+            for event in events.iter() {
+                if event.readable() {
+                    let fd = self.file.as_raw_fd();
+                    match event.token() {
+                        EXIT_FUSE_EVENT => {
+                            // Directly returning from here is reliable as we handle only one
+                            // epoll event which is `Read` or `Exit`.
+                            // One more trick, we don't read the event fd so as to make all
+                            // fuse threads exit. It relies on a LEVEL triggered event fd.
+                            info!("Will exit from fuse service");
+                            return Ok(None);
+                        }
+                        FUSE_DEV_EVENT => {
+                            match read(fd, &mut self.buf) {
+                                Ok(len) => {
+                                    let reader = Reader::new(FuseBuf::new(&mut self.buf[..len])).unwrap();
+                                    let writer = Writer::new(fd, self.bufsize).unwrap();
+                                    return Ok(Some((reader, writer)));
+                                }
+                                Err(nixError::Sys(e)) => match e {
+                                    Errno::ENOENT => {
+                                        // ENOENT means the operation was interrupted, it's safe
+                                        // to restart
+                                        trace!("restart reading");
+                                        continue;
                                     }
-                                    Err(nixError::Sys(e)) => match e {
-                                        Errno::ENOENT => {
-                                            // ENOENT means the operation was interrupted, it's safe
-                                            // to restart
-                                            trace!("restart reading");
-                                            continue;
-                                        }
-                                        Errno::EAGAIN | Errno::EINTR => {
-                                            continue;
-                                        }
-                                        Errno::ENODEV => {
-                                            info!("fuse filesystem umounted");
-                                            return Ok(None);
-                                        }
-                                        e => {
-                                            warn! {"read fuse dev failed on fd {}: {}", self.fd, e};
-                                            return Err(SessionFailure(format!(
-                                                "read new request: {:?}",
-                                                e
-                                            )));
-                                        }
-                                    },
-                                    Err(e) => {
-                                        return Err(SessionFailure(format!("epoll error: {}", e)));
+                                    Errno::EAGAIN | Errno::EINTR => {
+                                        continue;
                                     }
+                                    Errno::ENODEV => {
+                                        info!("fuse filesystem umounted");
+                                        return Ok(None);
+                                    }
+                                    e => {
+                                        warn! {"read fuse dev failed on fd {}: {}", fd, e};
+                                        return Err(SessionFailure(format!(
+                                            "read new request: {:?}",
+                                            e
+                                        )));
+                                    }
+                                },
+                                Err(e) => {
+                                    return Err(SessionFailure(format!("epoll error: {}", e)));
                                 }
                             }
-                            x => {
-                                error!("unexpected epoll event");
-                                return Err(SessionFailure(format!(
-                                    "unexpected epoll event: {}",
-                                    x,
-                                )));
-                            }
+                        }
+                        x => {
+                            error!("unexpected epoll event");
+                            return Err(SessionFailure(format!("unexpected epoll event: {}", x,)));
                         }
                     }
-                    x if (Events::EPOLLERR | Events::EPOLLHUP).contains(x) => {
-                        info!("FUSE channel already closed!");
-                        return Err(SessionFailure("epoll error".to_string()));
-                    }
-                    _ => {
-                        // We should not step into this branch as other event is not registered.
-                        continue;
-                    }
+                } else if event.hungup()
+                /*|| event.has_error()*/ // TODO: upgrade to vmm-sys-util v0.8.0
+                {
+                    info!("FUSE channel already closed!");
+                    return Err(SessionFailure("epoll error".to_string()));
+                } else {
+                    // We should not step into this branch as other event is not registered.
+                    panic!("unknown epoll result events");
                 }
             }
         }
-    }
-}
-
-impl Drop for FuseChannel {
-    fn drop(&mut self) {
-        let _ = close(self.fd);
     }
 }
 
@@ -353,6 +319,7 @@ mod tests {
     use super::*;
     use std::path::Path;
     use vmm_sys_util::tempdir::TempDir;
+    use vmm_sys_util::tempfile::TempFile;
 
     #[test]
     fn test_new_session() {
@@ -366,12 +333,8 @@ mod tests {
 
     #[test]
     fn test_new_channel() {
-        // invalid session fd
-        let ch = FuseChannel::new(30294, EventFd::new(0).unwrap(), 3);
-        assert!(ch.is_err());
-
         let ch = FuseChannel::new(
-            EventFd::new(0).unwrap().as_raw_fd(),
+            TempFile::new().unwrap().into_file(),
             EventFd::new(0).unwrap(),
             3,
         );
