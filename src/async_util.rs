@@ -194,6 +194,30 @@ impl<D: AsyncDrive> AsyncUtil<D> {
         result.map(|v| v as usize)
     }
 
+    /// Asynchronously write out data buffer to the file.
+    pub async fn write2(
+        drive: D,
+        fd: RawFd,
+        data: &[u8],
+        data2: &[u8],
+        offset: u64,
+    ) -> io::Result<usize> {
+        // Safe because we just transform the interface to access the underlying data buffers.
+        let bufs = [
+            unsafe { Box::from_raw(data as *const [u8] as *mut [u8]) },
+            unsafe { Box::from_raw(data2 as *const [u8] as *mut [u8]) },
+        ];
+        let bufs = bufs.to_vec().into_boxed_slice();
+
+        let event = WriteVectored { fd, bufs, offset };
+        let (WriteVectored { bufs, .. }, result) = Submission::new(event, drive).await;
+
+        // Manually tear down the fake [Box<[u8]> object, otherwise it will cause double-free.
+        std::mem::forget(bufs);
+
+        result.map(|v| v as usize)
+    }
+
     /// Asynchronously write out vectored data buffers to the file.
     pub async fn write_vectored(
         drive: D,
@@ -245,7 +269,6 @@ impl<D: AsyncDrive> AsyncUtil<D> {
     }
 }
 
-//<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
 thread_local! {
     static ASYNC_EXECUTOR: RefCell<Option<AsyncDriver>> = RefCell::new(None);
 }
@@ -384,7 +407,6 @@ impl AsyncExecutor {
         Ok(())
     }
 }
-//>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
 
 impl Drop for AsyncExecutor {
     fn drop(&mut self) {

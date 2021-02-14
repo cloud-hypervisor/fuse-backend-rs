@@ -348,7 +348,7 @@ impl<F: AsyncFileSystem + Sync> Server<F> {
                 w.async_write_all(ctx.drive(), out.as_slice())
                     .await
                     .map_err(Error::EncodeMessage)?;
-                w.async_commit(ctx.drive(), &[&data_writer.0])
+                w.async_commit(ctx.drive(), Some(&data_writer.0))
                     .await
                     .map_err(Error::EncodeMessage)?;
                 Ok(out.len as usize)
@@ -627,7 +627,7 @@ impl<D: AsyncDrive, F: AsyncFileSystem> AsyncContext<D, F> {
             .map_err(Error::EncodeMessage)?;
 
         // Commit header if it is buffered otherwise kernel gets nothing back.
-        w.async_commit(self.drive(), &[])
+        w.async_commit(self.drive(), None)
             .await
             .map(|_| {
                 debug_assert_eq!(header.len as usize, w.bytes_written());
