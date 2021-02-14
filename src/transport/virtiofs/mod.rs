@@ -267,7 +267,7 @@ impl<'a> Writer<'a> {
 
     /// Commit all internal buffers of self and others
     /// This is provided just to be compatible with fusedev
-    pub fn commit(&mut self, _others: &[&Writer<'a>]) -> io::Result<usize> {
+    pub fn commit(&mut self, _other: Option<&Writer<'a>>) -> io::Result<usize> {
         Ok(0)
     }
 
@@ -407,9 +407,9 @@ mod async_io {
         pub async fn async_commit<D: AsyncDrive>(
             &mut self,
             _drive: D,
-            others: &[&Writer<'a>],
+            other: Option<&Writer<'a>>,
         ) -> io::Result<usize> {
-            self.commit(others)
+            self.commit(other)
         }
     }
 }

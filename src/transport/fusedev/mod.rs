@@ -153,30 +153,28 @@ impl<'a> Writer<'a> {
 
     /// Commit all internal buffers of self and others
     /// We need this because the lifetime of others is usually shorter than self.
-    pub fn commit(&mut self, others: &[&Writer<'a>]) -> io::Result<usize> {
-        if self.buf.is_none() {
-            return Ok(0);
-        }
+    pub fn commit(&mut self, other: Option<&Writer<'a>>) -> io::Result<usize> {
+        let d = self.buf.as_ref().map(|v| v.as_slice()).unwrap_or(&[]);
+        let o = other
+            .map(|v| v.buf.as_ref().map(|v1| v1.as_slice()).unwrap_or(&[]))
+            .unwrap_or(&[]);
 
-        let mut buf: Vec<IoVec<&[u8]>> = Vec::new();
-        if let Some(data) = &&self.buf {
-            buf.push(IoVec::from_slice(data))
-        }
-        for other in others {
-            if let Some(data) = &other.buf {
-                buf.push(IoVec::from_slice(data));
+        let res = match (d.len(), o.len()) {
+            (0, 0) => Ok(0),
+            (0, _) => pwrite(self.fd, o, 0),
+            (_, 0) => pwrite(self.fd, d, 0),
+            (_, _) => {
+                let bufs = [IoVec::from_slice(d), IoVec::from_slice(o)];
+                writev(self.fd, &bufs)
             }
-        }
+        };
 
-        if !buf.is_empty() {
-            return writev(self.fd, buf.as_slice()).map_err(|e| {
-                error! {"fail to write to fuse device on commit: {}", e};
-                e.as_errno()
-                    .map(|r| io::Error::from_raw_os_error(r as i32))
-                    .unwrap_or_else(|| io::Error::new(io::ErrorKind::Other, format!("{}", e)))
-            });
-        }
-        Ok(0)
+        res.map_err(|e| {
+            error! {"fail to write to fuse device on commit: {}", e};
+            e.as_errno()
+                .map(|r| io::Error::from_raw_os_error(r as i32))
+                .unwrap_or_else(|| io::Error::new(io::ErrorKind::Other, format!("{}", e)))
+        })
     }
 
     /// Returns number of bytes already written to the internal buffer.
@@ -521,28 +519,24 @@ mod async_io {
         pub async fn async_commit<D: AsyncDrive>(
             &mut self,
             drive: D,
-            others: &[&Writer<'a>],
+            other: Option<&Writer<'a>>,
         ) -> io::Result<usize> {
-            if self.buf.is_none() {
-                return Ok(0);
-            }
+            let d = self.buf.as_ref().map(|v| v.as_slice()).unwrap_or(&[]);
+            let o = other
+                .map(|v| v.buf.as_ref().map(|v1| v1.as_slice()).unwrap_or(&[]))
+                .unwrap_or(&[]);
 
-            // TODO: remove one extra Vec allocation. One here, another in AsyncUtil::write_vectored().
-            let mut bufs = Vec::new();
-            if let Some(data) = self.buf.as_ref() {
-                bufs.push(IoSlice::new(data))
-            }
-            for other in others {
-                if let Some(data) = &other.buf {
-                    bufs.push(IoSlice::new(data))
-                }
-            }
+            let res = match (d.len(), o.len()) {
+                (0, 0) => Ok(0),
+                (0, _) => AsyncUtil::write(drive, self.fd, o, 0).await,
+                (_, 0) => AsyncUtil::write(drive, self.fd, d, 0).await,
+                (_, _) => AsyncUtil::write2(drive, self.fd, d, o, 0).await,
+            };
 
-            if !bufs.is_empty() {
-                AsyncUtil::write_vectored(drive, self.fd, &bufs, 0).await
-            } else {
-                Ok(0)
-            }
+            res.map_err(|e| {
+                error! {"fail to write to fuse device on commit: {}", e};
+                e
+            })
         }
     }
 }
@@ -703,7 +697,7 @@ mod tests {
         );
         assert!(writer.flush().is_err());
 
-        writer.commit(&[]).unwrap();
+        writer.commit(None).unwrap();
     }
 
     #[test]
@@ -733,7 +727,7 @@ mod tests {
         );
         assert!(writer.flush().is_err());
 
-        writer.commit(&[]).unwrap();
+        writer.commit(None).unwrap();
     }
 
     #[test]
@@ -762,7 +756,7 @@ mod tests {
             64
         );
 
-        writer.commit(&[&other]).unwrap();
+        writer.commit(Some(&other)).unwrap();
     }
 
     #[test]
@@ -1094,7 +1088,7 @@ mod tests {
             .spawn_with_handle(async move {
                 let drive = DemoDriver::default();
 
-                writer.async_commit(drive, &[&other]).await
+                writer.async_commit(drive, Some(&other)).await
             })
             .unwrap();
 

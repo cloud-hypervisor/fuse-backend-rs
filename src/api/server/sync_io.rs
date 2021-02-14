@@ -416,7 +416,8 @@ impl<F: FileSystem + Sync> Server<F> {
                 };
 
                 w.write_all(out.as_slice()).map_err(Error::EncodeMessage)?;
-                w.commit(&[&data_writer.0]).map_err(Error::EncodeMessage)?;
+                w.commit(Some(&data_writer.0))
+                    .map_err(Error::EncodeMessage)?;
                 Ok(out.len as usize)
             }
             Err(e) => reply_error_explicit(e, in_header.unique, w),
@@ -833,7 +834,7 @@ impl<F: FileSystem + Sync> Server<F> {
             };
 
             w.write_all(out.as_slice()).map_err(Error::EncodeMessage)?;
-            w.commit(&[&cursor]).map_err(Error::EncodeMessage)?;
+            w.commit(Some(&cursor)).map_err(Error::EncodeMessage)?;
             Ok(out.len as usize)
         }
     }
@@ -1246,7 +1247,7 @@ fn do_reply_error(err: io::Error, unique: u64, mut w: Writer, explicit: bool) ->
         .map_err(Error::EncodeMessage)?;
 
     // Commit header if it is buffered otherwise kernel gets nothing back.
-    w.commit(&[])
+    w.commit(None)
         .map(|_| {
             debug_assert_eq!(header.len as usize, w.bytes_written());
             w.bytes_written()
