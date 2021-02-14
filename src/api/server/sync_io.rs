@@ -1194,34 +1194,34 @@ fn reply_ok<T: ByteValued>(
 ) -> Result<usize> {
     let mut len = size_of::<OutHeader>();
 
-    if out.is_some() {
-        len += size_of::<T>();
-    }
-
-    if let Some(ref data) = data {
-        len += data.len();
-    }
-
-    let header = OutHeader {
-        len: len as u32,
-        error: 0,
-        unique,
-    };
-
-    trace!("fuse: new reply {:?}", header);
-    let mut buf = Vec::with_capacity(3);
-    buf.push(IoSlice::new(header.as_slice()));
-    // Need to write out header->out->data sequentially
-    if let Some(out) = out {
-        buf.push(IoSlice::new(out.as_slice()));
-        if let Some(data) = data {
-            buf.push(IoSlice::new(data));
-        }
-        w.write_vectored(&buf).map_err(Error::EncodeMessage)?;
+    if out.is_none() && data.is_none() {
+        let header = OutHeader {
+            len: len as u32,
+            error: 0,
+            unique,
+        };
+        trace!("fuse: new reply {:?}", header);
+        w.write(header.as_slice()).map_err(Error::EncodeMessage)?;
     } else {
-        if let Some(data) = data {
-            buf.push(IoSlice::new(data));
+        if out.is_some() {
+            len += size_of::<T>();
         }
+        if let Some(ref data) = data {
+            len += data.len();
+        }
+        let header = OutHeader {
+            len: len as u32,
+            error: 0,
+            unique,
+        };
+        trace!("fuse: new reply {:?}", header);
+
+        // Need to write out header->out->data sequentially
+        let mut buf = Vec::with_capacity(3);
+        buf.push(IoSlice::new(header.as_slice()));
+        out.as_ref()
+            .map(|out| buf.push(IoSlice::new(out.as_slice())));
+        data.as_ref().map(|data| buf.push(IoSlice::new(data)));
         w.write_vectored(&buf).map_err(Error::EncodeMessage)?;
     }
 

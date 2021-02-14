@@ -143,7 +143,6 @@ impl Drop for FuseSession {
 pub struct FuseChannel {
     file: File,
     poll_ctx: PollContext<u32>,
-    bufsize: usize,
     buf: Vec<u8>,
 }
 
@@ -162,7 +161,6 @@ impl FuseChannel {
         Ok(FuseChannel {
             file,
             poll_ctx,
-            bufsize,
             buf: vec![0x0u8; bufsize],
         })
     }
@@ -195,9 +193,22 @@ impl FuseChannel {
                         FUSE_DEV_EVENT => {
                             match read(fd, &mut self.buf) {
                                 Ok(len) => {
+                                    // ###############################################
+                                    // Note: it's a heavy hack to reuse the same underlying data
+                                    // buffer for both Reader and Writer, in order to reduce memory
+                                    // consumption. Here we assume Reader won't be used anymore once
+                                    // we start to write to the Writer. To get rid of this hack,
+                                    // just allocate a dedicated data buffer for Writer.
+                                    let buf = unsafe {
+                                        std::slice::from_raw_parts_mut(
+                                            self.buf.as_mut_ptr(),
+                                            self.buf.len(),
+                                        )
+                                    };
+                                    // Reader::new() and Writer::new() should always return success.
                                     let reader =
                                         Reader::new(FuseBuf::new(&mut self.buf[..len])).unwrap();
-                                    let writer = Writer::new(fd, self.bufsize).unwrap();
+                                    let writer = Writer::new(fd, buf).unwrap();
                                     return Ok(Some((reader, writer)));
                                 }
                                 Err(nixError::Sys(e)) => match e {
@@ -423,15 +434,23 @@ mod asyncio {
         pub async fn poll_handler(&mut self) {
             // TODO: register self.buf as io uring buffers.
             let drive = AsyncDriver::default();
-            let msg_size = self.buf.capacity();
 
             while !self.state.quiescing() {
                 let result = AsyncUtil::read(drive.clone(), self.fd, &mut self.buf, 0).await;
                 match result {
                     Ok(len) => {
+                        // ###############################################
+                        // Note: it's a heavy hack to reuse the same underlying data
+                        // buffer for both Reader and Writer, in order to reduce memory
+                        // consumption. Here we assume Reader won't be used anymore once
+                        // we start to write to the Writer. To get rid of this hack,
+                        // just allocate a dedicated data buffer for Writer.
+                        let buf = unsafe {
+                            std::slice::from_raw_parts_mut(self.buf.as_mut_ptr(), self.buf.len())
+                        };
                         // Reader::new() and Writer::new() should always return success.
                         let reader = Reader::new(FuseBuf::new(&mut self.buf[0..len])).unwrap();
-                        let writer = Writer::new(self.fd, msg_size).unwrap();
+                        let writer = Writer::new(self.fd, buf).unwrap();
                         let result = unsafe {
                             self.server
                                 .async_handle_message(drive.clone(), reader, writer, None)
