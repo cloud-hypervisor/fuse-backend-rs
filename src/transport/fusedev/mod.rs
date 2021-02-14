@@ -8,12 +8,9 @@ use std::collections::VecDeque;
 use std::fmt;
 use std::io::{self, IoSlice, Write};
 use std::marker::PhantomData;
-#[cfg(feature = "async-io")]
 use std::os::unix::io::RawFd;
 
-use libc::c_int;
 use nix::sys::uio::{pwrite, writev, IoVec};
-
 use vm_memory::{ByteValued, VolatileMemory, VolatileMemoryError, VolatileSlice};
 
 use super::{FileReadWriteVolatile, IoBuffers, Reader};
@@ -108,7 +105,7 @@ impl<'a> Reader<'a> {
 /// 3. Concurrency, caller should not write to the writer concurrently.
 #[derive(Debug, PartialEq, Eq)]
 pub struct Writer<'a> {
-    fd: c_int,
+    fd: RawFd,
     max_size: usize,
     bytes_written: usize,
     // buf used to support split writer.
@@ -121,7 +118,7 @@ pub struct Writer<'a> {
 
 impl<'a> Writer<'a> {
     /// Construct a new Writer
-    pub fn new(fd: c_int, max_size: usize) -> Result<Writer<'a>> {
+    pub fn new(fd: RawFd, max_size: usize) -> Result<Writer<'a>> {
         Ok(Writer {
             fd,
             max_size,

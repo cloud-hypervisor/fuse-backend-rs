@@ -318,10 +318,7 @@ impl<F: AsyncFileSystem + Sync> Server<F> {
         // Split the writer into 2 pieces: one for the `OutHeader` and the rest for the data.
         let w2 = match w.split_at(size_of::<OutHeader>()) {
             Ok(v) => v,
-            Err(e) => {
-                debug!("output buffer is too small, {}", e);
-                return Err(Error::InvalidHeaderLength);
-            }
+            Err(_e) => return Err(Error::InvalidHeaderLength),
         };
         let mut data_writer = AsyncZCWriter(w2);
         let result = self
