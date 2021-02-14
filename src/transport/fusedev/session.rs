@@ -90,8 +90,11 @@ impl FuseSession {
     /// Destroy a fuse session.
     pub fn umount(&mut self) -> Result<()> {
         if let Some(file) = self.file.take() {
-            // safe to unwrap as mountpoint was valid string otherwise mount fails
-            fuse_kern_umount(self.mountpoint.to_str().unwrap(), file)
+            if let Some(mountpoint) = self.mountpoint.to_str() {
+                fuse_kern_umount(mountpoint, file)
+            } else {
+                Err(SessionFailure("invalid mountpoint".to_string()))
+            }
         } else {
             Ok(())
         }
@@ -192,7 +195,8 @@ impl FuseChannel {
                         FUSE_DEV_EVENT => {
                             match read(fd, &mut self.buf) {
                                 Ok(len) => {
-                                    let reader = Reader::new(FuseBuf::new(&mut self.buf[..len])).unwrap();
+                                    let reader =
+                                        Reader::new(FuseBuf::new(&mut self.buf[..len])).unwrap();
                                     let writer = Writer::new(fd, self.bufsize).unwrap();
                                     return Ok(Some((reader, writer)));
                                 }
@@ -273,14 +277,16 @@ fn fuse_kern_mount(mountpoint: &Path, fsname: &str, subtype: &str, flags: MsFlag
         fstype.push_str(subtype);
     }
 
-    info!(
-        "mount source {} dest {} with fstype {} opts {} fd {}",
-        fsname,
-        mountpoint.to_str().unwrap(),
-        fstype,
-        opts,
-        file.as_raw_fd(),
-    );
+    if let Some(mountpoint) = mountpoint.to_str() {
+        info!(
+            "mount source {} dest {} with fstype {} opts {} fd {}",
+            fsname,
+            mountpoint,
+            fstype,
+            opts,
+            file.as_raw_fd(),
+        );
+    }
     mount(
         Some(fsname),
         mountpoint,

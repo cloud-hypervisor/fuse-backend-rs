@@ -390,7 +390,11 @@ impl<F: FileSystem + Sync> Server<F> {
         };
 
         // Split the writer into 2 pieces: one for the `OutHeader` and the rest for the data.
-        let mut data_writer = ZCWriter(w.split_at(size_of::<OutHeader>()).unwrap());
+        let w2 = match w.split_at(size_of::<OutHeader>()) {
+            Ok(v) => v,
+            Err(_e) => return Err(Error::InvalidHeaderLength),
+        };
+        let mut data_writer = ZCWriter(w2);
 
         match self.fs.read(
             Context::from(in_header),
@@ -792,7 +796,10 @@ impl<F: FileSystem + Sync> Server<F> {
         }
 
         // Skip over enough bytes for the header.
-        let mut cursor = w.split_at(size_of::<OutHeader>()).unwrap();
+        let mut cursor = match w.split_at(size_of::<OutHeader>()) {
+            Ok(v) => v,
+            Err(_e) => return Err(Error::InvalidHeaderLength),
+        };
 
         let res = if plus {
             self.fs.readdirplus(
