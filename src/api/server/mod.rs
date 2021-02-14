@@ -98,6 +98,7 @@ impl<'a> io::Write for ZCWriter<'a> {
     }
 }
 
+#[allow(dead_code)]
 struct ServerVersion {
     major: u32,
     minor: u32,

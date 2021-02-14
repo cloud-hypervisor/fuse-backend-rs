@@ -10,13 +10,14 @@ use std::thread;
 use vmm_sys_util::eventfd::EventFd;
 
 use fuse_backend_rs::api::{server::Server, Vfs, VfsOptions};
+use fuse_backend_rs::async_util::AsyncDriver;
 use fuse_backend_rs::passthrough::{Config, PassthroughFs};
 use fuse_backend_rs::transport::fusedev::{FuseChannel, FuseSession};
 
 /// A fusedev daemon example
 pub struct Daemon {
     mountpoint: String,
-    server: Arc<Server<Arc<Vfs>>>,
+    server: Arc<Server<Arc<Vfs<AsyncDriver>>>>,
     thread_cnt: u32,
     event_fd: EventFd,
     session: Option<FuseSession>,
@@ -91,7 +92,7 @@ impl Drop for Daemon {
 }
 
 struct FuseServer {
-    server: Arc<Server<Arc<Vfs>>>,
+    server: Arc<Server<Arc<Vfs<AsyncDriver>>>>,
     ch: FuseChannel,
 }
 
