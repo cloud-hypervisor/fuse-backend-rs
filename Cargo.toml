@@ -17,15 +17,15 @@ homepage = "https://github.com/cloud-hypervisor/"
 
 [dependencies]
 arc-swap = ">=0.4.6"
-async-trait = { version = "0.1.42", optional = true }
+#async-trait = { version = "0.1.42", optional = true }
 bitflags = ">=1.1.0"
 epoll = { version = "4.0", optional = true }
-futures = { version = "0.3", optional = true }
-iou = { version = "0.3.3", optional = true }
+#futures = { version = "0.3", optional = true }
+#iou = { version = "0.3.3", optional = true }
 libc = ">=0.2.68"
 log = ">=0.4.6"
 nix = "0.18.0"
-ringbahn = { version = "0.0.0-experimental.3", optional = true }
+#ringbahn = { version = "0.0.0-experimental.3", optional = true }
 vmm-sys-util = { version = "0.4", optional = true }
 vm-memory = "0.5"
 #vm-virtio = { git = "https://github.com/cloud-hypervisor/vm-virtio.git", branch = "dragonball", optional = true }
@@ -42,10 +42,10 @@ features = ["backend-mmap"]
 
 [features]
 default = ["fusedev"]
-async-io = ["async-trait", "futures", "iou", "ringbahn"]
+#async-io = ["async-trait", "futures", "iou", "ringbahn"]
 fusedev = ["vmm-sys-util", "epoll"]
 #virtiofs = ["vm-virtio"]
 #vhost-user-fs = ["virtiofs", "vhost-rs/vhost-user-slave"]
 
 [patch."registry+https://github.com/rust-lang/crates.io-index"]
-ringbahn = { git = "https://github.com/jiangliu/ringbahn.git", branch = "enhance", optional = true }
+#ringbahn = { git = "https://github.com/jiangliu/ringbahn.git", branch = "enhance", optional = true }
