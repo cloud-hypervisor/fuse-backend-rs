@@ -8,6 +8,7 @@ use std::collections::VecDeque;
 use std::fmt;
 use std::io::{self, IoSlice, Write};
 use std::marker::PhantomData;
+use std::mem::ManuallyDrop;
 use std::os::unix::io::RawFd;
 
 use nix::sys::uio::{pwrite, writev, IoVec};
@@ -106,24 +107,19 @@ impl<'a> Reader<'a> {
 #[derive(Debug, PartialEq, Eq)]
 pub struct Writer<'a> {
     fd: RawFd,
-    max_size: usize,
-    bytes_written: usize,
-    // buf used to support split writer.
-    // For split writers, we write to internal buffer upon write and construct
-    // use writev write to fd upon flush.
-    buf: Option<Vec<u8>>,
-    // phantom used to keep lifetime so that we keep in sync with virtiofs
-    phantom: PhantomData<&'a u8>,
+    buffered: bool,
+    buf: ManuallyDrop<Vec<u8>>,
+    phantom: PhantomData<&'a mut [u8]>,
 }
 
 impl<'a> Writer<'a> {
     /// Construct a new Writer
-    pub fn new(fd: RawFd, max_size: usize) -> Result<Writer<'a>> {
+    pub fn new(fd: RawFd, data_buf: &'a mut [u8]) -> Result<Writer<'a>> {
+        let buf = unsafe { Vec::from_raw_parts(data_buf.as_mut_ptr(), 0, data_buf.len()) };
         Ok(Writer {
             fd,
-            max_size,
-            bytes_written: 0,
-            buf: None,
+            buffered: false,
+            buf: ManuallyDrop::new(buf),
             phantom: PhantomData,
         })
     }
@@ -133,20 +129,27 @@ impl<'a> Writer<'a> {
     /// `Writer` can write up to `available_bytes() - offset` bytes.  Returns an error if
     /// `offset > self.available_bytes()`.
     pub fn split_at(&mut self, offset: usize) -> Result<Writer<'a>> {
-        if self.max_size < offset {
+        if self.buf.capacity() < offset {
             return Err(Error::SplitOutOfBounds(offset));
         }
-        // Need to set buf for self for the first split
-        if self.buf.is_none() {
-            self.buf = Some(Vec::with_capacity(offset));
-        }
-        let max_size = self.max_size - offset;
-        self.max_size = offset;
+
+        let (len1, len2) = if self.buf.len() > offset {
+            (offset, self.buf.len() - offset)
+        } else {
+            (self.buf.len(), 0)
+        };
+        let cap2 = self.buf.capacity() - offset;
+        let ptr = self.buf.as_mut_ptr();
+
+        // Safe because both buffers refer to different parts of the same underlying `data_buf`.
+        self.buf = unsafe { ManuallyDrop::new(Vec::from_raw_parts(ptr, len1, offset)) };
+        self.buffered = true;
+        let buf = unsafe { ManuallyDrop::new(Vec::from_raw_parts(ptr.add(offset), len2, cap2)) };
+
         Ok(Writer {
             fd: self.fd,
-            max_size,
-            bytes_written: 0,
-            buf: Some(Vec::with_capacity(max_size)),
+            buffered: true,
+            buf,
             phantom: PhantomData,
         })
     }
@@ -154,17 +157,17 @@ impl<'a> Writer<'a> {
     /// Commit all internal buffers of self and others
     /// We need this because the lifetime of others is usually shorter than self.
     pub fn commit(&mut self, other: Option<&Writer<'a>>) -> io::Result<usize> {
-        let d = self.buf.as_ref().map(|v| v.as_slice()).unwrap_or(&[]);
-        let o = other
-            .map(|v| v.buf.as_ref().map(|v1| v1.as_slice()).unwrap_or(&[]))
-            .unwrap_or(&[]);
+        if !self.buffered {
+            return Ok(0);
+        }
 
-        let res = match (d.len(), o.len()) {
+        let o = other.map(|v| v.buf.as_slice()).unwrap_or(&[]);
+        let res = match (self.buf.len(), o.len()) {
             (0, 0) => Ok(0),
             (0, _) => pwrite(self.fd, o, 0),
-            (_, 0) => pwrite(self.fd, d, 0),
+            (_, 0) => pwrite(self.fd, self.buf.as_slice(), 0),
             (_, _) => {
-                let bufs = [IoVec::from_slice(d), IoVec::from_slice(o)];
+                let bufs = [IoVec::from_slice(self.buf.as_slice()), IoVec::from_slice(o)];
                 writev(self.fd, &bufs)
             }
         };
@@ -178,22 +181,19 @@ impl<'a> Writer<'a> {
     }
 
     /// Returns number of bytes already written to the internal buffer.
-    /// Only available after a split.
     pub fn bytes_written(&self) -> usize {
-        if let Some(data) = &self.buf {
-            return data.len();
-        }
-        self.bytes_written
+        return self.buf.len();
     }
 
-    /// Returns number of bytes available for writing.  May return an error if the combined
-    /// lengths of all the buffers in the DescriptorChain would cause an overflow.
+    /// Returns number of bytes available for writing.
     pub fn available_bytes(&self) -> usize {
-        self.max_size - self.bytes_written()
+        self.buf.capacity() - self.buf.len()
     }
 
     fn account_written(&mut self, count: usize) {
-        self.bytes_written += count;
+        let new_len = self.buf.len() + count;
+        // Safe because check_avail_space() ensures that `count` is valid.
+        unsafe { self.buf.set_len(new_len) };
     }
 
     /// Writes an object to the writer.
@@ -210,22 +210,21 @@ impl<'a> Writer<'a> {
     ) -> io::Result<usize> {
         self.check_available_space(count)?;
 
-        let mut buf = Vec::with_capacity(count);
         let cnt = src.read_vectored_volatile(
             // Safe because we have made sure buf has at least count capacity above
-            unsafe { &[VolatileSlice::new(buf.as_mut_ptr(), count)] },
+            unsafe {
+                &[VolatileSlice::new(
+                    self.buf.as_mut_ptr().add(self.buf.len()),
+                    count,
+                )]
+            },
         )?;
+        self.account_written(cnt);
 
-        // Safe because we have just allocated larger count
-        unsafe { buf.set_len(cnt) };
-
-        if let Some(data) = &mut self.buf {
-            self.buf = Some([&data[..], &mut buf[..cnt]].concat());
-            self.account_written(cnt);
+        if self.buffered {
             Ok(cnt)
         } else {
-            // write to fd
-            self.write(&buf[..cnt])
+            Self::do_write(self.fd, &self.buf[..cnt])
         }
     }
 
@@ -234,28 +233,27 @@ impl<'a> Writer<'a> {
     pub fn write_from_at<F: FileReadWriteVolatile>(
         &mut self,
         mut src: F,
-        mut count: usize,
+        count: usize,
         off: u64,
     ) -> io::Result<usize> {
         self.check_available_space(count)?;
 
-        let mut buf = Vec::with_capacity(count);
-        count = src.read_vectored_at_volatile(
+        let cnt = src.read_vectored_at_volatile(
             // Safe because we have made sure buf has at least count capacity above
-            unsafe { &[VolatileSlice::new(buf.as_mut_ptr(), count)] },
+            unsafe {
+                &[VolatileSlice::new(
+                    self.buf.as_mut_ptr().add(self.buf.len()),
+                    count,
+                )]
+            },
             off,
         )?;
+        self.account_written(cnt);
 
-        // Safe because we have just allocated larger count
-        unsafe { buf.set_len(count) };
-
-        if let Some(data) = &mut self.buf {
-            self.buf = Some([&data[..], &mut buf[..count]].concat());
-            self.account_written(count);
-            Ok(count)
+        if self.buffered {
+            Ok(cnt)
         } else {
-            // write to fd
-            self.write(&buf[..count])
+            Self::do_write(self.fd, &self.buf[..cnt])
         }
     }
 
@@ -266,6 +264,7 @@ impl<'a> Writer<'a> {
         mut count: usize,
     ) -> io::Result<()> {
         self.check_available_space(count)?;
+
         while count > 0 {
             match self.write_from(&mut src, count) {
                 Ok(0) => {
@@ -284,6 +283,7 @@ impl<'a> Writer<'a> {
     }
 
     fn check_available_space(&self, sz: usize) -> io::Result<()> {
+        assert!(self.buffered || self.buf.len() == 0);
         if sz > self.available_bytes() {
             Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -297,31 +297,27 @@ impl<'a> Writer<'a> {
             Ok(())
         }
     }
+
+    fn do_write(fd: RawFd, data: &[u8]) -> io::Result<usize> {
+        pwrite(fd, data, 0).map_err(|e| {
+            error! {"fail to write to fuse device fd {}: {}, {:?}", fd, e, data};
+            io::Error::new(io::ErrorKind::Other, format!("{}", e))
+        })
+    }
 }
 
 impl<'a> io::Write for Writer<'a> {
     fn write(&mut self, data: &[u8]) -> io::Result<usize> {
         self.check_available_space(data.len())?;
-        if let Some(buf) = &mut self.buf {
-            // write to internal buf
-            let len = data.len();
-            buf.extend_from_slice(data);
-            self.account_written(len);
-            Ok(len)
+
+        if self.buffered {
+            self.buf.extend_from_slice(data);
+            Ok(data.len())
         } else {
-            // write to fd, can only happen once per instance
-            if self.fd <= 0 {
-                return Err(io::Error::from_raw_os_error(libc::EINVAL));
-            }
-            pwrite(self.fd, data, 0)
-                .map(|x| {
-                    self.account_written(x);
-                    x
-                })
-                .map_err(|e| {
-                    error! {"fail to write to fuse device fd {}: {}, {:?}", self.fd, e, data};
-                    io::Error::new(io::ErrorKind::Other, format!("{}", e))
-                })
+            Self::do_write(self.fd, data).map(|x| {
+                self.account_written(x);
+                x
+            })
         }
     }
 
@@ -329,9 +325,9 @@ impl<'a> io::Write for Writer<'a> {
     fn write_vectored(&mut self, bufs: &[IoSlice<'_>]) -> io::Result<usize> {
         self.check_available_space(bufs.iter().fold(0, |acc, x| acc + x.len()))?;
 
-        if let Some(data) = &mut self.buf {
+        if self.buffered {
             let count = bufs.iter().filter(|b| !b.is_empty()).fold(0, |acc, b| {
-                data.extend_from_slice(b);
+                self.buf.extend_from_slice(b);
                 acc + b.len()
             });
             Ok(count)
@@ -370,7 +366,6 @@ impl<'a> io::Write for Writer<'a> {
 #[cfg(feature = "async-io")]
 mod async_io {
     use super::*;
-    use futures::io::IoSliceMut;
 
     impl<'a> Reader<'a> {
         /// Reads data from the descriptor chain buffer into a File at offset `off`.
@@ -404,17 +399,12 @@ mod async_io {
         ) -> io::Result<usize> {
             self.check_available_space(data.len())?;
 
-            if let Some(buf) = &mut self.buf {
+            if self.buffered {
                 // write to internal buf
-                let len = data.len();
-                buf.extend_from_slice(data);
-                self.account_written(len);
-                Ok(len)
+                self.buf.extend_from_slice(data);
+                Ok(data.len())
             } else {
                 // write to fd, can only happen once per instance
-                if self.fd <= 0 {
-                    return Err(io::Error::from_raw_os_error(libc::EINVAL));
-                }
                 AsyncUtil::write(drive, self.fd, data, 0)
                     .await
                     .map(|x| {
@@ -437,9 +427,9 @@ mod async_io {
         ) -> io::Result<usize> {
             self.check_available_space(bufs.iter().fold(0, |acc, x| acc + x.len()))?;
 
-            if let Some(data) = &mut self.buf {
+            if self.buffered {
                 let count = bufs.iter().filter(|b| !b.is_empty()).fold(0, |acc, b| {
-                    data.extend_from_slice(b);
+                    self.buf.extend_from_slice(b);
                     acc + b.len()
                 });
                 Ok(count)
@@ -494,23 +484,17 @@ mod async_io {
             self.check_available_space(count)?;
 
             let drive2 = drive.clone();
-            let mut buf = Vec::with_capacity(count);
-            // safe because capacity is @count.
-            unsafe { buf.set_len(count) };
+            let buf = unsafe {
+                std::slice::from_raw_parts_mut(self.buf.as_mut_ptr().add(self.buf.len()), count)
+            };
+            let cnt = AsyncUtil::read(drive2, src, buf, off).await?;
+            self.account_written(cnt);
 
-            let count =
-                AsyncUtil::read_vectored(drive2, src, &[IoSliceMut::new(&mut buf)], off).await?;
-
-            // Safe because we have just allocated larger count
-            unsafe { buf.set_len(count) };
-
-            if let Some(data) = &mut self.buf {
-                self.buf = Some([&data[..], &mut buf[..count]].concat());
-                self.account_written(count);
-                Ok(count)
+            if self.buffered {
+                Ok(cnt)
             } else {
                 // write to fd
-                AsyncUtil::write(drive, self.fd, &buf[..count], 0).await
+                AsyncUtil::write(drive, self.fd, &self.buf[..cnt], 0).await
             }
         }
 
@@ -521,16 +505,13 @@ mod async_io {
             drive: D,
             other: Option<&Writer<'a>>,
         ) -> io::Result<usize> {
-            let d = self.buf.as_ref().map(|v| v.as_slice()).unwrap_or(&[]);
-            let o = other
-                .map(|v| v.buf.as_ref().map(|v1| v1.as_slice()).unwrap_or(&[]))
-                .unwrap_or(&[]);
+            let o = other.map(|v| v.buf.as_slice()).unwrap_or(&[]);
 
-            let res = match (d.len(), o.len()) {
+            let res = match (self.buf.len(), o.len()) {
                 (0, 0) => Ok(0),
                 (0, _) => AsyncUtil::write(drive, self.fd, o, 0).await,
-                (_, 0) => AsyncUtil::write(drive, self.fd, d, 0).await,
-                (_, _) => AsyncUtil::write2(drive, self.fd, d, o, 0).await,
+                (_, 0) => AsyncUtil::write(drive, self.fd, self.buf.as_slice(), 0).await,
+                (_, _) => AsyncUtil::write2(drive, self.fd, self.buf.as_slice(), o, 0).await,
             };
 
             res.map_err(|e| {
@@ -583,8 +564,10 @@ mod tests {
     #[test]
     fn writer_test_simple_chain() {
         let file = TempFile::new().unwrap().into_file();
-        let mut writer = Writer::new(file.as_raw_fd(), 106).unwrap();
+        let mut buf = vec![0x0u8; 106];
+        let mut writer = Writer::new(file.as_raw_fd(), &mut buf).unwrap();
 
+        writer.buffered = true;
         assert_eq!(writer.available_bytes(), 106);
         assert_eq!(writer.bytes_written(), 0);
 
@@ -609,7 +592,8 @@ mod tests {
     #[test]
     fn writer_test_split_chain() {
         let file = TempFile::new().unwrap().into_file();
-        let mut writer = Writer::new(file.as_raw_fd(), 108).unwrap();
+        let mut buf = vec![0x0u8; 108];
+        let mut writer = Writer::new(file.as_raw_fd(), &mut buf).unwrap();
         let writer2 = writer.split_at(106).unwrap();
 
         assert_eq!(writer.available_bytes(), 106);
@@ -675,8 +659,10 @@ mod tests {
     #[test]
     fn writer_simple_commit_header() {
         let file = TempFile::new().unwrap().into_file();
-        let mut writer = Writer::new(file.as_raw_fd(), 106).unwrap();
+        let mut buf = vec![0x0u8; 106];
+        let mut writer = Writer::new(file.as_raw_fd(), &mut buf).unwrap();
 
+        writer.buffered = true;
         assert_eq!(writer.available_bytes(), 106);
 
         writer.write(&[0x1u8; 4]).unwrap();
@@ -703,7 +689,8 @@ mod tests {
     #[test]
     fn writer_split_commit_header() {
         let file = TempFile::new().unwrap().into_file();
-        let mut writer = Writer::new(file.as_raw_fd(), 106).unwrap();
+        let mut buf = vec![0x0u8; 106];
+        let mut writer = Writer::new(file.as_raw_fd(), &mut buf).unwrap();
         let mut other = writer.split_at(4).expect("failed to split Writer");
 
         assert_eq!(writer.available_bytes(), 4);
@@ -733,7 +720,8 @@ mod tests {
     #[test]
     fn writer_split_commit_all() {
         let file = TempFile::new().unwrap().into_file();
-        let mut writer = Writer::new(file.as_raw_fd(), 106).unwrap();
+        let mut buf = vec![0x0u8; 106];
+        let mut writer = Writer::new(file.as_raw_fd(), &mut buf).unwrap();
         let mut other = writer.split_at(4).expect("failed to split Writer");
 
         assert_eq!(writer.available_bytes(), 4);
@@ -774,7 +762,8 @@ mod tests {
     #[test]
     fn write_full() {
         let file = TempFile::new().unwrap().into_file();
-        let mut writer = Writer::new(file.as_raw_fd(), 48).unwrap();
+        let mut buf = vec![0x0u8; 48];
+        let mut writer = Writer::new(file.as_raw_fd(), &mut buf).unwrap();
 
         let buf = vec![0xdeu8; 64];
         writer.write(&buf[..]).unwrap_err();
@@ -789,7 +778,8 @@ mod tests {
     #[test]
     fn write_vectored() {
         let file = TempFile::new().unwrap().into_file();
-        let mut writer = Writer::new(file.as_raw_fd(), 48).unwrap();
+        let mut buf = vec![0x0u8; 48];
+        let mut writer = Writer::new(file.as_raw_fd(), &mut buf).unwrap();
 
         let buf = vec![0xdeu8; 48];
         let slices = [
@@ -850,7 +840,8 @@ mod tests {
     #[test]
     fn write_obj() {
         let file1 = TempFile::new().unwrap().into_file();
-        let mut writer = Writer::new(file1.as_raw_fd(), 48).unwrap();
+        let mut buf = vec![0x0u8; 48];
+        let mut writer = Writer::new(file1.as_raw_fd(), &mut buf).unwrap();
         let val = 0x1u64;
 
         writer.write_obj(val).expect("failed to write from buffer");
@@ -860,9 +851,12 @@ mod tests {
     #[test]
     fn write_all_from() {
         let file1 = TempFile::new().unwrap().into_file();
-        let mut writer = Writer::new(file1.as_raw_fd(), 48).unwrap();
+        let mut buf = vec![0x0u8; 48];
+        let mut writer = Writer::new(file1.as_raw_fd(), &mut buf).unwrap();
         let mut file = TempFile::new().unwrap().into_file();
         let buf = vec![0xdeu8; 64];
+
+        writer.buffered = true;
 
         file.write_all(&buf).unwrap();
         file.seek(SeekFrom::Start(0)).unwrap();
@@ -881,7 +875,8 @@ mod tests {
     #[test]
     fn write_all_from_split() {
         let file1 = TempFile::new().unwrap().into_file();
-        let mut writer = Writer::new(file1.as_raw_fd(), 58).unwrap();
+        let mut buf = vec![0x0u8; 58];
+        let mut writer = Writer::new(file1.as_raw_fd(), &mut buf).unwrap();
         let _other = writer.split_at(48).unwrap();
         let mut file = TempFile::new().unwrap().into_file();
         let buf = vec![0xdeu8; 64];
@@ -903,9 +898,12 @@ mod tests {
     #[test]
     fn write_from_at() {
         let file1 = TempFile::new().unwrap().into_file();
-        let mut writer = Writer::new(file1.as_raw_fd(), 48).unwrap();
+        let mut buf = vec![0x0u8; 48];
+        let mut writer = Writer::new(file1.as_raw_fd(), &mut buf).unwrap();
         let mut file = TempFile::new().unwrap().into_file();
         let buf = vec![0xdeu8; 64];
+
+        writer.buffered = true;
 
         file.write_all(&buf).unwrap();
         file.seek(SeekFrom::Start(0)).unwrap();
@@ -927,7 +925,8 @@ mod tests {
     #[test]
     fn write_from_at_split() {
         let file1 = TempFile::new().unwrap().into_file();
-        let mut writer = Writer::new(file1.as_raw_fd(), 58).unwrap();
+        let mut buf = vec![0x0u8; 58];
+        let mut writer = Writer::new(file1.as_raw_fd(), &mut buf).unwrap();
         let _other = writer.split_at(48).unwrap();
         let mut file = TempFile::new().unwrap().into_file();
         let buf = vec![0xdeu8; 64];
@@ -976,12 +975,14 @@ mod tests {
     #[test]
     fn async_write() {
         let file = TempFile::new().unwrap().into_file();
-        let mut writer = Writer::new(file.as_raw_fd(), 48).unwrap();
 
         let executor = ThreadPool::new().unwrap();
+        let fd = file.as_raw_fd();
         let handle = executor
             .spawn_with_handle(async move {
                 let drive = DemoDriver::default();
+                let mut buf = vec![0x0u8; 48];
+                let mut writer = Writer::new(fd, &mut buf).unwrap();
 
                 let buf = vec![0xdeu8; 64];
                 writer.async_write(drive, &buf[..]).await
@@ -991,10 +992,12 @@ mod tests {
         // expect errors
         block_on(handle).unwrap_err();
 
-        let mut writer2 = Writer::new(file.as_raw_fd(), 48).unwrap();
+        let fd = file.as_raw_fd();
         let handle = executor
             .spawn_with_handle(async move {
                 let drive = DemoDriver::default();
+                let mut buf = vec![0x0u8; 48];
+                let mut writer2 = Writer::new(fd, &mut buf).unwrap();
 
                 let buf = vec![0xdeu8; 48];
                 writer2.async_write(drive, &buf[..]).await
@@ -1009,12 +1012,14 @@ mod tests {
     #[test]
     fn async_write_vectored() {
         let file = TempFile::new().unwrap().into_file();
-        let mut writer = Writer::new(file.as_raw_fd(), 48).unwrap();
 
         let executor = ThreadPool::new().unwrap();
+        let fd = file.as_raw_fd();
         let handle = executor
             .spawn_with_handle(async move {
                 let drive = DemoDriver::default();
+                let mut buf = vec![0x0u8; 48];
+                let mut writer = Writer::new(fd, &mut buf).unwrap();
 
                 let buf = vec![0xdeu8; 48];
                 let slices = [
@@ -1035,7 +1040,7 @@ mod tests {
     #[test]
     fn async_write_from_at() {
         let file1 = TempFile::new().unwrap().into_file();
-        let mut writer = Writer::new(file1.as_raw_fd(), 48).unwrap();
+        let fd1 = file1.as_raw_fd();
         let mut file = TempFile::new().unwrap().into_file();
         let buf = vec![0xdeu8; 64];
 
@@ -1047,6 +1052,8 @@ mod tests {
         let handle = executor
             .spawn_with_handle(async move {
                 let drive = DemoDriver::default();
+                let mut buf = vec![0x0u8; 48];
+                let mut writer = Writer::new(fd1, &mut buf).unwrap();
 
                 writer.async_write_from_at(drive, fd, 40, 16).await
             })
@@ -1060,7 +1067,10 @@ mod tests {
     #[test]
     fn async_writer_split_commit_all() {
         let file = TempFile::new().unwrap().into_file();
-        let mut writer = Writer::new(file.as_raw_fd(), 106).unwrap();
+        let fd = file.as_raw_fd();
+        let mut buf = vec![0x0u8; 106];
+        let buf = unsafe { std::mem::transmute::<&mut [u8], &'static mut [u8]>(&mut buf) };
+        let mut writer = Writer::new(fd, buf).unwrap();
         let mut other = writer.split_at(4).expect("failed to split Writer");
 
         assert_eq!(writer.available_bytes(), 4);
