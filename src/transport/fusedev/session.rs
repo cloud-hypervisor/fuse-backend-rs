@@ -347,3 +347,165 @@ mod tests {
         assert!(ch.is_ok());
     }
 }
+
+#[cfg(feature = "async-io")]
+pub use asyncio::FuseDevTask;
+
+#[cfg(feature = "async-io")]
+/// Task context to handle fuse request in asynchronous mode.
+mod asyncio {
+    use std::os::unix::io::RawFd;
+    use std::sync::Arc;
+
+    use crate::api::filesystem::AsyncFileSystem;
+    use crate::api::server::Server;
+    use crate::async_util::{AsyncDriver, AsyncExecutorState, AsyncUtil};
+    use crate::transport::{FuseBuf, Reader, Writer};
+
+    /// Task context to handle fuse request in asynchronous mode.
+    ///
+    /// This structure provides a context to handle fuse request in asynchronous mode, including
+    /// the fuse fd, a internal buffer and a `Server` instance to serve requests.
+    ///
+    /// ## Examples
+    /// ```ignore
+    /// let buf_size = 0x1_0000;
+    /// let state = AsyncExecutorState::new();
+    /// let mut task = FuseDevTask::new(buf_size, fuse_dev_fd, fs_server, state.clone());
+    ///
+    /// // Run the task
+    /// executor.spawn(async move { task.poll_handler().await });
+    ///
+    /// // Stop the task
+    /// state.quiesce();
+    /// ```
+    pub struct FuseDevTask<F: AsyncFileSystem + Sync> {
+        fd: RawFd,
+        buf: Vec<u8>,
+        state: AsyncExecutorState,
+        server: Arc<Server<F>>,
+    }
+
+    impl<F: AsyncFileSystem + Sync> FuseDevTask<F> {
+        /// Create a new fuse task context for asynchronous IO.
+        ///
+        /// # Parameters
+        /// - buf_size: size of buffer to receive requests from/send reply to the fuse fd
+        /// - fd: fuse device file descriptor
+        /// - server: `Server` instance to serve requests from the fuse fd
+        /// - state: shared state object to control the task object
+        ///
+        /// # Safety
+        /// The caller must ensure `fd` is valid during the lifetime of the returned task object.
+        pub fn new(
+            buf_size: usize,
+            fd: RawFd,
+            server: Arc<Server<F>>,
+            state: AsyncExecutorState,
+        ) -> Self {
+            FuseDevTask {
+                fd,
+                server,
+                state,
+                buf: vec![0x0u8; buf_size],
+            }
+        }
+
+        /// Handler to process fuse requests in asynchronous mode.
+        ///
+        /// An async fn to handle requests from the fuse fd. It works in asynchronous IO mode when:
+        /// - receiving request from fuse fd
+        /// - handling requests by calling Server::async_handle_requests()
+        /// - sending reply to fuse fd
+        ///
+        /// The async fn repeatedly return Poll::Pending when polled until the state has been set
+        /// to quiesce mode.
+        pub async fn poll_handler(&mut self) {
+            // TODO: register self.buf as io uring buffers.
+            let drive = AsyncDriver::default();
+            let msg_size = self.buf.capacity();
+
+            while !self.state.quiescing() {
+                let result = AsyncUtil::read(drive.clone(), self.fd, &mut self.buf, 0).await;
+                match result {
+                    Ok(len) => {
+                        // Reader::new() and Writer::new() should always return success.
+                        let reader = Reader::new(FuseBuf::new(&mut self.buf[0..len])).unwrap();
+                        let writer = Writer::new(self.fd, msg_size).unwrap();
+                        let result = unsafe {
+                            self.server
+                                .async_handle_message(drive.clone(), reader, writer, None)
+                                .await
+                        };
+
+                        if let Err(e) = result {
+                            // TODO: error handling
+                            error!("failed to handle fuse request, {}", e);
+                        }
+                    }
+                    Err(e) => {
+                        // TODO: error handling
+                        error!("failed to read request from fuse device fd, {}", e);
+                    }
+                }
+            }
+
+            // TODO: unregister self.buf as io uring buffers.
+
+            // Report that the task has been quiesced.
+            self.state.report();
+        }
+    }
+
+    impl<F: AsyncFileSystem + Sync> Clone for FuseDevTask<F> {
+        fn clone(&self) -> Self {
+            FuseDevTask {
+                fd: self.fd,
+                server: self.server.clone(),
+                state: self.state.clone(),
+                buf: vec![0x0u8; self.buf.capacity()],
+            }
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use std::os::unix::io::AsRawFd;
+
+        use super::*;
+        use crate::api::{Vfs, VfsOptions};
+        use crate::async_util::AsyncExecutor;
+
+        #[test]
+        fn test_fuse_task() {
+            let state = AsyncExecutorState::new();
+            let fs = Vfs::<AsyncDriver>::new(VfsOptions::default());
+            let server = Arc::new(Server::new(fs));
+            let file = vmm_sys_util::tempfile::TempFile::new().unwrap();
+            let fd = file.as_file().as_raw_fd();
+
+            let mut executor = AsyncExecutor::new(32);
+            executor.setup().unwrap();
+
+            // Create three tasks, which could handle three concurrent fuse requests.
+            let mut task = FuseDevTask::new(0x1000, fd, server.clone(), state.clone());
+            executor
+                .spawn(async move { task.poll_handler().await })
+                .unwrap();
+            let mut task = FuseDevTask::new(0x1000, fd, server.clone(), state.clone());
+            executor
+                .spawn(async move { task.poll_handler().await })
+                .unwrap();
+            let mut task = FuseDevTask::new(0x1000, fd, server.clone(), state.clone());
+            executor
+                .spawn(async move { task.poll_handler().await })
+                .unwrap();
+
+            for _i in 0..10 {
+                executor.run_once(false).unwrap();
+            }
+            state.quiesce();
+            executor.run_once(false).unwrap();
+        }
+    }
+}
