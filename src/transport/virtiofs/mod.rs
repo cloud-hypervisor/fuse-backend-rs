@@ -363,6 +363,41 @@ mod async_io {
             self.write(data)
         }
 
+        /// Write data from two buffers into this writer in asynchronous mode.
+        pub async fn async_write2<D: AsyncDrive>(
+            &mut self,
+            _drive: D,
+            data: &[u8],
+            data2: &[u8],
+        ) -> io::Result<usize> {
+            let len = data.len() + data2.len();
+            self.check_available_space(len)?;
+
+            let mut cnt = self.write(data)?;
+            cnt += self.write(data2)?;
+
+            Ok(cnt)
+        }
+
+        /// Write data from two buffers into this writer in asynchronous mode.
+        pub async fn async_write3<D: AsyncDrive>(
+            &mut self,
+            _drive: D,
+            data: &[u8],
+            data2: &[u8],
+            data3: &[u8],
+        ) -> io::Result<usize> {
+            let len = data.len() + data2.len() + data3.len();
+            self.check_available_space(len)?;
+
+            let mut cnt = self.write(data)?;
+            cnt += self.write(data2)?;
+            cnt += self.write(data3)?;
+
+            Ok(cnt)
+        }
+
+        /*
         /// Write data from a group of buffers into this writer in asynchronous mode, skipping empty
         /// buffers.
         pub async fn async_write_vectored<D: AsyncDrive>(
@@ -372,6 +407,7 @@ mod async_io {
         ) -> io::Result<usize> {
             self.write_vectored(bufs)
         }
+         */
 
         /// Attempts to write an entire buffer into this writer in asynchronous mode.
         pub async fn async_write_all<D: AsyncDrive>(
@@ -392,11 +428,11 @@ mod async_io {
             off: u64,
         ) -> io::Result<usize> {
             self.check_available_space(count)?;
-            let bufs = self.buffers.allocate_mut_io_slice(count);
+            let mut bufs = self.buffers.allocate_mut_io_slice(count);
             if bufs.is_empty() {
                 Ok(0)
             } else {
-                let result = AsyncUtil::read_vectored(drive, src, &bufs, off).await?;
+                let result = AsyncUtil::read_vectored(drive, src, &mut bufs, off).await?;
                 self.buffers.mark_used(count)?;
                 Ok(result)
             }

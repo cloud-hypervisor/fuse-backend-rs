@@ -6,10 +6,9 @@
 use std::cell::RefCell;
 use std::ffi::CStr;
 use std::future::Future;
-use std::io::{self, IoSlice, IoSliceMut};
+use std::io;
 use std::marker::PhantomData;
-use std::mem::ManuallyDrop;
-use std::ops::Deref;
+use std::ops::{Deref, DerefMut};
 use std::os::unix::io::RawFd;
 use std::pin::Pin;
 use std::sync::{
@@ -86,8 +85,8 @@ impl<D: AsyncDrive> AsyncUtil<D> {
         } else {
             FsyncFlags::empty()
         };
-        let event = Fsync { fd, flags };
 
+        let event = Fsync { fd, flags };
         let (_event, result) = Submission::new(event, drive).await;
 
         result.map(|_| ())
@@ -110,7 +109,6 @@ impl<D: AsyncDrive> AsyncUtil<D> {
             size,
             flags,
         };
-
         let (_event, result) = Submission::new(event, drive).await;
 
         result.map(|_| ())
@@ -125,23 +123,26 @@ impl<D: AsyncDrive> AsyncUtil<D> {
         let (Read { buf, .. }, result) = Submission::new(event, drive).await;
 
         // Manually tear down the fake [Box<[u8]> object, otherwise it will cause double-free.
-        let _ = ManuallyDrop::new(buf);
+        std::mem::forget(buf);
 
         result.map(|v| v as usize)
     }
 
     /// Asynchronously read from the file into vectored data buffers.
-    pub async fn read_vectored(
+    pub async fn read_vectored<T>(
         drive: D,
         fd: RawFd,
-        bufs: &[IoSliceMut<'_>],
+        bufs: &mut [T],
         offset: u64,
-    ) -> io::Result<usize> {
+    ) -> io::Result<usize>
+    where
+        T: DerefMut<Target = [u8]>,
+    {
         // Safe because we just transform the interface to access the underlying data buffers.
         let bufs: Vec<Box<[u8]>> = bufs
-            .iter()
+            .iter_mut()
             .filter(|b| !b.is_empty())
-            .map(|b| unsafe { Box::from_raw(b.deref() as *const [u8] as *mut [u8]) })
+            .map(|b| unsafe { Box::from_raw(b.deref_mut()) })
             .collect();
         let bufs = bufs.into();
 
@@ -189,12 +190,12 @@ impl<D: AsyncDrive> AsyncUtil<D> {
         let (Write { buf, .. }, result) = Submission::new(event, drive).await;
 
         // Manually tear down the fake [Box<[u8]> object, otherwise it will cause double-free.
-        let _ = ManuallyDrop::new(buf);
+        std::mem::forget(buf);
 
         result.map(|v| v as usize)
     }
 
-    /// Asynchronously write out data buffer to the file.
+    /// Asynchronously write out two data buffers to the file.
     pub async fn write2(
         drive: D,
         fd: RawFd,
@@ -218,13 +219,42 @@ impl<D: AsyncDrive> AsyncUtil<D> {
         result.map(|v| v as usize)
     }
 
-    /// Asynchronously write out vectored data buffers to the file.
-    pub async fn write_vectored(
+    /// Asynchronously write out three data buffers to the file.
+    pub async fn write3(
         drive: D,
         fd: RawFd,
-        bufs: &[IoSlice<'_>],
+        data: &[u8],
+        data2: &[u8],
+        data3: &[u8],
         offset: u64,
     ) -> io::Result<usize> {
+        // Safe because we just transform the interface to access the underlying data buffers.
+        let bufs = [
+            unsafe { Box::from_raw(data as *const [u8] as *mut [u8]) },
+            unsafe { Box::from_raw(data2 as *const [u8] as *mut [u8]) },
+            unsafe { Box::from_raw(data3 as *const [u8] as *mut [u8]) },
+        ];
+        let bufs = bufs.to_vec().into_boxed_slice();
+
+        let event = WriteVectored { fd, bufs, offset };
+        let (WriteVectored { bufs, .. }, result) = Submission::new(event, drive).await;
+
+        // Manually tear down the fake [Box<[u8]> object, otherwise it will cause double-free.
+        std::mem::forget(bufs);
+
+        result.map(|v| v as usize)
+    }
+
+    /// Asynchronously write out vectored data buffers to the file.
+    pub async fn write_vectored<T>(
+        drive: D,
+        fd: RawFd,
+        bufs: &[T],
+        offset: u64,
+    ) -> io::Result<usize>
+    where
+        T: Deref<Target = [u8]>,
+    {
         // Safe because we just transform the interface to access the underlying data buffers.
         let bufs: Vec<Box<[u8]>> = bufs
             .iter()
@@ -464,7 +494,7 @@ impl AsyncExecutorState {
 mod tests {
     use super::*;
 
-    use std::io::{Read, Seek, Write};
+    use std::io::{IoSlice, IoSliceMut, Read, Seek, Write};
     use std::os::unix::io::AsRawFd;
 
     use futures::executor::{block_on, ThreadPool};
@@ -493,7 +523,7 @@ mod tests {
                 let mut bufs = [0u8; 18];
 
                 let drive = DemoDriver::default();
-                AsyncUtil::read_vectored(drive, fd, &[IoSliceMut::new(&mut bufs)], 1).await
+                AsyncUtil::read_vectored(drive, fd, &mut [IoSliceMut::new(&mut bufs)], 1).await
 
                 //task.await
             })

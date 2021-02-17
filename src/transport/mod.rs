@@ -10,9 +10,9 @@
 
 use std::cmp;
 use std::collections::VecDeque;
-use std::io::{self, Read};
 #[cfg(feature = "async-io")]
-use std::io::{IoSlice, IoSliceMut};
+use std::io::IoSliceMut;
+use std::io::{self, Read};
 use std::mem::{size_of, MaybeUninit};
 use std::ptr::copy_nonoverlapping;
 
@@ -78,7 +78,7 @@ impl<'a> IoBuffers<'a> {
     }
 
     #[cfg(feature = "async-io")]
-    fn allocate_io_slice(&self, count: usize) -> Vec<IoSlice> {
+    fn allocate_io_slice(&self, count: usize) -> Vec<IoSliceMut> {
         let mut rem = count;
         let mut bufs = Vec::with_capacity(self.buffers.len());
 
@@ -96,8 +96,8 @@ impl<'a> IoBuffers<'a> {
                 buf
             };
             // Safe because we just change the interface to access underlying buffers.
-            bufs.push(IoSlice::new(unsafe {
-                std::slice::from_raw_parts(local_buf.as_ptr(), local_buf.len())
+            bufs.push(IoSliceMut::new(unsafe {
+                std::slice::from_raw_parts_mut(local_buf.as_ptr(), local_buf.len())
             }));
 
             // Don't need check_sub() as we just made sure rem >= local_buf.len()

@@ -1,7 +1,7 @@
 // Copyright (C) 2021 Alibaba Cloud. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use std::io::{self, IoSlice};
+use std::io;
 use std::marker::PhantomData;
 use std::mem::size_of;
 use std::os::unix::io::RawFd;
@@ -564,41 +564,26 @@ impl<D: AsyncDrive, F: AsyncFileSystem> AsyncContext<D, F> {
         data: Option<&[u8]>,
         mut w: Writer<'_>,
     ) -> Result<usize> {
-        let mut len = size_of::<OutHeader>();
-        if out.is_some() {
-            len += size_of::<T>();
-        }
-        if let Some(ref data) = data {
-            len += data.len();
-        }
-
+        let data2 = out.as_ref().map(|v| v.as_slice()).unwrap_or(&[]);
+        let data3 = data.unwrap_or(&[]);
+        let len = size_of::<OutHeader>() + data2.len() + data3.len();
         let header = OutHeader {
             len: len as u32,
             error: 0,
             unique: self.in_header.unique,
         };
-
         trace!("fuse: new reply {:?}", header);
-        let mut buf = Vec::with_capacity(3);
-        buf.push(IoSlice::new(header.as_slice()));
-        // Need to write out header->out->data sequentially
-        if let Some(out) = out {
-            buf.push(IoSlice::new(out.as_slice()));
-            if let Some(data) = data {
-                buf.push(IoSlice::new(data));
-            }
-            w.async_write_vectored(self.drive(), &buf)
-                .await
-                .map_err(Error::EncodeMessage)?;
-        } else {
-            if let Some(data) = data {
-                buf.push(IoSlice::new(data));
-            }
 
-            w.async_write_vectored(self.drive(), &buf)
-                .await
-                .map_err(Error::EncodeMessage)?;
-        }
+        let result = match (data2.len(), data3.len()) {
+            (0, 0) => w.async_write(self.drive(), header.as_slice()).await,
+            (0, _) => w.async_write2(self.drive(), header.as_slice(), data3).await,
+            (_, 0) => w.async_write2(self.drive(), header.as_slice(), data2).await,
+            (_, _) => {
+                w.async_write3(self.drive(), header.as_slice(), data2, data3)
+                    .await
+            }
+        };
+        result.map_err(Error::EncodeMessage)?;
 
         debug_assert_eq!(len, w.bytes_written());
         Ok(w.bytes_written())
