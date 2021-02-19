@@ -182,7 +182,7 @@ impl<'a> Writer<'a> {
 
     /// Returns number of bytes already written to the internal buffer.
     pub fn bytes_written(&self) -> usize {
-        return self.buf.len();
+        self.buf.len()
     }
 
     /// Returns number of bytes available for writing.

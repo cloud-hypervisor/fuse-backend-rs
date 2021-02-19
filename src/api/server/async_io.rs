@@ -183,8 +183,7 @@ impl<F: AsyncFileSystem + Sync> Server<F> {
             #[cfg(feature = "virtiofs")]
             x if x == Opcode::RemoveMapping as u32 => self.removemapping(in_header, r, w, vu_req),
             _ => {
-                return ctx
-                    .reply_error(io::Error::from_raw_os_error(libc::ENOSYS), w)
+                ctx.reply_error(io::Error::from_raw_os_error(libc::ENOSYS), w)
                     .await
             }
         }
