@@ -334,9 +334,9 @@ fn fuse_kern_umount(mountpoint: &str, file: File) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::io::FromRawFd;
     use std::path::Path;
     use vmm_sys_util::tempdir::TempDir;
-    use vmm_sys_util::tempfile::TempFile;
 
     #[test]
     fn test_new_session() {
@@ -351,7 +351,7 @@ mod tests {
     #[test]
     fn test_new_channel() {
         let ch = FuseChannel::new(
-            TempFile::new().unwrap().into_file(),
+            unsafe { File::from_raw_fd(EventFd::new(0).unwrap().as_raw_fd()) },
             EventFd::new(0).unwrap(),
             3,
         );
