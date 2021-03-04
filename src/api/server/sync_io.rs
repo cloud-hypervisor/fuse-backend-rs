@@ -724,7 +724,10 @@ impl<F: FileSystem + Sync> Server<F> {
                 if minor < KERNEL_MINOR_VERSION_INIT_OUT_SIZE {
                     reply_ok(
                         Some(
-                            *<[u8; FUSE_COMPAT_INIT_OUT_SIZE]>::from_slice(out.as_slice()).unwrap(),
+                            *<[u8; FUSE_COMPAT_INIT_OUT_SIZE]>::from_slice(
+                                out.as_slice().split_at(FUSE_COMPAT_INIT_OUT_SIZE).0,
+                            )
+                            .unwrap(),
                         ),
                         None,
                         in_header.unique,
@@ -733,8 +736,10 @@ impl<F: FileSystem + Sync> Server<F> {
                 } else if minor < KERNEL_MINOR_VERSION_INIT_22_OUT_SIZE {
                     reply_ok(
                         Some(
-                            *<[u8; FUSE_COMPAT_22_INIT_OUT_SIZE]>::from_slice(out.as_slice())
-                                .unwrap(),
+                            *<[u8; FUSE_COMPAT_22_INIT_OUT_SIZE]>::from_slice(
+                                out.as_slice().split_at(FUSE_COMPAT_22_INIT_OUT_SIZE).0,
+                            )
+                            .unwrap(),
                         ),
                         None,
                         in_header.unique,
