@@ -514,21 +514,39 @@ impl<D: AsyncDrive> PassthroughFs<D> {
         let inode = if let Some(v) = found {
             v
         } else {
-            // There is a possible race here where 2 threads end up adding the same file
-            // into the inode list.  However, since each of those will get a unique Inode
-            // value and unique file descriptors this shouldn't be that much of a problem.
-            let inode = self.next_inode.fetch_add(1, Ordering::Relaxed);
-            if inode > VFS_MAX_INO {
-                return Err(io::Error::new(
-                    io::ErrorKind::Other,
-                    format!("max inode number reached: {}", VFS_MAX_INO),
-                ));
-            }
-            trace!("fuse: do_lookup new inode {} altkey {:?}", inode, altkey);
-            self.inode_map
-                .insert(inode, altkey, InodeData::new(inode, f, 1));
+            let mut inodes = self.inode_map.get_map_mut();
 
-            inode
+            // Lookup inode_map again after acquiring the inode_map lock, as there might be another
+            // racing thread already added an inode with the same altkey while we're not holding
+            // the lock. If so just use the newly added inode, otherwise the inode will be replaced
+            // and results in EBADF.
+            match inodes.get_alt(&altkey).map(Arc::clone) {
+                Some(data) => {
+                    trace!(
+                        "fuse: do_lookup sees existing inode {} altkey {:?}",
+                        data.inode,
+                        altkey
+                    );
+                    data.refcount.fetch_add(1, Ordering::Relaxed);
+                    data.inode
+                }
+                None => {
+                    let inode = self.next_inode.fetch_add(1, Ordering::Relaxed);
+                    if inode > VFS_MAX_INO {
+                        return Err(io::Error::new(
+                            io::ErrorKind::Other,
+                            format!("max inode number reached: {}", VFS_MAX_INO),
+                        ));
+                    }
+                    trace!(
+                        "fuse: do_lookup adds new inode {} altkey {:?}",
+                        inode,
+                        altkey
+                    );
+                    inodes.insert(inode, altkey, Arc::new(InodeData::new(inode, f, 1)));
+                    inode
+                }
+            }
         };
 
         Ok(Entry {
