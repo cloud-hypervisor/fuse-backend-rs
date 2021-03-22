@@ -215,7 +215,11 @@ impl<D: AsyncDrive + Sync> AsyncFileSystem for PassthroughFs<D> {
                     let new = curr.saturating_add(1);
 
                     // Synchronizes with the forgot_one()
-                    if data.refcount.compare_and_swap(curr, new, Ordering::AcqRel) == curr {
+                    if data
+                        .refcount
+                        .compare_exchange(curr, new, Ordering::AcqRel, Ordering::Acquire)
+                        .is_ok()
+                    {
                         found = Some(data.inode);
                         break;
                     }
