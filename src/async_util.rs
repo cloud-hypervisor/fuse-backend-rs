@@ -466,7 +466,9 @@ impl AsyncExecutorState {
 
     /// Start to quiesce the executor/tasks.
     pub fn quiesce(&self) {
-        self.0.compare_and_swap(0, 1, Ordering::SeqCst);
+        let _ = self
+            .0
+            .compare_exchange(0, 1, Ordering::SeqCst, Ordering::SeqCst);
     }
 
     /// Check whether the executor is in quiescing state.
