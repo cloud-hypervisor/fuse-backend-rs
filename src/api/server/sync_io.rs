@@ -95,9 +95,7 @@ impl<F: FileSystem + Sync> Server<F> {
             x if x == Opcode::Setlkw as u32 => self.setlkw(in_header, r, w),
             x if x == Opcode::Access as u32 => self.access(in_header, r, w),
             x if x == Opcode::Create as u32 => self.create(in_header, r, w),
-            x if x == Opcode::Interrupt as u32 => self.interrupt(in_header),
             x if x == Opcode::Bmap as u32 => self.bmap(in_header, r, w),
-            x if x == Opcode::Destroy as u32 => self.destroy(),
             x if x == Opcode::Ioctl as u32 => self.ioctl(in_header, r, w),
             x if x == Opcode::Poll as u32 => self.poll(in_header, r, w),
             x if x == Opcode::NotifyReply as u32 => self.notify_reply(in_header, r, w),
@@ -110,11 +108,22 @@ impl<F: FileSystem + Sync> Server<F> {
             x if x == Opcode::SetupMapping as u32 => self.setupmapping(in_header, r, w, vu_req),
             #[cfg(feature = "virtiofs")]
             x if x == Opcode::RemoveMapping as u32 => self.removemapping(in_header, r, w, vu_req),
-            _ => reply_error(
-                io::Error::from_raw_os_error(libc::ENOSYS),
-                in_header.unique,
-                w,
-            ),
+            // Group reqeusts don't need reply together
+            x => match x {
+                x if x == Opcode::Interrupt as u32 => {
+                    self.interrupt(in_header);
+                    Ok(0)
+                }
+                x if x == Opcode::Destroy as u32 => {
+                    self.destroy();
+                    Ok(0)
+                }
+                _ => reply_error(
+                    io::Error::from_raw_os_error(libc::ENOSYS),
+                    in_header.unique,
+                    w,
+                ),
+            },
         };
         // Pass `None` because current API handler's design does not allow us to catch
         // the `out_header`. Hopefully, we can reach to `out_header` after some
@@ -967,9 +976,7 @@ impl<F: FileSystem + Sync> Server<F> {
         }
     }
 
-    pub(super) fn interrupt(&self, _in_header: &InHeader) -> Result<usize> {
-        Ok(0)
-    }
+    pub(super) fn interrupt(&self, _in_header: &InHeader) {}
 
     pub(super) fn bmap(&self, in_header: &InHeader, mut _r: Reader, w: Writer) -> Result<usize> {
         if let Err(e) = self.fs.bmap() {
@@ -979,11 +986,9 @@ impl<F: FileSystem + Sync> Server<F> {
         }
     }
 
-    pub(super) fn destroy(&self) -> Result<usize> {
+    pub(super) fn destroy(&self) {
         // No reply to this function.
         self.fs.destroy();
-
-        Ok(0)
     }
 
     pub(super) fn ioctl(&self, in_header: &InHeader, _r: Reader, w: Writer) -> Result<usize> {
