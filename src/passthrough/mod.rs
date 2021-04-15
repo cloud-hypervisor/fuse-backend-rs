@@ -34,9 +34,10 @@ use crate::BitmapSlice;
 #[cfg(feature = "async-io")]
 mod async_io;
 mod file_handle;
+mod multikey;
 mod sync_io;
 
-mod multikey;
+use file_handle::{FileHandle, MountFds};
 use multikey::MultikeyBTreeMap;
 
 use crate::async_util::{AsyncDrive, AsyncDriver};
@@ -66,7 +67,34 @@ impl InodeAltKey {
 
 enum FileOrHandle {
     File(File),
-    // TODO: Add file handle variant
+    #[allow(dead_code)]
+    Handle(FileHandle),
+}
+
+#[derive(Debug)]
+enum InodeFile<'a> {
+    Owned(File),
+    Ref(&'a File),
+}
+
+impl AsRawFd for InodeFile<'_> {
+    /// Return a file descriptor for this file
+    /// Note: This fd is only valid as long as the `InodeFile` exists.
+    fn as_raw_fd(&self) -> RawFd {
+        match self {
+            Self::Owned(file) => file.as_raw_fd(),
+            Self::Ref(file_ref) => file_ref.as_raw_fd(),
+        }
+    }
+}
+
+impl InodeFile<'_> {
+    fn into_ref(&self) -> &File {
+        match self {
+            Self::Owned(f) => f,
+            Self::Ref(f) => *f,
+        }
+    }
 }
 
 struct InodeData {
@@ -76,7 +104,7 @@ struct InodeData {
     refcount: AtomicU64,
 }
 
-impl InodeData {
+impl<'a> InodeData {
     fn new(inode: Inode, f: FileOrHandle, refcount: u64) -> Self {
         InodeData {
             inode,
@@ -85,19 +113,13 @@ impl InodeData {
         }
     }
 
-    // When making use of the underlying RawFd, the caller must ensure that the Arc<InodeData>
-    // object is within scope. Otherwise it may cause race window to access wrong target fd.
-    // By introducing this method, we could explicitly audit all callers making use of the
-    // underlying RawFd.
-    fn get_raw_fd(&self) -> RawFd {
+    fn get_file(&self, mount_fds: &MountFds) -> io::Result<InodeFile<'_>> {
         match &self.file_or_handle {
-            FileOrHandle::File(f) => f.as_raw_fd(),
-        }
-    }
-
-    fn get_file_ref(&self) -> &File {
-        match &self.file_or_handle {
-            FileOrHandle::File(f) => f,
+            FileOrHandle::File(f) => Ok(InodeFile::Ref(f)),
+            FileOrHandle::Handle(h) => {
+                let f = h.open_with_mount_fds(mount_fds, libc::O_PATH)?;
+                Ok(InodeFile::Owned(f))
+            }
         }
     }
 }
@@ -375,6 +397,9 @@ pub struct PassthroughFs<D: AsyncDrive = AsyncDriver, S: BitmapSlice + Send + Sy
     handle_map: HandleMap,
     next_handle: AtomicU64,
 
+    // Maps mount IDs to an open FD on the respective ID for the purpose of open_by_handle_at().
+    mount_fds: MountFds,
+
     // File descriptor pointing to the `/proc` directory. This is used to convert an fd from
     // `inodes` into one that can go into `handles`. This is accomplished by reading the
     // `self/fd/{}` symlink. We keep an open fd here in case the file system tree that we are meant
@@ -418,6 +443,7 @@ impl<D: AsyncDrive, S: BitmapSlice + Send + Sync> PassthroughFs<D, S> {
 
             handle_map: HandleMap::new(),
             next_handle: AtomicU64::new(1),
+            mount_fds: MountFds::new(),
 
             proc,
 
@@ -530,8 +556,9 @@ impl<D: AsyncDrive, S: BitmapSlice + Send + Sync> PassthroughFs<D, S> {
 
     fn do_lookup(&self, parent: Inode, name: &CStr) -> io::Result<Entry> {
         let p = self.inode_map.get(parent)?;
+        let p_file = p.get_file(&self.mount_fds)?;
         let f = Self::open_file(
-            p.get_raw_fd(),
+            p_file.as_raw_fd(),
             name,
             libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC,
             0,

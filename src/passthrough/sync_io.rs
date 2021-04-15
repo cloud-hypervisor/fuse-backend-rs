@@ -118,7 +118,8 @@ impl<D: AsyncDrive, S: BitmapSlice + Send + Sync> PassthroughFs<D, S> {
 
     fn open_inode(&self, inode: Inode, mut flags: i32) -> io::Result<File> {
         let data = self.inode_map.get(inode)?;
-        let pathname = CString::new(format!("self/fd/{}", data.get_raw_fd()))
+        let file = data.get_file(&self.mount_fds)?;
+        let pathname = CString::new(format!("self/fd/{}", file.as_raw_fd()))
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
 
         // When writeback caching is enabled, the kernel may send read requests even if the
@@ -304,11 +305,12 @@ impl<D: AsyncDrive, S: BitmapSlice + Send + Sync> PassthroughFs<D, S> {
             e
         })?;
 
-        let st = Self::stat(data.get_file_ref(), None).map_err(|e| {
+        let file = data.get_file(&self.mount_fds)?;
+        let st = Self::stat(&file, None).map_err(|e| {
             error!(
                 "fuse: do_getattr stat failed ino {} fd: {:?} err {:?}",
                 inode,
-                data.get_raw_fd(),
+                file.as_raw_fd(),
                 e
             );
             e
@@ -319,8 +321,9 @@ impl<D: AsyncDrive, S: BitmapSlice + Send + Sync> PassthroughFs<D, S> {
 
     fn do_unlink(&self, parent: Inode, name: &CStr, flags: libc::c_int) -> io::Result<()> {
         let data = self.inode_map.get(parent)?;
+        let file = data.get_file(&self.mount_fds)?;
         // Safe because this doesn't modify any memory and we check the return value.
-        let res = unsafe { libc::unlinkat(data.get_raw_fd(), name.as_ptr(), flags) };
+        let res = unsafe { libc::unlinkat(file.as_raw_fd(), name.as_ptr(), flags) };
         if res == 0 {
             Ok(())
         } else {
@@ -414,8 +417,9 @@ impl<D: AsyncDrive, S: BitmapSlice + Send + Sync> FileSystem<S> for PassthroughF
         let data = self.inode_map.get(inode)?;
         let mut out = MaybeUninit::<libc::statvfs64>::zeroed();
 
+        let file = data.get_file(&self.mount_fds)?;
         // Safe because this will only modify `out` and we check the return value.
-        match unsafe { libc::fstatvfs64(data.get_raw_fd(), out.as_mut_ptr()) } {
+        match unsafe { libc::fstatvfs64(file.as_raw_fd(), out.as_mut_ptr()) } {
             // Safe because the kernel guarantees that `out` has been initialized.
             0 => Ok(unsafe { out.assume_init() }),
             _ => Err(io::Error::last_os_error()),
@@ -477,8 +481,9 @@ impl<D: AsyncDrive, S: BitmapSlice + Send + Sync> FileSystem<S> for PassthroughF
         let res = {
             let (_uid, _gid) = set_creds(ctx.uid, ctx.gid)?;
 
+            let file = data.get_file(&self.mount_fds)?;
             // Safe because this doesn't modify any memory and we check the return value.
-            unsafe { libc::mkdirat(data.get_raw_fd(), name.as_ptr(), mode & !umask) }
+            unsafe { libc::mkdirat(file.as_raw_fd(), name.as_ptr(), mode & !umask) }
         };
         if res == 0 {
             self.do_lookup(parent, name)
@@ -576,12 +581,13 @@ impl<D: AsyncDrive, S: BitmapSlice + Send + Sync> FileSystem<S> for PassthroughF
         args: CreateIn,
     ) -> io::Result<(Entry, Option<Handle>, OpenOptions)> {
         let data = self.inode_map.get(parent)?;
+        let data_file = data.get_file(&self.mount_fds)?;
 
         let new_file = {
             let (_uid, _gid) = set_creds(ctx.uid, ctx.gid)?;
 
             Self::create_file_excl(
-                data.get_raw_fd(),
+                data_file.as_raw_fd(),
                 name,
                 args.flags as i32,
                 args.mode & !(args.umask & 0o777),
@@ -606,7 +612,7 @@ impl<D: AsyncDrive, S: BitmapSlice + Send + Sync> FileSystem<S> for PassthroughF
                 let (_uid, _gid) = set_creds(ctx.uid, ctx.gid)?;
 
                 Self::open_file(
-                    data.get_raw_fd(),
+                    data_file.as_raw_fd(),
                     name,
                     args.flags as i32 | libc::O_CREAT | libc::O_CLOEXEC | libc::O_NOFOLLOW,
                     args.mode & !(args.umask & 0o777),
@@ -756,8 +762,9 @@ impl<D: AsyncDrive, S: BitmapSlice + Send + Sync> FileSystem<S> for PassthroughF
             ProcPath(CString),
         }
 
+        let file = inode_data.get_file(&self.mount_fds)?;
         let data = if self.no_open.load(Ordering::Relaxed) {
-            let pathname = CString::new(format!("self/fd/{}", inode_data.get_raw_fd()))
+            let pathname = CString::new(format!("self/fd/{}", file.as_raw_fd()))
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
             Data::ProcPath(pathname)
         } else {
@@ -767,7 +774,7 @@ impl<D: AsyncDrive, S: BitmapSlice + Send + Sync> FileSystem<S> for PassthroughF
                 let fd = hd.get_handle_raw_fd();
                 Data::Handle(hd, fd)
             } else {
-                let pathname = CString::new(format!("self/fd/{}", inode_data.get_raw_fd()))
+                let pathname = CString::new(format!("self/fd/{}", file.as_raw_fd()))
                     .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
                 Data::ProcPath(pathname)
             }
@@ -808,7 +815,7 @@ impl<D: AsyncDrive, S: BitmapSlice + Send + Sync> FileSystem<S> for PassthroughF
             // Safe because this doesn't modify any memory and we check the return value.
             let res = unsafe {
                 libc::fchownat(
-                    inode_data.get_raw_fd(),
+                    file.as_raw_fd(),
                     empty.as_ptr(),
                     uid,
                     gid,
@@ -896,6 +903,8 @@ impl<D: AsyncDrive, S: BitmapSlice + Send + Sync> FileSystem<S> for PassthroughF
     ) -> io::Result<()> {
         let old_inode = self.inode_map.get(olddir)?;
         let new_inode = self.inode_map.get(newdir)?;
+        let old_file = old_inode.get_file(&self.mount_fds)?;
+        let new_file = new_inode.get_file(&self.mount_fds)?;
 
         // Safe because this doesn't modify any memory and we check the return value.
         // TODO: Switch to libc::renameat2 once https://github.com/rust-lang/libc/pull/1508 lands
@@ -903,9 +912,9 @@ impl<D: AsyncDrive, S: BitmapSlice + Send + Sync> FileSystem<S> for PassthroughF
         let res = unsafe {
             libc::syscall(
                 libc::SYS_renameat2,
-                old_inode.get_raw_fd(),
+                old_file.as_raw_fd(),
                 oldname.as_ptr(),
-                new_inode.get_raw_fd(),
+                new_file.as_raw_fd(),
                 newname.as_ptr(),
                 flags,
             )
@@ -927,6 +936,7 @@ impl<D: AsyncDrive, S: BitmapSlice + Send + Sync> FileSystem<S> for PassthroughF
         umask: u32,
     ) -> io::Result<Entry> {
         let data = self.inode_map.get(parent)?;
+        let file = data.get_file(&self.mount_fds)?;
 
         let res = {
             let (_uid, _gid) = set_creds(ctx.uid, ctx.gid)?;
@@ -934,7 +944,7 @@ impl<D: AsyncDrive, S: BitmapSlice + Send + Sync> FileSystem<S> for PassthroughF
             // Safe because this doesn't modify any memory and we check the return value.
             unsafe {
                 libc::mknodat(
-                    data.get_raw_fd(),
+                    file.as_raw_fd(),
                     name.as_ptr(),
                     (mode & !umask) as libc::mode_t,
                     u64::from(rdev),
@@ -957,6 +967,8 @@ impl<D: AsyncDrive, S: BitmapSlice + Send + Sync> FileSystem<S> for PassthroughF
     ) -> io::Result<Entry> {
         let data = self.inode_map.get(inode)?;
         let new_inode = self.inode_map.get(newparent)?;
+        let file = data.get_file(&self.mount_fds)?;
+        let new_file = new_inode.get_file(&self.mount_fds)?;
 
         // Safe because this is a constant value and a valid C string.
         let empty = unsafe { CStr::from_bytes_with_nul_unchecked(EMPTY_CSTR) };
@@ -964,9 +976,9 @@ impl<D: AsyncDrive, S: BitmapSlice + Send + Sync> FileSystem<S> for PassthroughF
         // Safe because this doesn't modify any memory and we check the return value.
         let res = unsafe {
             libc::linkat(
-                data.get_raw_fd(),
+                file.as_raw_fd(),
                 empty.as_ptr(),
-                new_inode.get_raw_fd(),
+                new_file.as_raw_fd(),
                 newname.as_ptr(),
                 libc::AT_EMPTY_PATH,
             )
@@ -990,8 +1002,9 @@ impl<D: AsyncDrive, S: BitmapSlice + Send + Sync> FileSystem<S> for PassthroughF
         let res = {
             let (_uid, _gid) = set_creds(ctx.uid, ctx.gid)?;
 
+            let file = data.get_file(&self.mount_fds)?;
             // Safe because this doesn't modify any memory and we check the return value.
-            unsafe { libc::symlinkat(linkname.as_ptr(), data.get_raw_fd(), name.as_ptr()) }
+            unsafe { libc::symlinkat(linkname.as_ptr(), file.as_raw_fd(), name.as_ptr()) }
         };
         if res == 0 {
             self.do_lookup(parent, name)
@@ -1005,11 +1018,12 @@ impl<D: AsyncDrive, S: BitmapSlice + Send + Sync> FileSystem<S> for PassthroughF
         let empty = unsafe { CStr::from_bytes_with_nul_unchecked(EMPTY_CSTR) };
         let mut buf = Vec::<u8>::with_capacity(libc::PATH_MAX as usize);
         let data = self.inode_map.get(inode)?;
+        let file = data.get_file(&self.mount_fds)?;
 
         // Safe because this will only modify the contents of `buf` and we check the return value.
         let res = unsafe {
             libc::readlinkat(
-                data.get_raw_fd(),
+                file.as_raw_fd(),
                 empty.as_ptr(),
                 buf.as_mut_ptr() as *mut libc::c_char,
                 libc::PATH_MAX as usize,
@@ -1086,7 +1100,7 @@ impl<D: AsyncDrive, S: BitmapSlice + Send + Sync> FileSystem<S> for PassthroughF
 
     fn access(&self, ctx: Context, inode: Inode, mask: u32) -> io::Result<()> {
         let data = self.inode_map.get(inode)?;
-        let st = Self::stat(data.get_file_ref(), None)?;
+        let st = Self::stat(&data.get_file(&self.mount_fds)?, None)?;
         let mode = mask as i32 & (libc::R_OK | libc::W_OK | libc::X_OK);
 
         if mode == libc::F_OK {
@@ -1139,7 +1153,8 @@ impl<D: AsyncDrive, S: BitmapSlice + Send + Sync> FileSystem<S> for PassthroughF
         }
 
         let data = self.inode_map.get(inode)?;
-        let pathname = CString::new(format!("/proc/self/fd/{}", data.get_raw_fd()))
+        let file = data.get_file(&self.mount_fds)?;
+        let pathname = CString::new(format!("/proc/self/fd/{}", file.as_raw_fd()))
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
 
         // The f{set,get,remove,list}xattr functions don't work on an fd opened with `O_PATH` so we
@@ -1173,8 +1188,9 @@ impl<D: AsyncDrive, S: BitmapSlice + Send + Sync> FileSystem<S> for PassthroughF
         }
 
         let data = self.inode_map.get(inode)?;
+        let file = data.get_file(&self.mount_fds)?;
         let mut buf = Vec::<u8>::with_capacity(size as usize);
-        let pathname = CString::new(format!("/proc/self/fd/{}", data.get_raw_fd()))
+        let pathname = CString::new(format!("/proc/self/fd/{}", file.as_raw_fd(),))
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
 
         // The f{set,get,remove,list}xattr functions don't work on an fd opened with `O_PATH` so we
@@ -1207,8 +1223,9 @@ impl<D: AsyncDrive, S: BitmapSlice + Send + Sync> FileSystem<S> for PassthroughF
         }
 
         let data = self.inode_map.get(inode)?;
+        let file = data.get_file(&self.mount_fds)?;
         let mut buf = Vec::<u8>::with_capacity(size as usize);
-        let pathname = CString::new(format!("/proc/self/fd/{}", data.get_raw_fd()))
+        let pathname = CString::new(format!("/proc/self/fd/{}", file.as_raw_fd()))
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
 
         // The f{set,get,remove,list}xattr functions don't work on an fd opened with `O_PATH` so we
@@ -1240,7 +1257,8 @@ impl<D: AsyncDrive, S: BitmapSlice + Send + Sync> FileSystem<S> for PassthroughF
         }
 
         let data = self.inode_map.get(inode)?;
-        let pathname = CString::new(format!("/proc/self/fd/{}", data.get_raw_fd()))
+        let file = data.get_file(&self.mount_fds)?;
+        let pathname = CString::new(format!("/proc/self/fd/{}", file.as_raw_fd()))
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
 
         // The f{set,get,remove,list}xattr functions don't work on an fd opened with `O_PATH` so we

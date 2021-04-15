@@ -61,7 +61,8 @@ impl<D: AsyncDrive, S: BitmapSlice + Send + Sync> PassthroughFs<D, S> {
         mut flags: i32,
     ) -> io::Result<File> {
         let data = self.inode_map.get(inode)?;
-        let pathname = CString::new(format!("self/fd/{}", data.get_raw_fd()))
+        let file = data.get_file(&self.mount_fds)?;
+        let pathname = CString::new(format!("self/fd/{}", file.as_raw_fd()))
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
 
         // When writeback caching is enabled, the kernel may send read requests even if the
@@ -127,18 +128,17 @@ impl<D: AsyncDrive, S: BitmapSlice + Send + Sync> PassthroughFs<D, S> {
             error!("fuse: do_getattr ino {} Not find err {:?}", inode, e);
             e
         })?;
+        let file = data.get_file(&self.mount_fds)?;
 
-        let st = Self::async_stat(data.get_file_ref(), None)
-            .await
-            .map_err(|e| {
-                error!(
-                    "fuse: do_getattr stat failed ino {} fd: {:?} err {:?}",
-                    inode,
-                    data.get_raw_fd(),
-                    e
-                );
+        let st = Self::async_stat(file.into_ref(), None).await.map_err(|e| {
+            error!(
+                "fuse: do_getattr stat failed ino {} fd: {:?} err {:?}",
+                inode,
+                file.as_raw_fd(),
                 e
-            })?;
+            );
+            e
+        })?;
 
         Ok((st, self.cfg.attr_timeout))
     }
@@ -195,10 +195,11 @@ impl<D: AsyncDrive + Sync, S: BitmapSlice + Send + Sync> AsyncFileSystem<D, S>
         parent: <Self as FileSystem<S>>::Inode,
         name: &CStr,
     ) -> io::Result<Entry> {
-        let p = self.inode_map.get(parent)?;
+        let data = self.inode_map.get(parent)?;
+        let file = data.get_file(&self.mount_fds)?;
         let f = Self::async_open_file(
             &ctx,
-            p.get_raw_fd(),
+            file.as_raw_fd(),
             name,
             libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC,
             0,
@@ -293,7 +294,8 @@ impl<D: AsyncDrive + Sync, S: BitmapSlice + Send + Sync> AsyncFileSystem<D, S>
         }
 
         let data = if self.no_open.load(Ordering::Relaxed) {
-            let pathname = CString::new(format!("self/fd/{}", inode_data.get_raw_fd()))
+            let file = inode_data.get_file(&self.mount_fds)?;
+            let pathname = CString::new(format!("self/fd/{}", file.as_raw_fd()))
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
             Data::ProcPath(pathname)
         } else {
@@ -303,7 +305,8 @@ impl<D: AsyncDrive + Sync, S: BitmapSlice + Send + Sync> AsyncFileSystem<D, S>
                 let fd = hd.get_handle_raw_fd();
                 Data::Handle(hd, fd)
             } else {
-                let pathname = CString::new(format!("self/fd/{}", inode_data.get_raw_fd()))
+                let file = inode_data.get_file(&self.mount_fds)?;
+                let pathname = CString::new(format!("self/fd/{}", file.as_raw_fd()))
                     .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
                 Data::ProcPath(pathname)
             }
@@ -340,11 +343,12 @@ impl<D: AsyncDrive + Sync, S: BitmapSlice + Send + Sync> AsyncFileSystem<D, S>
 
             // Safe because this is a constant value and a valid C string.
             let empty = unsafe { CStr::from_bytes_with_nul_unchecked(EMPTY_CSTR) };
+            let file = inode_data.get_file(&self.mount_fds)?;
 
             // Safe because this doesn't modify any memory and we check the return value.
             let res = unsafe {
                 libc::fchownat(
-                    inode_data.get_raw_fd(),
+                    file.as_raw_fd(),
                     empty.as_ptr(),
                     uid,
                     gid,
