@@ -6,8 +6,10 @@ use std::collections::HashMap;
 use std::ffi::CStr;
 use std::fs::File;
 use std::io;
-use std::os::unix::io::{AsRawFd, FromRawFd};
+use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
 use std::sync::RwLock;
+
+use crate::passthrough::PassthroughFs;
 
 /// An arbitrary maximum size for CFileHandle::f_handle.
 ///
@@ -78,7 +80,6 @@ impl MountFds {
 
 impl FileHandle {
     /// Create a file handle for the given file.
-    #[allow(dead_code)]
     fn from_name_at(dir: &impl AsRawFd, path: &CStr) -> io::Result<Self> {
         let mut mount_id: libc::c_int = 0;
         let mut c_fh = CFileHandle::new();
@@ -100,6 +101,53 @@ impl FileHandle {
         } else {
             Err(io::Error::last_os_error())
         }
+    }
+
+    /**
+     * Create a file handle for the given file, and ensure that `mount_fds` contains a valid fd for
+     * the mount the file is on (so that `handle.open_with_mount_fds()` will work).
+     *
+     * If `path` is empty, `reopen_dir` may be invoked to duplicate `dir` with custom
+     * `libc::open()` flags.
+     */
+    pub fn from_name_at_with_mount_fds<F>(
+        dir: &impl AsRawFd,
+        path: &CStr,
+        mount_fds: &MountFds,
+        reopen_dir: F,
+    ) -> io::Result<Self>
+    where
+        F: FnOnce(RawFd, libc::c_int) -> io::Result<File>,
+    {
+        let handle = Self::from_name_at(dir, path)?;
+
+        if !mount_fds.map.read().unwrap().contains_key(&handle.mnt_id) {
+            let file = if path.to_bytes().is_empty() {
+                // `open_by_handle_at()` needs a non-`O_PATH` fd, and `dir` may be `O_PATH`, so we
+                // have to open a new fd here
+                reopen_dir(
+                    dir.as_raw_fd(),
+                    libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                )?
+            } else {
+                PassthroughFs::open_file(
+                    dir.as_raw_fd(),
+                    path,
+                    libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                    0,
+                )?
+            };
+
+            // liubo: TODO find mnt id
+            // Ensure that `file` refers to an inode with the mount ID we need
+            // if statx(&file, None)?.mnt_id != handle.mnt_id {
+            //     return Err(io::Error::from_raw_os_error(libc::EIO));
+            // }
+
+            mount_fds.map.write().unwrap().insert(handle.mnt_id, file);
+        }
+
+        Ok(handle)
     }
 
     /**
