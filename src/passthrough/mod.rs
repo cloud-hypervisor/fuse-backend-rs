@@ -56,7 +56,6 @@ enum InodeAltKey {
         ino: libc::ino64_t,
         dev: libc::dev_t,
     },
-    #[allow(dead_code)]
     Handle(FileHandle),
 }
 
@@ -71,7 +70,6 @@ impl InodeAltKey {
 
 enum FileOrHandle {
     File(File),
-    #[allow(dead_code)]
     Handle(FileHandle),
 }
 
@@ -404,6 +402,18 @@ pub struct Config {
     ///
     /// The default value for this option is `false`.
     pub killpriv_v2: bool,
+
+    /// Whether to use file handles to reference inodes.  We need to be able to open file
+    /// descriptors for arbitrary inodes, and by default that is done by storing an `O_PATH` FD in
+    /// `InodeData`.  Not least because there is a maximum number of FDs a process can have open
+    /// users may find it preferable to store a file handle instead, which we can use to open an FD
+    /// when necessary.
+    /// So this switch allows to choose between the alternatives: When set to `false`, `InodeData`
+    /// will store `O_PATH` FDs.  Otherwise, we will attempt to generate and store a file handle
+    /// instead.
+    ///
+    /// The default is `false`.
+    pub inode_file_handles: bool,
 }
 
 impl Default for Config {
@@ -419,6 +429,7 @@ impl Default for Config {
             no_open: false,
             no_opendir: false,
             killpriv_v2: false,
+            inode_file_handles: false,
         }
     }
 }
@@ -507,16 +518,41 @@ impl<D: AsyncDrive, S: BitmapSlice + Send + Sync> PassthroughFs<D, S> {
     /// Initialize the Passthrough file system.
     pub fn import(&self) -> io::Result<()> {
         let root = CString::new(self.cfg.root_dir.as_str()).expect("CString::new failed");
-        // We use `O_PATH` because we just want this for traversing the directory tree
-        // and not for actually reading the contents.
-        let f = Self::open_file(
-            libc::AT_FDCWD,
-            &root,
-            libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-            0,
-        )?;
 
-        let st = Self::stat(&f, None)?;
+        let handle = if self.cfg.inode_file_handles {
+            FileHandle::from_name_at_with_mount_fds(
+                &libc::AT_FDCWD,
+                &root,
+                &self.mount_fds,
+                |fd, flags| {
+                    let pathname = CString::new(format!("self/fd/{}", fd.as_raw_fd()))
+                        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+                    Self::open_file(self.proc.as_raw_fd(), &pathname, flags, 0)
+                },
+            )
+        } else {
+            Err(io::Error::from_raw_os_error(libc::ENOTSUP))
+        };
+
+        // Ignore errors, because having a handle is optional
+        let file_or_handle = if let Ok(h) = handle {
+            FileOrHandle::Handle(h)
+        } else {
+            // We use `O_PATH` because we just want this for traversing the directory tree
+            // and not for actually reading the contents.
+            let f = Self::open_file(
+                libc::AT_FDCWD,
+                &root,
+                libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                0,
+            )?;
+            FileOrHandle::File(f)
+        };
+
+        let st = match &file_or_handle {
+            FileOrHandle::File(f) => Self::stat(f, None)?,
+            FileOrHandle::Handle(_) => Self::stat(&libc::AT_FDCWD, Some(&root))?,
+        };
 
         // Safe because this doesn't modify any memory and there is no need to check the return
         // value because this system call always succeeds. We need to clear the umask here because
@@ -524,14 +560,18 @@ impl<D: AsyncDrive, S: BitmapSlice + Send + Sync> PassthroughFs<D, S> {
         unsafe { libc::umask(0o000) };
 
         let ids_altkey = InodeAltKey::ids_from_stat(&st);
-        let handle_altkey: Option<InodeAltKey> = None;
+
+        // Note that this will always be `None` if `cfg.inode_file_handles` is false, but we only
+        // really need this alt key when we do not have an `O_PATH` fd open for every inode.  So if
+        // `cfg.inode_file_handles` is false, we do not need this key anyway.
+        let handle_altkey = file_or_handle.handle().map(|h| InodeAltKey::Handle(*h));
 
         // Not sure why the root inode gets a refcount of 2 but that's what libfuse does.
         self.inode_map.insert(
             fuse::ROOT_ID,
             ids_altkey,
             handle_altkey,
-            InodeData::new(fuse::ROOT_ID, FileOrHandle::File(f), 2, ids_altkey),
+            InodeData::new(fuse::ROOT_ID, file_or_handle, 2, ids_altkey),
         );
 
         Ok(())
@@ -607,17 +647,43 @@ impl<D: AsyncDrive, S: BitmapSlice + Send + Sync> PassthroughFs<D, S> {
     fn do_lookup(&self, parent: Inode, name: &CStr) -> io::Result<Entry> {
         let p = self.inode_map.get(parent)?;
         let p_file = p.get_file(&self.mount_fds)?;
-        let f = Self::open_file(
-            p_file.as_raw_fd(),
-            name,
-            libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-            0,
-        )?;
-        let st = Self::stat(&f, None)?;
+
+        let handle = if self.cfg.inode_file_handles {
+            FileHandle::from_name_at_with_mount_fds(&p_file, name, &self.mount_fds, |fd, flags| {
+                let pathname = CString::new(format!("self/fd/{}", fd.as_raw_fd()))
+                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+                Self::open_file(self.proc.as_raw_fd(), &pathname, flags, 0)
+                // reopen_fd_through_proc(&fd, flags, &self.proc_self_fd)
+            })
+        } else {
+            Err(io::Error::from_raw_os_error(libc::ENOTSUP))
+        };
+
+        // Ignore errors, because having a handle is optional
+        let file_or_handle = if let Ok(h) = handle {
+            FileOrHandle::Handle(h)
+        } else {
+            let f = Self::open_file(
+                p_file.as_raw_fd(),
+                name,
+                libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                0,
+            )?;
+
+            FileOrHandle::File(f)
+        };
+
+        let st = match &file_or_handle {
+            FileOrHandle::File(f) => Self::stat(f, None)?,
+            FileOrHandle::Handle(_) => Self::stat(&p_file, Some(name))?,
+        };
+
         let ids_altkey = InodeAltKey::ids_from_stat(&st);
 
-        // TODO: Once we generate file handles, set this
-        let handle_altkey: Option<InodeAltKey> = None;
+        // Note that this will always be `None` if `cfg.inode_file_handles` is false, but we only
+        // really need this alt key when we do not have an `O_PATH` fd open for every inode.  So if
+        // `cfg.inode_file_handles` is false, we do not need this key anyway.
+        let handle_altkey = file_or_handle.handle().map(|h| InodeAltKey::Handle(*h));
 
         let mut found = None;
         'search: loop {
@@ -650,8 +716,6 @@ impl<D: AsyncDrive, S: BitmapSlice + Send + Sync> PassthroughFs<D, S> {
         let inode = if let Some(v) = found {
             v
         } else {
-            let mut inodes = self.inode_map.get_map_mut();
-
             // Lookup inode_map again after acquiring the inode_map lock, as there might be another
             // racing thread already added an inode with the same altkey while we're not holding
             // the lock. If so just use the newly added inode, otherwise the inode will be replaced
@@ -685,7 +749,7 @@ impl<D: AsyncDrive, S: BitmapSlice + Send + Sync> PassthroughFs<D, S> {
                         inode,
                         ids_altkey,
                         handle_altkey,
-                        InodeData::new(inode, FileOrHandle::File(f), 1, ids_altkey),
+                        InodeData::new(inode, file_or_handle, 1, ids_altkey),
                     );
                     inode
                 }
