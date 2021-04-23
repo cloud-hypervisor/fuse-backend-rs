@@ -17,7 +17,7 @@ use libc::{blksize_t, nlink_t};
 pub const KERNEL_VERSION: u32 = 7;
 
 /// Minor version number of this interface.
-pub const KERNEL_MINOR_VERSION: u32 = 31;
+pub const KERNEL_MINOR_VERSION: u32 = 33;
 
 /// Init reply size is FUSE_COMPAT_INIT_OUT_SIZE
 pub const KERNEL_MINOR_VERSION_INIT_OUT_SIZE: u32 = 5;
@@ -32,17 +32,18 @@ pub const KERNEL_MINOR_VERSION_LOOKUP_NEGATIVE_ENTRY_ZERO: u32 = 4;
 pub const ROOT_ID: u64 = 1;
 
 // Bitmasks for `fuse_setattr_in.valid`.
-const FATTR_MODE: u32 = 1;
-const FATTR_UID: u32 = 2;
-const FATTR_GID: u32 = 4;
-const FATTR_SIZE: u32 = 8;
-const FATTR_ATIME: u32 = 16;
-const FATTR_MTIME: u32 = 32;
-pub const FATTR_FH: u32 = 64;
-const FATTR_ATIME_NOW: u32 = 128;
-const FATTR_MTIME_NOW: u32 = 256;
-pub const FATTR_LOCKOWNER: u32 = 512;
-const FATTR_CTIME: u32 = 1024;
+const FATTR_MODE: u32 = 0x1;
+const FATTR_UID: u32 = 0x2;
+const FATTR_GID: u32 = 0x4;
+const FATTR_SIZE: u32 = 0x8;
+const FATTR_ATIME: u32 = 0x10;
+const FATTR_MTIME: u32 = 0x20;
+pub const FATTR_FH: u32 = 0x40;
+const FATTR_ATIME_NOW: u32 = 0x80;
+const FATTR_MTIME_NOW: u32 = 0x100;
+pub const FATTR_LOCKOWNER: u32 = 0x200;
+const FATTR_CTIME: u32 = 0x400;
+const FATTR_KILL_SUIDGID: u32 = 0x800;
 
 bitflags! {
     pub struct SetattrValid: u32 {
@@ -55,10 +56,14 @@ bitflags! {
         const ATIME_NOW = FATTR_ATIME_NOW;
         const MTIME_NOW = FATTR_MTIME_NOW;
         const CTIME = FATTR_CTIME;
+        const KILL_SUIDGID = FATTR_KILL_SUIDGID;
     }
 }
 
-// Flags returned by the OPEN request.
+// Flags use by the OPEN request/reply.
+
+/// Kill suid and sgid if executable
+pub const FOPEN_IN_KILL_SUIDGID: u32 = 1;
 
 /// Bypass page cache for this open file.
 const FOPEN_DIRECT_IO: u32 = 1;
@@ -170,6 +175,12 @@ const EXPLICIT_INVAL_DATA: u32 = 0x200_0000;
 // INIT response init_out.map_alignment contains byte alignment for foffset and
 // moffset fields in struct fuse_setupmapping_out and fuse_removemapping_one.
 const MAP_ALIGNMENT: u32 = 0x400_0000;
+
+// Kernel supports auto-mounting directory submounts
+const SUBMOUNTS: u32 = 0x800_0000;
+
+// Filesystem responsible for clearing security.capability xattr and setuid/setgid bits.
+const HANDLE_KILLPRIV_V2: u32 = 0x1000_0000;
 
 bitflags! {
     /// A bitfield passed in as a parameter to and returned from the `init` method of the
@@ -390,6 +401,20 @@ bitflags! {
         ///
         /// This feature is enabled by default.
         const MAP_ALIGNMENT = MAP_ALIGNMENT;
+
+        /// Kernel supports the ATTR_SUBMOUNT flag.
+        const SUBMOUNTS = SUBMOUNTS;
+
+        /// Filesystem responsible for clearing security.capability xattr and setuid/setgid bits.
+        /// 1. clear "security.capability" on write, truncate and chown unconditionally
+        /// 2. sgid is cleared only if group executable bit is set
+        /// 3. clear suid/sgid when one of the following is true:
+        ///  -. setattr has FATTR_SIZE and FATTR_KILL_SUIDGID set.
+        ///  -. setattr has FATTR_UID or FATTR_GID
+        ///  -. open has O_TRUNC and FOPEN_IN_KILL_SUIDGID
+        ///  -. create has O_TRUNC and FOPEN_IN_KILL_SUIDGID flag set.
+        ///  -. write has WRITE_KILL_PRIV
+        const HANDLE_KILLPRIV_V2 = HANDLE_KILLPRIV_V2;
     }
 }
 
@@ -465,6 +490,10 @@ bitflags! {
     }
 }
 
+/// EntryOut flags
+/// Entry is a submount root
+pub const ATTR_SUBMOUNT: u32 = 1;
+
 /// Request poll notify.
 pub const POLL_SCHEDULE_NOTIFY: u32 = 1;
 
@@ -505,7 +534,7 @@ pub struct Attr {
     pub gid: u32,
     pub rdev: u32,
     pub blksize: u32,
-    pub padding: u32,
+    pub flags: u32,
 }
 unsafe impl ByteValued for Attr {}
 
