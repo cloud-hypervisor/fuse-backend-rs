@@ -16,6 +16,8 @@ impl<D: AsyncDrive> FileSystem for Vfs<D> {
         let mut n_opts = *self.opts.load().deref().deref();
         if n_opts.no_open {
             n_opts.no_open = !(opts & FsOptions::ZERO_MESSAGE_OPEN).is_empty();
+            // We can't support FUSE_ATOMIC_O_TRUNC with no_open
+            n_opts.out_opts.remove(FsOptions::ATOMIC_O_TRUNC);
         }
         n_opts.no_opendir = !(opts & FsOptions::ZERO_MESSAGE_OPENDIR).is_empty();
         if n_opts.no_writeback {
