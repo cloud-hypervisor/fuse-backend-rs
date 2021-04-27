@@ -345,6 +345,8 @@ impl<D: AsyncDrive> FileSystem for PassthroughFs<D> {
             && capable.contains(FsOptions::ZERO_MESSAGE_OPEN)
         {
             opts |= FsOptions::ZERO_MESSAGE_OPEN;
+            // We can't support FUSE_ATOMIC_O_TRUNC with no_open
+            opts.remove(FsOptions::ATOMIC_O_TRUNC);
             self.no_open.store(true, Ordering::Relaxed);
         }
         if (!self.cfg.do_import || self.cfg.no_opendir)

@@ -703,8 +703,7 @@ impl<F: FileSystem + Sync> Server<F> {
             | FsOptions::ASYNC_DIO
             | FsOptions::HAS_IOCTL_DIR
             | FsOptions::MAX_PAGES
-            | FsOptions::EXPLICIT_INVAL_DATA
-            | FsOptions::ATOMIC_O_TRUNC;
+            | FsOptions::EXPLICIT_INVAL_DATA;
 
         let capable = FsOptions::from_bits_truncate(flags);
 
