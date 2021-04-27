@@ -20,14 +20,14 @@ use crate::async_util::AsyncDrive;
 use crate::transport::{FileReadWriteVolatile, FsCacheReqHandler, Reader, Writer};
 use crate::{bytes_to_cstr, encode_io_error_kind, Error, Result};
 
-struct AsyncZCReader<'a>(Reader<'a>);
+struct AsyncZcReader<'a>(Reader<'a>);
 
 // The underlying VolatileSlice contains "*mut u8", which is just a pointer to a u8 array.
 // So safe to send to other threads.
 unsafe impl<'a> Send for Reader<'a> {}
 
 #[async_trait]
-impl<'a, D: AsyncDrive> AsyncZeroCopyReader<D> for AsyncZCReader<'a> {
+impl<'a, D: AsyncDrive> AsyncZeroCopyReader<D> for AsyncZcReader<'a> {
     async fn async_read_to(
         &mut self,
         drive: D,
@@ -39,7 +39,7 @@ impl<'a, D: AsyncDrive> AsyncZeroCopyReader<D> for AsyncZCReader<'a> {
     }
 }
 
-impl<'a> ZeroCopyReader for AsyncZCReader<'a> {
+impl<'a> ZeroCopyReader for AsyncZcReader<'a> {
     fn read_to(
         &mut self,
         f: &mut dyn FileReadWriteVolatile,
@@ -50,20 +50,20 @@ impl<'a> ZeroCopyReader for AsyncZCReader<'a> {
     }
 }
 
-impl<'a> io::Read for AsyncZCReader<'a> {
+impl<'a> io::Read for AsyncZcReader<'a> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         self.0.read(buf)
     }
 }
 
-struct AsyncZCWriter<'a>(Writer<'a>);
+struct AsyncZcWriter<'a>(Writer<'a>);
 
 // The underlying VolatileSlice contains "*mut u8", which is just a pointer to a u8 array.
 // So safe to send to other threads.
 unsafe impl<'a> Send for Writer<'a> {}
 
 #[async_trait]
-impl<'a, D: AsyncDrive + 'static> AsyncZeroCopyWriter<D> for AsyncZCWriter<'a> {
+impl<'a, D: AsyncDrive + 'static> AsyncZeroCopyWriter<D> for AsyncZcWriter<'a> {
     async fn async_write_from(
         &mut self,
         drive: D,
@@ -77,7 +77,7 @@ impl<'a, D: AsyncDrive + 'static> AsyncZeroCopyWriter<D> for AsyncZCWriter<'a> {
     }
 }
 
-impl<'a> ZeroCopyWriter for AsyncZCWriter<'a> {
+impl<'a> ZeroCopyWriter for AsyncZcWriter<'a> {
     fn write_from(
         &mut self,
         f: &mut dyn FileReadWriteVolatile,
@@ -88,7 +88,7 @@ impl<'a> ZeroCopyWriter for AsyncZCWriter<'a> {
     }
 }
 
-impl<'a> io::Write for AsyncZCWriter<'a> {
+impl<'a> io::Write for AsyncZcWriter<'a> {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         self.0.write(buf)
     }
@@ -328,7 +328,7 @@ impl<F: AsyncFileSystem + Sync> Server<F> {
             Ok(v) => v,
             Err(_e) => return Err(Error::InvalidHeaderLength),
         };
-        let mut data_writer = AsyncZCWriter(w2);
+        let mut data_writer = AsyncZcWriter(w2);
         let result = self
             .fs
             .async_read(
@@ -393,7 +393,7 @@ impl<F: AsyncFileSystem + Sync> Server<F> {
             None
         };
         let delayed_write = write_flags & WRITE_CACHE != 0;
-        let mut data_reader = AsyncZCReader(r);
+        let mut data_reader = AsyncZcReader(r);
         let result = self
             .fs
             .async_write(

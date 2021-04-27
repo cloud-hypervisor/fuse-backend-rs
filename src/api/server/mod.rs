@@ -56,9 +56,9 @@ impl<F: FileSystem + Sync> Server<F> {
     }
 }
 
-struct ZCReader<'a>(Reader<'a>);
+struct ZcReader<'a>(Reader<'a>);
 
-impl<'a> ZeroCopyReader for ZCReader<'a> {
+impl<'a> ZeroCopyReader for ZcReader<'a> {
     fn read_to(
         &mut self,
         f: &mut dyn FileReadWriteVolatile,
@@ -69,15 +69,15 @@ impl<'a> ZeroCopyReader for ZCReader<'a> {
     }
 }
 
-impl<'a> io::Read for ZCReader<'a> {
+impl<'a> io::Read for ZcReader<'a> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         self.0.read(buf)
     }
 }
 
-struct ZCWriter<'a>(Writer<'a>);
+struct ZcWriter<'a>(Writer<'a>);
 
-impl<'a> ZeroCopyWriter for ZCWriter<'a> {
+impl<'a> ZeroCopyWriter for ZcWriter<'a> {
     fn write_from(
         &mut self,
         f: &mut dyn FileReadWriteVolatile,
@@ -88,7 +88,7 @@ impl<'a> ZeroCopyWriter for ZCWriter<'a> {
     }
 }
 
-impl<'a> io::Write for ZCWriter<'a> {
+impl<'a> io::Write for ZcWriter<'a> {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         self.0.write(buf)
     }
