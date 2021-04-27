@@ -11,7 +11,7 @@ use std::time::Duration;
 use vm_memory::ByteValued;
 
 use super::{
-    Server, ServerUtil, ServerVersion, ZCReader, ZCWriter, DIRENT_PADDING, MAX_BUFFER_SIZE,
+    Server, ServerUtil, ServerVersion, ZcReader, ZcWriter, DIRENT_PADDING, MAX_BUFFER_SIZE,
     MAX_REQ_PAGES,
 };
 use crate::abi::linux_abi::*;
@@ -403,7 +403,7 @@ impl<F: FileSystem + Sync> Server<F> {
             Ok(v) => v,
             Err(_e) => return Err(Error::InvalidHeaderLength),
         };
-        let mut data_writer = ZCWriter(w2);
+        let mut data_writer = ZcWriter(w2);
 
         match self.fs.read(
             Context::from(in_header),
@@ -460,7 +460,7 @@ impl<F: FileSystem + Sync> Server<F> {
 
         let delayed_write = write_flags & WRITE_CACHE != 0;
 
-        let mut data_reader = ZCReader(r);
+        let mut data_reader = ZcReader(r);
 
         match self.fs.write(
             Context::from(in_header),
