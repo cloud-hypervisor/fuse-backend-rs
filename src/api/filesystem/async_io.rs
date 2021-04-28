@@ -403,6 +403,7 @@ pub trait AsyncFileSystem: FileSystem {
         lock_owner: Option<u64>,
         delayed_write: bool,
         flags: u32,
+        fuse_flags: u32,
     ) -> io::Result<usize>;
 
     /*
@@ -952,6 +953,7 @@ impl<FS: AsyncFileSystem> AsyncFileSystem for Arc<FS> {
         lock_owner: Option<u64>,
         delayed_write: bool,
         flags: u32,
+        fuse_flags: u32,
     ) -> Pin<Box<dyn Future<Output = io::Result<usize>> + Send + 'async_trait>>
     where
         'a: 'async_trait,
@@ -968,6 +970,7 @@ impl<FS: AsyncFileSystem> AsyncFileSystem for Arc<FS> {
             lock_owner,
             delayed_write,
             flags,
+            fuse_flags,
         )
     }
 

@@ -908,7 +908,7 @@ pub struct WriteIn {
     pub fh: u64,
     pub offset: u64,
     pub size: u32,
-    pub write_flags: u32,
+    pub fuse_flags: u32,
     pub lock_owner: u64,
     pub flags: u32,
     pub padding: u32,

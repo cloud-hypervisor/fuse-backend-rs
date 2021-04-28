@@ -500,6 +500,7 @@ impl<D: AsyncDrive + Sync> AsyncFileSystem for PassthroughFs<D> {
         _lock_owner: Option<u64>,
         _delayed_write: bool,
         _flags: u32,
+        _fuse_flags: u32,
     ) -> io::Result<usize> {
         let data = self
             .async_get_data(&ctx, handle, inode, libc::O_RDWR)
@@ -508,6 +509,7 @@ impl<D: AsyncDrive + Sync> AsyncFileSystem for PassthroughFs<D> {
             .get_drive::<D>()
             .ok_or_else(|| io::Error::from_raw_os_error(libc::EINVAL))?;
 
+        // FIXME: handle WRITE_KILL_PRIV properly
         r.async_read_to(drive, data.get_handle_raw_fd(), size as usize, offset)
             .await
     }

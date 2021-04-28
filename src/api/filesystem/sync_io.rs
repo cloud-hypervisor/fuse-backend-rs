@@ -402,6 +402,7 @@ pub trait FileSystem {
         lock_owner: Option<u64>,
         delayed_write: bool,
         flags: u32,
+        fuse_flags: u32,
     ) -> io::Result<usize> {
         Err(io::Error::from_raw_os_error(libc::ENOSYS))
     }
@@ -1000,6 +1001,7 @@ impl<FS: FileSystem> FileSystem for Arc<FS> {
         lock_owner: Option<u64>,
         delayed_write: bool,
         flags: u32,
+        fuse_flags: u32,
     ) -> io::Result<usize> {
         self.deref().write(
             ctx,
@@ -1011,6 +1013,7 @@ impl<FS: FileSystem> FileSystem for Arc<FS> {
             lock_owner,
             delayed_write,
             flags,
+            fuse_flags,
         )
     }
 

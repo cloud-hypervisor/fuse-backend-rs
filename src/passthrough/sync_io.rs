@@ -702,7 +702,8 @@ impl<D: AsyncDrive> FileSystem for PassthroughFs<D> {
         offset: u64,
         _lock_owner: Option<u64>,
         _delayed_write: bool,
-        flags: u32,
+        _flags: u32,
+        fuse_flags: u32,
     ) -> io::Result<usize> {
         let data = self.get_data(handle, inode, libc::O_RDWR)?;
 
@@ -714,7 +715,7 @@ impl<D: AsyncDrive> FileSystem for PassthroughFs<D> {
 
         // Cap restored when _killpriv is dropped
         let _killpriv =
-            if self.killpriv_v2.load(Ordering::Relaxed) && (flags & WRITE_KILL_PRIV != 0) {
+            if self.killpriv_v2.load(Ordering::Relaxed) && (fuse_flags & WRITE_KILL_PRIV != 0) {
                 self::drop_cap_fsetid()?
             } else {
                 None
