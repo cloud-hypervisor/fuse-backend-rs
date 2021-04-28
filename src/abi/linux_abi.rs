@@ -846,7 +846,7 @@ impl From<SetattrIn> for libc::stat64 {
 #[derive(Debug, Default, Copy, Clone)]
 pub struct OpenIn {
     pub flags: u32,
-    pub unused: u32,
+    pub fuse_flags: u32,
 }
 unsafe impl ByteValued for OpenIn {}
 
@@ -856,7 +856,7 @@ pub struct CreateIn {
     pub flags: u32,
     pub mode: u32,
     pub umask: u32,
-    pub padding: u32,
+    pub fuse_flags: u32,
 }
 unsafe impl ByteValued for CreateIn {}
 

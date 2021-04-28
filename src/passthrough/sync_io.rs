@@ -21,6 +21,7 @@ use crate::api::filesystem::{
     Context, DirEntry, Entry, FileSystem, FsOptions, GetxattrReply, ListxattrReply, OpenOptions,
     SetattrValid, ZeroCopyReader, ZeroCopyWriter,
 };
+use crate::api::CreateIn;
 use crate::async_util::AsyncDrive;
 use crate::bytes_to_cstr;
 #[cfg(feature = "vhost-user-fs")]
@@ -496,6 +497,7 @@ impl<D: AsyncDrive> FileSystem for PassthroughFs<D> {
         _ctx: Context,
         inode: Inode,
         flags: u32,
+        fuse_flags: u32,
     ) -> io::Result<(Option<Handle>, OpenOptions)> {
         if self.no_open.load(Ordering::Relaxed) {
             info!("fuse: open is not supported.");
@@ -527,9 +529,7 @@ impl<D: AsyncDrive> FileSystem for PassthroughFs<D> {
         ctx: Context,
         parent: Inode,
         name: &CStr,
-        mode: u32,
-        flags: u32,
-        umask: u32,
+        args: CreateIn,
     ) -> io::Result<(Entry, Option<Handle>, OpenOptions)> {
         let (_uid, _gid) = set_creds(ctx.uid, ctx.gid)?;
         let data = self.inode_map.get(parent)?;
@@ -540,8 +540,8 @@ impl<D: AsyncDrive> FileSystem for PassthroughFs<D> {
         let file = Self::open_file(
             data.get_raw_fd(),
             name,
-            flags as i32 | libc::O_CREAT | libc::O_CLOEXEC | libc::O_NOFOLLOW,
-            mode & !(umask & 0o777),
+            args.flags as i32 | libc::O_CREAT | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+            args.mode & !(args.umask & 0o777),
         )?;
 
         let entry = self.do_lookup(parent, name)?;

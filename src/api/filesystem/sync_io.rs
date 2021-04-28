@@ -13,7 +13,7 @@ use std::time::Duration;
 use super::{
     Context, DirEntry, Entry, GetxattrReply, ListxattrReply, ZeroCopyReader, ZeroCopyWriter,
 };
-use crate::abi::linux_abi::{FsOptions, OpenOptions, SetattrValid};
+use crate::abi::linux_abi::{CreateIn, FsOptions, OpenOptions, SetattrValid};
 #[cfg(feature = "virtiofs")]
 pub use crate::abi::virtio_fs::RemovemappingOne;
 #[cfg(feature = "virtiofs")]
@@ -311,6 +311,7 @@ pub trait FileSystem {
         ctx: Context,
         inode: Self::Inode,
         flags: u32,
+        fuse_flags: u32,
     ) -> io::Result<(Option<Self::Handle>, OpenOptions)> {
         // Matches the behavior of libfuse.
         Ok((None, OpenOptions::empty()))
@@ -335,9 +336,7 @@ pub trait FileSystem {
         ctx: Context,
         parent: Self::Inode,
         name: &CStr,
-        mode: u32,
-        flags: u32,
-        umask: u32,
+        args: CreateIn,
     ) -> io::Result<(Entry, Option<Self::Handle>, OpenOptions)> {
         Err(io::Error::from_raw_os_error(libc::ENOSYS))
     }
@@ -959,8 +958,9 @@ impl<FS: FileSystem> FileSystem for Arc<FS> {
         ctx: Context,
         inode: Self::Inode,
         flags: u32,
+        fuse_flags: u32,
     ) -> io::Result<(Option<Self::Handle>, OpenOptions)> {
-        self.deref().open(ctx, inode, flags)
+        self.deref().open(ctx, inode, flags, fuse_flags)
     }
 
     fn create(
@@ -968,11 +968,9 @@ impl<FS: FileSystem> FileSystem for Arc<FS> {
         ctx: Context,
         parent: Self::Inode,
         name: &CStr,
-        mode: u32,
-        flags: u32,
-        umask: u32,
+        args: CreateIn,
     ) -> io::Result<(Entry, Option<Self::Handle>, OpenOptions)> {
-        self.deref().create(ctx, parent, name, mode, flags, umask)
+        self.deref().create(ctx, parent, name, args)
     }
 
     fn read(
