@@ -174,6 +174,10 @@ pub struct VfsOptions {
     /// Disable fuse WRITEBACK_CACHE option so that kernel will not cache
     /// buffer writes.
     pub no_writeback: bool,
+    /// Enable fuse killpriv_v2 support. When enabled, fuse file system makes sure
+    /// to remove security.capability xattr and setuid/setgid bits. See details in
+    /// comments for HANDLE_KILLPRIV_V2
+    pub killpriv_v2: bool,
     /// File system options passed in from client
     pub in_opts: FsOptions,
     /// File system options returned to client
@@ -186,6 +190,7 @@ impl Default for VfsOptions {
             no_open: true,
             no_opendir: true,
             no_writeback: false,
+            killpriv_v2: false,
             in_opts: FsOptions::empty(),
             out_opts: FsOptions::ASYNC_READ
                 | FsOptions::PARALLEL_DIROPS
@@ -198,7 +203,8 @@ impl Default for VfsOptions {
                 | FsOptions::CACHE_SYMLINKS
                 | FsOptions::DO_READDIRPLUS
                 | FsOptions::READDIRPLUS_AUTO
-                | FsOptions::ZERO_MESSAGE_OPENDIR,
+                | FsOptions::ZERO_MESSAGE_OPENDIR
+                | FsOptions::HANDLE_KILLPRIV_V2,
         }
     }
 }
@@ -859,13 +865,15 @@ mod tests {
             | FsOptions::CACHE_SYMLINKS
             | FsOptions::DO_READDIRPLUS
             | FsOptions::READDIRPLUS_AUTO
-            | FsOptions::ZERO_MESSAGE_OPENDIR;
+            | FsOptions::ZERO_MESSAGE_OPENDIR
+            | FsOptions::HANDLE_KILLPRIV_V2;
         let opts = vfs.opts.load();
 
         assert_eq!(opts.no_open, true);
         assert_eq!(opts.no_opendir, true);
         assert_eq!(opts.no_writeback, false);
-        assert_eq!(opts.in_opts, FsOptions::empty());
+        assert_eq!(opts.killpriv_v2, false);
+        assert_eq!(opts.in_opts.is_empty(), true);
         assert_eq!(opts.out_opts, out_opts);
 
         vfs.init(FsOptions::ASYNC_READ).unwrap();
@@ -875,6 +883,7 @@ mod tests {
         assert_eq!(opts.no_open, false);
         assert_eq!(opts.no_opendir, false);
         assert_eq!(opts.no_writeback, false);
+        assert_eq!(opts.killpriv_v2, false);
 
         vfs.destroy();
         assert!(vfs.initialized());
@@ -887,6 +896,7 @@ mod tests {
         assert_eq!(opts.no_open, true);
         assert_eq!(opts.no_opendir, true);
         assert_eq!(opts.no_writeback, false);
+        assert_eq!(opts.killpriv_v2, false);
         assert_eq!(opts.out_opts, out_opts & in_opts);
     }
 

@@ -23,6 +23,9 @@ impl<D: AsyncDrive> FileSystem for Vfs<D> {
         if n_opts.no_writeback {
             n_opts.out_opts.remove(FsOptions::WRITEBACK_CACHE);
         }
+        if !n_opts.killpriv_v2 {
+            n_opts.out_opts.remove(FsOptions::HANDLE_KILLPRIV_V2);
+        }
         n_opts.in_opts = opts;
 
         n_opts.out_opts &= opts;
