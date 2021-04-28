@@ -312,6 +312,7 @@ impl<D: AsyncDrive> FileSystem for Vfs<D> {
         lock_owner: Option<u64>,
         delayed_write: bool,
         flags: u32,
+        fuse_flags: u32,
     ) -> Result<usize> {
         match self.get_real_rootfs(inode)? {
             (Left(fs), idata) => fs.write(
@@ -324,6 +325,7 @@ impl<D: AsyncDrive> FileSystem for Vfs<D> {
                 lock_owner,
                 delayed_write,
                 flags,
+                fuse_flags,
             ),
             (Right(fs), idata) => fs.write(
                 ctx,
@@ -335,6 +337,7 @@ impl<D: AsyncDrive> FileSystem for Vfs<D> {
                 lock_owner,
                 delayed_write,
                 flags,
+                fuse_flags,
             ),
         }
     }
