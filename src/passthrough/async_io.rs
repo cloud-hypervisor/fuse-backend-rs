@@ -97,8 +97,9 @@ impl<D: AsyncDrive> PassthroughFs<D> {
         ctx: &Context,
         inode: Inode,
         flags: u32,
-        fuse_flags: u32,
+        _fuse_flags: u32,
     ) -> io::Result<(Option<Handle>, OpenOptions)> {
+        // FIXME: handle FOPEN_IN_KILL_SUIDGID properly
         let file = self.async_open_inode(ctx, inode, flags as i32).await?;
         let data = HandleData::new(inode, file);
         let handle = self.next_handle.fetch_add(1, Ordering::Relaxed);

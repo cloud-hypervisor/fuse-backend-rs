@@ -316,6 +316,11 @@ pub struct Config {
     ///
     /// The default value for this option is `false`.
     pub no_opendir: bool,
+
+    /// Control whether kill_priv_v2 is enabled.
+    ///
+    /// The default value for this option is `false`.
+    pub killpriv_v2: bool,
 }
 
 impl Default for Config {
@@ -330,6 +335,7 @@ impl Default for Config {
             do_import: true,
             no_open: false,
             no_opendir: false,
+            killpriv_v2: false,
         }
     }
 }
@@ -370,6 +376,9 @@ pub struct PassthroughFs<D> {
     // Whether no_opendir is enabled.
     no_opendir: AtomicBool,
 
+    // Whether kill_priv_v2 is enabled.
+    killpriv_v2: AtomicBool,
+
     cfg: Config,
 
     phantom: PhantomData<D>,
@@ -399,6 +408,7 @@ impl<D: AsyncDrive> PassthroughFs<D> {
             writeback: AtomicBool::new(false),
             no_open: AtomicBool::new(false),
             no_opendir: AtomicBool::new(false),
+            killpriv_v2: AtomicBool::new(false),
             cfg,
 
             phantom: PhantomData,
@@ -459,6 +469,30 @@ impl<D: AsyncDrive> PassthroughFs<D> {
         } else {
             Err(io::Error::last_os_error())
         }
+    }
+
+    fn create_file_excl(
+        dfd: i32,
+        pathname: &CStr,
+        flags: i32,
+        mode: u32,
+    ) -> io::Result<Option<File>> {
+        let fd = unsafe {
+            libc::openat(
+                dfd,
+                pathname.as_ptr(),
+                flags & libc::O_CREAT & libc::O_EXCL,
+                mode,
+            )
+        };
+        if fd < 0 {
+            let err = io::Error::last_os_error();
+            if err.kind() == io::ErrorKind::NotFound {
+                return Ok(None);
+            }
+            return Err(err);
+        }
+        Ok(Some(unsafe { File::from_raw_fd(fd) }))
     }
 
     fn open_file(dfd: i32, pathname: &CStr, flags: i32, mode: u32) -> io::Result<File> {
