@@ -6,6 +6,7 @@ use std::io;
 use async_trait::async_trait;
 
 use super::*;
+use crate::api::CreateIn;
 use crate::async_util::AsyncDrive;
 
 #[async_trait]
@@ -64,14 +65,15 @@ impl<D: AsyncDrive + Sync> AsyncFileSystem for Vfs<D> {
         ctx: Context,
         inode: <Self as FileSystem>::Inode,
         flags: u32,
+        fuse_flags: u32,
     ) -> Result<(Option<<Self as FileSystem>::Handle>, OpenOptions)> {
         if self.opts.load().no_open {
             Err(Error::from_raw_os_error(libc::ENOSYS))
         } else {
             match self.get_real_rootfs(inode)? {
-                (Left(fs), idata) => fs.open(ctx, idata.ino(), flags),
+                (Left(fs), idata) => fs.open(ctx, idata.ino(), flags, fuse_flags),
                 (Right(fs), idata) => fs
-                    .async_open(ctx, idata.ino(), flags)
+                    .async_open(ctx, idata.ino(), flags, fuse_flags)
                     .await
                     .map(|(h, opt)| (h.map(Into::into), opt)),
             }
@@ -83,19 +85,18 @@ impl<D: AsyncDrive + Sync> AsyncFileSystem for Vfs<D> {
         ctx: Context,
         parent: <Self as FileSystem>::Inode,
         name: &CStr,
-        mode: u32,
-        flags: u32,
-        umask: u32,
+        args: CreateIn,
     ) -> Result<(Entry, Option<<Self as FileSystem>::Handle>, OpenOptions)> {
         match self.get_real_rootfs(parent)? {
-            (Left(fs), idata) => fs.create(ctx, idata.ino(), name, mode, flags, umask),
-            (Right(fs), idata) => fs
-                .async_create(ctx, idata.ino(), name, mode, flags, umask)
-                .await
-                .map(|(mut a, b, c)| {
-                    a.inode = self.convert_inode(idata.fs_idx(), a.inode)?;
-                    Ok((a, b, c))
-                })?,
+            (Left(fs), idata) => fs.create(ctx, idata.ino(), name, args),
+            (Right(fs), idata) => {
+                fs.async_create(ctx, idata.ino(), name, args)
+                    .await
+                    .map(|(mut a, b, c)| {
+                        a.inode = self.convert_inode(idata.fs_idx(), a.inode)?;
+                        Ok((a, b, c))
+                    })?
+            }
         }
     }
 
