@@ -12,4 +12,4 @@ smoke: check
 	cargo test --features="fusedev" -- --nocapture
 
 docker-smoke:
-	docker run --rm --privileged -v ${current_dir}:/fuse-rs rust:1.47.0 sh -c "rustup component add clippy rustfmt; cd /fuse-rs; make smoke"
+	docker run --rm --privileged -v ${current_dir}:/fuse-rs rust:slim sh -c "apt update;apt install -y make; rustup component add clippy rustfmt; cd /fuse-rs; make smoke"

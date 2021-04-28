@@ -10,17 +10,11 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  build:
-
+  CI:
     runs-on: ubuntu-latest
-
     steps:
     - uses: actions/checkout@v2
-    - name: clippy and format
-      run: |
-        cargo clippy --features "fusedev" -- -Dclippy::all
-        cargo fmt -- --check
-    - name: Build fusedev
-      run: cargo build --verbose --features "fusedev"
-    - name: Run tests fusedev
-      run: cargo test --verbose --features "fusedev"
+    - name: build and check
+      run: make check
+    - name: smoke
+      run: make docker-smoke
