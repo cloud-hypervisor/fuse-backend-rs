@@ -532,25 +532,25 @@ impl From<libc::stat64> for Attr {
     }
 }
 
-impl Into<libc::stat64> for Attr {
-    fn into(self) -> libc::stat64 {
+impl From<Attr> for libc::stat64 {
+    fn from(attr: Attr) -> libc::stat64 {
         // Safe because we are zero-initializing a struct
         let mut out: libc::stat64 = unsafe { mem::zeroed() };
-        out.st_ino = self.ino;
-        out.st_size = self.size as i64;
-        out.st_blocks = self.blocks as i64;
-        out.st_atime = self.atime as i64;
-        out.st_mtime = self.mtime as i64;
-        out.st_ctime = self.ctime as i64;
-        out.st_atime_nsec = self.atimensec as i64;
-        out.st_mtime_nsec = self.mtimensec as i64;
-        out.st_ctime_nsec = self.ctimensec as i64;
-        out.st_mode = self.mode;
-        out.st_nlink = self.nlink as nlink_t;
-        out.st_uid = self.uid;
-        out.st_gid = self.gid;
-        out.st_rdev = self.rdev as u64;
-        out.st_blksize = self.blksize as blksize_t;
+        out.st_ino = attr.ino;
+        out.st_size = attr.size as i64;
+        out.st_blocks = attr.blocks as i64;
+        out.st_atime = attr.atime as i64;
+        out.st_mtime = attr.mtime as i64;
+        out.st_ctime = attr.ctime as i64;
+        out.st_atime_nsec = attr.atimensec as i64;
+        out.st_mtime_nsec = attr.mtimensec as i64;
+        out.st_ctime_nsec = attr.ctimensec as i64;
+        out.st_mode = attr.mode;
+        out.st_nlink = attr.nlink as nlink_t;
+        out.st_uid = attr.uid;
+        out.st_gid = attr.gid;
+        out.st_rdev = attr.rdev as u64;
+        out.st_blksize = attr.blksize as blksize_t;
 
         out
     }
@@ -794,20 +794,20 @@ pub struct SetattrIn {
 }
 unsafe impl ByteValued for SetattrIn {}
 
-impl Into<libc::stat64> for SetattrIn {
-    fn into(self) -> libc::stat64 {
+impl From<SetattrIn> for libc::stat64 {
+    fn from(attr: SetattrIn) -> libc::stat64 {
         // Safe because we are zero-initializing a struct with only POD fields.
         let mut out: libc::stat64 = unsafe { mem::zeroed() };
-        out.st_mode = self.mode;
-        out.st_uid = self.uid;
-        out.st_gid = self.gid;
-        out.st_size = self.size as i64;
-        out.st_atime = self.atime as i64;
-        out.st_mtime = self.mtime as i64;
-        out.st_ctime = self.ctime as i64;
-        out.st_atime_nsec = i64::from(self.atimensec);
-        out.st_mtime_nsec = i64::from(self.mtimensec);
-        out.st_ctime_nsec = i64::from(self.ctimensec);
+        out.st_mode = attr.mode;
+        out.st_uid = attr.uid;
+        out.st_gid = attr.gid;
+        out.st_size = attr.size as i64;
+        out.st_atime = attr.atime as i64;
+        out.st_mtime = attr.mtime as i64;
+        out.st_ctime = attr.ctime as i64;
+        out.st_atime_nsec = i64::from(attr.atimensec);
+        out.st_mtime_nsec = i64::from(attr.mtimensec);
+        out.st_ctime_nsec = i64::from(attr.ctimensec);
 
         out
     }
