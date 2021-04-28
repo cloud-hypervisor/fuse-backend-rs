@@ -15,6 +15,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use super::*;
+use crate::abi::linux_abi::{FOPEN_IN_KILL_SUIDGID, WRITE_KILL_PRIV};
 #[cfg(feature = "vhost-user-fs")]
 use crate::abi::virtio_fs;
 use crate::api::filesystem::{
@@ -87,6 +88,27 @@ pub(crate) fn set_creds(
     // We have to change the gid before we change the uid because if we change the uid first then we
     // lose the capability to change the gid.  However changing back can happen in any order.
     ScopedGid::new(gid).and_then(|gid| Ok((ScopedUid::new(uid)?, gid)))
+}
+
+struct CapFsetid {}
+
+fn drop_cap_fsetid() -> io::Result<Option<CapFsetid>> {
+    if !caps::has_cap(None, caps::CapSet::Effective, caps::Capability::CAP_FSETID)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?
+    {
+        return Ok(None);
+    }
+    caps::drop(None, caps::CapSet::Effective, caps::Capability::CAP_FSETID)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    Ok(Some(CapFsetid {}))
+}
+
+impl Drop for CapFsetid {
+    fn drop(&mut self) {
+        if let Err(e) = caps::raise(None, caps::CapSet::Effective, caps::Capability::CAP_FSETID) {
+            error!("fail to restore thread cap_fsetid: {}", e);
+        };
+    }
 }
 
 impl<D: AsyncDrive> PassthroughFs<D> {
@@ -242,11 +264,24 @@ impl<D: AsyncDrive> PassthroughFs<D> {
         Ok(())
     }
 
-    fn do_open(&self, inode: Inode, flags: u32) -> io::Result<(Option<Handle>, OpenOptions)> {
+    fn do_open(
+        &self,
+        inode: Inode,
+        flags: u32,
+        fuse_flags: u32,
+    ) -> io::Result<(Option<Handle>, OpenOptions)> {
+        let killpriv = if self.killpriv_v2.load(Ordering::Relaxed)
+            && (fuse_flags & FOPEN_IN_KILL_SUIDGID != 0)
+        {
+            self::drop_cap_fsetid()?
+        } else {
+            None
+        };
         let file = self.open_inode(inode, flags as i32)?;
+        drop(killpriv);
+
         let data = HandleData::new(inode, file);
         let handle = self.next_handle.fetch_add(1, Ordering::Relaxed);
-
         self.handle_map.insert(handle, data);
 
         let mut opts = OpenOptions::empty();
@@ -356,6 +391,12 @@ impl<D: AsyncDrive> FileSystem for PassthroughFs<D> {
             opts |= FsOptions::ZERO_MESSAGE_OPENDIR;
             self.no_opendir.store(true, Ordering::Relaxed);
         }
+        if (!self.cfg.do_import || self.cfg.killpriv_v2)
+            && capable.contains(FsOptions::HANDLE_KILLPRIV_V2)
+        {
+            opts |= FsOptions::HANDLE_KILLPRIV_V2;
+            self.killpriv_v2.store(true, Ordering::Relaxed);
+        }
 
         Ok(opts)
     }
@@ -409,7 +450,7 @@ impl<D: AsyncDrive> FileSystem for PassthroughFs<D> {
             info!("fuse: opendir is not supported.");
             Err(io::Error::from_raw_os_error(libc::ENOSYS))
         } else {
-            self.do_open(inode, flags | (libc::O_DIRECTORY as u32))
+            self.do_open(inode, flags | (libc::O_DIRECTORY as u32), 0)
         }
     }
 
@@ -503,7 +544,7 @@ impl<D: AsyncDrive> FileSystem for PassthroughFs<D> {
             info!("fuse: open is not supported.");
             Err(io::Error::from_raw_os_error(libc::ENOSYS))
         } else {
-            self.do_open(inode, flags)
+            self.do_open(inode, flags, fuse_flags)
         }
     }
 
@@ -534,15 +575,36 @@ impl<D: AsyncDrive> FileSystem for PassthroughFs<D> {
         let (_uid, _gid) = set_creds(ctx.uid, ctx.gid)?;
         let data = self.inode_map.get(parent)?;
 
+        let new_file = Self::create_file_excl(
+            data.get_raw_fd(),
+            name,
+            args.flags as i32,
+            args.mode & !(args.umask & 0o777),
+        )?;
+
         // Safe because this doesn't modify any memory and we check the return value. We don't
         // really check `flags` because if the kernel can't handle poorly specified flags then we
         // have much bigger problems.
-        let file = Self::open_file(
-            data.get_raw_fd(),
-            name,
-            args.flags as i32 | libc::O_CREAT | libc::O_CLOEXEC | libc::O_NOFOLLOW,
-            args.mode & !(args.umask & 0o777),
-        )?;
+        let file = match new_file {
+            Some(f) => f,
+            None => {
+                // Cap restored when _killpriv is dropped
+                let _killpriv = if self.killpriv_v2.load(Ordering::Relaxed)
+                    && (args.fuse_flags & FOPEN_IN_KILL_SUIDGID != 0)
+                {
+                    self::drop_cap_fsetid()?
+                } else {
+                    None
+                };
+
+                Self::open_file(
+                    data.get_raw_fd(),
+                    name,
+                    args.flags as i32 | libc::O_CREAT | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+                    args.mode & !(args.umask & 0o777),
+                )?
+            }
+        };
 
         let entry = self.do_lookup(parent, name)?;
 
@@ -640,7 +702,7 @@ impl<D: AsyncDrive> FileSystem for PassthroughFs<D> {
         offset: u64,
         _lock_owner: Option<u64>,
         _delayed_write: bool,
-        _flags: u32,
+        flags: u32,
     ) -> io::Result<usize> {
         let data = self.get_data(handle, inode, libc::O_RDWR)?;
 
@@ -649,6 +711,14 @@ impl<D: AsyncDrive> FileSystem for PassthroughFs<D> {
         // so data.file won't be closed.
         let f = unsafe { File::from_raw_fd(data.get_handle_raw_fd()) };
         let mut f = ManuallyDrop::new(f);
+
+        // Cap restored when _killpriv is dropped
+        let _killpriv =
+            if self.killpriv_v2.load(Ordering::Relaxed) && (flags & WRITE_KILL_PRIV != 0) {
+                self::drop_cap_fsetid()?
+            } else {
+                None
+            };
 
         r.read_to(&mut *f, size as usize, offset)
     }
@@ -742,6 +812,15 @@ impl<D: AsyncDrive> FileSystem for PassthroughFs<D> {
         }
 
         if valid.contains(SetattrValid::SIZE) {
+            // Cap restored when _killpriv is dropped
+            let _killpriv = if self.killpriv_v2.load(Ordering::Relaxed)
+                && valid.contains(SetattrValid::KILL_SUIDGID)
+            {
+                self::drop_cap_fsetid()?
+            } else {
+                None
+            };
+
             // Safe because this doesn't modify any memory and we check the return value.
             let res = match data {
                 Data::Handle(_, fd) => unsafe { libc::ftruncate(fd, attr.st_size) },

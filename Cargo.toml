@@ -19,6 +19,7 @@ homepage = "https://github.com/cloud-hypervisor/"
 arc-swap = ">=0.4.6"
 #async-trait = { version = "0.1.42", optional = true }
 bitflags = ">=1.1.0"
+caps = "0.5.1"
 #futures = { version = "0.3", optional = true }
 #iou = { version = "0.3.3", optional = true }
 libc = ">=0.2.68"
