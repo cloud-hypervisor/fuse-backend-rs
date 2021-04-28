@@ -133,6 +133,7 @@ impl<D: AsyncDrive + Sync> AsyncFileSystem for Vfs<D> {
         lock_owner: Option<u64>,
         delayed_write: bool,
         flags: u32,
+        fuse_flags: u32,
     ) -> Result<usize> {
         match self.get_real_rootfs(inode)? {
             (Left(_fs), _idata) => Err(io::Error::from_raw_os_error(libc::ENOSYS)),
@@ -147,6 +148,7 @@ impl<D: AsyncDrive + Sync> AsyncFileSystem for Vfs<D> {
                     lock_owner,
                     delayed_write,
                     flags,
+                    fuse_flags,
                 )
                 .await
             }

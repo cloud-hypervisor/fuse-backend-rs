@@ -379,7 +379,7 @@ impl<F: AsyncFileSystem + Sync> Server<F> {
             fh,
             offset,
             size,
-            write_flags,
+            fuse_flags,
             lock_owner,
             flags,
             ..
@@ -391,12 +391,12 @@ impl<F: AsyncFileSystem + Sync> Server<F> {
                 .await;
         }
 
-        let owner = if write_flags & WRITE_LOCKOWNER != 0 {
+        let owner = if fuse_flags & WRITE_LOCKOWNER != 0 {
             Some(lock_owner)
         } else {
             None
         };
-        let delayed_write = write_flags & WRITE_CACHE != 0;
+        let delayed_write = fuse_flags & WRITE_CACHE != 0;
         let mut data_reader = AsyncZcReader(r);
         let result = self
             .fs
@@ -410,6 +410,7 @@ impl<F: AsyncFileSystem + Sync> Server<F> {
                 owner,
                 delayed_write,
                 flags,
+                fuse_flags,
             )
             .await;
 
