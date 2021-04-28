@@ -824,19 +824,19 @@ pub struct SetattrIn {
 unsafe impl ByteValued for SetattrIn {}
 
 impl From<SetattrIn> for libc::stat64 {
-    fn from(attr: SetattrIn) -> libc::stat64 {
+    fn from(setattr: SetattrIn) -> libc::stat64 {
         // Safe because we are zero-initializing a struct with only POD fields.
         let mut out: libc::stat64 = unsafe { mem::zeroed() };
-        out.st_mode = attr.mode;
-        out.st_uid = attr.uid;
-        out.st_gid = attr.gid;
-        out.st_size = attr.size as i64;
-        out.st_atime = attr.atime as i64;
-        out.st_mtime = attr.mtime as i64;
-        out.st_ctime = attr.ctime as i64;
-        out.st_atime_nsec = i64::from(attr.atimensec);
-        out.st_mtime_nsec = i64::from(attr.mtimensec);
-        out.st_ctime_nsec = i64::from(attr.ctimensec);
+        out.st_mode = setattr.mode;
+        out.st_uid = setattr.uid;
+        out.st_gid = setattr.gid;
+        out.st_size = setattr.size as i64;
+        out.st_atime = setattr.atime as i64;
+        out.st_mtime = setattr.mtime as i64;
+        out.st_ctime = setattr.ctime as i64;
+        out.st_atime_nsec = i64::from(setattr.atimensec);
+        out.st_mtime_nsec = i64::from(setattr.mtimensec);
+        out.st_ctime_nsec = i64::from(setattr.ctimensec);
 
         out
     }
