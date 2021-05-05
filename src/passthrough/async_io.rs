@@ -10,6 +10,7 @@ use crate::abi::linux_abi::{OpenOptions, SetattrValid};
 use crate::api::filesystem::{
     AsyncFileSystem, AsyncZeroCopyReader, AsyncZeroCopyWriter, Context, FileSystem,
 };
+use crate::api::CreateIn;
 use crate::async_util::{AsyncDrive, AsyncUtil};
 
 //use crate::passthrough::sync_io::set_creds;
@@ -96,7 +97,9 @@ impl<D: AsyncDrive> PassthroughFs<D> {
         ctx: &Context,
         inode: Inode,
         flags: u32,
+        _fuse_flags: u32,
     ) -> io::Result<(Option<Handle>, OpenOptions)> {
+        // FIXME: handle FOPEN_IN_KILL_SUIDGID properly
         let file = self.async_open_inode(ctx, inode, flags as i32).await?;
         let data = HandleData::new(inode, file);
         let handle = self.next_handle.fetch_add(1, Ordering::Relaxed);
@@ -407,12 +410,13 @@ impl<D: AsyncDrive + Sync> AsyncFileSystem for PassthroughFs<D> {
         ctx: Context,
         inode: <Self as FileSystem>::Inode,
         flags: u32,
+        fuse_flags: u32,
     ) -> io::Result<(Option<<Self as FileSystem>::Handle>, OpenOptions)> {
         if self.no_open.load(Ordering::Relaxed) {
             info!("fuse: open is not supported.");
             Err(io::Error::from_raw_os_error(libc::ENOSYS))
         } else {
-            self.async_do_open(&ctx, inode, flags).await
+            self.async_do_open(&ctx, inode, flags, fuse_flags).await
         }
     }
 
@@ -421,9 +425,7 @@ impl<D: AsyncDrive + Sync> AsyncFileSystem for PassthroughFs<D> {
         ctx: Context,
         parent: <Self as FileSystem>::Inode,
         name: &CStr,
-        mode: u32,
-        flags: u32,
-        umask: u32,
+        args: CreateIn,
     ) -> io::Result<(Entry, Option<<Self as FileSystem>::Handle>, OpenOptions)> {
         unimplemented!()
         // let (_uid, _gid) = set_creds(ctx.uid, ctx.gid)?;
@@ -498,6 +500,7 @@ impl<D: AsyncDrive + Sync> AsyncFileSystem for PassthroughFs<D> {
         _lock_owner: Option<u64>,
         _delayed_write: bool,
         _flags: u32,
+        _fuse_flags: u32,
     ) -> io::Result<usize> {
         let data = self
             .async_get_data(&ctx, handle, inode, libc::O_RDWR)
@@ -506,6 +509,7 @@ impl<D: AsyncDrive + Sync> AsyncFileSystem for PassthroughFs<D> {
             .get_drive::<D>()
             .ok_or_else(|| io::Error::from_raw_os_error(libc::EINVAL))?;
 
+        // FIXME: handle WRITE_KILL_PRIV properly
         r.async_read_to(drive, data.get_handle_raw_fd(), size as usize, offset)
             .await
     }

@@ -14,6 +14,7 @@ use async_trait::async_trait;
 
 use super::{Context, Entry, FileSystem, ZeroCopyReader, ZeroCopyWriter};
 use crate::abi::linux_abi::{OpenOptions, SetattrValid};
+use crate::api::CreateIn;
 use crate::async_util::AsyncDrive;
 
 /// A trait for directly copying data from the fuse transport into a `File` without first storing it
@@ -318,6 +319,7 @@ pub trait AsyncFileSystem: FileSystem {
         ctx: Context,
         inode: Self::Inode,
         flags: u32,
+        fuse_flags: u32,
     ) -> io::Result<(Option<Self::Handle>, OpenOptions)>;
 
     /// Create and open a file.
@@ -339,9 +341,7 @@ pub trait AsyncFileSystem: FileSystem {
         ctx: Context,
         parent: Self::Inode,
         name: &CStr,
-        mode: u32,
-        flags: u32,
-        umask: u32,
+        args: CreateIn,
     ) -> io::Result<(Entry, Option<Self::Handle>, OpenOptions)>;
 
     /// Read data from a file.
@@ -403,6 +403,7 @@ pub trait AsyncFileSystem: FileSystem {
         lock_owner: Option<u64>,
         delayed_write: bool,
         flags: u32,
+        fuse_flags: u32,
     ) -> io::Result<usize>;
 
     /*
@@ -897,12 +898,13 @@ impl<FS: AsyncFileSystem> AsyncFileSystem for Arc<FS> {
         ctx: Context,
         inode: Self::Inode,
         flags: u32,
+        fuse_flags: u32,
     ) -> Pin<OpenFuture<'async_trait, Self::Handle>>
     where
         'a: 'async_trait,
         Self: 'async_trait,
     {
-        self.deref().async_open(ctx, inode, flags)
+        self.deref().async_open(ctx, inode, flags, fuse_flags)
     }
 
     fn async_create<'a, 'b, 'async_trait>(
@@ -910,17 +912,14 @@ impl<FS: AsyncFileSystem> AsyncFileSystem for Arc<FS> {
         ctx: Context,
         parent: Self::Inode,
         name: &'b CStr,
-        mode: u32,
-        flags: u32,
-        umask: u32,
+        args: CreateIn,
     ) -> Pin<CreateFuture<'async_trait, Self::Handle>>
     where
         'a: 'async_trait,
         'b: 'async_trait,
         Self: 'async_trait,
     {
-        self.deref()
-            .async_create(ctx, parent, name, mode, flags, umask)
+        self.deref().async_create(ctx, parent, name, args)
     }
 
     fn async_read<'a, 'b, 'async_trait>(
@@ -954,6 +953,7 @@ impl<FS: AsyncFileSystem> AsyncFileSystem for Arc<FS> {
         lock_owner: Option<u64>,
         delayed_write: bool,
         flags: u32,
+        fuse_flags: u32,
     ) -> Pin<Box<dyn Future<Output = io::Result<usize>> + Send + 'async_trait>>
     where
         'a: 'async_trait,
@@ -970,6 +970,7 @@ impl<FS: AsyncFileSystem> AsyncFileSystem for Arc<FS> {
             lock_owner,
             delayed_write,
             flags,
+            fuse_flags,
         )
     }
 

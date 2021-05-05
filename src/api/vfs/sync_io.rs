@@ -23,6 +23,9 @@ impl<D: AsyncDrive> FileSystem for Vfs<D> {
         if n_opts.no_writeback {
             n_opts.out_opts.remove(FsOptions::WRITEBACK_CACHE);
         }
+        if !n_opts.killpriv_v2 {
+            n_opts.out_opts.remove(FsOptions::HANDLE_KILLPRIV_V2);
+        }
         n_opts.in_opts = opts;
 
         n_opts.out_opts &= opts;
@@ -244,14 +247,15 @@ impl<D: AsyncDrive> FileSystem for Vfs<D> {
         ctx: Context,
         inode: VfsInode,
         flags: u32,
+        fuse_flags: u32,
     ) -> Result<(Option<u64>, OpenOptions)> {
         if self.opts.load().no_open {
             Err(Error::from_raw_os_error(libc::ENOSYS))
         } else {
             match self.get_real_rootfs(inode)? {
-                (Left(fs), idata) => fs.open(ctx, idata.ino(), flags),
+                (Left(fs), idata) => fs.open(ctx, idata.ino(), flags, fuse_flags),
                 (Right(fs), idata) => fs
-                    .open(ctx, idata.ino(), flags)
+                    .open(ctx, idata.ino(), flags, fuse_flags)
                     .map(|(h, opt)| (h.map(Into::into), opt)),
             }
         }
@@ -262,14 +266,12 @@ impl<D: AsyncDrive> FileSystem for Vfs<D> {
         ctx: Context,
         parent: VfsInode,
         name: &CStr,
-        mode: u32,
-        flags: u32,
-        umask: u32,
+        args: CreateIn,
     ) -> Result<(Entry, Option<u64>, OpenOptions)> {
         match self.get_real_rootfs(parent)? {
-            (Left(fs), idata) => fs.create(ctx, idata.ino(), name, mode, flags, umask),
+            (Left(fs), idata) => fs.create(ctx, idata.ino(), name, args),
             (Right(fs), idata) => {
-                fs.create(ctx, idata.ino(), name, mode, flags, umask)
+                fs.create(ctx, idata.ino(), name, args)
                     .map(|(mut a, b, c)| {
                         a.inode = self.convert_inode(idata.fs_idx(), a.inode)?;
                         Ok((a, b, c))
@@ -310,6 +312,7 @@ impl<D: AsyncDrive> FileSystem for Vfs<D> {
         lock_owner: Option<u64>,
         delayed_write: bool,
         flags: u32,
+        fuse_flags: u32,
     ) -> Result<usize> {
         match self.get_real_rootfs(inode)? {
             (Left(fs), idata) => fs.write(
@@ -322,6 +325,7 @@ impl<D: AsyncDrive> FileSystem for Vfs<D> {
                 lock_owner,
                 delayed_write,
                 flags,
+                fuse_flags,
             ),
             (Right(fs), idata) => fs.write(
                 ctx,
@@ -333,6 +337,7 @@ impl<D: AsyncDrive> FileSystem for Vfs<D> {
                 lock_owner,
                 delayed_write,
                 flags,
+                fuse_flags,
             ),
         }
     }

@@ -16,6 +16,7 @@ use crate::api::filesystem::{
     AsyncFileSystem, AsyncZeroCopyReader, AsyncZeroCopyWriter, Context, ZeroCopyReader,
     ZeroCopyWriter,
 };
+use crate::api::CreateIn;
 use crate::async_util::AsyncDrive;
 use crate::transport::{FileReadWriteVolatile, FsCacheReqHandler, Reader, Writer};
 use crate::{bytes_to_cstr, encode_io_error_kind, Error, Result};
@@ -279,8 +280,11 @@ impl<F: AsyncFileSystem + Sync> Server<F> {
         w: Writer<'_>,
         ctx: AsyncContext<D, F>,
     ) -> Result<usize> {
-        let OpenIn { flags, .. } = r.read_obj().map_err(Error::DecodeMessage)?;
-        let result = self.fs.async_open(ctx.context(), ctx.nodeid(), flags).await;
+        let OpenIn { flags, fuse_flags } = r.read_obj().map_err(Error::DecodeMessage)?;
+        let result = self
+            .fs
+            .async_open(ctx.context(), ctx.nodeid(), flags, fuse_flags)
+            .await;
 
         match result {
             Ok((handle, opts)) => {
@@ -375,7 +379,7 @@ impl<F: AsyncFileSystem + Sync> Server<F> {
             fh,
             offset,
             size,
-            write_flags,
+            fuse_flags,
             lock_owner,
             flags,
             ..
@@ -387,12 +391,12 @@ impl<F: AsyncFileSystem + Sync> Server<F> {
                 .await;
         }
 
-        let owner = if write_flags & WRITE_LOCKOWNER != 0 {
+        let owner = if fuse_flags & WRITE_LOCKOWNER != 0 {
             Some(lock_owner)
         } else {
             None
         };
-        let delayed_write = write_flags & WRITE_CACHE != 0;
+        let delayed_write = fuse_flags & WRITE_CACHE != 0;
         let mut data_reader = AsyncZcReader(r);
         let result = self
             .fs
@@ -406,6 +410,7 @@ impl<F: AsyncFileSystem + Sync> Server<F> {
                 owner,
                 delayed_write,
                 flags,
+                fuse_flags,
             )
             .await;
 
@@ -470,14 +475,12 @@ impl<F: AsyncFileSystem + Sync> Server<F> {
         w: Writer<'_>,
         ctx: AsyncContext<D, F>,
     ) -> Result<usize> {
-        let CreateIn {
-            flags, mode, umask, ..
-        } = r.read_obj().map_err(Error::DecodeMessage)?;
+        let args: CreateIn = r.read_obj().map_err(Error::DecodeMessage)?;
         let buf = ServerUtil::get_message_body(&mut r, &ctx.in_header, size_of::<CreateIn>())?;
         let name = bytes_to_cstr(&buf)?;
         let result = self
             .fs
-            .async_create(ctx.context(), ctx.nodeid(), name, mode, flags, umask)
+            .async_create(ctx.context(), ctx.nodeid(), name, args)
             .await;
 
         match result {

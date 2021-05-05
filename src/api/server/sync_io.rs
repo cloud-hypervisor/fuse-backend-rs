@@ -354,12 +354,14 @@ impl<F: FileSystem + Sync> Server<F> {
     }
 
     fn open(&self, in_header: &InHeader, mut r: Reader, w: Writer) -> Result<usize> {
-        let OpenIn { flags, .. } = r.read_obj().map_err(Error::DecodeMessage)?;
+        let OpenIn { flags, fuse_flags } = r.read_obj().map_err(Error::DecodeMessage)?;
 
-        match self
-            .fs
-            .open(Context::from(in_header), in_header.nodeid.into(), flags)
-        {
+        match self.fs.open(
+            Context::from(in_header),
+            in_header.nodeid.into(),
+            flags,
+            fuse_flags,
+        ) {
             Ok((handle, opts)) => {
                 let out = OpenOut {
                     fh: handle.map(Into::into).unwrap_or(0),
@@ -438,7 +440,7 @@ impl<F: FileSystem + Sync> Server<F> {
             fh,
             offset,
             size,
-            write_flags,
+            fuse_flags,
             lock_owner,
             flags,
             ..
@@ -452,13 +454,13 @@ impl<F: FileSystem + Sync> Server<F> {
             );
         }
 
-        let owner = if write_flags & WRITE_LOCKOWNER != 0 {
+        let owner = if fuse_flags & WRITE_LOCKOWNER != 0 {
             Some(lock_owner)
         } else {
             None
         };
 
-        let delayed_write = write_flags & WRITE_CACHE != 0;
+        let delayed_write = fuse_flags & WRITE_CACHE != 0;
 
         let mut data_reader = ZcReader(r);
 
@@ -472,6 +474,7 @@ impl<F: FileSystem + Sync> Server<F> {
             owner,
             delayed_write,
             flags,
+            fuse_flags,
         ) {
             Ok(count) => {
                 let out = WriteOut {
@@ -933,9 +936,7 @@ impl<F: FileSystem + Sync> Server<F> {
     }
 
     fn create(&self, in_header: &InHeader, mut r: Reader, w: Writer) -> Result<usize> {
-        let CreateIn {
-            flags, mode, umask, ..
-        } = r.read_obj().map_err(Error::DecodeMessage)?;
+        let args: CreateIn = r.read_obj().map_err(Error::DecodeMessage)?;
         let buf = ServerUtil::get_message_body(&mut r, in_header, size_of::<CreateIn>())?;
         let name = bytes_to_cstr(&buf)?;
 
@@ -943,9 +944,7 @@ impl<F: FileSystem + Sync> Server<F> {
             Context::from(in_header),
             in_header.nodeid.into(),
             name,
-            mode,
-            flags,
-            umask,
+            args,
         ) {
             Ok((entry, handle, opts)) => {
                 let entry_out = EntryOut {

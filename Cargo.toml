@@ -24,6 +24,7 @@ bitflags = ">=1.1.0"
 libc = ">=0.2.68"
 log = ">=0.4.6"
 nix = "0.18.0"
+caps = "0.5.1"
 #ringbahn = { version = "0.0.0-experimental.3", optional = true }
 vmm-sys-util = { version = "0.4", optional = true }
 vm-memory = "0.5"
