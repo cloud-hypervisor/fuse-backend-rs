@@ -2,7 +2,11 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::*;
+#[cfg(any(feature = "vhost-user-fs", feature = "virtiofs"))]
+use crate::abi::virtio_fs;
 use crate::async_util::AsyncDrive;
+#[cfg(any(feature = "vhost-user-fs", feature = "virtiofs"))]
+use crate::transport::FsCacheReqHandler;
 
 impl<D: AsyncDrive> FileSystem for Vfs<D> {
     type Inode = VfsInode;
@@ -582,6 +586,42 @@ impl<D: AsyncDrive> FileSystem for Vfs<D> {
         match self.get_real_rootfs(inode)? {
             (Left(fs), idata) => fs.access(ctx, idata.ino(), mask),
             (Right(fs), idata) => fs.access(ctx, idata.ino(), mask),
+        }
+    }
+
+    #[cfg(any(feature = "vhost-user-fs", feature = "virtiofs"))]
+    fn setupmapping(
+        &self,
+        ctx: Context,
+        inode: VfsInode,
+        handle: u64,
+        foffset: u64,
+        len: u64,
+        flags: u64,
+        moffset: u64,
+        req: &mut dyn FsCacheReqHandler,
+    ) -> Result<()> {
+        match self.get_real_rootfs(inode)? {
+            (Left(fs), idata) => {
+                fs.setupmapping(ctx, idata.ino(), handle, foffset, len, flags, moffset, req)
+            }
+            (Right(fs), idata) => {
+                fs.setupmapping(ctx, idata.ino(), handle, foffset, len, flags, moffset, req)
+            }
+        }
+    }
+
+    #[cfg(any(feature = "vhost-user-fs", feature = "virtiofs"))]
+    fn removemapping(
+        &self,
+        ctx: Context,
+        inode: VfsInode,
+        requests: Vec<virtio_fs::RemovemappingOne>,
+        req: &mut dyn FsCacheReqHandler,
+    ) -> Result<()> {
+        match self.get_real_rootfs(inode)? {
+            (Left(fs), idata) => fs.removemapping(ctx, idata.ino(), requests, req),
+            (Right(fs), idata) => fs.removemapping(ctx, idata.ino(), requests, req),
         }
     }
 }
