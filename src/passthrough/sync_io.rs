@@ -16,7 +16,7 @@ use std::time::Duration;
 
 use super::*;
 use crate::abi::linux_abi::{FOPEN_IN_KILL_SUIDGID, WRITE_KILL_PRIV};
-#[cfg(feature = "vhost-user-fs")]
+#[cfg(any(feature = "vhost-user-fs", feature = "virtiofs"))]
 use crate::abi::virtio_fs;
 use crate::api::filesystem::{
     Context, DirEntry, Entry, FileSystem, FsOptions, GetxattrReply, ListxattrReply, OpenOptions,
@@ -25,7 +25,7 @@ use crate::api::filesystem::{
 use crate::api::CreateIn;
 use crate::async_util::AsyncDrive;
 use crate::bytes_to_cstr;
-#[cfg(feature = "vhost-user-fs")]
+#[cfg(any(feature = "vhost-user-fs", feature = "virtiofs"))]
 use crate::transport::FsCacheReqHandler;
 
 macro_rules! scoped_cred {
@@ -632,7 +632,7 @@ impl<D: AsyncDrive> FileSystem for PassthroughFs<D> {
         self.do_unlink(parent, name, 0)
     }
 
-    #[cfg(feature = "vhost-user-fs")]
+    #[cfg(any(feature = "vhost-user-fs", feature = "virtiofs"))]
     fn setupmapping(
         &self,
         _ctx: Context,
@@ -659,7 +659,7 @@ impl<D: AsyncDrive> FileSystem for PassthroughFs<D> {
         (*vu_req).map(foffset, moffset, len, flags, file.as_raw_fd())
     }
 
-    #[cfg(feature = "vhost-user-fs")]
+    #[cfg(any(feature = "vhost-user-fs", feature = "virtiofs"))]
     fn removemapping(
         &self,
         _ctx: Context,
