@@ -886,7 +886,7 @@ mod tests {
         assert_eq!(opts.killpriv_v2, false);
 
         vfs.destroy();
-        assert!(vfs.initialized());
+        assert_eq!(vfs.initialized(), false);
 
         let vfs = Vfs::<AsyncDriver>::default();
         let in_opts =
