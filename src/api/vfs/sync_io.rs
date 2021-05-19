@@ -54,8 +54,7 @@ impl<D: AsyncDrive> FileSystem for Vfs<D> {
                 .iter()
                 .for_each(|(_, f)| f.destroy());
 
-            // Keep initialized true to avoid being attacked by guest
-            // self.initialized.store(false, Ordering::Release);
+            self.initialized.store(false, Ordering::Release);
         }
     }
 
