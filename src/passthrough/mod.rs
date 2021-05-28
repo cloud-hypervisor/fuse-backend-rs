@@ -571,6 +571,7 @@ impl<D: AsyncDrive> PassthroughFs<D> {
                 None => {
                     let inode = self.next_inode.fetch_add(1, Ordering::Relaxed);
                     if inode > VFS_MAX_INO {
+                        error!("fuse: max inode number reached: {}", VFS_MAX_INO);
                         return Err(io::Error::new(
                             io::ErrorKind::Other,
                             format!("max inode number reached: {}", VFS_MAX_INO),

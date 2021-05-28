@@ -1240,7 +1240,7 @@ fn do_reply_error(err: io::Error, unique: u64, mut w: Writer, explicit: bool) ->
         unique,
     };
 
-    if explicit {
+    if explicit || err.raw_os_error().is_none() {
         error!("fuse: reply error header {:?}, error {:?}", header, err);
     } else {
         trace!("fuse: reply error header {:?}, error {:?}", header, err);
