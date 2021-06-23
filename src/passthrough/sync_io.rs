@@ -472,11 +472,14 @@ impl<D: AsyncDrive, S: BitmapSlice + Send + Sync> FileSystem<S> for PassthroughF
         mode: u32,
         umask: u32,
     ) -> io::Result<Entry> {
-        let (_uid, _gid) = set_creds(ctx.uid, ctx.gid)?;
         let data = self.inode_map.get(parent)?;
 
-        // Safe because this doesn't modify any memory and we check the return value.
-        let res = unsafe { libc::mkdirat(data.get_raw_fd(), name.as_ptr(), mode & !umask) };
+        let res = {
+            let (_uid, _gid) = set_creds(ctx.uid, ctx.gid)?;
+
+            // Safe because this doesn't modify any memory and we check the return value.
+            unsafe { libc::mkdirat(data.get_raw_fd(), name.as_ptr(), mode & !umask) }
+        };
         if res == 0 {
             self.do_lookup(parent, name)
         } else {
@@ -572,15 +575,18 @@ impl<D: AsyncDrive, S: BitmapSlice + Send + Sync> FileSystem<S> for PassthroughF
         name: &CStr,
         args: CreateIn,
     ) -> io::Result<(Entry, Option<Handle>, OpenOptions)> {
-        let (_uid, _gid) = set_creds(ctx.uid, ctx.gid)?;
         let data = self.inode_map.get(parent)?;
 
-        let new_file = Self::create_file_excl(
-            data.get_raw_fd(),
-            name,
-            args.flags as i32,
-            args.mode & !(args.umask & 0o777),
-        )?;
+        let new_file = {
+            let (_uid, _gid) = set_creds(ctx.uid, ctx.gid)?;
+
+            Self::create_file_excl(
+                data.get_raw_fd(),
+                name,
+                args.flags as i32,
+                args.mode & !(args.umask & 0o777),
+            )?
+        };
 
         // Safe because this doesn't modify any memory and we check the return value. We don't
         // really check `flags` because if the kernel can't handle poorly specified flags then we
@@ -596,6 +602,8 @@ impl<D: AsyncDrive, S: BitmapSlice + Send + Sync> FileSystem<S> for PassthroughF
                 } else {
                     None
                 };
+
+                let (_uid, _gid) = set_creds(ctx.uid, ctx.gid)?;
 
                 Self::open_file(
                     data.get_raw_fd(),
@@ -918,17 +926,20 @@ impl<D: AsyncDrive, S: BitmapSlice + Send + Sync> FileSystem<S> for PassthroughF
         rdev: u32,
         umask: u32,
     ) -> io::Result<Entry> {
-        let (_uid, _gid) = set_creds(ctx.uid, ctx.gid)?;
         let data = self.inode_map.get(parent)?;
 
-        // Safe because this doesn't modify any memory and we check the return value.
-        let res = unsafe {
-            libc::mknodat(
-                data.get_raw_fd(),
-                name.as_ptr(),
-                (mode & !umask) as libc::mode_t,
-                u64::from(rdev),
-            )
+        let res = {
+            let (_uid, _gid) = set_creds(ctx.uid, ctx.gid)?;
+
+            // Safe because this doesn't modify any memory and we check the return value.
+            unsafe {
+                libc::mknodat(
+                    data.get_raw_fd(),
+                    name.as_ptr(),
+                    (mode & !umask) as libc::mode_t,
+                    u64::from(rdev),
+                )
+            }
         };
         if res < 0 {
             Err(io::Error::last_os_error())
@@ -974,11 +985,14 @@ impl<D: AsyncDrive, S: BitmapSlice + Send + Sync> FileSystem<S> for PassthroughF
         parent: Inode,
         name: &CStr,
     ) -> io::Result<Entry> {
-        let (_uid, _gid) = set_creds(ctx.uid, ctx.gid)?;
         let data = self.inode_map.get(parent)?;
 
-        // Safe because this doesn't modify any memory and we check the return value.
-        let res = unsafe { libc::symlinkat(linkname.as_ptr(), data.get_raw_fd(), name.as_ptr()) };
+        let res = {
+            let (_uid, _gid) = set_creds(ctx.uid, ctx.gid)?;
+
+            // Safe because this doesn't modify any memory and we check the return value.
+            unsafe { libc::symlinkat(linkname.as_ptr(), data.get_raw_fd(), name.as_ptr()) }
+        };
         if res == 0 {
             self.do_lookup(parent, name)
         } else {
