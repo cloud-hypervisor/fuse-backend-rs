@@ -141,7 +141,7 @@ impl<D: AsyncDrive, S: BitmapSlice + Send + Sync> PassthroughFs<D, S> {
         Ok((st, self.cfg.attr_timeout))
     }
 
-    async fn async_stat(dir: &File, path: Option<&CStr>) -> io::Result<libc::stat64> {
+    async fn async_stat(dir: &impl AsRawFd, path: Option<&CStr>) -> io::Result<libc::stat64> {
         // Safe because this is a constant value and a valid C string.
         let pathname =
             path.unwrap_or_else(|| unsafe { CStr::from_bytes_with_nul_unchecked(EMPTY_CSTR) });

@@ -452,7 +452,7 @@ impl<D: AsyncDrive, S: BitmapSlice + Send + Sync> PassthroughFs<D, S> {
         vec![self.proc.as_raw_fd()]
     }
 
-    fn stat(dir: &File, path: Option<&CStr>) -> io::Result<libc::stat64> {
+    fn stat(dir: &impl AsRawFd, path: Option<&CStr>) -> io::Result<libc::stat64> {
         // Safe because this is a constant value and a valid C string.
         let pathname =
             path.unwrap_or_else(|| unsafe { CStr::from_bytes_with_nul_unchecked(EMPTY_CSTR) });
