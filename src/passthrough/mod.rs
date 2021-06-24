@@ -33,6 +33,7 @@ use crate::BitmapSlice;
 
 #[cfg(feature = "async-io")]
 mod async_io;
+mod file_handle;
 mod sync_io;
 
 mod multikey;
