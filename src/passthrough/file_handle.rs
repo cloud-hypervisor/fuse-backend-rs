@@ -9,7 +9,7 @@ use std::fmt::{Debug, Formatter};
 use std::fs::File;
 use std::io;
 use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
-use std::sync::RwLock;
+use std::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use crate::async_util::AsyncDriver;
 use crate::passthrough::PassthroughFs;
@@ -18,17 +18,17 @@ use crate::passthrough::PassthroughFs;
 ///
 /// According to Linux ABI, struct file_handle has a flexible array member 'f_handle', but it's
 /// hard-coded here for simplicity.
-const MAX_HANDLE_SZ: usize = 128;
+pub const MAX_HANDLE_SZ: usize = 128;
 
 #[derive(Clone, Copy)]
 #[repr(C)]
-struct CFileHandle {
+pub(crate) struct CFileHandle {
     // Size of f_handle [in, out]
-    handle_bytes: libc::c_uint,
+    pub(crate) handle_bytes: libc::c_uint,
     // Handle type [out]
-    handle_type: libc::c_int,
+    pub(crate) handle_type: libc::c_int,
     // File identifier (sized by caller) [out]
-    f_handle: [libc::c_char; MAX_HANDLE_SZ],
+    pub(crate) f_handle: [libc::c_char; MAX_HANDLE_SZ],
 }
 
 impl CFileHandle {
@@ -87,7 +87,7 @@ impl Debug for CFileHandle {
 #[derive(Clone, Copy, PartialOrd, Ord, PartialEq, Eq, Debug)]
 pub struct FileHandle {
     pub(crate) mnt_id: u64,
-    handle: CFileHandle,
+    pub(crate) handle: CFileHandle,
 }
 
 extern "C" {
@@ -205,12 +205,20 @@ impl FileHandle {
 /// given mount ID, so that when opening a handle we can look it up.
 #[derive(Default)]
 pub struct MountFds {
-    map: RwLock<HashMap<u64, File>>,
+    pub(crate) map: RwLock<HashMap<u64, File>>,
 }
 
 impl MountFds {
     pub fn new() -> Self {
         MountFds::default()
+    }
+
+    pub fn get_map(&self) -> RwLockReadGuard<'_, HashMap<u64, std::fs::File>> {
+        self.map.read().unwrap()
+    }
+
+    pub fn get_map_mut(&self) -> RwLockWriteGuard<'_, HashMap<u64, std::fs::File>> {
+        self.map.write().unwrap()
     }
 
     fn ensure_mount_point<F>(
