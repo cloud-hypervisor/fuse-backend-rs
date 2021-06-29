@@ -122,20 +122,23 @@ impl FileHandle {
         let handle = Self::from_name_at(dir, path)?;
 
         if !mount_fds.map.read().unwrap().contains_key(&handle.mnt_id) {
-            let file = if path.to_bytes().is_empty() {
+            let (path_fd, _path_file) = if path.to_bytes().is_empty() {
                 // `open_by_handle_at()` needs a non-`O_PATH` fd, and `dir` may be `O_PATH`, so we
                 // have to open a new fd here
-                reopen_dir(
-                    dir.as_raw_fd(),
-                    libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-                )?
+                // We do not know whether `dir`/`path` is a special file, though, and we must not open
+                // special files with anything but `O_PATH`, so we have to get some `O_PATH` fd first
+                // that we can stat to find out whether it is safe to open.
+                // (When opening a new fd here, keep a `File` object around so the fd is closed when it
+                // goes out of scope.)
+                (dir.as_raw_fd(), None)
             } else {
-                PassthroughFs::open_file(
+                let f = PassthroughFs::open_file(
                     dir.as_raw_fd(),
                     path,
-                    libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                    libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC,
                     0,
-                )?
+                )?;
+                (f.as_raw_fd(), Some(f))
             };
 
             // liubo: TODO find mnt id
@@ -143,6 +146,15 @@ impl FileHandle {
             // if statx(&file, None)?.mnt_id != handle.mnt_id {
             //     return Err(io::Error::from_raw_os_error(libc::EIO));
             // }
+
+            let st = PassthroughFs::stat(&path_fd, None)?;
+            // Ensure that we can safely reopen `path_fd` with `O_RDONLY`
+            let file_type = st.st_mode & libc::S_IFMT;
+            if file_type != libc::S_IFREG && file_type != libc::S_IFDIR {
+                return Err(io::Error::from_raw_os_error(libc::EIO));
+            }
+
+            let file = reopen_dir(path_fd, libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC)?;
 
             mount_fds.map.write().unwrap().insert(handle.mnt_id, file);
         }

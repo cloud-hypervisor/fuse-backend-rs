@@ -652,7 +652,16 @@ impl<D: AsyncDrive, S: BitmapSlice + Send + Sync> PassthroughFs<D, S> {
             FileHandle::from_name_at_with_mount_fds(&p_file, name, &self.mount_fds, |fd, flags| {
                 let pathname = CString::new(format!("self/fd/{}", fd.as_raw_fd()))
                     .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-                Self::open_file(self.proc.as_raw_fd(), &pathname, flags, 0)
+
+                // We don't really check `flags` because if the kernel can't handle poorly specified flags
+                // then we have much bigger problems. Also, clear the `O_NOFOLLOW` flag if it is set since
+                // we need to follow the `/proc/self/fd` symlink to get the file.
+                Self::open_file(
+                    self.proc.as_raw_fd(),
+                    &pathname,
+                    (flags | libc::O_CLOEXEC) & (!libc::O_NOFOLLOW),
+                    0,
+                )
                 // reopen_fd_through_proc(&fd, flags, &self.proc_self_fd)
             })
         } else {
