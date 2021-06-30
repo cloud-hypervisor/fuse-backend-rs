@@ -644,25 +644,28 @@ impl<D: AsyncDrive, S: BitmapSlice + Send + Sync> PassthroughFs<D, S> {
         Ok(unsafe { File::from_raw_fd(fd) })
     }
 
+    fn open_proc_file(proc: &File, fd: RawFd, flags: i32) -> io::Result<File> {
+        let pathname = CString::new(format!("self/fd/{}", fd))
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+
+        // We don't really check `flags` because if the kernel can't handle poorly specified flags
+        // then we have much bigger problems. Also, clear the `O_NOFOLLOW` flag if it is set since
+        // we need to follow the `/proc/self/fd` symlink to get the file.
+        Self::open_file(
+            proc.as_raw_fd(),
+            &pathname,
+            (flags | libc::O_CLOEXEC) & (!libc::O_NOFOLLOW),
+            0,
+        )
+    }
+
     fn do_lookup(&self, parent: Inode, name: &CStr) -> io::Result<Entry> {
         let p = self.inode_map.get(parent)?;
         let p_file = p.get_file(&self.mount_fds)?;
 
         let handle = if self.cfg.inode_file_handles {
             FileHandle::from_name_at_with_mount_fds(&p_file, name, &self.mount_fds, |fd, flags| {
-                let pathname = CString::new(format!("self/fd/{}", fd.as_raw_fd()))
-                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-
-                // We don't really check `flags` because if the kernel can't handle poorly specified flags
-                // then we have much bigger problems. Also, clear the `O_NOFOLLOW` flag if it is set since
-                // we need to follow the `/proc/self/fd` symlink to get the file.
-                Self::open_file(
-                    self.proc.as_raw_fd(),
-                    &pathname,
-                    (flags | libc::O_CLOEXEC) & (!libc::O_NOFOLLOW),
-                    0,
-                )
-                // reopen_fd_through_proc(&fd, flags, &self.proc_self_fd)
+                Self::open_proc_file(&self.proc, fd.as_raw_fd(), flags)
             })
         } else {
             Err(io::Error::from_raw_os_error(libc::ENOTSUP))

@@ -112,15 +112,9 @@ impl Drop for CapFsetid {
 }
 
 impl<D: AsyncDrive, S: BitmapSlice + Send + Sync> PassthroughFs<D, S> {
-    fn open_proc_file(&self, pathname: &CStr, flags: i32) -> io::Result<File> {
-        Self::open_file(self.proc.as_raw_fd(), pathname, flags, 0)
-    }
-
     fn open_inode(&self, inode: Inode, mut flags: i32) -> io::Result<File> {
         let data = self.inode_map.get(inode)?;
         let file = data.get_file(&self.mount_fds)?;
-        let pathname = CString::new(format!("self/fd/{}", file.as_raw_fd()))
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
 
         // When writeback caching is enabled, the kernel may send read requests even if the
         // userspace program opened the file write-only. So we need to ensure that we have opened
@@ -141,10 +135,7 @@ impl<D: AsyncDrive, S: BitmapSlice + Send + Sync> PassthroughFs<D, S> {
             flags &= !libc::O_APPEND;
         }
 
-        // We don't really check `flags` because if the kernel can't handle poorly specified flags
-        // then we have much bigger problems. Also, clear the `O_NOFOLLOW` flag if it is set since
-        // we need to follow the `/proc/self/fd` symlink to get the file.
-        self.open_proc_file(&pathname, (flags | libc::O_CLOEXEC) & (!libc::O_NOFOLLOW))
+        Self::open_proc_file(&self.proc, file.as_raw_fd(), flags)
     }
 
     fn do_readdir(
