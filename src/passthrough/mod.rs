@@ -846,3 +846,65 @@ impl<D: AsyncDrive, S: 'static + BitmapSlice + Send + Sync> BackendFileSystem<D,
 fn ebadf() -> io::Error {
     io::Error::from_raw_os_error(libc::EBADF)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::api::filesystem::*;
+    use flexi_logger::{self, colored_opt_format, Logger};
+    use log;
+    use vmm_sys_util::{tempdir::TempDir, tempfile::TempFile};
+
+    #[test]
+    fn test_passthroughfs_inode_file_handles() {
+        Logger::with_env_or_str("trace")
+            .format(colored_opt_format)
+            .start()
+            .unwrap();
+
+        log::set_max_level(log::LevelFilter::Trace);
+
+        let source = TempDir::new().expect("Cannot create temporary directory.");
+        let parent_path =
+            TempDir::new_in(source.as_path()).expect("Cannot create temporary directory.");
+        let child_path =
+            TempFile::new_in(parent_path.as_path()).expect("Cannot create temporary file.");
+
+        let fs_cfg = Config {
+            writeback: true,
+            do_import: true,
+            no_open: true,
+            inode_file_handles: true,
+            root_dir: source
+                .as_path()
+                .to_str()
+                .expect("source path to string")
+                .to_string(),
+            ..Default::default()
+        };
+        let fs = PassthroughFs::new(fs_cfg).unwrap();
+        fs.import().unwrap();
+
+        let ctx = Context {
+            uid: 0,
+            gid: 0,
+            pid: 0,
+        };
+
+        // read a few files to inode map.
+        let parent = CString::new(parent_path.as_path().to_str().expect("path to string")).unwrap();
+        let p_entry = fs.lookup(ctx, ROOT_ID, &parent).unwrap();
+        let p_inode = p_entry.inode;
+
+        let child = CString::new(child_path.as_path().to_str().expect("path to string")).unwrap();
+        let c_entry = fs.lookup(ctx, p_inode, &child).unwrap();
+
+        let data = fs.inode_map.get(c_entry.inode).unwrap();
+        assert_eq!(matches!(data.file_or_handle, FileOrHandle::Handle(_)), true);
+
+        let (_, duration) = fs.getattr(ctx, c_entry.inode, None).unwrap();
+        assert_eq!(duration, fs.cfg.attr_timeout);
+
+        fs.destroy();
+    }
+}
