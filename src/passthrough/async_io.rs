@@ -51,7 +51,17 @@ impl<D: AsyncDrive, S: BitmapSlice + Send + Sync> PassthroughFs<D, S> {
         pathname: &CStr,
         flags: i32,
     ) -> io::Result<File> {
-        Self::async_open_file(ctx, self.proc.as_raw_fd(), pathname, flags, 0).await
+        // We don't really check `flags` because if the kernel can't handle poorly specified flags
+        // then we have much bigger problems. Also, clear the `O_NOFOLLOW` flag if it is set since
+        // we need to follow the `/proc/self/fd` symlink to get the file.
+        Self::async_open_file(
+            ctx,
+            self.proc.as_raw_fd(),
+            pathname,
+            (flags | libc::O_CLOEXEC) & (!libc::O_NOFOLLOW),
+            0,
+        )
+        .await
     }
 
     async fn async_open_inode(
