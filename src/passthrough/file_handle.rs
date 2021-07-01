@@ -99,7 +99,9 @@ impl FileHandle {
                 handle: c_fh,
             })
         } else {
-            Err(io::Error::last_os_error())
+            let e = io::Error::last_os_error();
+            error!("from_name_at failed error {:?}", e);
+            Err(e)
         }
     }
 
@@ -137,7 +139,14 @@ impl FileHandle {
                     path,
                     libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC,
                     0,
-                )?;
+                )
+                .map_err(|e| {
+                    error!(
+                        "from_name_at_with_mount_fds: open_file on {:?} failed error {:?}",
+                        path, e
+                    );
+                    e
+                })?;
                 (f.as_raw_fd(), Some(f))
             };
 
@@ -151,6 +160,10 @@ impl FileHandle {
             // Ensure that we can safely reopen `path_fd` with `O_RDONLY`
             let file_type = st.st_mode & libc::S_IFMT;
             if file_type != libc::S_IFREG && file_type != libc::S_IFDIR {
+                error!(
+                    "from_name_at_with_mount_fds: file {:?} is special file",
+                    path
+                );
                 return Err(io::Error::from_raw_os_error(libc::EIO));
             }
 
@@ -175,7 +188,9 @@ impl FileHandle {
             let file = unsafe { File::from_raw_fd(ret) };
             Ok(file)
         } else {
-            Err(io::Error::last_os_error())
+            let e = io::Error::last_os_error();
+            error!("open_by_handle_at failed error {:?}", e);
+            Err(e)
         }
     }
 
@@ -192,7 +207,13 @@ impl FileHandle {
         let mount_fds_locked = mount_fds.map.read().unwrap();
         let mount_file = mount_fds_locked
             .get(&self.mnt_id)
-            .ok_or_else(|| io::Error::from_raw_os_error(libc::ENODEV))?;
+            .ok_or_else(|| {
+                error!(
+                    "open_with_mount_fds: mnt_id {:?} is not found.",
+                    &self.mnt_id
+                );
+                io::Error::from_raw_os_error(libc::ENODEV)
+            })?;
 
         self.open(mount_file, flags)
     }

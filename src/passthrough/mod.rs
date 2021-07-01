@@ -752,9 +752,10 @@ impl<D: AsyncDrive, S: BitmapSlice + Send + Sync> PassthroughFs<D, S> {
                         ));
                     }
                     trace!(
-                        "fuse: do_lookup adds new inode {} ids_altkey {:?}",
+                        "fuse: do_lookup adds new inode {} ids_altkey {:?} handle_altkey {:?}",
                         inode,
-                        ids_altkey
+                        ids_altkey,
+                        handle_altkey
                     );
 
                     self.inode_map.insert(
