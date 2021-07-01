@@ -430,7 +430,7 @@ impl<D: AsyncDrive, S: BitmapSlice + Send + Sync> PassthroughFs<D, S> {
             0,
         )?;
 
-        let st = Self::stat(&f)?;
+        let st = Self::stat(&f, None)?;
 
         // Safe because this doesn't modify any memory and there is no need to check the return
         // value because this system call always succeeds. We need to clear the umask here because
@@ -452,15 +452,16 @@ impl<D: AsyncDrive, S: BitmapSlice + Send + Sync> PassthroughFs<D, S> {
         vec![self.proc.as_raw_fd()]
     }
 
-    fn stat(f: &File) -> io::Result<libc::stat64> {
+    fn stat(dir: &File, path: Option<&CStr>) -> io::Result<libc::stat64> {
         // Safe because this is a constant value and a valid C string.
-        let pathname = unsafe { CStr::from_bytes_with_nul_unchecked(EMPTY_CSTR) };
+        let pathname =
+            path.unwrap_or_else(|| unsafe { CStr::from_bytes_with_nul_unchecked(EMPTY_CSTR) });
         let mut st = MaybeUninit::<libc::stat64>::zeroed();
 
         // Safe because the kernel will only write data in `st` and we check the return value.
         let res = unsafe {
             libc::fstatat64(
-                f.as_raw_fd(),
+                dir.as_raw_fd(),
                 pathname.as_ptr(),
                 st.as_mut_ptr(),
                 libc::AT_EMPTY_PATH | libc::AT_SYMLINK_NOFOLLOW,
@@ -521,7 +522,7 @@ impl<D: AsyncDrive, S: BitmapSlice + Send + Sync> PassthroughFs<D, S> {
             libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC,
             0,
         )?;
-        let st = Self::stat(&f)?;
+        let st = Self::stat(&f, None)?;
         let altkey = InodeAltKey::from_stat(&st);
 
         let mut found = None;

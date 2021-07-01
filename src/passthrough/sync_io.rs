@@ -304,7 +304,7 @@ impl<D: AsyncDrive, S: BitmapSlice + Send + Sync> PassthroughFs<D, S> {
             e
         })?;
 
-        let st = Self::stat(&data.file).map_err(|e| {
+        let st = Self::stat(&data.file, None).map_err(|e| {
             error!(
                 "fuse: do_getattr stat failed ino {} fd: {:?} err {:?}",
                 inode,
@@ -1072,7 +1072,7 @@ impl<D: AsyncDrive, S: BitmapSlice + Send + Sync> FileSystem<S> for PassthroughF
 
     fn access(&self, ctx: Context, inode: Inode, mask: u32) -> io::Result<()> {
         let data = self.inode_map.get(inode)?;
-        let st = Self::stat(&data.file)?;
+        let st = Self::stat(&data.file, None)?;
         let mode = mask as i32 & (libc::R_OK | libc::W_OK | libc::X_OK);
 
         if mode == libc::F_OK {
