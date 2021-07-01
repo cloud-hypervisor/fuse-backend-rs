@@ -64,18 +64,23 @@ impl InodeAltKey {
     }
 }
 
+enum FileOrHandle {
+    File(File),
+    // TODO: Add file handle variant
+}
+
 struct InodeData {
     inode: Inode,
     // Most of these aren't actually files but ¯\_(ツ)_/¯.
-    file: File,
+    file_or_handle: FileOrHandle,
     refcount: AtomicU64,
 }
 
 impl InodeData {
-    fn new(inode: Inode, file: File, refcount: u64) -> Self {
+    fn new(inode: Inode, f: FileOrHandle, refcount: u64) -> Self {
         InodeData {
             inode,
-            file,
+            file_or_handle: f,
             refcount: AtomicU64::new(refcount),
         }
     }
@@ -85,7 +90,15 @@ impl InodeData {
     // By introducing this method, we could explicitly audit all callers making use of the
     // underlying RawFd.
     fn get_raw_fd(&self) -> RawFd {
-        self.file.as_raw_fd()
+        match &self.file_or_handle {
+            FileOrHandle::File(f) => f.as_raw_fd(),
+        }
+    }
+
+    fn get_file_ref(&self) -> &File {
+        match &self.file_or_handle {
+            FileOrHandle::File(f) => f,
+        }
     }
 }
 
@@ -442,7 +455,7 @@ impl<D: AsyncDrive, S: BitmapSlice + Send + Sync> PassthroughFs<D, S> {
         self.inode_map.insert(
             fuse::ROOT_ID,
             InodeAltKey::from_stat(&st),
-            InodeData::new(fuse::ROOT_ID, f, 2),
+            InodeData::new(fuse::ROOT_ID, FileOrHandle::File(f), 2),
         );
 
         Ok(())
@@ -587,7 +600,11 @@ impl<D: AsyncDrive, S: BitmapSlice + Send + Sync> PassthroughFs<D, S> {
                         inode,
                         altkey
                     );
-                    inodes.insert(inode, altkey, Arc::new(InodeData::new(inode, f, 1)));
+                    inodes.insert(
+                        inode,
+                        altkey,
+                        Arc::new(InodeData::new(inode, FileOrHandle::File(f), 1)),
+                    );
                     inode
                 }
             }

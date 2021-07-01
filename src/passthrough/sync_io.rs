@@ -304,7 +304,7 @@ impl<D: AsyncDrive, S: BitmapSlice + Send + Sync> PassthroughFs<D, S> {
             e
         })?;
 
-        let st = Self::stat(&data.file, None).map_err(|e| {
+        let st = Self::stat(data.get_file_ref(), None).map_err(|e| {
             error!(
                 "fuse: do_getattr stat failed ino {} fd: {:?} err {:?}",
                 inode,
@@ -1086,7 +1086,7 @@ impl<D: AsyncDrive, S: BitmapSlice + Send + Sync> FileSystem<S> for PassthroughF
 
     fn access(&self, ctx: Context, inode: Inode, mask: u32) -> io::Result<()> {
         let data = self.inode_map.get(inode)?;
-        let st = Self::stat(&data.file, None)?;
+        let st = Self::stat(data.get_file_ref(), None)?;
         let mode = mask as i32 & (libc::R_OK | libc::W_OK | libc::X_OK);
 
         if mode == libc::F_OK {
@@ -1139,7 +1139,7 @@ impl<D: AsyncDrive, S: BitmapSlice + Send + Sync> FileSystem<S> for PassthroughF
         }
 
         let data = self.inode_map.get(inode)?;
-        let pathname = CString::new(format!("/proc/self/fd/{}", data.file.as_raw_fd()))
+        let pathname = CString::new(format!("/proc/self/fd/{}", data.get_raw_fd()))
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
 
         // The f{set,get,remove,list}xattr functions don't work on an fd opened with `O_PATH` so we
@@ -1174,7 +1174,7 @@ impl<D: AsyncDrive, S: BitmapSlice + Send + Sync> FileSystem<S> for PassthroughF
 
         let data = self.inode_map.get(inode)?;
         let mut buf = Vec::<u8>::with_capacity(size as usize);
-        let pathname = CString::new(format!("/proc/self/fd/{}", data.file.as_raw_fd()))
+        let pathname = CString::new(format!("/proc/self/fd/{}", data.get_raw_fd()))
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
 
         // The f{set,get,remove,list}xattr functions don't work on an fd opened with `O_PATH` so we
@@ -1208,7 +1208,7 @@ impl<D: AsyncDrive, S: BitmapSlice + Send + Sync> FileSystem<S> for PassthroughF
 
         let data = self.inode_map.get(inode)?;
         let mut buf = Vec::<u8>::with_capacity(size as usize);
-        let pathname = CString::new(format!("/proc/self/fd/{}", data.file.as_raw_fd()))
+        let pathname = CString::new(format!("/proc/self/fd/{}", data.get_raw_fd()))
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
 
         // The f{set,get,remove,list}xattr functions don't work on an fd opened with `O_PATH` so we
@@ -1240,7 +1240,7 @@ impl<D: AsyncDrive, S: BitmapSlice + Send + Sync> FileSystem<S> for PassthroughF
         }
 
         let data = self.inode_map.get(inode)?;
-        let pathname = CString::new(format!("/proc/self/fd/{}", data.file.as_raw_fd()))
+        let pathname = CString::new(format!("/proc/self/fd/{}", data.get_raw_fd()))
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
 
         // The f{set,get,remove,list}xattr functions don't work on an fd opened with `O_PATH` so we
