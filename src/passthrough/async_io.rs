@@ -206,11 +206,12 @@ impl<D: AsyncDrive + Sync, S: BitmapSlice + Send + Sync> AsyncFileSystem<D, S>
         )
         .await?;
         let st = Self::async_stat(&f, None).await?;
-        let altkey = InodeAltKey::ids_from_stat(&st);
+        let ids_altkey = InodeAltKey::ids_from_stat(&st);
+        let handle_altkey: Option<InodeAltKey> = None;
 
         let mut found = None;
         'search: loop {
-            match self.inode_map.get_alt(&altkey) {
+            match self.inode_map.get_alt(&ids_altkey, handle_altkey.as_ref()) {
                 // No existing entry found
                 None => break 'search,
                 Some(data) => {
@@ -250,11 +251,16 @@ impl<D: AsyncDrive + Sync, S: BitmapSlice + Send + Sync> AsyncFileSystem<D, S>
                     format!("max inode number reached: {}", VFS_MAX_INO),
                 ));
             }
-            trace!("fuse: do_lookup new inode {} altkey {:?}", inode, altkey);
+            trace!(
+                "fuse: do_lookup new inode {} ids_altkey {:?}",
+                inode,
+                ids_altkey
+            );
             self.inode_map.insert(
                 inode,
-                altkey,
-                InodeData::new(inode, FileOrHandle::File(f), 1, altkey),
+                ids_altkey,
+                handle_altkey,
+                InodeData::new(inode, FileOrHandle::File(f), 1, ids_altkey),
             );
 
             inode

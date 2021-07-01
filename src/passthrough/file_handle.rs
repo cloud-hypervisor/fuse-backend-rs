@@ -25,6 +25,7 @@ pub struct MountFds {
     map: RwLock<HashMap<u64, File>>,
 }
 
+#[derive(Clone, Copy, PartialOrd, Ord, PartialEq, Eq, Debug)]
 #[repr(C)]
 struct CFileHandle {
     // Size of f_handle [in, out]
@@ -45,6 +46,7 @@ impl CFileHandle {
     }
 }
 
+#[derive(Clone, Copy, PartialOrd, Ord, PartialEq, Eq, Debug)]
 pub struct FileHandle {
     mnt_id: u64,
     handle: CFileHandle,
