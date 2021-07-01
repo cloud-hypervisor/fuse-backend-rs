@@ -56,6 +56,8 @@ enum InodeAltKey {
         ino: libc::ino64_t,
         dev: libc::dev_t,
     },
+    #[allow(dead_code)]
+    Handle(FileHandle),
 }
 
 impl InodeAltKey {
@@ -71,6 +73,15 @@ enum FileOrHandle {
     File(File),
     #[allow(dead_code)]
     Handle(FileHandle),
+}
+
+impl FileOrHandle {
+    fn handle(&self) -> Option<&FileHandle> {
+        match self {
+            FileOrHandle::File(_) => None,
+            FileOrHandle::Handle(h) => Some(h),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -153,8 +164,30 @@ impl InodeMap {
             .ok_or_else(ebadf)
     }
 
-    fn get_alt(&self, altkey: &InodeAltKey) -> Option<Arc<InodeData>> {
-        self.inodes.read().unwrap().get_alt(altkey).map(Arc::clone)
+    fn get_alt(
+        &self,
+        ids_altkey: &InodeAltKey,
+        handle_altkey: Option<&InodeAltKey>,
+    ) -> Option<Arc<InodeData>> {
+        let inodes = self.inodes.read().unwrap();
+
+        handle_altkey
+            .map(|altkey| inodes.get_alt(altkey))
+            .flatten()
+            .or_else(|| {
+                inodes.get_alt(&ids_altkey).filter(|data| {
+                    // When we have to fall back to looking up an inode by its IDs, ensure that
+                    // we hit an entry that does not have a file handle.  Entries with file
+                    // handles must also have a handle alt key, so if we have not found it by
+                    // that handle alt key, we must have found an entry with a mismatching
+                    // handle; i.e. an entry for a different file, even though it has the same
+                    // inode ID.
+                    // (This can happen when we look up a new file that has reused the inode ID
+                    // of some previously unlinked inode we still have in `.inodes`.)
+                    handle_altkey.is_none() || data.file_or_handle.handle().is_none()
+                })
+            })
+            .map(Arc::clone)
     }
 
     fn get_map_mut(
@@ -163,11 +196,20 @@ impl InodeMap {
         self.inodes.write().unwrap()
     }
 
-    fn insert(&self, inode: Inode, altkey: InodeAltKey, data: InodeData) {
+    fn insert(
+        &self,
+        inode: Inode,
+        ids_altkey: InodeAltKey,
+        handle_altkey: Option<InodeAltKey>,
+        data: InodeData,
+    ) {
         let mut inodes = self.get_map_mut();
 
         inodes.insert(inode, Arc::new(data));
-        inodes.insert_alt(altkey, inode);
+        inodes.insert_alt(ids_altkey, inode);
+        if let Some(altkey) = handle_altkey {
+            inodes.insert_alt(altkey, inode);
+        }
     }
 }
 
@@ -481,13 +523,15 @@ impl<D: AsyncDrive, S: BitmapSlice + Send + Sync> PassthroughFs<D, S> {
         // we want the client to be able to set all the bits in the mode.
         unsafe { libc::umask(0o000) };
 
-        let altkey = InodeAltKey::ids_from_stat(&st);
+        let ids_altkey = InodeAltKey::ids_from_stat(&st);
+        let handle_altkey: Option<InodeAltKey> = None;
 
         // Not sure why the root inode gets a refcount of 2 but that's what libfuse does.
         self.inode_map.insert(
             fuse::ROOT_ID,
-            altkey,
-            InodeData::new(fuse::ROOT_ID, FileOrHandle::File(f), 2, altkey),
+            ids_altkey,
+            handle_altkey,
+            InodeData::new(fuse::ROOT_ID, FileOrHandle::File(f), 2, ids_altkey),
         );
 
         Ok(())
@@ -572,9 +616,12 @@ impl<D: AsyncDrive, S: BitmapSlice + Send + Sync> PassthroughFs<D, S> {
         let st = Self::stat(&f, None)?;
         let ids_altkey = InodeAltKey::ids_from_stat(&st);
 
+        // TODO: Once we generate file handles, set this
+        let handle_altkey: Option<InodeAltKey> = None;
+
         let mut found = None;
         'search: loop {
-            match self.inode_map.get_alt(&ids_altkey) {
+            match self.inode_map.get_alt(&ids_altkey, handle_altkey.as_ref()) {
                 // No existing entry found
                 None => break 'search,
                 Some(data) => {
@@ -609,7 +656,7 @@ impl<D: AsyncDrive, S: BitmapSlice + Send + Sync> PassthroughFs<D, S> {
             // racing thread already added an inode with the same altkey while we're not holding
             // the lock. If so just use the newly added inode, otherwise the inode will be replaced
             // and results in EBADF.
-            match inodes.get_alt(&ids_altkey).map(Arc::clone) {
+            match self.inode_map.get_alt(&ids_altkey, handle_altkey.as_ref()) {
                 Some(data) => {
                     trace!(
                         "fuse: do_lookup sees existing inode {} ids_altkey {:?}",
@@ -633,11 +680,13 @@ impl<D: AsyncDrive, S: BitmapSlice + Send + Sync> PassthroughFs<D, S> {
                         inode,
                         ids_altkey
                     );
-                    inodes.insert(
+
+                    self.inode_map.insert(
                         inode,
-                        Arc::new(InodeData::new(inode, FileOrHandle::File(f), 1, ids_altkey)),
+                        ids_altkey,
+                        handle_altkey,
+                        InodeData::new(inode, FileOrHandle::File(f), 1, ids_altkey),
                     );
-                    inodes.insert_alt(ids_altkey, inode);
                     inode
                 }
             }
