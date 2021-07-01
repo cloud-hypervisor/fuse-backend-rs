@@ -206,7 +206,7 @@ impl<D: AsyncDrive + Sync, S: BitmapSlice + Send + Sync> AsyncFileSystem<D, S>
         )
         .await?;
         let st = Self::async_stat(&f, None).await?;
-        let altkey = InodeAltKey::from_stat(&st);
+        let altkey = InodeAltKey::ids_from_stat(&st);
 
         let mut found = None;
         'search: loop {

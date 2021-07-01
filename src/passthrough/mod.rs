@@ -50,15 +50,17 @@ const PROC_CSTR: &[u8] = b"/proc\0";
 type Inode = u64;
 type Handle = u64;
 
-#[derive(Clone, Copy, Debug, PartialOrd, Ord, PartialEq, Eq)]
-struct InodeAltKey {
-    ino: libc::ino64_t,
-    dev: libc::dev_t,
+#[derive(Clone, Copy, PartialOrd, Ord, PartialEq, Eq, Debug)]
+enum InodeAltKey {
+    Ids {
+        ino: libc::ino64_t,
+        dev: libc::dev_t,
+    },
 }
 
 impl InodeAltKey {
-    fn from_stat(st: &libc::stat64) -> Self {
-        InodeAltKey {
+    fn ids_from_stat(st: &libc::stat64) -> Self {
+        InodeAltKey::Ids {
             ino: st.st_ino,
             dev: st.st_dev,
         }
@@ -479,7 +481,7 @@ impl<D: AsyncDrive, S: BitmapSlice + Send + Sync> PassthroughFs<D, S> {
         // we want the client to be able to set all the bits in the mode.
         unsafe { libc::umask(0o000) };
 
-        let altkey = InodeAltKey::from_stat(&st);
+        let altkey = InodeAltKey::ids_from_stat(&st);
 
         // Not sure why the root inode gets a refcount of 2 but that's what libfuse does.
         self.inode_map.insert(
@@ -568,11 +570,11 @@ impl<D: AsyncDrive, S: BitmapSlice + Send + Sync> PassthroughFs<D, S> {
             0,
         )?;
         let st = Self::stat(&f, None)?;
-        let altkey = InodeAltKey::from_stat(&st);
+        let ids_altkey = InodeAltKey::ids_from_stat(&st);
 
         let mut found = None;
         'search: loop {
-            match self.inode_map.get_alt(&altkey) {
+            match self.inode_map.get_alt(&ids_altkey) {
                 // No existing entry found
                 None => break 'search,
                 Some(data) => {
@@ -607,12 +609,12 @@ impl<D: AsyncDrive, S: BitmapSlice + Send + Sync> PassthroughFs<D, S> {
             // racing thread already added an inode with the same altkey while we're not holding
             // the lock. If so just use the newly added inode, otherwise the inode will be replaced
             // and results in EBADF.
-            match inodes.get_alt(&altkey).map(Arc::clone) {
+            match inodes.get_alt(&ids_altkey).map(Arc::clone) {
                 Some(data) => {
                     trace!(
-                        "fuse: do_lookup sees existing inode {} altkey {:?}",
+                        "fuse: do_lookup sees existing inode {} ids_altkey {:?}",
                         data.inode,
-                        altkey
+                        ids_altkey
                     );
                     data.refcount.fetch_add(1, Ordering::Relaxed);
                     data.inode
@@ -627,15 +629,15 @@ impl<D: AsyncDrive, S: BitmapSlice + Send + Sync> PassthroughFs<D, S> {
                         ));
                     }
                     trace!(
-                        "fuse: do_lookup adds new inode {} altkey {:?}",
+                        "fuse: do_lookup adds new inode {} ids_altkey {:?}",
                         inode,
-                        altkey
+                        ids_altkey
                     );
                     inodes.insert(
                         inode,
-                        Arc::new(InodeData::new(inode, FileOrHandle::File(f), 1, altkey)),
+                        Arc::new(InodeData::new(inode, FileOrHandle::File(f), 1, ids_altkey)),
                     );
-                    inodes.insert_alt(altkey, inode);
+                    inodes.insert_alt(ids_altkey, inode);
                     inode
                 }
             }
