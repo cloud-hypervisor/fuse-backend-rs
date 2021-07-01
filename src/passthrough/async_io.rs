@@ -254,7 +254,7 @@ impl<D: AsyncDrive + Sync, S: BitmapSlice + Send + Sync> AsyncFileSystem<D, S>
             self.inode_map.insert(
                 inode,
                 altkey,
-                InodeData::new(inode, FileOrHandle::File(f), 1),
+                InodeData::new(inode, FileOrHandle::File(f), 1, altkey),
             );
 
             inode

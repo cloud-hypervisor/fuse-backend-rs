@@ -102,14 +102,16 @@ struct InodeData {
     // Most of these aren't actually files but ¯\_(ツ)_/¯.
     file_or_handle: FileOrHandle,
     refcount: AtomicU64,
+    altkey: InodeAltKey,
 }
 
 impl<'a> InodeData {
-    fn new(inode: Inode, f: FileOrHandle, refcount: u64) -> Self {
+    fn new(inode: Inode, f: FileOrHandle, refcount: u64, altkey: InodeAltKey) -> Self {
         InodeData {
             inode,
             file_or_handle: f,
             refcount: AtomicU64::new(refcount),
+            altkey: altkey,
         }
     }
 
@@ -160,10 +162,10 @@ impl InodeMap {
     }
 
     fn insert(&self, inode: Inode, altkey: InodeAltKey, data: InodeData) {
-        self.inodes
-            .write()
-            .unwrap()
-            .insert(inode, altkey, Arc::new(data));
+        let mut inodes = self.get_map_mut();
+
+        inodes.insert(inode, Arc::new(data));
+        inodes.insert_alt(altkey, inode);
     }
 }
 
@@ -477,11 +479,13 @@ impl<D: AsyncDrive, S: BitmapSlice + Send + Sync> PassthroughFs<D, S> {
         // we want the client to be able to set all the bits in the mode.
         unsafe { libc::umask(0o000) };
 
+        let altkey = InodeAltKey::from_stat(&st);
+
         // Not sure why the root inode gets a refcount of 2 but that's what libfuse does.
         self.inode_map.insert(
             fuse::ROOT_ID,
-            InodeAltKey::from_stat(&st),
-            InodeData::new(fuse::ROOT_ID, FileOrHandle::File(f), 2),
+            altkey,
+            InodeData::new(fuse::ROOT_ID, FileOrHandle::File(f), 2, altkey),
         );
 
         Ok(())
@@ -629,9 +633,9 @@ impl<D: AsyncDrive, S: BitmapSlice + Send + Sync> PassthroughFs<D, S> {
                     );
                     inodes.insert(
                         inode,
-                        altkey,
-                        Arc::new(InodeData::new(inode, FileOrHandle::File(f), 1)),
+                        Arc::new(InodeData::new(inode, FileOrHandle::File(f), 1, altkey)),
                     );
+                    inodes.insert_alt(altkey, inode);
                     inode
                 }
             }
