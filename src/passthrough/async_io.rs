@@ -128,7 +128,7 @@ impl<D: AsyncDrive, S: BitmapSlice + Send + Sync> PassthroughFs<D, S> {
             e
         })?;
 
-        let st = Self::async_stat(&data.file).await.map_err(|e| {
+        let st = Self::async_stat(&data.file, None).await.map_err(|e| {
             error!(
                 "fuse: do_getattr stat failed ino {} fd: {:?} err {:?}",
                 inode,
@@ -141,16 +141,17 @@ impl<D: AsyncDrive, S: BitmapSlice + Send + Sync> PassthroughFs<D, S> {
         Ok((st, self.cfg.attr_timeout))
     }
 
-    async fn async_stat(f: &File) -> io::Result<libc::stat64> {
+    async fn async_stat(dir: &File, path: Option<&CStr>) -> io::Result<libc::stat64> {
         // Safe because this is a constant value and a valid C string.
-        let pathname = unsafe { CStr::from_bytes_with_nul_unchecked(EMPTY_CSTR) };
+        let pathname =
+            path.unwrap_or_else(|| unsafe { CStr::from_bytes_with_nul_unchecked(EMPTY_CSTR) });
         let mut st = MaybeUninit::<libc::stat64>::zeroed();
 
         // TODO:
         // Safe because the kernel will only write data in `st` and we check the return value.
         let res = unsafe {
             libc::fstatat64(
-                f.as_raw_fd(),
+                dir.as_raw_fd(),
                 pathname.as_ptr(),
                 st.as_mut_ptr(),
                 libc::AT_EMPTY_PATH | libc::AT_SYMLINK_NOFOLLOW,
@@ -201,7 +202,7 @@ impl<D: AsyncDrive + Sync, S: BitmapSlice + Send + Sync> AsyncFileSystem<D, S>
             0,
         )
         .await?;
-        let st = Self::async_stat(&f).await?;
+        let st = Self::async_stat(&f, None).await?;
         let altkey = InodeAltKey::from_stat(&st);
 
         let mut found = None;
