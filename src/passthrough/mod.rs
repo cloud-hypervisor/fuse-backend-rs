@@ -851,9 +851,46 @@ fn ebadf() -> io::Error {
 mod tests {
     use super::*;
     use crate::api::filesystem::*;
+    use crate::api::{Vfs, VfsOptions};
     use flexi_logger::{self, colored_opt_format, Logger};
     use log;
+    use std::ops::Deref;
     use vmm_sys_util::{tempdir::TempDir, tempfile::TempFile};
+
+    fn passthroughfs_no_open(cfg: bool) {
+        let opts = VfsOptions {
+            no_open: cfg,
+            ..Default::default()
+        };
+
+        let vfs = &Vfs::new(opts);
+        // Assume that fuse kernel supports no_open.
+        vfs.init(FsOptions::ZERO_MESSAGE_OPEN).unwrap();
+
+        let fs_cfg = Config {
+            do_import: false,
+            no_open: cfg,
+            ..Default::default()
+        };
+        let fs = PassthroughFs::new(fs_cfg.clone()).unwrap();
+        fs.import().unwrap();
+        vfs.mount(Box::new(fs), "/submnt/A").unwrap();
+
+        let p_fs = vfs.get_rootfs("/submnt/A").unwrap().unwrap();
+        let any_fs = p_fs.deref().as_any();
+        any_fs
+            .downcast_ref::<PassthroughFs>()
+            .map(|fs| {
+                assert_eq!(fs.no_open.load(Ordering::Relaxed), cfg);
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn test_passthroughfs_no_open() {
+        passthroughfs_no_open(true);
+        passthroughfs_no_open(false);
+    }
 
     #[test]
     fn test_passthroughfs_inode_file_handles() {
