@@ -22,6 +22,8 @@ impl<D: AsyncDrive, S: BitmapSlice> FileSystem<S> for Vfs<D, S> {
             n_opts.no_open = !(opts & FsOptions::ZERO_MESSAGE_OPEN).is_empty();
             // We can't support FUSE_ATOMIC_O_TRUNC with no_open
             n_opts.out_opts.remove(FsOptions::ATOMIC_O_TRUNC);
+        } else {
+            n_opts.out_opts.remove(FsOptions::ZERO_MESSAGE_OPEN);
         }
         n_opts.no_opendir = !(opts & FsOptions::ZERO_MESSAGE_OPENDIR).is_empty();
         if n_opts.no_writeback {
