@@ -11,7 +11,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use super::{
-    Context, DirEntry, Entry, GetxattrReply, ListxattrReply, ZeroCopyReader, ZeroCopyWriter,
+    BitmapSlice, Context, DirEntry, Entry, GetxattrReply, ListxattrReply, ZeroCopyReader,
+    ZeroCopyWriter,
 };
 use crate::abi::linux_abi::{CreateIn, FsOptions, OpenOptions, SetattrValid};
 #[cfg(feature = "virtiofs")]
@@ -21,7 +22,7 @@ use crate::transport::virtiofs::FsCacheReqHandler;
 
 /// The main trait that connects a file system with a transport.
 #[allow(unused_variables)]
-pub trait FileSystem {
+pub trait FileSystem<S: BitmapSlice = ()> {
     /// Represents a location in the filesystem tree and can be used to perform operations that act
     /// on the metadata of a file/directory (e.g., `getattr` and `setattr`). Can also be used as the
     /// starting point for looking up paths in the filesystem tree. An `Inode` may support operating
@@ -362,7 +363,7 @@ pub trait FileSystem {
         ctx: Context,
         inode: Self::Inode,
         handle: Self::Handle,
-        w: &mut dyn ZeroCopyWriter,
+        w: &mut dyn ZeroCopyWriter<S = S>,
         size: u32,
         offset: u64,
         lock_owner: Option<u64>,
@@ -396,7 +397,7 @@ pub trait FileSystem {
         ctx: Context,
         inode: Self::Inode,
         handle: Self::Handle,
-        r: &mut dyn ZeroCopyReader,
+        r: &mut dyn ZeroCopyReader<S = S>,
         size: u32,
         offset: u64,
         lock_owner: Option<u64>,
@@ -842,7 +843,7 @@ pub trait FileSystem {
     }
 }
 
-impl<FS: FileSystem> FileSystem for Arc<FS> {
+impl<FS: FileSystem<S>, S: BitmapSlice> FileSystem<S> for Arc<FS> {
     type Inode = FS::Inode;
     type Handle = FS::Handle;
 
@@ -979,7 +980,7 @@ impl<FS: FileSystem> FileSystem for Arc<FS> {
         ctx: Context,
         inode: Self::Inode,
         handle: Self::Handle,
-        w: &mut dyn ZeroCopyWriter,
+        w: &mut dyn ZeroCopyWriter<S = S>,
         size: u32,
         offset: u64,
         lock_owner: Option<u64>,
@@ -995,7 +996,7 @@ impl<FS: FileSystem> FileSystem for Arc<FS> {
         ctx: Context,
         inode: Self::Inode,
         handle: Self::Handle,
-        r: &mut dyn ZeroCopyReader,
+        r: &mut dyn ZeroCopyReader<S = S>,
         size: u32,
         offset: u64,
         lock_owner: Option<u64>,

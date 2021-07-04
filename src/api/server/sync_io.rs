@@ -18,8 +18,9 @@ use crate::abi::linux_abi::*;
 #[cfg(feature = "virtiofs")]
 use crate::abi::virtio_fs::{RemovemappingIn, RemovemappingOne, SetupmappingIn};
 use crate::api::filesystem::{Context, DirEntry, Entry, FileSystem, GetxattrReply, ListxattrReply};
+use crate::async_util::AsyncDrive;
 use crate::transport::{FsCacheReqHandler, Reader, Writer};
-use crate::{bytes_to_cstr, encode_io_error_kind, Error, Result};
+use crate::{bytes_to_cstr, encode_io_error_kind, BitmapSlice, Error, Result};
 
 /// Provide concrete backend filesystem a way to catch information/metrics from fuse.
 pub trait MetricsHook {
@@ -29,7 +30,7 @@ pub trait MetricsHook {
     fn release(&self, oh: Option<&OutHeader>);
 }
 
-impl<F: FileSystem + Sync> Server<F> {
+impl<F: FileSystem<S> + Sync, D: AsyncDrive, S: BitmapSlice> Server<F, D, S> {
     /// Main entrance to handle requests from the transport layer.
     ///
     /// It receives Fuse requests from transport layers, parses the request according to Fuse ABI,
@@ -39,14 +40,14 @@ impl<F: FileSystem + Sync> Server<F> {
     #[allow(clippy::cognitive_complexity)]
     pub fn handle_message(
         &self,
-        mut r: Reader,
-        w: Writer,
+        mut r: Reader<'_, S>,
+        w: Writer<'_, S>,
         vu_req: Option<&mut dyn FsCacheReqHandler>,
         hook: Option<&dyn MetricsHook>,
     ) -> Result<usize> {
         let in_header: &InHeader = &r.read_obj().map_err(Error::DecodeMessage)?;
         if in_header.len > MAX_BUFFER_SIZE {
-            return reply_error_explicit(
+            return Self::reply_error_explicit(
                 io::Error::from_raw_os_error(libc::ENOMEM),
                 in_header.unique,
                 w,
@@ -61,7 +62,7 @@ impl<F: FileSystem + Sync> Server<F> {
 
         hook.map_or((), |h| h.collect(in_header));
 
-        let r = match in_header.opcode {
+        let res = match in_header.opcode {
             x if x == Opcode::Lookup as u32 => self.lookup(in_header, r, w),
             x if x == Opcode::Forget as u32 => self.forget(in_header, r), // No reply.
             x if x == Opcode::Getattr as u32 => self.getattr(in_header, r, w),
@@ -118,22 +119,28 @@ impl<F: FileSystem + Sync> Server<F> {
                     self.destroy();
                     Ok(0)
                 }
-                _ => reply_error(
+                _ => Self::reply_error(
                     io::Error::from_raw_os_error(libc::ENOSYS),
                     in_header.unique,
                     w,
                 ),
             },
         };
+
         // Pass `None` because current API handler's design does not allow us to catch
         // the `out_header`. Hopefully, we can reach to `out_header` after some
         // refactoring work someday.
         hook.map_or((), |h| h.release(None));
 
-        r
+        res
     }
 
-    fn lookup(&self, in_header: &InHeader, mut r: Reader, w: Writer) -> Result<usize> {
+    fn lookup(
+        &self,
+        in_header: &InHeader,
+        mut r: Reader<'_, S>,
+        w: Writer<'_, S>,
+    ) -> Result<usize> {
         let buf = ServerUtil::get_message_body(&mut r, in_header, 0)?;
         let name = bytes_to_cstr(buf.as_ref())?;
         let version = self.vers.load();
@@ -147,7 +154,7 @@ impl<F: FileSystem + Sync> Server<F> {
                 if version.minor < KERNEL_MINOR_VERSION_LOOKUP_NEGATIVE_ENTRY_ZERO
                     && entry.inode == 0 =>
             {
-                reply_error(
+                Self::reply_error(
                     io::Error::from_raw_os_error(libc::ENOENT),
                     in_header.unique,
                     w,
@@ -156,13 +163,13 @@ impl<F: FileSystem + Sync> Server<F> {
             Ok(entry) => {
                 let out = EntryOut::from(entry);
 
-                reply_ok(Some(out), None, in_header.unique, w)
+                Self::reply_ok(Some(out), None, in_header.unique, w)
             }
-            Err(e) => reply_error(e, in_header.unique, w),
+            Err(e) => Self::reply_error(e, in_header.unique, w),
         }
     }
 
-    pub(super) fn forget(&self, in_header: &InHeader, mut r: Reader) -> Result<usize> {
+    pub(super) fn forget(&self, in_header: &InHeader, mut r: Reader<'_, S>) -> Result<usize> {
         let ForgetIn { nlookup } = r.read_obj().map_err(Error::DecodeMessage)?;
 
         self.fs
@@ -172,7 +179,12 @@ impl<F: FileSystem + Sync> Server<F> {
         Ok(0)
     }
 
-    fn getattr(&self, in_header: &InHeader, mut r: Reader, w: Writer) -> Result<usize> {
+    fn getattr(
+        &self,
+        in_header: &InHeader,
+        mut r: Reader<'_, S>,
+        w: Writer<'_, S>,
+    ) -> Result<usize> {
         let GetattrIn { flags, fh, .. } = r.read_obj().map_err(Error::DecodeMessage)?;
         let handle = if (flags & GETATTR_FH) != 0 {
             Some(fh.into())
@@ -183,10 +195,15 @@ impl<F: FileSystem + Sync> Server<F> {
             .fs
             .getattr(Context::from(in_header), in_header.nodeid.into(), handle);
 
-        handle_attr_result(in_header, w, result)
+        Self::handle_attr_result(in_header, w, result)
     }
 
-    fn setattr(&self, in_header: &InHeader, mut r: Reader, w: Writer) -> Result<usize> {
+    fn setattr(
+        &self,
+        in_header: &InHeader,
+        mut r: Reader<'_, S>,
+        w: Writer<'_, S>,
+    ) -> Result<usize> {
         let setattr_in: SetattrIn = r.read_obj().map_err(Error::DecodeMessage)?;
         let handle = if setattr_in.valid & FATTR_FH != 0 {
             Some(setattr_in.fh.into())
@@ -203,23 +220,28 @@ impl<F: FileSystem + Sync> Server<F> {
             valid,
         );
 
-        handle_attr_result(in_header, w, result)
+        Self::handle_attr_result(in_header, w, result)
     }
 
-    pub(super) fn readlink(&self, in_header: &InHeader, w: Writer) -> Result<usize> {
+    pub(super) fn readlink(&self, in_header: &InHeader, w: Writer<'_, S>) -> Result<usize> {
         match self
             .fs
             .readlink(Context::from(in_header), in_header.nodeid.into())
         {
             Ok(linkname) => {
                 // We need to disambiguate the option type here even though it is `None`.
-                reply_ok(None::<u8>, Some(&linkname), in_header.unique, w)
+                Self::reply_ok(None::<u8>, Some(&linkname), in_header.unique, w)
             }
-            Err(e) => reply_error(e, in_header.unique, w),
+            Err(e) => Self::reply_error(e, in_header.unique, w),
         }
     }
 
-    pub(super) fn symlink(&self, in_header: &InHeader, mut r: Reader, w: Writer) -> Result<usize> {
+    pub(super) fn symlink(
+        &self,
+        in_header: &InHeader,
+        mut r: Reader<'_, S>,
+        w: Writer<'_, S>,
+    ) -> Result<usize> {
         let buf = ServerUtil::get_message_body(&mut r, in_header, 0)?;
         // The name and linkname are encoded one after another and separated by a nul character.
         let (name, linkname) = ServerUtil::extract_two_cstrs(&buf)?;
@@ -230,12 +252,17 @@ impl<F: FileSystem + Sync> Server<F> {
             in_header.nodeid.into(),
             name,
         ) {
-            Ok(entry) => reply_ok(Some(EntryOut::from(entry)), None, in_header.unique, w),
-            Err(e) => reply_error(e, in_header.unique, w),
+            Ok(entry) => Self::reply_ok(Some(EntryOut::from(entry)), None, in_header.unique, w),
+            Err(e) => Self::reply_error(e, in_header.unique, w),
         }
     }
 
-    pub(super) fn mknod(&self, in_header: &InHeader, mut r: Reader, w: Writer) -> Result<usize> {
+    pub(super) fn mknod(
+        &self,
+        in_header: &InHeader,
+        mut r: Reader<'_, S>,
+        w: Writer<'_, S>,
+    ) -> Result<usize> {
         let MknodIn {
             mode, rdev, umask, ..
         } = r.read_obj().map_err(Error::DecodeMessage)?;
@@ -250,12 +277,17 @@ impl<F: FileSystem + Sync> Server<F> {
             rdev,
             umask,
         ) {
-            Ok(entry) => reply_ok(Some(EntryOut::from(entry)), None, in_header.unique, w),
-            Err(e) => reply_error(e, in_header.unique, w),
+            Ok(entry) => Self::reply_ok(Some(EntryOut::from(entry)), None, in_header.unique, w),
+            Err(e) => Self::reply_error(e, in_header.unique, w),
         }
     }
 
-    pub(super) fn mkdir(&self, in_header: &InHeader, mut r: Reader, w: Writer) -> Result<usize> {
+    pub(super) fn mkdir(
+        &self,
+        in_header: &InHeader,
+        mut r: Reader<'_, S>,
+        w: Writer<'_, S>,
+    ) -> Result<usize> {
         let MkdirIn { mode, umask } = r.read_obj().map_err(Error::DecodeMessage)?;
         let buf = ServerUtil::get_message_body(&mut r, in_header, size_of::<MkdirIn>())?;
         let name = bytes_to_cstr(buf.as_ref())?;
@@ -267,12 +299,17 @@ impl<F: FileSystem + Sync> Server<F> {
             mode,
             umask,
         ) {
-            Ok(entry) => reply_ok(Some(EntryOut::from(entry)), None, in_header.unique, w),
-            Err(e) => reply_error(e, in_header.unique, w),
+            Ok(entry) => Self::reply_ok(Some(EntryOut::from(entry)), None, in_header.unique, w),
+            Err(e) => Self::reply_error(e, in_header.unique, w),
         }
     }
 
-    pub(super) fn unlink(&self, in_header: &InHeader, mut r: Reader, w: Writer) -> Result<usize> {
+    pub(super) fn unlink(
+        &self,
+        in_header: &InHeader,
+        mut r: Reader<'_, S>,
+        w: Writer<'_, S>,
+    ) -> Result<usize> {
         let buf = ServerUtil::get_message_body(&mut r, in_header, 0)?;
         let name = bytes_to_cstr(buf.as_ref())?;
 
@@ -280,12 +317,17 @@ impl<F: FileSystem + Sync> Server<F> {
             .fs
             .unlink(Context::from(in_header), in_header.nodeid.into(), name)
         {
-            Ok(()) => reply_ok(None::<u8>, None, in_header.unique, w),
-            Err(e) => reply_error(e, in_header.unique, w),
+            Ok(()) => Self::reply_ok(None::<u8>, None, in_header.unique, w),
+            Err(e) => Self::reply_error(e, in_header.unique, w),
         }
     }
 
-    pub(super) fn rmdir(&self, in_header: &InHeader, mut r: Reader, w: Writer) -> Result<usize> {
+    pub(super) fn rmdir(
+        &self,
+        in_header: &InHeader,
+        mut r: Reader<'_, S>,
+        w: Writer<'_, S>,
+    ) -> Result<usize> {
         let buf = ServerUtil::get_message_body(&mut r, in_header, 0)?;
         let name = bytes_to_cstr(buf.as_ref())?;
 
@@ -293,8 +335,8 @@ impl<F: FileSystem + Sync> Server<F> {
             .fs
             .rmdir(Context::from(in_header), in_header.nodeid.into(), name)
         {
-            Ok(()) => reply_ok(None::<u8>, None, in_header.unique, w),
-            Err(e) => reply_error(e, in_header.unique, w),
+            Ok(()) => Self::reply_ok(None::<u8>, None, in_header.unique, w),
+            Err(e) => Self::reply_error(e, in_header.unique, w),
         }
     }
 
@@ -304,8 +346,8 @@ impl<F: FileSystem + Sync> Server<F> {
         msg_size: usize,
         newdir: u64,
         flags: u32,
-        mut r: Reader,
-        w: Writer,
+        mut r: Reader<'_, S>,
+        w: Writer<'_, S>,
     ) -> Result<usize> {
         let buf = ServerUtil::get_message_body(&mut r, in_header, msg_size)?;
         let (oldname, newname) = ServerUtil::extract_two_cstrs(&buf)?;
@@ -318,18 +360,28 @@ impl<F: FileSystem + Sync> Server<F> {
             newname,
             flags,
         ) {
-            Ok(()) => reply_ok(None::<u8>, None, in_header.unique, w),
-            Err(e) => reply_error(e, in_header.unique, w),
+            Ok(()) => Self::reply_ok(None::<u8>, None, in_header.unique, w),
+            Err(e) => Self::reply_error(e, in_header.unique, w),
         }
     }
 
-    pub(super) fn rename(&self, in_header: &InHeader, mut r: Reader, w: Writer) -> Result<usize> {
+    pub(super) fn rename(
+        &self,
+        in_header: &InHeader,
+        mut r: Reader<'_, S>,
+        w: Writer<'_, S>,
+    ) -> Result<usize> {
         let RenameIn { newdir } = r.read_obj().map_err(Error::DecodeMessage)?;
 
         self.do_rename(in_header, size_of::<RenameIn>(), newdir, 0, r, w)
     }
 
-    pub(super) fn rename2(&self, in_header: &InHeader, mut r: Reader, w: Writer) -> Result<usize> {
+    pub(super) fn rename2(
+        &self,
+        in_header: &InHeader,
+        mut r: Reader<'_, S>,
+        w: Writer<'_, S>,
+    ) -> Result<usize> {
         let Rename2In { newdir, flags, .. } = r.read_obj().map_err(Error::DecodeMessage)?;
 
         let flags = flags & (libc::RENAME_EXCHANGE | libc::RENAME_NOREPLACE) as u32;
@@ -337,7 +389,12 @@ impl<F: FileSystem + Sync> Server<F> {
         self.do_rename(in_header, size_of::<Rename2In>(), newdir, flags, r, w)
     }
 
-    pub(super) fn link(&self, in_header: &InHeader, mut r: Reader, w: Writer) -> Result<usize> {
+    pub(super) fn link(
+        &self,
+        in_header: &InHeader,
+        mut r: Reader<'_, S>,
+        w: Writer<'_, S>,
+    ) -> Result<usize> {
         let LinkIn { oldnodeid } = r.read_obj().map_err(Error::DecodeMessage)?;
         let buf = ServerUtil::get_message_body(&mut r, in_header, size_of::<LinkIn>())?;
         let name = bytes_to_cstr(buf.as_ref())?;
@@ -348,12 +405,12 @@ impl<F: FileSystem + Sync> Server<F> {
             in_header.nodeid.into(),
             name,
         ) {
-            Ok(entry) => reply_ok(Some(EntryOut::from(entry)), None, in_header.unique, w),
-            Err(e) => reply_error(e, in_header.unique, w),
+            Ok(entry) => Self::reply_ok(Some(EntryOut::from(entry)), None, in_header.unique, w),
+            Err(e) => Self::reply_error(e, in_header.unique, w),
         }
     }
 
-    fn open(&self, in_header: &InHeader, mut r: Reader, w: Writer) -> Result<usize> {
+    fn open(&self, in_header: &InHeader, mut r: Reader<'_, S>, w: Writer<'_, S>) -> Result<usize> {
         let OpenIn { flags, fuse_flags } = r.read_obj().map_err(Error::DecodeMessage)?;
 
         match self.fs.open(
@@ -369,13 +426,18 @@ impl<F: FileSystem + Sync> Server<F> {
                     ..Default::default()
                 };
 
-                reply_ok(Some(out), None, in_header.unique, w)
+                Self::reply_ok(Some(out), None, in_header.unique, w)
             }
-            Err(e) => reply_error(e, in_header.unique, w),
+            Err(e) => Self::reply_error(e, in_header.unique, w),
         }
     }
 
-    fn read(&self, in_header: &InHeader, mut r: Reader, mut w: Writer) -> Result<usize> {
+    fn read(
+        &self,
+        in_header: &InHeader,
+        mut r: Reader<'_, S>,
+        mut w: Writer<'_, S>,
+    ) -> Result<usize> {
         let ReadIn {
             fh,
             offset,
@@ -387,7 +449,7 @@ impl<F: FileSystem + Sync> Server<F> {
         } = r.read_obj().map_err(Error::DecodeMessage)?;
 
         if size > MAX_BUFFER_SIZE {
-            return reply_error_explicit(
+            return Self::reply_error_explicit(
                 io::Error::from_raw_os_error(libc::ENOMEM),
                 in_header.unique,
                 w,
@@ -431,11 +493,11 @@ impl<F: FileSystem + Sync> Server<F> {
                     .map_err(Error::EncodeMessage)?;
                 Ok(out.len as usize)
             }
-            Err(e) => reply_error_explicit(e, in_header.unique, w),
+            Err(e) => Self::reply_error_explicit(e, in_header.unique, w),
         }
     }
 
-    fn write(&self, in_header: &InHeader, mut r: Reader, w: Writer) -> Result<usize> {
+    fn write(&self, in_header: &InHeader, mut r: Reader<'_, S>, w: Writer<'_, S>) -> Result<usize> {
         let WriteIn {
             fh,
             offset,
@@ -447,7 +509,7 @@ impl<F: FileSystem + Sync> Server<F> {
         } = r.read_obj().map_err(Error::DecodeMessage)?;
 
         if size > MAX_BUFFER_SIZE {
-            return reply_error_explicit(
+            return Self::reply_error_explicit(
                 io::Error::from_raw_os_error(libc::ENOMEM),
                 in_header.unique,
                 w,
@@ -482,23 +544,28 @@ impl<F: FileSystem + Sync> Server<F> {
                     ..Default::default()
                 };
 
-                reply_ok(Some(out), None, in_header.unique, w)
+                Self::reply_ok(Some(out), None, in_header.unique, w)
             }
-            Err(e) => reply_error_explicit(e, in_header.unique, w),
+            Err(e) => Self::reply_error_explicit(e, in_header.unique, w),
         }
     }
 
-    pub(super) fn statfs(&self, in_header: &InHeader, w: Writer) -> Result<usize> {
+    pub(super) fn statfs(&self, in_header: &InHeader, w: Writer<'_, S>) -> Result<usize> {
         match self
             .fs
             .statfs(Context::from(in_header), in_header.nodeid.into())
         {
-            Ok(st) => reply_ok(Some(Kstatfs::from(st)), None, in_header.unique, w),
-            Err(e) => reply_error(e, in_header.unique, w),
+            Ok(st) => Self::reply_ok(Some(Kstatfs::from(st)), None, in_header.unique, w),
+            Err(e) => Self::reply_error(e, in_header.unique, w),
         }
     }
 
-    pub(super) fn release(&self, in_header: &InHeader, mut r: Reader, w: Writer) -> Result<usize> {
+    pub(super) fn release(
+        &self,
+        in_header: &InHeader,
+        mut r: Reader<'_, S>,
+        w: Writer<'_, S>,
+    ) -> Result<usize> {
         let ReleaseIn {
             fh,
             flags,
@@ -523,12 +590,12 @@ impl<F: FileSystem + Sync> Server<F> {
             flock_release,
             lock_owner,
         ) {
-            Ok(()) => reply_ok(None::<u8>, None, in_header.unique, w),
-            Err(e) => reply_error(e, in_header.unique, w),
+            Ok(()) => Self::reply_ok(None::<u8>, None, in_header.unique, w),
+            Err(e) => Self::reply_error(e, in_header.unique, w),
         }
     }
 
-    fn fsync(&self, in_header: &InHeader, mut r: Reader, w: Writer) -> Result<usize> {
+    fn fsync(&self, in_header: &InHeader, mut r: Reader<'_, S>, w: Writer<'_, S>) -> Result<usize> {
         let FsyncIn {
             fh, fsync_flags, ..
         } = r.read_obj().map_err(Error::DecodeMessage)?;
@@ -540,12 +607,17 @@ impl<F: FileSystem + Sync> Server<F> {
             datasync,
             fh.into(),
         ) {
-            Ok(()) => reply_ok(None::<u8>, None, in_header.unique, w),
-            Err(e) => reply_error(e, in_header.unique, w),
+            Ok(()) => Self::reply_ok(None::<u8>, None, in_header.unique, w),
+            Err(e) => Self::reply_error(e, in_header.unique, w),
         }
     }
 
-    pub(super) fn setxattr(&self, in_header: &InHeader, mut r: Reader, w: Writer) -> Result<usize> {
+    pub(super) fn setxattr(
+        &self,
+        in_header: &InHeader,
+        mut r: Reader<'_, S>,
+        w: Writer<'_, S>,
+    ) -> Result<usize> {
         let SetxattrIn { size, flags } = r.read_obj().map_err(Error::DecodeMessage)?;
         let buf = ServerUtil::get_message_body(&mut r, in_header, size_of::<SetxattrIn>())?;
 
@@ -568,15 +640,20 @@ impl<F: FileSystem + Sync> Server<F> {
             value,
             flags,
         ) {
-            Ok(()) => reply_ok(None::<u8>, None, in_header.unique, w),
-            Err(e) => reply_error(e, in_header.unique, w),
+            Ok(()) => Self::reply_ok(None::<u8>, None, in_header.unique, w),
+            Err(e) => Self::reply_error(e, in_header.unique, w),
         }
     }
 
-    pub(super) fn getxattr(&self, in_header: &InHeader, mut r: Reader, w: Writer) -> Result<usize> {
+    pub(super) fn getxattr(
+        &self,
+        in_header: &InHeader,
+        mut r: Reader<'_, S>,
+        w: Writer<'_, S>,
+    ) -> Result<usize> {
         let GetxattrIn { size, .. } = r.read_obj().map_err(Error::DecodeMessage)?;
         if size > MAX_BUFFER_SIZE {
-            return reply_error_explicit(
+            return Self::reply_error_explicit(
                 io::Error::from_raw_os_error(libc::ENOMEM),
                 in_header.unique,
                 w,
@@ -592,29 +669,31 @@ impl<F: FileSystem + Sync> Server<F> {
             name,
             size,
         ) {
-            Ok(GetxattrReply::Value(val)) => reply_ok(None::<u8>, Some(&val), in_header.unique, w),
+            Ok(GetxattrReply::Value(val)) => {
+                Self::reply_ok(None::<u8>, Some(&val), in_header.unique, w)
+            }
             Ok(GetxattrReply::Count(count)) => {
                 let out = GetxattrOut {
                     size: count,
                     ..Default::default()
                 };
 
-                reply_ok(Some(out), None, in_header.unique, w)
+                Self::reply_ok(Some(out), None, in_header.unique, w)
             }
-            Err(e) => reply_error(e, in_header.unique, w),
+            Err(e) => Self::reply_error(e, in_header.unique, w),
         }
     }
 
     pub(super) fn listxattr(
         &self,
         in_header: &InHeader,
-        mut r: Reader,
-        w: Writer,
+        mut r: Reader<'_, S>,
+        w: Writer<'_, S>,
     ) -> Result<usize> {
         let GetxattrIn { size, .. } = r.read_obj().map_err(Error::DecodeMessage)?;
 
         if size > MAX_BUFFER_SIZE {
-            return reply_error_explicit(
+            return Self::reply_error_explicit(
                 io::Error::from_raw_os_error(libc::ENOMEM),
                 in_header.unique,
                 w,
@@ -625,24 +704,26 @@ impl<F: FileSystem + Sync> Server<F> {
             .fs
             .listxattr(Context::from(in_header), in_header.nodeid.into(), size)
         {
-            Ok(ListxattrReply::Names(val)) => reply_ok(None::<u8>, Some(&val), in_header.unique, w),
+            Ok(ListxattrReply::Names(val)) => {
+                Self::reply_ok(None::<u8>, Some(&val), in_header.unique, w)
+            }
             Ok(ListxattrReply::Count(count)) => {
                 let out = GetxattrOut {
                     size: count,
                     ..Default::default()
                 };
 
-                reply_ok(Some(out), None, in_header.unique, w)
+                Self::reply_ok(Some(out), None, in_header.unique, w)
             }
-            Err(e) => reply_error(e, in_header.unique, w),
+            Err(e) => Self::reply_error(e, in_header.unique, w),
         }
     }
 
     pub(super) fn removexattr(
         &self,
         in_header: &InHeader,
-        mut r: Reader,
-        w: Writer,
+        mut r: Reader<'_, S>,
+        w: Writer<'_, S>,
     ) -> Result<usize> {
         let buf = ServerUtil::get_message_body(&mut r, in_header, 0)?;
         let name = bytes_to_cstr(&buf)?;
@@ -651,12 +732,17 @@ impl<F: FileSystem + Sync> Server<F> {
             .fs
             .removexattr(Context::from(in_header), in_header.nodeid.into(), name)
         {
-            Ok(()) => reply_ok(None::<u8>, None, in_header.unique, w),
-            Err(e) => reply_error(e, in_header.unique, w),
+            Ok(()) => Self::reply_ok(None::<u8>, None, in_header.unique, w),
+            Err(e) => Self::reply_error(e, in_header.unique, w),
         }
     }
 
-    pub(super) fn flush(&self, in_header: &InHeader, mut r: Reader, w: Writer) -> Result<usize> {
+    pub(super) fn flush(
+        &self,
+        in_header: &InHeader,
+        mut r: Reader<'_, S>,
+        w: Writer<'_, S>,
+    ) -> Result<usize> {
         let FlushIn { fh, lock_owner, .. } = r.read_obj().map_err(Error::DecodeMessage)?;
 
         match self.fs.flush(
@@ -665,12 +751,17 @@ impl<F: FileSystem + Sync> Server<F> {
             fh.into(),
             lock_owner,
         ) {
-            Ok(()) => reply_ok(None::<u8>, None, in_header.unique, w),
-            Err(e) => reply_error(e, in_header.unique, w),
+            Ok(()) => Self::reply_ok(None::<u8>, None, in_header.unique, w),
+            Err(e) => Self::reply_error(e, in_header.unique, w),
         }
     }
 
-    pub(super) fn init(&self, in_header: &InHeader, mut r: Reader, w: Writer) -> Result<usize> {
+    pub(super) fn init(
+        &self,
+        in_header: &InHeader,
+        mut r: Reader<'_, S>,
+        w: Writer<'_, S>,
+    ) -> Result<usize> {
         let InitIn {
             major,
             minor,
@@ -680,7 +771,7 @@ impl<F: FileSystem + Sync> Server<F> {
 
         if major < KERNEL_VERSION {
             error!("Unsupported fuse protocol version: {}.{}", major, minor);
-            return reply_error_explicit(
+            return Self::reply_error_explicit(
                 io::Error::from_raw_os_error(libc::EPROTO),
                 in_header.unique,
                 w,
@@ -695,7 +786,7 @@ impl<F: FileSystem + Sync> Server<F> {
                 ..Default::default()
             };
 
-            return reply_ok(Some(out), None, in_header.unique, w);
+            return Self::reply_ok(Some(out), None, in_header.unique, w);
         }
 
         // These fuse features are supported by this server by default.
@@ -733,7 +824,7 @@ impl<F: FileSystem + Sync> Server<F> {
                 let vers = ServerVersion { major, minor };
                 self.vers.store(Arc::new(vers));
                 if minor < KERNEL_MINOR_VERSION_INIT_OUT_SIZE {
-                    reply_ok(
+                    Self::reply_ok(
                         Some(
                             *<[u8; FUSE_COMPAT_INIT_OUT_SIZE]>::from_slice(
                                 out.as_slice().split_at(FUSE_COMPAT_INIT_OUT_SIZE).0,
@@ -745,7 +836,7 @@ impl<F: FileSystem + Sync> Server<F> {
                         w,
                     )
                 } else if minor < KERNEL_MINOR_VERSION_INIT_22_OUT_SIZE {
-                    reply_ok(
+                    Self::reply_ok(
                         Some(
                             *<[u8; FUSE_COMPAT_22_INIT_OUT_SIZE]>::from_slice(
                                 out.as_slice().split_at(FUSE_COMPAT_22_INIT_OUT_SIZE).0,
@@ -757,14 +848,19 @@ impl<F: FileSystem + Sync> Server<F> {
                         w,
                     )
                 } else {
-                    reply_ok(Some(out), None, in_header.unique, w)
+                    Self::reply_ok(Some(out), None, in_header.unique, w)
                 }
             }
-            Err(e) => reply_error(e, in_header.unique, w),
+            Err(e) => Self::reply_error(e, in_header.unique, w),
         }
     }
 
-    pub(super) fn opendir(&self, in_header: &InHeader, mut r: Reader, w: Writer) -> Result<usize> {
+    pub(super) fn opendir(
+        &self,
+        in_header: &InHeader,
+        mut r: Reader<'_, S>,
+        w: Writer<'_, S>,
+    ) -> Result<usize> {
         let OpenIn { flags, .. } = r.read_obj().map_err(Error::DecodeMessage)?;
 
         match self
@@ -778,17 +874,17 @@ impl<F: FileSystem + Sync> Server<F> {
                     ..Default::default()
                 };
 
-                reply_ok(Some(out), None, in_header.unique, w)
+                Self::reply_ok(Some(out), None, in_header.unique, w)
             }
-            Err(e) => reply_error(e, in_header.unique, w),
+            Err(e) => Self::reply_error(e, in_header.unique, w),
         }
     }
 
     fn do_readdir(
         &self,
         in_header: &InHeader,
-        mut r: Reader,
-        mut w: Writer,
+        mut r: Reader<'_, S>,
+        mut w: Writer<'_, S>,
         plus: bool,
     ) -> Result<usize> {
         let ReadIn {
@@ -796,7 +892,7 @@ impl<F: FileSystem + Sync> Server<F> {
         } = r.read_obj().map_err(Error::DecodeMessage)?;
 
         if size > MAX_BUFFER_SIZE {
-            return reply_error_explicit(
+            return Self::reply_error_explicit(
                 io::Error::from_raw_os_error(libc::ENOMEM),
                 in_header.unique,
                 w,
@@ -805,7 +901,7 @@ impl<F: FileSystem + Sync> Server<F> {
 
         let available_bytes = w.available_bytes();
         if available_bytes < size as usize {
-            return reply_error_explicit(
+            return Self::reply_error_explicit(
                 io::Error::from_raw_os_error(libc::ENOMEM),
                 in_header.unique,
                 w,
@@ -825,7 +921,7 @@ impl<F: FileSystem + Sync> Server<F> {
                 fh.into(),
                 size,
                 offset,
-                &mut |d, e| add_dirent(&mut cursor, size, d, Some(e)),
+                &mut |d, e| Self::add_dirent(&mut cursor, size, d, Some(e)),
             )
         } else {
             self.fs.readdir(
@@ -834,12 +930,12 @@ impl<F: FileSystem + Sync> Server<F> {
                 fh.into(),
                 size,
                 offset,
-                &mut |d| add_dirent(&mut cursor, size, d, None),
+                &mut |d| Self::add_dirent(&mut cursor, size, d, None),
             )
         };
 
         if let Err(e) = res {
-            reply_error_explicit(e, in_header.unique, w)
+            Self::reply_error_explicit(e, in_header.unique, w)
         } else {
             // Don't use `reply_ok` because we need to set a custom size length for the
             // header.
@@ -855,19 +951,29 @@ impl<F: FileSystem + Sync> Server<F> {
         }
     }
 
-    pub(super) fn readdir(&self, in_header: &InHeader, r: Reader, w: Writer) -> Result<usize> {
+    pub(super) fn readdir(
+        &self,
+        in_header: &InHeader,
+        r: Reader<'_, S>,
+        w: Writer<'_, S>,
+    ) -> Result<usize> {
         self.do_readdir(in_header, r, w, false)
     }
 
-    pub(super) fn readdirplus(&self, in_header: &InHeader, r: Reader, w: Writer) -> Result<usize> {
+    pub(super) fn readdirplus(
+        &self,
+        in_header: &InHeader,
+        r: Reader<'_, S>,
+        w: Writer<'_, S>,
+    ) -> Result<usize> {
         self.do_readdir(in_header, r, w, true)
     }
 
     pub(super) fn releasedir(
         &self,
         in_header: &InHeader,
-        mut r: Reader,
-        w: Writer,
+        mut r: Reader<'_, S>,
+        w: Writer<'_, S>,
     ) -> Result<usize> {
         let ReleaseIn { fh, flags, .. } = r.read_obj().map_err(Error::DecodeMessage)?;
 
@@ -877,12 +983,17 @@ impl<F: FileSystem + Sync> Server<F> {
             flags,
             fh.into(),
         ) {
-            Ok(()) => reply_ok(None::<u8>, None, in_header.unique, w),
-            Err(e) => reply_error(e, in_header.unique, w),
+            Ok(()) => Self::reply_ok(None::<u8>, None, in_header.unique, w),
+            Err(e) => Self::reply_error(e, in_header.unique, w),
         }
     }
 
-    fn fsyncdir(&self, in_header: &InHeader, mut r: Reader, w: Writer) -> Result<usize> {
+    fn fsyncdir(
+        &self,
+        in_header: &InHeader,
+        mut r: Reader<'_, S>,
+        w: Writer<'_, S>,
+    ) -> Result<usize> {
         let FsyncIn {
             fh, fsync_flags, ..
         } = r.read_obj().map_err(Error::DecodeMessage)?;
@@ -894,48 +1005,73 @@ impl<F: FileSystem + Sync> Server<F> {
             datasync,
             fh.into(),
         ) {
-            Ok(()) => reply_ok(None::<u8>, None, in_header.unique, w),
-            Err(e) => reply_error(e, in_header.unique, w),
+            Ok(()) => Self::reply_ok(None::<u8>, None, in_header.unique, w),
+            Err(e) => Self::reply_error(e, in_header.unique, w),
         }
     }
 
-    pub(super) fn getlk(&self, in_header: &InHeader, mut _r: Reader, w: Writer) -> Result<usize> {
+    pub(super) fn getlk(
+        &self,
+        in_header: &InHeader,
+        mut _r: Reader<'_, S>,
+        w: Writer<'_, S>,
+    ) -> Result<usize> {
         if let Err(e) = self.fs.getlk() {
-            reply_error(e, in_header.unique, w)
+            Self::reply_error(e, in_header.unique, w)
         } else {
             Ok(0)
         }
     }
 
-    pub(super) fn setlk(&self, in_header: &InHeader, mut _r: Reader, w: Writer) -> Result<usize> {
+    pub(super) fn setlk(
+        &self,
+        in_header: &InHeader,
+        mut _r: Reader<'_, S>,
+        w: Writer<'_, S>,
+    ) -> Result<usize> {
         if let Err(e) = self.fs.setlk() {
-            reply_error(e, in_header.unique, w)
+            Self::reply_error(e, in_header.unique, w)
         } else {
             Ok(0)
         }
     }
 
-    pub(super) fn setlkw(&self, in_header: &InHeader, mut _r: Reader, w: Writer) -> Result<usize> {
+    pub(super) fn setlkw(
+        &self,
+        in_header: &InHeader,
+        mut _r: Reader<'_, S>,
+        w: Writer<'_, S>,
+    ) -> Result<usize> {
         if let Err(e) = self.fs.setlkw() {
-            reply_error(e, in_header.unique, w)
+            Self::reply_error(e, in_header.unique, w)
         } else {
             Ok(0)
         }
     }
 
-    pub(super) fn access(&self, in_header: &InHeader, mut r: Reader, w: Writer) -> Result<usize> {
+    pub(super) fn access(
+        &self,
+        in_header: &InHeader,
+        mut r: Reader<'_, S>,
+        w: Writer<'_, S>,
+    ) -> Result<usize> {
         let AccessIn { mask, .. } = r.read_obj().map_err(Error::DecodeMessage)?;
 
         match self
             .fs
             .access(Context::from(in_header), in_header.nodeid.into(), mask)
         {
-            Ok(()) => reply_ok(None::<u8>, None, in_header.unique, w),
-            Err(e) => reply_error(e, in_header.unique, w),
+            Ok(()) => Self::reply_ok(None::<u8>, None, in_header.unique, w),
+            Err(e) => Self::reply_error(e, in_header.unique, w),
         }
     }
 
-    fn create(&self, in_header: &InHeader, mut r: Reader, w: Writer) -> Result<usize> {
+    fn create(
+        &self,
+        in_header: &InHeader,
+        mut r: Reader<'_, S>,
+        w: Writer<'_, S>,
+    ) -> Result<usize> {
         let args: CreateIn = r.read_obj().map_err(Error::DecodeMessage)?;
         let buf = ServerUtil::get_message_body(&mut r, in_header, size_of::<CreateIn>())?;
         let name = bytes_to_cstr(&buf)?;
@@ -963,22 +1099,27 @@ impl<F: FileSystem + Sync> Server<F> {
                 };
 
                 // Kind of a hack to write both structs.
-                reply_ok(
+                Self::reply_ok(
                     Some(entry_out),
                     Some(open_out.as_slice()),
                     in_header.unique,
                     w,
                 )
             }
-            Err(e) => reply_error(e, in_header.unique, w),
+            Err(e) => Self::reply_error(e, in_header.unique, w),
         }
     }
 
     pub(super) fn interrupt(&self, _in_header: &InHeader) {}
 
-    pub(super) fn bmap(&self, in_header: &InHeader, mut _r: Reader, w: Writer) -> Result<usize> {
+    pub(super) fn bmap(
+        &self,
+        in_header: &InHeader,
+        mut _r: Reader<'_, S>,
+        w: Writer<'_, S>,
+    ) -> Result<usize> {
         if let Err(e) = self.fs.bmap() {
-            reply_error(e, in_header.unique, w)
+            Self::reply_error(e, in_header.unique, w)
         } else {
             Ok(0)
         }
@@ -989,17 +1130,27 @@ impl<F: FileSystem + Sync> Server<F> {
         self.fs.destroy();
     }
 
-    pub(super) fn ioctl(&self, in_header: &InHeader, _r: Reader, w: Writer) -> Result<usize> {
+    pub(super) fn ioctl(
+        &self,
+        in_header: &InHeader,
+        _r: Reader<'_, S>,
+        w: Writer<'_, S>,
+    ) -> Result<usize> {
         if let Err(e) = self.fs.ioctl() {
-            reply_error(e, in_header.unique, w)
+            Self::reply_error(e, in_header.unique, w)
         } else {
             Ok(0)
         }
     }
 
-    pub(super) fn poll(&self, in_header: &InHeader, mut _r: Reader, w: Writer) -> Result<usize> {
+    pub(super) fn poll(
+        &self,
+        in_header: &InHeader,
+        mut _r: Reader<'_, S>,
+        w: Writer<'_, S>,
+    ) -> Result<usize> {
         if let Err(e) = self.fs.poll() {
-            reply_error(e, in_header.unique, w)
+            Self::reply_error(e, in_header.unique, w)
         } else {
             Ok(0)
         }
@@ -1008,11 +1159,11 @@ impl<F: FileSystem + Sync> Server<F> {
     pub(super) fn notify_reply(
         &self,
         in_header: &InHeader,
-        mut _r: Reader,
-        w: Writer,
+        mut _r: Reader<'_, S>,
+        w: Writer<'_, S>,
     ) -> Result<usize> {
         if let Err(e) = self.fs.notify_reply() {
-            reply_error(e, in_header.unique, w)
+            Self::reply_error(e, in_header.unique, w)
         } else {
             Ok(0)
         }
@@ -1021,21 +1172,21 @@ impl<F: FileSystem + Sync> Server<F> {
     pub(super) fn batch_forget(
         &self,
         in_header: &InHeader,
-        mut r: Reader,
-        w: Writer,
+        mut r: Reader<'_, S>,
+        w: Writer<'_, S>,
     ) -> Result<usize> {
         let BatchForgetIn { count, .. } = r.read_obj().map_err(Error::DecodeMessage)?;
 
         if let Some(size) = (count as usize).checked_mul(size_of::<ForgetOne>()) {
             if size > MAX_BUFFER_SIZE as usize {
-                return reply_error_explicit(
+                return Self::reply_error_explicit(
                     io::Error::from_raw_os_error(libc::ENOMEM),
                     in_header.unique,
                     w,
                 );
             }
         } else {
-            return reply_error_explicit(
+            return Self::reply_error_explicit(
                 io::Error::from_raw_os_error(libc::EOVERFLOW),
                 in_header.unique,
                 w,
@@ -1057,7 +1208,12 @@ impl<F: FileSystem + Sync> Server<F> {
         Ok(0)
     }
 
-    fn fallocate(&self, in_header: &InHeader, mut r: Reader, w: Writer) -> Result<usize> {
+    fn fallocate(
+        &self,
+        in_header: &InHeader,
+        mut r: Reader<'_, S>,
+        w: Writer<'_, S>,
+    ) -> Result<usize> {
         let FallocateIn {
             fh,
             offset,
@@ -1074,12 +1230,17 @@ impl<F: FileSystem + Sync> Server<F> {
             offset,
             length,
         ) {
-            Ok(()) => reply_ok(None::<u8>, None, in_header.unique, w),
-            Err(e) => reply_error(e, in_header.unique, w),
+            Ok(()) => Self::reply_ok(None::<u8>, None, in_header.unique, w),
+            Err(e) => Self::reply_error(e, in_header.unique, w),
         }
     }
 
-    pub(super) fn lseek(&self, in_header: &InHeader, mut r: Reader, w: Writer) -> Result<usize> {
+    pub(super) fn lseek(
+        &self,
+        in_header: &InHeader,
+        mut r: Reader<'_, S>,
+        w: Writer<'_, S>,
+    ) -> Result<usize> {
         let LseekIn {
             fh, offset, whence, ..
         } = r.read_obj().map_err(Error::DecodeMessage)?;
@@ -1094,20 +1255,20 @@ impl<F: FileSystem + Sync> Server<F> {
             Ok(offset) => {
                 let out = LseekOut { offset };
 
-                reply_ok(Some(out), None, in_header.unique, w)
+                Self::reply_ok(Some(out), None, in_header.unique, w)
             }
-            Err(e) => reply_error(e, in_header.unique, w),
+            Err(e) => Self::reply_error(e, in_header.unique, w),
         }
     }
 }
 
 #[cfg(feature = "virtiofs")]
-impl<F: FileSystem + Sync> Server<F> {
+impl<F: FileSystem<S> + Sync, D: AsyncDrive, S: BitmapSlice> Server<F, D, S> {
     pub(super) fn setupmapping(
         &self,
         in_header: &InHeader,
-        mut r: Reader,
-        w: Writer,
+        mut r: Reader<'_, S>,
+        w: Writer<'_, S>,
         vu_req: Option<&mut dyn FsCacheReqHandler>,
     ) -> Result<usize> {
         if let Some(req) = vu_req {
@@ -1129,11 +1290,11 @@ impl<F: FileSystem + Sync> Server<F> {
                 moffset,
                 req,
             ) {
-                Ok(()) => reply_ok(None::<u8>, None, in_header.unique, w),
-                Err(e) => reply_error(e, in_header.unique, w),
+                Ok(()) => Self::reply_ok(None::<u8>, None, in_header.unique, w),
+                Err(e) => Self::reply_error(e, in_header.unique, w),
             }
         } else {
-            reply_error_explicit(
+            Self::reply_error_explicit(
                 io::Error::from_raw_os_error(libc::EINVAL),
                 in_header.unique,
                 w,
@@ -1144,8 +1305,8 @@ impl<F: FileSystem + Sync> Server<F> {
     pub(super) fn removemapping(
         &self,
         in_header: &InHeader,
-        mut r: Reader,
-        w: Writer,
+        mut r: Reader<'_, S>,
+        w: Writer<'_, S>,
         vu_req: Option<&mut dyn FsCacheReqHandler>,
     ) -> Result<usize> {
         if let Some(req) = vu_req {
@@ -1153,14 +1314,14 @@ impl<F: FileSystem + Sync> Server<F> {
 
             if let Some(size) = (count as usize).checked_mul(size_of::<RemovemappingOne>()) {
                 if size > MAX_BUFFER_SIZE as usize {
-                    return reply_error_explicit(
+                    return Self::reply_error_explicit(
                         io::Error::from_raw_os_error(libc::ENOMEM),
                         in_header.unique,
                         w,
                     );
                 }
             } else {
-                return reply_error_explicit(
+                return Self::reply_error_explicit(
                     io::Error::from_raw_os_error(libc::EOVERFLOW),
                     in_header.unique,
                     w,
@@ -1181,11 +1342,11 @@ impl<F: FileSystem + Sync> Server<F> {
                 requests,
                 req,
             ) {
-                Ok(()) => reply_ok(None::<u8>, None, in_header.unique, w),
-                Err(e) => reply_error(e, in_header.unique, w),
+                Ok(()) => Self::reply_ok(None::<u8>, None, in_header.unique, w),
+                Err(e) => Self::reply_error(e, in_header.unique, w),
             }
         } else {
-            reply_error_explicit(
+            Self::reply_error_explicit(
                 io::Error::from_raw_os_error(libc::EINVAL),
                 in_header.unique,
                 w,
@@ -1194,152 +1355,159 @@ impl<F: FileSystem + Sync> Server<F> {
     }
 }
 
-fn reply_ok<T: ByteValued>(
-    out: Option<T>,
-    data: Option<&[u8]>,
-    unique: u64,
-    mut w: Writer,
-) -> Result<usize> {
-    let data2 = out.as_ref().map(|v| v.as_slice()).unwrap_or(&[]);
-    let data3 = data.unwrap_or(&[]);
-    let len = size_of::<OutHeader>() + data2.len() + data3.len();
-    let header = OutHeader {
-        len: len as u32,
-        error: 0,
-        unique,
-    };
-    trace!("fuse: new reply {:?}", header);
+impl<F: FileSystem<S> + Sync, D: AsyncDrive, S: BitmapSlice> Server<F, D, S> {
+    fn reply_ok<T: ByteValued>(
+        out: Option<T>,
+        data: Option<&[u8]>,
+        unique: u64,
+        mut w: Writer<'_, S>,
+    ) -> Result<usize> {
+        let data2 = out.as_ref().map(|v| v.as_slice()).unwrap_or(&[]);
+        let data3 = data.unwrap_or(&[]);
+        let len = size_of::<OutHeader>() + data2.len() + data3.len();
+        let header = OutHeader {
+            len: len as u32,
+            error: 0,
+            unique,
+        };
+        trace!("fuse: new reply {:?}", header);
 
-    match (data2.len(), data3.len()) {
-        (0, 0) => w.write(header.as_slice()).map_err(Error::EncodeMessage)?,
-        (0, _) => w
-            .write_vectored(&[IoSlice::new(header.as_slice()), IoSlice::new(data3)])
-            .map_err(Error::EncodeMessage)?,
-        (_, 0) => w
-            .write_vectored(&[IoSlice::new(header.as_slice()), IoSlice::new(data2)])
-            .map_err(Error::EncodeMessage)?,
-        (_, _) => w
-            .write_vectored(&[
-                IoSlice::new(header.as_slice()),
-                IoSlice::new(data2),
-                IoSlice::new(data3),
-            ])
-            .map_err(Error::EncodeMessage)?,
-    };
-
-    debug_assert_eq!(len, w.bytes_written());
-    Ok(w.bytes_written())
-}
-
-fn do_reply_error(err: io::Error, unique: u64, mut w: Writer, explicit: bool) -> Result<usize> {
-    let header = OutHeader {
-        len: size_of::<OutHeader>() as u32,
-        error: -err
-            .raw_os_error()
-            .unwrap_or_else(|| encode_io_error_kind(err.kind())),
-        unique,
-    };
-
-    if explicit || err.raw_os_error().is_none() {
-        error!("fuse: reply error header {:?}, error {:?}", header, err);
-    } else {
-        trace!("fuse: reply error header {:?}, error {:?}", header, err);
-    }
-    w.write_all(header.as_slice())
-        .map_err(Error::EncodeMessage)?;
-
-    // Commit header if it is buffered otherwise kernel gets nothing back.
-    w.commit(None)
-        .map(|_| {
-            debug_assert_eq!(header.len as usize, w.bytes_written());
-            w.bytes_written()
-        })
-        .map_err(Error::EncodeMessage)
-}
-
-// reply operation error back to fuse client, don't print error message, as they are not server's
-// internal error, and client could deal with them.
-fn reply_error(err: io::Error, unique: u64, w: Writer) -> Result<usize> {
-    do_reply_error(err, unique, w, false)
-}
-
-fn reply_error_explicit(err: io::Error, unique: u64, w: Writer) -> Result<usize> {
-    do_reply_error(err, unique, w, true)
-}
-
-fn handle_attr_result(
-    in_header: &InHeader,
-    w: Writer,
-    result: io::Result<(libc::stat64, Duration)>,
-) -> Result<usize> {
-    match result {
-        Ok((st, timeout)) => {
-            let out = AttrOut {
-                attr_valid: timeout.as_secs(),
-                attr_valid_nsec: timeout.subsec_nanos(),
-                dummy: 0,
-                attr: st.into(),
-            };
-            reply_ok(Some(out), None, in_header.unique, w)
-        }
-        Err(e) => reply_error(e, in_header.unique, w),
-    }
-}
-
-fn add_dirent(
-    cursor: &mut Writer,
-    max: u32,
-    d: DirEntry,
-    entry: Option<Entry>,
-) -> io::Result<usize> {
-    if d.name.len() > ::std::u32::MAX as usize {
-        return Err(io::Error::from_raw_os_error(libc::EOVERFLOW));
-    }
-
-    let dirent_len = size_of::<Dirent>()
-        .checked_add(d.name.len())
-        .ok_or_else(|| io::Error::from_raw_os_error(libc::EOVERFLOW))?;
-
-    // Directory entries must be padded to 8-byte alignment.  If adding 7 causes
-    // an overflow then this dirent cannot be properly padded.
-    let padded_dirent_len = dirent_len
-        .checked_add(7)
-        .map(|l| l & !7)
-        .ok_or_else(|| io::Error::from_raw_os_error(libc::EOVERFLOW))?;
-
-    let total_len = if entry.is_some() {
-        padded_dirent_len
-            .checked_add(size_of::<EntryOut>())
-            .ok_or_else(|| io::Error::from_raw_os_error(libc::EOVERFLOW))?
-    } else {
-        padded_dirent_len
-    };
-
-    // Skip the entry if there's no enough space left.
-    if (max as usize).saturating_sub(cursor.bytes_written()) < total_len {
-        Ok(0)
-    } else {
-        if let Some(entry) = entry {
-            cursor.write_all(EntryOut::from(entry).as_slice())?;
-        }
-
-        let dirent = Dirent {
-            ino: d.ino,
-            off: d.offset,
-            namelen: d.name.len() as u32,
-            type_: d.type_,
+        match (data2.len(), data3.len()) {
+            (0, 0) => w.write(header.as_slice()).map_err(Error::EncodeMessage)?,
+            (0, _) => w
+                .write_vectored(&[IoSlice::new(header.as_slice()), IoSlice::new(data3)])
+                .map_err(Error::EncodeMessage)?,
+            (_, 0) => w
+                .write_vectored(&[IoSlice::new(header.as_slice()), IoSlice::new(data2)])
+                .map_err(Error::EncodeMessage)?,
+            (_, _) => w
+                .write_vectored(&[
+                    IoSlice::new(header.as_slice()),
+                    IoSlice::new(data2),
+                    IoSlice::new(data3),
+                ])
+                .map_err(Error::EncodeMessage)?,
         };
 
-        cursor.write_all(dirent.as_slice())?;
-        cursor.write_all(d.name)?;
+        debug_assert_eq!(len, w.bytes_written());
+        Ok(w.bytes_written())
+    }
 
-        // We know that `dirent_len` <= `padded_dirent_len` due to the check above
-        // so there's no need for checked arithmetic.
-        let padding = padded_dirent_len - dirent_len;
-        if padding > 0 {
-            cursor.write_all(&DIRENT_PADDING[..padding])?;
+    fn do_reply_error(
+        err: io::Error,
+        unique: u64,
+        mut w: Writer<'_, S>,
+        explicit: bool,
+    ) -> Result<usize> {
+        let header = OutHeader {
+            len: size_of::<OutHeader>() as u32,
+            error: -err
+                .raw_os_error()
+                .unwrap_or_else(|| encode_io_error_kind(err.kind())),
+            unique,
+        };
+
+        if explicit || err.raw_os_error().is_none() {
+            error!("fuse: reply error header {:?}, error {:?}", header, err);
+        } else {
+            trace!("fuse: reply error header {:?}, error {:?}", header, err);
+        }
+        w.write_all(header.as_slice())
+            .map_err(Error::EncodeMessage)?;
+
+        // Commit header if it is buffered otherwise kernel gets nothing back.
+        w.commit(None)
+            .map(|_| {
+                debug_assert_eq!(header.len as usize, w.bytes_written());
+                w.bytes_written()
+            })
+            .map_err(Error::EncodeMessage)
+    }
+
+    // reply operation error back to fuse client, don't print error message, as they are not server's
+    // internal error, and client could deal with them.
+    fn reply_error(err: io::Error, unique: u64, w: Writer<'_, S>) -> Result<usize> {
+        Self::do_reply_error(err, unique, w, false)
+    }
+
+    fn reply_error_explicit(err: io::Error, unique: u64, w: Writer<'_, S>) -> Result<usize> {
+        Self::do_reply_error(err, unique, w, true)
+    }
+
+    fn handle_attr_result(
+        in_header: &InHeader,
+        w: Writer<'_, S>,
+        result: io::Result<(libc::stat64, Duration)>,
+    ) -> Result<usize> {
+        match result {
+            Ok((st, timeout)) => {
+                let out = AttrOut {
+                    attr_valid: timeout.as_secs(),
+                    attr_valid_nsec: timeout.subsec_nanos(),
+                    dummy: 0,
+                    attr: st.into(),
+                };
+                Self::reply_ok(Some(out), None, in_header.unique, w)
+            }
+            Err(e) => Self::reply_error(e, in_header.unique, w),
+        }
+    }
+
+    fn add_dirent(
+        cursor: &mut Writer<'_, S>,
+        max: u32,
+        d: DirEntry,
+        entry: Option<Entry>,
+    ) -> io::Result<usize> {
+        if d.name.len() > ::std::u32::MAX as usize {
+            return Err(io::Error::from_raw_os_error(libc::EOVERFLOW));
         }
 
-        Ok(total_len)
+        let dirent_len = size_of::<Dirent>()
+            .checked_add(d.name.len())
+            .ok_or_else(|| io::Error::from_raw_os_error(libc::EOVERFLOW))?;
+
+        // Directory entries must be padded to 8-byte alignment.  If adding 7 causes
+        // an overflow then this dirent cannot be properly padded.
+        let padded_dirent_len = dirent_len
+            .checked_add(7)
+            .map(|l| l & !7)
+            .ok_or_else(|| io::Error::from_raw_os_error(libc::EOVERFLOW))?;
+
+        let total_len = if entry.is_some() {
+            padded_dirent_len
+                .checked_add(size_of::<EntryOut>())
+                .ok_or_else(|| io::Error::from_raw_os_error(libc::EOVERFLOW))?
+        } else {
+            padded_dirent_len
+        };
+
+        // Skip the entry if there's no enough space left.
+        if (max as usize).saturating_sub(cursor.bytes_written()) < total_len {
+            Ok(0)
+        } else {
+            if let Some(entry) = entry {
+                cursor.write_all(EntryOut::from(entry).as_slice())?;
+            }
+
+            let dirent = Dirent {
+                ino: d.ino,
+                off: d.offset,
+                namelen: d.name.len() as u32,
+                type_: d.type_,
+            };
+
+            cursor.write_all(dirent.as_slice())?;
+            cursor.write_all(d.name)?;
+
+            // We know that `dirent_len` <= `padded_dirent_len` due to the check above
+            // so there's no need for checked arithmetic.
+            let padding = padded_dirent_len - dirent_len;
+            if padding > 0 {
+                cursor.write_all(&DIRENT_PADDING[..padding])?;
+            }
+
+            Ok(total_len)
+        }
     }
 }

@@ -8,7 +8,7 @@ use crate::async_util::AsyncDrive;
 #[cfg(any(feature = "vhost-user-fs", feature = "virtiofs"))]
 use crate::transport::FsCacheReqHandler;
 
-impl<D: AsyncDrive> FileSystem for Vfs<D> {
+impl<D: AsyncDrive, S: BitmapSlice> FileSystem<S> for Vfs<D, S> {
     type Inode = VfsInode;
     type Handle = VfsHandle;
 
@@ -288,7 +288,7 @@ impl<D: AsyncDrive> FileSystem for Vfs<D> {
         ctx: Context,
         inode: VfsInode,
         handle: u64,
-        w: &mut dyn ZeroCopyWriter,
+        w: &mut dyn ZeroCopyWriter<S = S>,
         size: u32,
         offset: u64,
         lock_owner: Option<u64>,
@@ -309,7 +309,7 @@ impl<D: AsyncDrive> FileSystem for Vfs<D> {
         ctx: Context,
         inode: VfsInode,
         handle: u64,
-        r: &mut dyn ZeroCopyReader,
+        r: &mut dyn ZeroCopyReader<S = S>,
         size: u32,
         offset: u64,
         lock_owner: Option<u64>,

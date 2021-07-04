@@ -111,7 +111,7 @@ impl Drop for CapFsetid {
     }
 }
 
-impl<D: AsyncDrive> PassthroughFs<D> {
+impl<D: AsyncDrive, S: BitmapSlice + Send + Sync> PassthroughFs<D, S> {
     fn open_proc_file(&self, pathname: &CStr, flags: i32) -> io::Result<File> {
         Self::open_file(self.proc.as_raw_fd(), pathname, flags, 0)
     }
@@ -359,7 +359,7 @@ impl<D: AsyncDrive> PassthroughFs<D> {
     }
 }
 
-impl<D: AsyncDrive> FileSystem for PassthroughFs<D> {
+impl<D: AsyncDrive, S: BitmapSlice + Send + Sync> FileSystem<S> for PassthroughFs<D, S> {
     type Inode = Inode;
     type Handle = Handle;
 
@@ -675,7 +675,7 @@ impl<D: AsyncDrive> FileSystem for PassthroughFs<D> {
         _ctx: Context,
         inode: Inode,
         handle: Handle,
-        w: &mut dyn ZeroCopyWriter,
+        w: &mut dyn ZeroCopyWriter<S = S>,
         size: u32,
         offset: u64,
         _lock_owner: Option<u64>,
@@ -697,7 +697,7 @@ impl<D: AsyncDrive> FileSystem for PassthroughFs<D> {
         _ctx: Context,
         inode: Inode,
         handle: Handle,
-        r: &mut dyn ZeroCopyReader,
+        r: &mut dyn ZeroCopyReader<S = S>,
         size: u32,
         offset: u64,
         _lock_owner: Option<u64>,

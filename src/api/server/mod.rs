@@ -18,6 +18,7 @@
 
 use std::ffi::CStr;
 use std::io::{self, Read};
+use std::marker::PhantomData;
 use std::mem::size_of;
 use std::sync::Arc;
 
@@ -25,8 +26,9 @@ use arc_swap::ArcSwap;
 
 use super::filesystem::{FileSystem, ZeroCopyReader, ZeroCopyWriter};
 use crate::abi::linux_abi::*;
+use crate::async_util::{AsyncDrive, AsyncDriver};
 use crate::transport::{FileReadWriteVolatile, Reader, Writer};
-use crate::{bytes_to_cstr, Error, Result};
+use crate::{bytes_to_cstr, BitmapSlice, Error, Result};
 
 #[cfg(feature = "async-io")]
 mod async_io;
@@ -38,30 +40,36 @@ const MAX_REQ_PAGES: u16 = 256; // 1MB
 const DIRENT_PADDING: [u8; 8] = [0; 8];
 
 /// Fuse Server to handle requests from the Fuse client and vhost user master.
-pub struct Server<F: FileSystem + Sync> {
+pub struct Server<F: FileSystem<S> + Sync, D: AsyncDrive = AsyncDriver, S: BitmapSlice = ()> {
     fs: F,
     vers: ArcSwap<ServerVersion>,
+    phantom: PhantomData<D>,
+    phantom2: PhantomData<S>,
 }
 
-impl<F: FileSystem + Sync> Server<F> {
+impl<F: FileSystem<S> + Sync, D: AsyncDrive, S: BitmapSlice> Server<F, D, S> {
     /// Create a Server instance from a filesystem driver object.
-    pub fn new(fs: F) -> Server<F> {
+    pub fn new(fs: F) -> Server<F, D, S> {
         Server {
             fs,
             vers: ArcSwap::new(Arc::new(ServerVersion {
                 major: KERNEL_VERSION,
                 minor: KERNEL_MINOR_VERSION,
             })),
+            phantom: PhantomData,
+            phantom2: PhantomData,
         }
     }
 }
 
-struct ZcReader<'a>(Reader<'a>);
+struct ZcReader<'a, S: BitmapSlice = ()>(Reader<'a, S>);
 
-impl<'a> ZeroCopyReader for ZcReader<'a> {
+impl<'a, S: BitmapSlice> ZeroCopyReader for ZcReader<'a, S> {
+    type S = S;
+
     fn read_to(
         &mut self,
-        f: &mut dyn FileReadWriteVolatile,
+        f: &mut dyn FileReadWriteVolatile<S>,
         count: usize,
         off: u64,
     ) -> io::Result<usize> {
@@ -69,18 +77,20 @@ impl<'a> ZeroCopyReader for ZcReader<'a> {
     }
 }
 
-impl<'a> io::Read for ZcReader<'a> {
+impl<'a, S: BitmapSlice> io::Read for ZcReader<'a, S> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         self.0.read(buf)
     }
 }
 
-struct ZcWriter<'a>(Writer<'a>);
+struct ZcWriter<'a, S: BitmapSlice = ()>(Writer<'a, S>);
 
-impl<'a> ZeroCopyWriter for ZcWriter<'a> {
+impl<'a, S: BitmapSlice> ZeroCopyWriter for ZcWriter<'a, S> {
+    type S = S;
+
     fn write_from(
         &mut self,
-        f: &mut dyn FileReadWriteVolatile,
+        f: &mut dyn FileReadWriteVolatile<S>,
         count: usize,
         off: u64,
     ) -> io::Result<usize> {
@@ -88,7 +98,7 @@ impl<'a> ZeroCopyWriter for ZcWriter<'a> {
     }
 }
 
-impl<'a> io::Write for ZcWriter<'a> {
+impl<'a, S: BitmapSlice> io::Write for ZcWriter<'a, S> {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         self.0.write(buf)
     }
@@ -107,8 +117,8 @@ struct ServerVersion {
 struct ServerUtil();
 
 impl ServerUtil {
-    fn get_message_body(
-        r: &mut Reader,
+    fn get_message_body<S: BitmapSlice>(
+        r: &mut Reader<'_, S>,
         in_header: &InHeader,
         sub_hdr_sz: usize,
     ) -> Result<Vec<u8>> {

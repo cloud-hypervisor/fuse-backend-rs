@@ -11,12 +11,16 @@
 use std::cmp;
 use std::collections::VecDeque;
 #[cfg(feature = "async-io")]
+use std::io::IoSlice;
+#[cfg(all(feature = "async-io", feature = "virtiofs"))]
 use std::io::IoSliceMut;
 use std::io::{self, Read};
 use std::mem::{size_of, MaybeUninit};
 use std::ptr::copy_nonoverlapping;
 
 use vm_memory::{ByteValued, VolatileSlice};
+
+use crate::BitmapSlice;
 
 pub mod file_traits;
 pub use file_traits::{FileReadWriteVolatile, FileSetLen};
@@ -32,12 +36,12 @@ pub mod fusedev;
 pub use self::fusedev::{Error, FsCacheReqHandler, FuseBuf, FuseSession, Result, Writer};
 
 #[derive(Clone)]
-struct IoBuffers<'a> {
-    buffers: VecDeque<VolatileSlice<'a>>,
+struct IoBuffers<'a, S> {
+    buffers: VecDeque<VolatileSlice<'a, S>>,
     bytes_consumed: usize,
 }
 
-impl<'a> IoBuffers<'a> {
+impl<S: BitmapSlice> IoBuffers<'_, S> {
     fn available_bytes(&self) -> usize {
         // This is guaranteed not to overflow because the total length of the chain
         // is checked during all creations of `IoBuffers` (see
@@ -51,7 +55,7 @@ impl<'a> IoBuffers<'a> {
         self.bytes_consumed
     }
 
-    fn allocate_volatile_slice(&self, count: usize) -> Vec<VolatileSlice> {
+    fn allocate_volatile_slice(&self, count: usize) -> Vec<VolatileSlice<'_, S>> {
         let mut rem = count;
         let mut bufs = Vec::with_capacity(self.buffers.len());
 
@@ -64,7 +68,7 @@ impl<'a> IoBuffers<'a> {
             // more data is written out and causes data corruption.
             let local_buf = if buf.len() > rem {
                 // Safe because we just check rem < buf.len()
-                vm_memory_subslice(&buf, 0, rem).unwrap()
+                buf.subslice(0, rem).unwrap()
             } else {
                 buf
             };
@@ -78,7 +82,7 @@ impl<'a> IoBuffers<'a> {
     }
 
     #[cfg(feature = "async-io")]
-    fn allocate_io_slice(&self, count: usize) -> Vec<IoSliceMut> {
+    fn allocate_io_slice(&self, count: usize) -> Vec<IoSlice> {
         let mut rem = count;
         let mut bufs = Vec::with_capacity(self.buffers.len());
 
@@ -96,8 +100,8 @@ impl<'a> IoBuffers<'a> {
                 buf
             };
             // Safe because we just change the interface to access underlying buffers.
-            bufs.push(IoSliceMut::new(unsafe {
-                std::slice::from_raw_parts_mut(local_buf.as_ptr(), local_buf.len())
+            bufs.push(IoSlice::new(unsafe {
+                std::slice::from_raw_parts(local_buf.as_ptr(), local_buf.len())
             }));
 
             // Don't need check_sub() as we just made sure rem >= local_buf.len()
@@ -107,8 +111,7 @@ impl<'a> IoBuffers<'a> {
         bufs
     }
 
-    #[cfg(feature = "async-io")]
-    #[allow(dead_code)]
+    #[cfg(all(feature = "async-io", feature = "virtiofs"))]
     fn allocate_mut_io_slice(&self, count: usize) -> Vec<IoSliceMut> {
         let mut rem = count;
         let mut bufs = Vec::with_capacity(self.buffers.len());
@@ -136,6 +139,30 @@ impl<'a> IoBuffers<'a> {
         }
 
         bufs
+    }
+
+    #[cfg(all(feature = "async-io", feature = "virtiofs"))]
+    fn mark_dirty(&self, count: usize) {
+        let mut rem = count;
+
+        for &buf in &self.buffers {
+            if rem == 0 {
+                break;
+            }
+
+            // If buffer contains more data than `rem`, truncate buffer to `rem`, otherwise
+            // more data is written out and causes data corruption.
+            let local_buf = if buf.len() > rem {
+                // Safe because we just check rem < buf.len()
+                buf.subslice(0, rem).unwrap()
+            } else {
+                buf
+            };
+            local_buf.bitmap().mark_dirty(0, local_buf.len());
+
+            // Don't need check_sub() as we just made sure rem >= local_buf.len()
+            rem -= local_buf.len() as usize;
+        }
     }
 
     fn mark_used(&mut self, bytes_consumed: usize) -> io::Result<()> {
@@ -178,7 +205,7 @@ impl<'a> IoBuffers<'a> {
     /// the error is returned to the caller.
     fn consume<F>(&mut self, count: usize, f: F) -> io::Result<usize>
     where
-        F: FnOnce(&[VolatileSlice]) -> io::Result<usize>,
+        F: FnOnce(&[VolatileSlice<'_, S>]) -> io::Result<usize>,
     {
         let bufs = self.allocate_volatile_slice(count);
         if bufs.is_empty() {
@@ -190,7 +217,7 @@ impl<'a> IoBuffers<'a> {
         }
     }
 
-    fn split_at(&mut self, offset: usize) -> Result<IoBuffers<'a>> {
+    fn split_at(&mut self, offset: usize) -> Result<Self> {
         let mut rem = offset;
         let pos = self.buffers.iter().position(|buf| {
             if rem < buf.len() {
@@ -208,8 +235,8 @@ impl<'a> IoBuffers<'a> {
                 // There must be at least one element in `other` because we checked
                 // its `size` value in the call to `position` above.
                 let front = other.pop_front().expect("empty VecDeque after split");
-                let head = unsafe { VolatileSlice::new(front.as_ptr(), rem) };
-                self.buffers.push_back(head);
+                self.buffers
+                    .push_back(front.subslice(0, rem).map_err(Error::VolatileMemoryError)?);
                 other.push_front(front.offset(rem).map_err(Error::VolatileMemoryError)?);
             }
 
@@ -236,11 +263,11 @@ impl<'a> IoBuffers<'a> {
 /// Reader will skip iterating over descriptor chain when first writable
 /// descriptor is encountered.
 #[derive(Clone)]
-pub struct Reader<'a> {
-    buffers: IoBuffers<'a>,
+pub struct Reader<'a, S = ()> {
+    buffers: IoBuffers<'a, S>,
 }
 
-impl<'a> Reader<'a> {
+impl<S: BitmapSlice> Reader<'_, S> {
     /// Reads an object from the descriptor chain buffer.
     pub fn read_obj<T: ByteValued>(&mut self) -> io::Result<T> {
         let mut obj = MaybeUninit::<T>::uninit();
@@ -262,7 +289,7 @@ impl<'a> Reader<'a> {
     /// Returns the number of bytes read from the descriptor chain buffer.
     /// The number of bytes read can be less than `count` if there isn't
     /// enough data in the descriptor chain buffer.
-    pub fn read_to<F: FileReadWriteVolatile>(
+    pub fn read_to<F: FileReadWriteVolatile<S>>(
         &mut self,
         mut dst: F,
         count: usize,
@@ -275,7 +302,7 @@ impl<'a> Reader<'a> {
     /// Returns the number of bytes read from the descriptor chain buffer.
     /// The number of bytes read can be less than `count` if there isn't
     /// enough data in the descriptor chain buffer.
-    pub fn read_to_at<F: FileReadWriteVolatile>(
+    pub fn read_to_at<F: FileReadWriteVolatile<S>>(
         &mut self,
         mut dst: F,
         count: usize,
@@ -286,7 +313,7 @@ impl<'a> Reader<'a> {
     }
 
     /// Reads exactly size of data from the descriptor chain buffer into a file descriptor.
-    pub fn read_exact_to<F: FileReadWriteVolatile>(
+    pub fn read_exact_to<F: FileReadWriteVolatile<S>>(
         &mut self,
         mut dst: F,
         mut count: usize,
@@ -323,14 +350,14 @@ impl<'a> Reader<'a> {
     /// After the split, `self` will be able to read up to `offset` bytes while the returned
     /// `Reader` can read up to `available_bytes() - offset` bytes.  Returns an error if
     /// `offset > self.available_bytes()`.
-    pub fn split_at(&mut self, offset: usize) -> Result<Reader<'a>> {
+    pub fn split_at(&mut self, offset: usize) -> Result<Self> {
         self.buffers
             .split_at(offset)
             .map(|buffers| Reader { buffers })
     }
 }
 
-impl<'a> io::Read for Reader<'a> {
+impl<S: BitmapSlice> io::Read for Reader<'_, S> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         self.buffers.consume(buf.len(), |bufs| {
             let mut rem = buf;
