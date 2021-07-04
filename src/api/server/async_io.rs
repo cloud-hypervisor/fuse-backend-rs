@@ -19,16 +19,16 @@ use crate::api::filesystem::{
 use crate::api::CreateIn;
 use crate::async_util::AsyncDrive;
 use crate::transport::{FileReadWriteVolatile, FsCacheReqHandler, Reader, Writer};
-use crate::{bytes_to_cstr, encode_io_error_kind, Error, Result};
+use crate::{bytes_to_cstr, encode_io_error_kind, BitmapSlice, Error, Result};
 
-struct AsyncZcReader<'a>(Reader<'a>);
+struct AsyncZcReader<'a, S: BitmapSlice = ()>(Reader<'a, S>);
 
 // The underlying VolatileSlice contains "*mut u8", which is just a pointer to a u8 array.
 // So safe to send to other threads.
-unsafe impl<'a> Send for Reader<'a> {}
+unsafe impl<'a, S: BitmapSlice> Send for Reader<'a, S> {}
 
 #[async_trait]
-impl<'a, D: AsyncDrive> AsyncZeroCopyReader<D> for AsyncZcReader<'a> {
+impl<'a, D: AsyncDrive, S: BitmapSlice> AsyncZeroCopyReader<D, S> for AsyncZcReader<'a, S> {
     async fn async_read_to(
         &mut self,
         drive: D,
@@ -40,10 +40,12 @@ impl<'a, D: AsyncDrive> AsyncZeroCopyReader<D> for AsyncZcReader<'a> {
     }
 }
 
-impl<'a> ZeroCopyReader for AsyncZcReader<'a> {
+impl<'a, S: BitmapSlice> ZeroCopyReader for AsyncZcReader<'a, S> {
+    type S = S;
+
     fn read_to(
         &mut self,
-        f: &mut dyn FileReadWriteVolatile,
+        f: &mut dyn FileReadWriteVolatile<S>,
         count: usize,
         off: u64,
     ) -> io::Result<usize> {
@@ -51,20 +53,22 @@ impl<'a> ZeroCopyReader for AsyncZcReader<'a> {
     }
 }
 
-impl<'a> io::Read for AsyncZcReader<'a> {
+impl<'a, S: BitmapSlice> io::Read for AsyncZcReader<'a, S> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         self.0.read(buf)
     }
 }
 
-struct AsyncZcWriter<'a>(Writer<'a>);
+struct AsyncZcWriter<'a, S: BitmapSlice = ()>(Writer<'a, S>);
 
 // The underlying VolatileSlice contains "*mut u8", which is just a pointer to a u8 array.
 // So safe to send to other threads.
-unsafe impl<'a> Send for Writer<'a> {}
+unsafe impl<'a, S: BitmapSlice> Send for Writer<'a, S> {}
 
 #[async_trait]
-impl<'a, D: AsyncDrive + 'static> AsyncZeroCopyWriter<D> for AsyncZcWriter<'a> {
+impl<'a, D: AsyncDrive + 'static, S: BitmapSlice> AsyncZeroCopyWriter<D, S>
+    for AsyncZcWriter<'a, S>
+{
     async fn async_write_from(
         &mut self,
         drive: D,
@@ -78,10 +82,12 @@ impl<'a, D: AsyncDrive + 'static> AsyncZeroCopyWriter<D> for AsyncZcWriter<'a> {
     }
 }
 
-impl<'a> ZeroCopyWriter for AsyncZcWriter<'a> {
+impl<'a, S: BitmapSlice> ZeroCopyWriter for AsyncZcWriter<'a, S> {
+    type S = S;
+
     fn write_from(
         &mut self,
-        f: &mut dyn FileReadWriteVolatile,
+        f: &mut dyn FileReadWriteVolatile<S>,
         count: usize,
         off: u64,
     ) -> io::Result<usize> {
@@ -89,7 +95,7 @@ impl<'a> ZeroCopyWriter for AsyncZcWriter<'a> {
     }
 }
 
-impl<'a> io::Write for AsyncZcWriter<'a> {
+impl<'a, S: BitmapSlice> io::Write for AsyncZcWriter<'a, S> {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         self.0.write(buf)
     }
@@ -99,7 +105,7 @@ impl<'a> io::Write for AsyncZcWriter<'a> {
     }
 }
 
-impl<F: AsyncFileSystem + Sync> Server<F> {
+impl<F: AsyncFileSystem<D, S> + Sync, D: AsyncDrive, S: BitmapSlice> Server<F, D, S> {
     /// Main entrance to handle requests from the transport layer.
     ///
     /// It receives Fuse requests from transport layers, parses the request according to Fuse ABI,
@@ -113,11 +119,11 @@ impl<F: AsyncFileSystem + Sync> Server<F> {
     /// on the invariant.
     #[allow(unused_variables)]
     #[allow(clippy::cognitive_complexity)]
-    pub async unsafe fn async_handle_message<D: AsyncDrive>(
+    pub async unsafe fn async_handle_message(
         &self,
         drive: D,
-        mut r: Reader<'_>,
-        w: Writer<'_>,
+        mut r: Reader<'_, S>,
+        w: Writer<'_, S>,
         vu_req: Option<&mut dyn FsCacheReqHandler>,
     ) -> Result<usize> {
         let in_header = r.read_obj().map_err(Error::DecodeMessage)?;
@@ -199,11 +205,11 @@ impl<F: AsyncFileSystem + Sync> Server<F> {
         }
     }
 
-    async fn async_lookup<D: AsyncDrive>(
+    async fn async_lookup(
         &self,
-        mut r: Reader<'_>,
-        w: Writer<'_>,
-        ctx: AsyncContext<D, F>,
+        mut r: Reader<'_, S>,
+        w: Writer<'_, S>,
+        ctx: AsyncContext<F, D, S>,
     ) -> Result<usize> {
         let buf = ServerUtil::get_message_body(&mut r, &ctx.in_header, 0)?;
         let name = bytes_to_cstr(buf.as_ref())?;
@@ -232,11 +238,11 @@ impl<F: AsyncFileSystem + Sync> Server<F> {
         }
     }
 
-    async fn async_getattr<D: AsyncDrive>(
+    async fn async_getattr(
         &self,
-        mut r: Reader<'_>,
-        w: Writer<'_>,
-        ctx: AsyncContext<D, F>,
+        mut r: Reader<'_, S>,
+        w: Writer<'_, S>,
+        ctx: AsyncContext<F, D, S>,
     ) -> Result<usize> {
         let GetattrIn { flags, fh, .. } = r.read_obj().map_err(Error::DecodeMessage)?;
         let handle = if (flags & GETATTR_FH) != 0 {
@@ -252,11 +258,11 @@ impl<F: AsyncFileSystem + Sync> Server<F> {
         ctx.handle_attr_result(w, result).await
     }
 
-    async fn async_setattr<D: AsyncDrive>(
+    async fn async_setattr(
         &self,
-        mut r: Reader<'_>,
-        w: Writer<'_>,
-        ctx: AsyncContext<D, F>,
+        mut r: Reader<'_, S>,
+        w: Writer<'_, S>,
+        ctx: AsyncContext<F, D, S>,
     ) -> Result<usize> {
         let setattr_in: SetattrIn = r.read_obj().map_err(Error::DecodeMessage)?;
         let handle = if setattr_in.valid & FATTR_FH != 0 {
@@ -274,11 +280,11 @@ impl<F: AsyncFileSystem + Sync> Server<F> {
         ctx.handle_attr_result(w, result).await
     }
 
-    async fn async_open<D: AsyncDrive>(
+    async fn async_open(
         &self,
-        mut r: Reader<'_>,
-        w: Writer<'_>,
-        ctx: AsyncContext<D, F>,
+        mut r: Reader<'_, S>,
+        w: Writer<'_, S>,
+        ctx: AsyncContext<F, D, S>,
     ) -> Result<usize> {
         let OpenIn { flags, fuse_flags } = r.read_obj().map_err(Error::DecodeMessage)?;
         let result = self
@@ -299,11 +305,11 @@ impl<F: AsyncFileSystem + Sync> Server<F> {
         }
     }
 
-    async fn async_read<D: AsyncDrive>(
+    async fn async_read(
         &self,
-        mut r: Reader<'_>,
-        mut w: Writer<'_>,
-        ctx: AsyncContext<D, F>,
+        mut r: Reader<'_, S>,
+        mut w: Writer<'_, S>,
+        ctx: AsyncContext<F, D, S>,
     ) -> Result<usize> {
         let ReadIn {
             fh,
@@ -369,11 +375,11 @@ impl<F: AsyncFileSystem + Sync> Server<F> {
         }
     }
 
-    async fn async_write<D: AsyncDrive>(
+    async fn async_write(
         &self,
-        mut r: Reader<'_>,
-        w: Writer<'_>,
-        ctx: AsyncContext<D, F>,
+        mut r: Reader<'_, S>,
+        w: Writer<'_, S>,
+        ctx: AsyncContext<F, D, S>,
     ) -> Result<usize> {
         let WriteIn {
             fh,
@@ -427,11 +433,11 @@ impl<F: AsyncFileSystem + Sync> Server<F> {
         }
     }
 
-    async fn async_fsync<D: AsyncDrive>(
+    async fn async_fsync(
         &self,
-        mut r: Reader<'_>,
-        w: Writer<'_>,
-        ctx: AsyncContext<D, F>,
+        mut r: Reader<'_, S>,
+        w: Writer<'_, S>,
+        ctx: AsyncContext<F, D, S>,
     ) -> Result<usize> {
         let FsyncIn {
             fh, fsync_flags, ..
@@ -448,11 +454,11 @@ impl<F: AsyncFileSystem + Sync> Server<F> {
         }
     }
 
-    async fn async_fsyncdir<D: AsyncDrive>(
+    async fn async_fsyncdir(
         &self,
-        mut r: Reader<'_>,
-        w: Writer<'_>,
-        ctx: AsyncContext<D, F>,
+        mut r: Reader<'_, S>,
+        w: Writer<'_, S>,
+        ctx: AsyncContext<F, D, S>,
     ) -> Result<usize> {
         let FsyncIn {
             fh, fsync_flags, ..
@@ -469,11 +475,11 @@ impl<F: AsyncFileSystem + Sync> Server<F> {
         }
     }
 
-    async fn async_create<D: AsyncDrive>(
+    async fn async_create(
         &self,
-        mut r: Reader<'_>,
-        w: Writer<'_>,
-        ctx: AsyncContext<D, F>,
+        mut r: Reader<'_, S>,
+        w: Writer<'_, S>,
+        ctx: AsyncContext<F, D, S>,
     ) -> Result<usize> {
         let args: CreateIn = r.read_obj().map_err(Error::DecodeMessage)?;
         let buf = ServerUtil::get_message_body(&mut r, &ctx.in_header, size_of::<CreateIn>())?;
@@ -508,11 +514,11 @@ impl<F: AsyncFileSystem + Sync> Server<F> {
         }
     }
 
-    async fn async_fallocate<D: AsyncDrive>(
+    async fn async_fallocate(
         &self,
-        mut r: Reader<'_>,
-        w: Writer<'_>,
-        ctx: AsyncContext<D, F>,
+        mut r: Reader<'_, S>,
+        w: Writer<'_, S>,
+        ctx: AsyncContext<F, D, S>,
     ) -> Result<usize> {
         let FallocateIn {
             fh,
@@ -533,18 +539,20 @@ impl<F: AsyncFileSystem + Sync> Server<F> {
     }
 }
 
-struct AsyncContext<D, F> {
+struct AsyncContext<F, D, S> {
     drive: D,
     in_header: InHeader,
     phantom: PhantomData<F>,
+    phantom2: PhantomData<S>,
 }
 
-impl<D: AsyncDrive, F: AsyncFileSystem> AsyncContext<D, F> {
+impl<F: AsyncFileSystem<D, S>, D: AsyncDrive, S: BitmapSlice> AsyncContext<F, D, S> {
     fn new(in_header: InHeader, drive: D) -> Self {
         AsyncContext {
             drive,
             in_header,
             phantom: PhantomData,
+            phantom2: PhantomData,
         }
     }
 
@@ -573,7 +581,7 @@ impl<D: AsyncDrive, F: AsyncFileSystem> AsyncContext<D, F> {
         &self,
         out: Option<T>,
         data: Option<&[u8]>,
-        mut w: Writer<'_>,
+        mut w: Writer<'_, S>,
     ) -> Result<usize> {
         let data2 = out.as_ref().map(|v| v.as_slice()).unwrap_or(&[]);
         let data3 = data.unwrap_or(&[]);
@@ -603,7 +611,7 @@ impl<D: AsyncDrive, F: AsyncFileSystem> AsyncContext<D, F> {
     async fn do_reply_error(
         &self,
         err: io::Error,
-        mut w: Writer<'_>,
+        mut w: Writer<'_, S>,
         internal_err: bool,
     ) -> Result<usize> {
         let header = OutHeader {
@@ -634,13 +642,13 @@ impl<D: AsyncDrive, F: AsyncFileSystem> AsyncContext<D, F> {
 
     // reply operation error back to fuse client, don't print error message, as they are not
     // server's internal error, and client could deal with them.
-    async fn reply_error(&self, err: io::Error, w: Writer<'_>) -> Result<usize> {
+    async fn reply_error(&self, err: io::Error, w: Writer<'_, S>) -> Result<usize> {
         self.do_reply_error(err, w, false).await
     }
 
     async fn handle_attr_result(
         &self,
-        w: Writer<'_>,
+        w: Writer<'_, S>,
         result: io::Result<(libc::stat64, Duration)>,
     ) -> Result<usize> {
         match result {

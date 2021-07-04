@@ -15,7 +15,9 @@ use crate::async_util::{AsyncDrive, AsyncUtil};
 
 //use crate::passthrough::sync_io::set_creds;
 
-impl<D: AsyncDrive + Sync> BackendFileSystem for PassthroughFs<D> {
+impl<D: AsyncDrive + Sync, S: 'static + BitmapSlice + Send + Sync> BackendFileSystem<D, S>
+    for PassthroughFs<D, S>
+{
     fn mount(&self) -> io::Result<(Entry, u64)> {
         let entry = self.do_lookup(fuse::ROOT_ID, &CString::new(".").unwrap())?;
         Ok((entry, VFS_MAX_INO))
@@ -26,7 +28,7 @@ impl<D: AsyncDrive + Sync> BackendFileSystem for PassthroughFs<D> {
     }
 }
 
-impl<D: AsyncDrive> PassthroughFs<D> {
+impl<D: AsyncDrive, S: BitmapSlice + Send + Sync> PassthroughFs<D, S> {
     async fn async_open_file(
         ctx: &Context,
         dfd: i32,
@@ -181,13 +183,13 @@ impl<D: AsyncDrive> PassthroughFs<D> {
 
 #[async_trait]
 #[allow(unused_variables)]
-impl<D: AsyncDrive + Sync> AsyncFileSystem for PassthroughFs<D> {
-    type D = D;
-
+impl<D: AsyncDrive + Sync, S: BitmapSlice + Send + Sync> AsyncFileSystem<D, S>
+    for PassthroughFs<D, S>
+{
     async fn async_lookup(
         &self,
         ctx: Context,
-        parent: <Self as FileSystem>::Inode,
+        parent: <Self as FileSystem<S>>::Inode,
         name: &CStr,
     ) -> io::Result<Entry> {
         let p = self.inode_map.get(parent)?;
@@ -263,8 +265,8 @@ impl<D: AsyncDrive + Sync> AsyncFileSystem for PassthroughFs<D> {
     async fn async_getattr(
         &self,
         ctx: Context,
-        inode: <Self as FileSystem>::Inode,
-        handle: Option<<Self as FileSystem>::Handle>,
+        inode: <Self as FileSystem<S>>::Inode,
+        handle: Option<<Self as FileSystem<S>>::Handle>,
     ) -> io::Result<(libc::stat64, Duration)> {
         self.async_do_getattr(inode).await
     }
@@ -272,9 +274,9 @@ impl<D: AsyncDrive + Sync> AsyncFileSystem for PassthroughFs<D> {
     async fn async_setattr(
         &self,
         ctx: Context,
-        inode: <Self as FileSystem>::Inode,
+        inode: <Self as FileSystem<S>>::Inode,
         attr: libc::stat64,
-        handle: Option<<Self as FileSystem>::Handle>,
+        handle: Option<<Self as FileSystem<S>>::Handle>,
         valid: SetattrValid,
     ) -> io::Result<(libc::stat64, Duration)> {
         let inode_data = self.inode_map.get(inode)?;
@@ -409,10 +411,10 @@ impl<D: AsyncDrive + Sync> AsyncFileSystem for PassthroughFs<D> {
     async fn async_open(
         &self,
         ctx: Context,
-        inode: <Self as FileSystem>::Inode,
+        inode: <Self as FileSystem<S>>::Inode,
         flags: u32,
         fuse_flags: u32,
-    ) -> io::Result<(Option<<Self as FileSystem>::Handle>, OpenOptions)> {
+    ) -> io::Result<(Option<<Self as FileSystem<S>>::Handle>, OpenOptions)> {
         if self.no_open.load(Ordering::Relaxed) {
             info!("fuse: open is not supported.");
             Err(io::Error::from_raw_os_error(libc::ENOSYS))
@@ -424,10 +426,10 @@ impl<D: AsyncDrive + Sync> AsyncFileSystem for PassthroughFs<D> {
     async fn async_create(
         &self,
         ctx: Context,
-        parent: <Self as FileSystem>::Inode,
+        parent: <Self as FileSystem<S>>::Inode,
         name: &CStr,
         args: CreateIn,
-    ) -> io::Result<(Entry, Option<<Self as FileSystem>::Handle>, OpenOptions)> {
+    ) -> io::Result<(Entry, Option<<Self as FileSystem<S>>::Handle>, OpenOptions)> {
         unimplemented!()
         // let (_uid, _gid) = set_creds(ctx.uid, ctx.gid)?;
         // let data = self.inode_map.get(parent)?;
@@ -470,9 +472,9 @@ impl<D: AsyncDrive + Sync> AsyncFileSystem for PassthroughFs<D> {
     async fn async_read(
         &self,
         ctx: Context,
-        inode: <Self as FileSystem>::Inode,
-        handle: <Self as FileSystem>::Handle,
-        w: &mut (dyn AsyncZeroCopyWriter<D> + Send),
+        inode: <Self as FileSystem<S>>::Inode,
+        handle: <Self as FileSystem<S>>::Handle,
+        w: &mut (dyn AsyncZeroCopyWriter<D, S> + Send),
         size: u32,
         offset: u64,
         _lock_owner: Option<u64>,
@@ -493,9 +495,9 @@ impl<D: AsyncDrive + Sync> AsyncFileSystem for PassthroughFs<D> {
     async fn async_write(
         &self,
         ctx: Context,
-        inode: <Self as FileSystem>::Inode,
-        handle: <Self as FileSystem>::Handle,
-        r: &mut (dyn AsyncZeroCopyReader<D> + Send),
+        inode: <Self as FileSystem<S>>::Inode,
+        handle: <Self as FileSystem<S>>::Handle,
+        r: &mut (dyn AsyncZeroCopyReader<D, S> + Send),
         size: u32,
         offset: u64,
         _lock_owner: Option<u64>,
@@ -518,9 +520,9 @@ impl<D: AsyncDrive + Sync> AsyncFileSystem for PassthroughFs<D> {
     async fn async_fsync(
         &self,
         ctx: Context,
-        inode: <Self as FileSystem>::Inode,
+        inode: <Self as FileSystem<S>>::Inode,
         datasync: bool,
-        handle: <Self as FileSystem>::Handle,
+        handle: <Self as FileSystem<S>>::Handle,
     ) -> io::Result<()> {
         let data = self
             .async_get_data(&ctx, handle, inode, libc::O_RDONLY)
@@ -536,8 +538,8 @@ impl<D: AsyncDrive + Sync> AsyncFileSystem for PassthroughFs<D> {
     async fn async_fallocate(
         &self,
         ctx: Context,
-        inode: <Self as FileSystem>::Inode,
-        handle: <Self as FileSystem>::Handle,
+        inode: <Self as FileSystem<S>>::Inode,
+        handle: <Self as FileSystem<S>>::Handle,
         mode: u32,
         offset: u64,
         length: u64,
@@ -557,9 +559,9 @@ impl<D: AsyncDrive + Sync> AsyncFileSystem for PassthroughFs<D> {
     async fn async_fsyncdir(
         &self,
         ctx: Context,
-        inode: <Self as FileSystem>::Inode,
+        inode: <Self as FileSystem<S>>::Inode,
         datasync: bool,
-        handle: <Self as FileSystem>::Handle,
+        handle: <Self as FileSystem<S>>::Handle,
     ) -> io::Result<()> {
         self.async_fsync(ctx, inode, datasync, handle).await
     }

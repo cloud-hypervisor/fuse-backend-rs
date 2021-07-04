@@ -12,15 +12,17 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 
-use super::{Context, Entry, FileSystem, ZeroCopyReader, ZeroCopyWriter};
+use super::{BitmapSlice, Context, Entry, FileSystem, ZeroCopyReader, ZeroCopyWriter};
 use crate::abi::linux_abi::{OpenOptions, SetattrValid};
 use crate::api::CreateIn;
-use crate::async_util::AsyncDrive;
+use crate::async_util::{AsyncDrive, AsyncDriver};
 
 /// A trait for directly copying data from the fuse transport into a `File` without first storing it
 /// in an intermediate buffer in asynchronous mode.
 #[async_trait]
-pub trait AsyncZeroCopyReader<D: AsyncDrive>: ZeroCopyReader {
+pub trait AsyncZeroCopyReader<D: AsyncDrive = AsyncDriver, S: BitmapSlice = ()>:
+    ZeroCopyReader<S = S>
+{
     /// Copies at most `count` bytes from `self` directly into `f` at offset `off` without storing
     /// it in any intermediate buffers. If the return value is `Ok(n)` then it must be guaranteed
     /// that `0 <= n <= count`. If `n` is `0`, then it can indicate one of 3 possibilities:
@@ -46,7 +48,9 @@ pub trait AsyncZeroCopyReader<D: AsyncDrive>: ZeroCopyReader {
 /// A trait for directly copying data from a `RawFd` into the fuse transport without first storing
 /// it in an intermediate buffer in asynchronous mode.
 #[async_trait]
-pub trait AsyncZeroCopyWriter<D: AsyncDrive>: ZeroCopyWriter {
+pub trait AsyncZeroCopyWriter<D: AsyncDrive = AsyncDriver, S: BitmapSlice = ()>:
+    ZeroCopyWriter<S = S>
+{
     /// Copies at most `count` bytes from `f` at offset `off` directly into `self` without storing
     /// it in any intermediate buffers. If the return value is `Ok(n)` then it must be guaranteed
     /// that `0 <= n <= count`. If `n` is `0`, then it can indicate one of 3 possibilities:
@@ -72,10 +76,7 @@ pub trait AsyncZeroCopyWriter<D: AsyncDrive>: ZeroCopyWriter {
 /// The main trait that connects a file system with a transport.
 #[allow(unused_variables)]
 #[async_trait]
-pub trait AsyncFileSystem: FileSystem {
-    /// Type of asynchronous event driver.
-    type D: AsyncDrive;
-
+pub trait AsyncFileSystem<D: AsyncDrive = AsyncDriver, S: BitmapSlice = ()>: FileSystem<S> {
     /// Look up a directory entry by name and get its attributes.
     ///
     /// If this call is successful then the lookup count of the `Inode` associated with the returned
@@ -365,7 +366,7 @@ pub trait AsyncFileSystem: FileSystem {
         ctx: Context,
         inode: Self::Inode,
         handle: Self::Handle,
-        w: &mut (dyn AsyncZeroCopyWriter<Self::D> + Send),
+        w: &mut (dyn AsyncZeroCopyWriter<D, S> + Send),
         size: u32,
         offset: u64,
         lock_owner: Option<u64>,
@@ -397,7 +398,7 @@ pub trait AsyncFileSystem: FileSystem {
         ctx: Context,
         inode: Self::Inode,
         handle: Self::Handle,
-        r: &mut (dyn AsyncZeroCopyReader<Self::D> + Send),
+        r: &mut (dyn AsyncZeroCopyReader<D, S> + Send),
         size: u32,
         offset: u64,
         lock_owner: Option<u64>,
@@ -848,9 +849,7 @@ type OpenFuture<'async_trait, H> =
 type CreateFuture<'async_trait, H> =
     Box<dyn Future<Output = io::Result<(Entry, Option<H>, OpenOptions)>> + Send + 'async_trait>;
 
-impl<FS: AsyncFileSystem> AsyncFileSystem for Arc<FS> {
-    type D = <FS as AsyncFileSystem>::D;
-
+impl<FS: AsyncFileSystem<D, S>, D: AsyncDrive, S: BitmapSlice> AsyncFileSystem<D, S> for Arc<FS> {
     fn async_lookup<'a, 'b, 'async_trait>(
         &'a self,
         ctx: Context,
@@ -927,7 +926,7 @@ impl<FS: AsyncFileSystem> AsyncFileSystem for Arc<FS> {
         ctx: Context,
         inode: Self::Inode,
         handle: Self::Handle,
-        w: &'b mut (dyn AsyncZeroCopyWriter<<FS as AsyncFileSystem>::D> + Send),
+        w: &'b mut (dyn AsyncZeroCopyWriter<D, S> + Send),
         size: u32,
         offset: u64,
         lock_owner: Option<u64>,
@@ -947,7 +946,7 @@ impl<FS: AsyncFileSystem> AsyncFileSystem for Arc<FS> {
         ctx: Context,
         inode: Self::Inode,
         handle: Self::Handle,
-        r: &'b mut (dyn AsyncZeroCopyReader<<FS as AsyncFileSystem>::D> + Send),
+        r: &'b mut (dyn AsyncZeroCopyReader<D, S> + Send),
         size: u32,
         offset: u64,
         lock_owner: Option<u64>,

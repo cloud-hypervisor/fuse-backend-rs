@@ -30,7 +30,8 @@ use arc_swap::ArcSwap;
 use super::pseudo_fs::PseudoFs;
 use crate::abi::linux_abi::*;
 use crate::api::filesystem::*;
-use crate::async_util::AsyncDrive;
+use crate::async_util::{AsyncDrive, AsyncDriver};
+use crate::BitmapSlice;
 
 #[cfg(feature = "async-io")]
 mod async_io;
@@ -45,7 +46,8 @@ pub const VFS_MAX_INO: u64 = 0xff_ffff_ffff_ffff;
 const VFS_INDEX_SHIFT: u8 = 56;
 const VFS_PSEUDO_FS_IDX: VfsIndex = 0;
 
-type ArcBackFs<DR> = Arc<BackFileSystem<DR>>;
+type ArcBackFs<DR, S> = Arc<BackFileSystem<DR, S>>;
+type VfsEitherFs<'a, D, S> = Either<&'a PseudoFs<S>, ArcBackFs<D, S>>;
 
 type VfsHandle = u64;
 /// Vfs backend file system index
@@ -119,15 +121,12 @@ use Either::*;
 
 /// Type that implements BackendFileSystem and Sync and Send
 /// D refers to the type of asynchronous event driver
-pub type BackFileSystem<D> =
-    Box<dyn BackendFileSystem<Inode = u64, Handle = u64, D = D> + Sync + Send>;
+pub type BackFileSystem<D, S> =
+    Box<dyn BackendFileSystem<D, S, Inode = u64, Handle = u64> + Sync + Send>;
 
 #[cfg(not(feature = "async-io"))]
 /// BackendFileSystem abstracts all backend file systems under vfs
-pub trait BackendFileSystem: FileSystem {
-    /// placeholder for async driver
-    type D;
-
+pub trait BackendFileSystem<D: AsyncDrive, S: BitmapSlice = ()>: FileSystem<S> {
     /// mount returns the backend file system root inode entry and
     /// the largest inode number it has.
     fn mount(&self) -> Result<(Entry, u64)> {
@@ -142,7 +141,9 @@ pub trait BackendFileSystem: FileSystem {
 
 #[cfg(feature = "async-io")]
 /// BackendFileSystem abstracts all backend file systems under vfs
-pub trait BackendFileSystem: AsyncFileSystem {
+pub trait BackendFileSystem<D: AsyncDrive = AsyncDriver, S: BitmapSlice = ()>:
+    AsyncFileSystem<D, S>
+{
     /// mount returns the backend file system root inode entry and
     /// the largest inode number it has.
     fn mount(&self) -> Result<(Entry, u64)> {
@@ -210,26 +211,27 @@ impl Default for VfsOptions {
 }
 
 /// A union fs that combines multiple backend file systems.
-pub struct Vfs<D> {
+pub struct Vfs<D: AsyncDrive = AsyncDriver, S: BitmapSlice = ()> {
     next_super: AtomicU8,
-    root: PseudoFs,
+    root: PseudoFs<S>,
     // mountpoints maps from pseudo fs inode to mounted fs mountpoint data
     mountpoints: ArcSwap<HashMap<u64, Arc<MountPointData>>>,
     // superblocks keeps track of all mounted file systems
-    superblocks: ArcSwap<HashMap<VfsIndex, Arc<BackFileSystem<D>>>>,
+    superblocks: ArcSwap<HashMap<VfsIndex, Arc<BackFileSystem<D, S>>>>,
     opts: ArcSwap<VfsOptions>,
     initialized: AtomicBool,
     lock: Mutex<()>,
     phantom: PhantomData<D>,
+    phantom2: PhantomData<S>,
 }
 
-impl<D: AsyncDrive> Default for Vfs<D> {
+impl<D: AsyncDrive, S: BitmapSlice> Default for Vfs<D, S> {
     fn default() -> Self {
         Self::new(VfsOptions::default())
     }
 }
 
-impl<D: AsyncDrive> Vfs<D> {
+impl<D: AsyncDrive, S: BitmapSlice> Vfs<D, S> {
     /// Create a new vfs instance
     pub fn new(opts: VfsOptions) -> Self {
         Vfs {
@@ -241,6 +243,7 @@ impl<D: AsyncDrive> Vfs<D> {
             lock: Mutex::new(()),
             initialized: AtomicBool::new(false),
             phantom: PhantomData,
+            phantom2: PhantomData,
         }
     }
 
@@ -252,7 +255,7 @@ impl<D: AsyncDrive> Vfs<D> {
 
     fn insert_mount_locked(
         &self,
-        fs: BackFileSystem<D>,
+        fs: BackFileSystem<D, S>,
         mut entry: Entry,
         fs_idx: VfsIndex,
         path: &str,
@@ -289,7 +292,7 @@ impl<D: AsyncDrive> Vfs<D> {
     }
 
     /// Mount a backend file system to path
-    pub fn mount(&self, fs: BackFileSystem<D>, path: &str) -> VfsResult<VfsIndex> {
+    pub fn mount(&self, fs: BackFileSystem<D, S>, path: &str) -> VfsResult<VfsIndex> {
         let (entry, ino) = fs.mount().map_err(VfsError::Mount)?;
         if ino > VFS_MAX_INO {
             fs.destroy();
@@ -351,7 +354,7 @@ impl<D: AsyncDrive> Vfs<D> {
     }
 
     /// Get the mounted backend file system alongside the path if there's one.
-    pub fn get_rootfs(&self, path: &str) -> VfsResult<Option<Arc<BackFileSystem<D>>>> {
+    pub fn get_rootfs(&self, path: &str) -> VfsResult<Option<Arc<BackFileSystem<D, S>>>> {
         // Serialize mount operations. Do not expect poisoned lock here.
         let _guard = self.lock.lock().unwrap();
         let inode = match self.root.path_walk(path).map_err(VfsError::PathWalk)? {
@@ -432,7 +435,7 @@ impl<D: AsyncDrive> Vfs<D> {
         ))
     }
 
-    fn get_fs_by_idx(&self, fs_idx: VfsIndex) -> Result<Arc<BackFileSystem<D>>> {
+    fn get_fs_by_idx(&self, fs_idx: VfsIndex) -> Result<Arc<BackFileSystem<D, S>>> {
         self.superblocks
             .load()
             .get(&fs_idx)
@@ -440,10 +443,7 @@ impl<D: AsyncDrive> Vfs<D> {
             .ok_or_else(|| Error::from_raw_os_error(libc::ENOENT))
     }
 
-    fn get_real_rootfs(
-        &self,
-        inode: VfsInode,
-    ) -> Result<(Either<&PseudoFs, ArcBackFs<D>>, VfsInode)> {
+    fn get_real_rootfs(&self, inode: VfsInode) -> Result<(VfsEitherFs<'_, D, S>, VfsInode)> {
         // ROOT_ID is special, we need to check if we have a mountpoint on the vfs root
         if inode.is_pseudo_fs() && inode.ino() == ROOT_ID {
             if let Some(mnt) = self.mountpoints.load().get(&inode.ino()).map(Arc::clone) {
@@ -462,7 +462,7 @@ impl<D: AsyncDrive> Vfs<D> {
 
     fn lookup_pseudo(
         &self,
-        fs: &PseudoFs,
+        fs: &PseudoFs<S>,
         idata: VfsInode,
         ctx: Context,
         name: &CStr,
@@ -520,15 +520,19 @@ mod tests {
     #[allow(unused_variables)]
     #[async_trait]
     impl AsyncFileSystem for FakeFileSystemOne {
-        type D = AsyncDriver;
-
         async fn async_lookup(
             &self,
             ctx: Context,
             parent: <Self as FileSystem>::Inode,
             name: &CStr,
         ) -> Result<Entry> {
-            unimplemented!()
+            Ok(Entry {
+                inode: 0,
+                generation: 0,
+                attr: unsafe { std::mem::zeroed() },
+                attr_timeout: Default::default(),
+                entry_timeout: Default::default(),
+            })
         }
 
         async fn async_getattr(
@@ -556,6 +560,7 @@ mod tests {
             ctx: Context,
             inode: <Self as FileSystem>::Inode,
             flags: u32,
+            fuse_flags: u32,
         ) -> Result<(Option<<Self as FileSystem>::Handle>, OpenOptions)> {
             unimplemented!()
         }
@@ -565,9 +570,7 @@ mod tests {
             ctx: Context,
             parent: <Self as FileSystem>::Inode,
             name: &CStr,
-            mode: u32,
-            flags: u32,
-            umask: u32,
+            args: CreateIn,
         ) -> Result<(Entry, Option<<Self as FileSystem>::Handle>, OpenOptions)> {
             unimplemented!()
         }
@@ -577,7 +580,7 @@ mod tests {
             ctx: Context,
             inode: <Self as FileSystem>::Inode,
             handle: <Self as FileSystem>::Handle,
-            w: &mut (dyn AsyncZeroCopyWriter<Self::D> + Send),
+            w: &mut (dyn AsyncZeroCopyWriter + Send),
             size: u32,
             offset: u64,
             lock_owner: Option<u64>,
@@ -591,12 +594,13 @@ mod tests {
             ctx: Context,
             inode: <Self as FileSystem>::Inode,
             handle: <Self as FileSystem>::Handle,
-            r: &mut (dyn AsyncZeroCopyReader<Self::D> + Send),
+            r: &mut (dyn AsyncZeroCopyReader + Send),
             size: u32,
             offset: u64,
             lock_owner: Option<u64>,
             delayed_write: bool,
             flags: u32,
+            fuse_flags: u32,
         ) -> Result<usize> {
             unimplemented!()
         }
@@ -655,9 +659,7 @@ mod tests {
     }
 
     #[cfg(not(feature = "async-io"))]
-    impl BackendFileSystem for FakeFileSystemOne {
-        type D = AsyncDriver;
-
+    impl BackendFileSystem<AsyncDriver, ()> for FakeFileSystemOne {
         fn mount(&self) -> Result<(Entry, u64)> {
             Ok((
                 Entry {
@@ -695,8 +697,6 @@ mod tests {
     #[allow(unused_variables)]
     #[async_trait]
     impl AsyncFileSystem for FakeFileSystemTwo {
-        type D = AsyncDriver;
-
         async fn async_lookup(
             &self,
             ctx: Context,
@@ -731,6 +731,7 @@ mod tests {
             ctx: Context,
             inode: <Self as FileSystem>::Inode,
             flags: u32,
+            fuse_flags: u32,
         ) -> Result<(Option<<Self as FileSystem>::Handle>, OpenOptions)> {
             unimplemented!()
         }
@@ -740,9 +741,7 @@ mod tests {
             ctx: Context,
             parent: <Self as FileSystem>::Inode,
             name: &CStr,
-            mode: u32,
-            flags: u32,
-            umask: u32,
+            args: CreateIn,
         ) -> Result<(Entry, Option<<Self as FileSystem>::Handle>, OpenOptions)> {
             unimplemented!()
         }
@@ -752,7 +751,7 @@ mod tests {
             ctx: Context,
             inode: <Self as FileSystem>::Inode,
             handle: <Self as FileSystem>::Handle,
-            w: &mut (dyn AsyncZeroCopyWriter<Self::D> + Send),
+            w: &mut (dyn AsyncZeroCopyWriter + Send),
             size: u32,
             offset: u64,
             lock_owner: Option<u64>,
@@ -766,12 +765,13 @@ mod tests {
             ctx: Context,
             inode: <Self as FileSystem>::Inode,
             handle: <Self as FileSystem>::Handle,
-            r: &mut (dyn AsyncZeroCopyReader<Self::D> + Send),
+            r: &mut (dyn AsyncZeroCopyReader + Send),
             size: u32,
             offset: u64,
             lock_owner: Option<u64>,
             delayed_write: bool,
             flags: u32,
+            fuse_flags: u32,
         ) -> Result<usize> {
             unimplemented!()
         }
@@ -829,9 +829,7 @@ mod tests {
     }
 
     #[cfg(not(feature = "async-io"))]
-    impl BackendFileSystem for FakeFileSystemTwo {
-        type D = AsyncDriver;
-
+    impl BackendFileSystem<AsyncDriver, ()> for FakeFileSystemTwo {
         fn mount(&self) -> Result<(Entry, u64)> {
             Ok((
                 Entry {

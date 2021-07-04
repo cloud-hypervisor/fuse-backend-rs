@@ -23,6 +23,7 @@ use futures::{
     ready,
     task::{LocalSpawnExt, SpawnError},
 };
+use iou::sqe::FsyncFlags;
 use iou::{CompletionQueue, IoUring, Registrar, SQEs, SetupFeatures, SetupFlags, SubmissionQueue};
 use nix::{
     fcntl::{FallocateFlags, OFlag},
@@ -33,9 +34,9 @@ use ringbahn::{
     event::{Fallocate, Fsync, OpenAt, Read, ReadVectored, Write, WriteVectored},
     Drive,
 };
-
-use iou::sqe::FsyncFlags;
 use vm_memory::VolatileSlice;
+
+use crate::BitmapSlice;
 
 pub use ringbahn::Submission;
 
@@ -157,10 +158,10 @@ impl<D: AsyncDrive> AsyncUtil<D> {
     }
 
     /// Asynchronously read from the file into vectored data buffers.
-    pub async fn read_to_volatile_slices(
+    pub async fn read_to_volatile_slices<S: BitmapSlice>(
         drive: D,
         fd: RawFd,
-        slices: &[VolatileSlice<'_>],
+        slices: &[VolatileSlice<'_, S>],
         offset: u64,
     ) -> io::Result<usize> {
         // Safe because we just transform the interface to access the underlying data buffers.
@@ -177,6 +178,10 @@ impl<D: AsyncDrive> AsyncUtil<D> {
         // Manually tear down the fake Box<[Box<[u8]>> object, otherwise it will cause double-free.
         let mut vec: Vec<Box<[u8]>> = bufs.into();
         unsafe { vec.set_len(0) };
+
+        for buf in slices {
+            buf.bitmap().mark_dirty(0, buf.len());
+        }
 
         result.map(|v| v as usize)
     }
@@ -204,17 +209,17 @@ impl<D: AsyncDrive> AsyncUtil<D> {
         offset: u64,
     ) -> io::Result<usize> {
         // Safe because we just transform the interface to access the underlying data buffers.
-        let bufs = [
+        let bufs = vec![
             unsafe { Box::from_raw(data as *const [u8] as *mut [u8]) },
             unsafe { Box::from_raw(data2 as *const [u8] as *mut [u8]) },
         ];
-        let bufs = bufs.to_vec().into_boxed_slice();
+        let bufs = bufs.into_boxed_slice();
 
         let event = WriteVectored { fd, bufs, offset };
         let (WriteVectored { bufs, .. }, result) = Submission::new(event, drive).await;
 
         // Manually tear down the fake [Box<[u8]> object, otherwise it will cause double-free.
-        std::mem::forget(bufs);
+        unsafe { bufs.into_vec().set_len(0) };
 
         result.map(|v| v as usize)
     }
@@ -229,18 +234,18 @@ impl<D: AsyncDrive> AsyncUtil<D> {
         offset: u64,
     ) -> io::Result<usize> {
         // Safe because we just transform the interface to access the underlying data buffers.
-        let bufs = [
+        let bufs = vec![
             unsafe { Box::from_raw(data as *const [u8] as *mut [u8]) },
             unsafe { Box::from_raw(data2 as *const [u8] as *mut [u8]) },
             unsafe { Box::from_raw(data3 as *const [u8] as *mut [u8]) },
         ];
-        let bufs = bufs.to_vec().into_boxed_slice();
+        let bufs = bufs.into_boxed_slice();
 
         let event = WriteVectored { fd, bufs, offset };
         let (WriteVectored { bufs, .. }, result) = Submission::new(event, drive).await;
 
         // Manually tear down the fake [Box<[u8]> object, otherwise it will cause double-free.
-        std::mem::forget(bufs);
+        unsafe { bufs.into_vec().set_len(0) };
 
         result.map(|v| v as usize)
     }
@@ -274,10 +279,10 @@ impl<D: AsyncDrive> AsyncUtil<D> {
     }
 
     /// Asynchronously write out vectored data buffers to the file.
-    pub async fn write_from_volatile_slices(
+    pub async fn write_from_volatile_slices<S: BitmapSlice>(
         drive: D,
         fd: RawFd,
-        slices: &[VolatileSlice<'_>],
+        slices: &[VolatileSlice<'_, S>],
         offset: u64,
     ) -> io::Result<usize> {
         // Safe because we just transform the interface to access the underlying data buffers.

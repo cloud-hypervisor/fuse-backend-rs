@@ -46,6 +46,7 @@ use std::io::{self, IoSlice, Write};
 use std::os::unix::io::RawFd;
 use std::ptr::copy_nonoverlapping;
 
+use vm_memory::bitmap::{BitmapSlice, MS};
 use vm_memory::{ByteValued, GuestMemory, GuestMemoryError, VolatileMemoryError, VolatileSlice};
 use vm_virtio::{DescriptorChain, Error as QueueError};
 
@@ -103,12 +104,10 @@ pub type Result<T> = std::result::Result<T, Error>;
 
 impl std::error::Error for Error {}
 
-impl<'a> Reader<'a> {
+impl<'a, M: GuestMemory> Reader<'a, M> {
     /// Construct a new Reader wrapper over `desc_chain`.
-    pub fn new<M: GuestMemory>(
-        mem: &'a M,
-        desc_chain: DescriptorChain<'a, M>,
-    ) -> Result<Reader<'a>> {
+    #[allow(clippy::new_ret_no_self)]
+    pub fn new(mem: &'a M, desc_chain: DescriptorChain<'a, M>) -> Result<Reader<'a, MS<'a, M>>> {
         let mut total_len: usize = 0;
         let chain = if desc_chain.is_indirect() {
             desc_chain
@@ -130,7 +129,7 @@ impl<'a> Reader<'a> {
                 mem.get_slice(desc.addr(), desc.len() as usize)
                     .map_err(Error::GuestMemoryError)
             })
-            .collect::<Result<VecDeque<VolatileSlice<'a>>>>()?;
+            .collect::<Result<VecDeque<VolatileSlice<'a, MS<M>>>>>()?;
 
         Ok(Reader {
             buffers: IoBuffers {
@@ -149,16 +148,14 @@ impl<'a> Reader<'a> {
 /// Writer will start iterating the descriptors from the first writable one and will
 /// assume that all following descriptors are writable.
 #[derive(Clone)]
-pub struct Writer<'a> {
-    buffers: IoBuffers<'a>,
+pub struct Writer<'a, S = ()> {
+    buffers: IoBuffers<'a, S>,
 }
 
-impl<'a> Writer<'a> {
+impl<'a, M: GuestMemory> Writer<'a, M> {
     /// Construct a new Writer wrapper over `desc_chain`.
-    pub fn new<M: GuestMemory>(
-        mem: &'a M,
-        desc_chain: DescriptorChain<'a, M>,
-    ) -> Result<Writer<'a>> {
+    #[allow(clippy::new_ret_no_self)]
+    pub fn new(mem: &'a M, desc_chain: DescriptorChain<'a, M>) -> Result<Writer<'a, MS<'a, M>>> {
         let mut total_len: usize = 0;
         let chain = if desc_chain.is_indirect() {
             desc_chain
@@ -180,7 +177,7 @@ impl<'a> Writer<'a> {
                 mem.get_slice(desc.addr(), desc.len() as usize)
                     .map_err(Error::GuestMemoryError)
             })
-            .collect::<Result<VecDeque<VolatileSlice<'a>>>>()?;
+            .collect::<Result<VecDeque<VolatileSlice<'a, MS<M>>>>>()?;
 
         Ok(Writer {
             buffers: IoBuffers {
@@ -189,7 +186,9 @@ impl<'a> Writer<'a> {
             },
         })
     }
+}
 
+impl<'a, S: BitmapSlice> Writer<'a, S> {
     /// Writes an object to the descriptor chain buffer.
     pub fn write_obj<T: ByteValued>(&mut self, val: T) -> io::Result<()> {
         self.write_all(val.as_slice())
@@ -197,7 +196,7 @@ impl<'a> Writer<'a> {
 
     /// Writes data to the descriptor chain buffer from a file descriptor.
     /// Returns the number of bytes written to the descriptor chain buffer.
-    pub fn write_from<F: FileReadWriteVolatile>(
+    pub fn write_from<F: FileReadWriteVolatile<S>>(
         &mut self,
         mut src: F,
         count: usize,
@@ -209,7 +208,7 @@ impl<'a> Writer<'a> {
 
     /// Writes data to the descriptor chain buffer from a File at offset `off`.
     /// Returns the number of bytes written to the descriptor chain buffer.
-    pub fn write_from_at<F: FileReadWriteVolatile>(
+    pub fn write_from_at<F: FileReadWriteVolatile<S>>(
         &mut self,
         mut src: F,
         count: usize,
@@ -221,7 +220,7 @@ impl<'a> Writer<'a> {
     }
 
     /// Writes all data to the descriptor chain buffer from a file descriptor.
-    pub fn write_all_from<F: FileReadWriteVolatile>(
+    pub fn write_all_from<F: FileReadWriteVolatile<S>>(
         &mut self,
         mut src: F,
         mut count: usize,
@@ -259,7 +258,7 @@ impl<'a> Writer<'a> {
     /// After the split, `self` will be able to write up to `offset` bytes while the returned
     /// `Writer` can write up to `available_bytes() - offset` bytes.  Returns an error if
     /// `offset > self.available_bytes()`.
-    pub fn split_at(&mut self, offset: usize) -> Result<Writer<'a>> {
+    pub fn split_at(&mut self, offset: usize) -> Result<Self> {
         self.buffers
             .split_at(offset)
             .map(|buffers| Writer { buffers })
@@ -267,7 +266,7 @@ impl<'a> Writer<'a> {
 
     /// Commit all internal buffers of self and others
     /// This is provided just to be compatible with fusedev
-    pub fn commit(&mut self, _other: Option<&Writer<'a>>) -> io::Result<usize> {
+    pub fn commit(&mut self, _other: Option<&Self>) -> io::Result<usize> {
         Ok(0)
     }
 
@@ -287,7 +286,7 @@ impl<'a> Writer<'a> {
     }
 }
 
-impl<'a> io::Write for Writer<'a> {
+impl<'a, S: BitmapSlice> io::Write for Writer<'a, S> {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         self.check_available_space(buf.len())?;
 
@@ -301,6 +300,7 @@ impl<'a> io::Write for Writer<'a> {
                 unsafe {
                     copy_nonoverlapping(rem.as_ptr(), buf.as_ptr(), copy_len);
                 }
+                buf.bitmap().mark_dirty(0, copy_len);
                 rem = &rem[copy_len..];
                 total += copy_len;
             }
@@ -330,7 +330,7 @@ impl<'a> io::Write for Writer<'a> {
 mod async_io {
     use super::*;
 
-    impl<'a> Reader<'a> {
+    impl<'a, S: BitmapSlice> Reader<'a, S> {
         /// Reads data from the descriptor chain buffer into a File at offset `off`.
         /// Returns the number of bytes read from the descriptor chain buffer.
         /// The number of bytes read can be less than `count` if there isn't
@@ -353,7 +353,7 @@ mod async_io {
         }
     }
 
-    impl<'a> Writer<'a> {
+    impl<'a, S: BitmapSlice> Writer<'a, S> {
         /// Write data from a buffer into this writer in asynchronous mode.
         pub async fn async_write<D: AsyncDrive>(
             &mut self,
@@ -433,6 +433,7 @@ mod async_io {
                 Ok(0)
             } else {
                 let result = AsyncUtil::read_vectored(drive, src, &mut bufs, off).await?;
+                self.buffers.mark_dirty(count);
                 self.buffers.mark_used(count)?;
                 Ok(result)
             }
@@ -443,7 +444,7 @@ mod async_io {
         pub async fn async_commit<D: AsyncDrive>(
             &mut self,
             _drive: D,
-            other: Option<&Writer<'a>>,
+            other: Option<&Self>,
         ) -> io::Result<usize> {
             self.commit(other)
         }

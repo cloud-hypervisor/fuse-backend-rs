@@ -60,6 +60,8 @@ use std::ffi::{CStr, FromBytesWithNulError};
 use std::io::ErrorKind;
 use std::{error, fmt, io};
 
+use vm_memory::bitmap::BitmapSlice;
+
 /// Error codes for Fuse related operations.
 #[derive(Debug)]
 pub enum Error {

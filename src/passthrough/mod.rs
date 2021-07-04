@@ -29,6 +29,7 @@ use vm_memory::ByteValued;
 use crate::abi::linux_abi as fuse;
 use crate::api::filesystem::Entry;
 use crate::api::{BackendFileSystem, VFS_MAX_INO};
+use crate::BitmapSlice;
 
 #[cfg(feature = "async-io")]
 mod async_io;
@@ -37,7 +38,7 @@ mod sync_io;
 mod multikey;
 use multikey::MultikeyBTreeMap;
 
-use crate::async_util::AsyncDrive;
+use crate::async_util::{AsyncDrive, AsyncDriver};
 
 const CURRENT_DIR_CSTR: &[u8] = b".\0";
 const PARENT_DIR_CSTR: &[u8] = b"..\0";
@@ -347,7 +348,7 @@ impl Default for Config {
 /// that wish to serve only a specific directory should set up the environment so that that
 /// directory ends up as the root of the file system process. One way to accomplish this is via a
 /// combination of mount namespaces and the pivot_root system call.
-pub struct PassthroughFs<D> {
+pub struct PassthroughFs<D: AsyncDrive = AsyncDriver, S: BitmapSlice + Send + Sync = ()> {
     // File descriptors for various points in the file system tree. These fds are always opened with
     // the `O_PATH` option so they cannot be used for reading or writing any data. See the
     // documentation of the `O_PATH` flag in `open(2)` for more details on what one can and cannot
@@ -382,11 +383,12 @@ pub struct PassthroughFs<D> {
     cfg: Config,
 
     phantom: PhantomData<D>,
+    phantom2: PhantomData<S>,
 }
 
-impl<D: AsyncDrive> PassthroughFs<D> {
+impl<D: AsyncDrive, S: BitmapSlice + Send + Sync> PassthroughFs<D, S> {
     /// Create a Passthrough file system instance.
-    pub fn new(cfg: Config) -> io::Result<PassthroughFs<D>> {
+    pub fn new(cfg: Config) -> io::Result<PassthroughFs<D, S>> {
         // Safe because this is a constant value and a valid C string.
         let proc_cstr = unsafe { CStr::from_bytes_with_nul_unchecked(PROC_CSTR) };
         let proc = Self::open_file(
@@ -412,6 +414,7 @@ impl<D: AsyncDrive> PassthroughFs<D> {
             cfg,
 
             phantom: PhantomData,
+            phantom2: PhantomData,
         })
     }
 
@@ -649,8 +652,9 @@ impl<D: AsyncDrive> PassthroughFs<D> {
 }
 
 #[cfg(not(feature = "async-io"))]
-impl<D: AsyncDrive> BackendFileSystem for PassthroughFs<D> {
-    type D = D;
+impl<D: AsyncDrive, S: 'static + BitmapSlice + Send + Sync> BackendFileSystem<D, S>
+    for PassthroughFs<D, S>
+{
     fn mount(&self) -> io::Result<(Entry, u64)> {
         let entry = self.do_lookup(fuse::ROOT_ID, &CString::new(".").unwrap())?;
         Ok((entry, VFS_MAX_INO))
