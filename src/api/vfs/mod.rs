@@ -703,7 +703,7 @@ mod tests {
             parent: <Self as FileSystem>::Inode,
             name: &CStr,
         ) -> Result<Entry> {
-            unimplemented!()
+            Err(std::io::Error::from_raw_os_error(libc::EINVAL))
         }
 
         async fn async_getattr(
