@@ -73,7 +73,7 @@ pub trait AsyncZeroCopyWriter<D: AsyncDrive = AsyncDriver, S: BitmapSlice = ()>:
     ) -> io::Result<usize>;
 }
 
-/// The main trait that connects a file system with a transport.
+/// The main trait that connects a file system with a transport with asynchronous IO.
 #[allow(unused_variables)]
 #[async_trait]
 pub trait AsyncFileSystem<D: AsyncDrive = AsyncDriver, S: BitmapSlice = ()>: FileSystem<S> {

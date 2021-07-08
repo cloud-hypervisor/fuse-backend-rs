@@ -377,6 +377,18 @@ impl Context {
     }
 }
 
+impl Default for Context {
+    fn default() -> Self {
+        Context {
+            uid: 0,
+            gid: 0,
+            pid: 0,
+            #[cfg(feature = "async-io")]
+            drive: 0,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

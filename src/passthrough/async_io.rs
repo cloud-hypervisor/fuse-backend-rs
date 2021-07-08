@@ -140,15 +140,17 @@ impl<D: AsyncDrive, S: BitmapSlice + Send + Sync> PassthroughFs<D, S> {
         })?;
         let file = data.get_file(&self.mount_fds)?;
 
-        let st = Self::async_stat(file.into_ref(), None).await.map_err(|e| {
-            error!(
-                "fuse: do_getattr stat failed ino {} fd: {:?} err {:?}",
-                inode,
-                file.as_raw_fd(),
+        let st = Self::async_stat(file.get_file_ref(), None)
+            .await
+            .map_err(|e| {
+                error!(
+                    "fuse: do_getattr stat failed ino {} fd: {:?} err {:?}",
+                    inode,
+                    file.as_raw_fd(),
+                    e
+                );
                 e
-            );
-            e
-        })?;
+            })?;
 
         Ok((st, self.cfg.attr_timeout))
     }
@@ -268,9 +270,9 @@ impl<D: AsyncDrive + Sync, S: BitmapSlice + Send + Sync> AsyncFileSystem<D, S>
             );
             self.inode_map.insert(
                 inode,
+                InodeData::new(inode, FileOrHandle::File(f), 1, ids_altkey),
                 ids_altkey,
                 handle_altkey,
-                InodeData::new(inode, FileOrHandle::File(f), 1, ids_altkey),
             );
 
             inode

@@ -407,8 +407,8 @@ impl<D: AsyncDrive, S: BitmapSlice + Send + Sync> FileSystem<S> for PassthroughF
     fn statfs(&self, _ctx: Context, inode: Inode) -> io::Result<libc::statvfs64> {
         let data = self.inode_map.get(inode)?;
         let mut out = MaybeUninit::<libc::statvfs64>::zeroed();
-
         let file = data.get_file(&self.mount_fds)?;
+
         // Safe because this will only modify `out` and we check the return value.
         match unsafe { libc::fstatvfs64(file.as_raw_fd(), out.as_mut_ptr()) } {
             // Safe because the kernel guarantees that `out` has been initialized.

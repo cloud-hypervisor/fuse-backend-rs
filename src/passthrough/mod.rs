@@ -49,6 +49,7 @@ const PROC_CSTR: &[u8] = b"/proc\0";
 
 type Inode = u64;
 type Handle = u64;
+type MultiKeyMap = MultikeyBTreeMap<Inode, InodeAltKey, Arc<InodeData>>;
 
 #[derive(Clone, Copy, PartialOrd, Ord, PartialEq, Eq, Debug)]
 enum InodeAltKey {
@@ -99,8 +100,9 @@ impl AsRawFd for InodeFile<'_> {
     }
 }
 
+#[cfg(feature = "async-io")]
 impl InodeFile<'_> {
-    fn into_ref(&self) -> &File {
+    fn get_file_ref(&self) -> &File {
         match self {
             Self::Owned(f) => f,
             Self::Ref(f) => *f,
@@ -112,8 +114,8 @@ struct InodeData {
     inode: Inode,
     // Most of these aren't actually files but ¯\_(ツ)_/¯.
     file_or_handle: FileOrHandle,
-    refcount: AtomicU64,
     altkey: InodeAltKey,
+    refcount: AtomicU64,
 }
 
 impl<'a> InodeData {
@@ -121,8 +123,8 @@ impl<'a> InodeData {
         InodeData {
             inode,
             file_or_handle: f,
+            altkey,
             refcount: AtomicU64::new(refcount),
-            altkey: altkey,
         }
     }
 
@@ -139,7 +141,7 @@ impl<'a> InodeData {
 
 /// Data structures to manage accessed inodes.
 struct InodeMap {
-    inodes: RwLock<MultikeyBTreeMap<Inode, InodeAltKey, Arc<InodeData>>>,
+    inodes: RwLock<MultiKeyMap>,
 }
 
 impl InodeMap {
@@ -188,18 +190,16 @@ impl InodeMap {
             .map(Arc::clone)
     }
 
-    fn get_map_mut(
-        &self,
-    ) -> RwLockWriteGuard<MultikeyBTreeMap<Inode, InodeAltKey, Arc<InodeData>>> {
+    fn get_map_mut(&self) -> RwLockWriteGuard<MultiKeyMap> {
         self.inodes.write().unwrap()
     }
 
     fn insert(
         &self,
         inode: Inode,
+        data: InodeData,
         ids_altkey: InodeAltKey,
         handle_altkey: Option<InodeAltKey>,
-        data: InodeData,
     ) {
         let mut inodes = self.get_map_mut();
 
@@ -569,9 +569,9 @@ impl<D: AsyncDrive, S: BitmapSlice + Send + Sync> PassthroughFs<D, S> {
         // Not sure why the root inode gets a refcount of 2 but that's what libfuse does.
         self.inode_map.insert(
             fuse::ROOT_ID,
+            InodeData::new(fuse::ROOT_ID, file_or_handle, 2, ids_altkey),
             ids_altkey,
             handle_altkey,
-            InodeData::new(fuse::ROOT_ID, file_or_handle, 2, ids_altkey),
         );
 
         Ok(())
@@ -663,17 +663,15 @@ impl<D: AsyncDrive, S: BitmapSlice + Send + Sync> PassthroughFs<D, S> {
         )
     }
 
-    fn do_lookup(&self, parent: Inode, name: &CStr) -> io::Result<Entry> {
-        let p = self.inode_map.get(parent)?;
-        let p_file = p.get_file(&self.mount_fds)?;
-
+    fn open_file_or_handle(
+        &self,
+        fd: RawFd,
+        name: &CStr,
+    ) -> io::Result<(FileOrHandle, libc::stat64, InodeAltKey, Option<InodeAltKey>)> {
         let handle = if self.cfg.inode_file_handles {
-            FileHandle::from_name_at_with_mount_fds(
-                p_file.as_raw_fd(),
-                name,
-                &self.mount_fds,
-                |fd, flags| Self::open_proc_file(&self.proc, fd, flags),
-            )
+            FileHandle::from_name_at_with_mount_fds(fd, name, &self.mount_fds, |fd, flags| {
+                Self::open_proc_file(&self.proc, fd, flags)
+            })
         } else {
             Err(io::Error::from_raw_os_error(libc::ENOTSUP))
         };
@@ -683,7 +681,7 @@ impl<D: AsyncDrive, S: BitmapSlice + Send + Sync> PassthroughFs<D, S> {
             FileOrHandle::Handle(h)
         } else {
             let f = Self::open_file(
-                p_file.as_raw_fd(),
+                fd,
                 name,
                 libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC,
                 0,
@@ -694,7 +692,7 @@ impl<D: AsyncDrive, S: BitmapSlice + Send + Sync> PassthroughFs<D, S> {
 
         let st = match &file_or_handle {
             FileOrHandle::File(f) => Self::stat(f, None)?,
-            FileOrHandle::Handle(_) => Self::stat(&p_file, Some(name))?,
+            FileOrHandle::Handle(_) => Self::stat_fd(fd, Some(name))?,
         };
 
         let ids_altkey = InodeAltKey::ids_from_stat(&st);
@@ -703,6 +701,15 @@ impl<D: AsyncDrive, S: BitmapSlice + Send + Sync> PassthroughFs<D, S> {
         // really need this alt key when we do not have an `O_PATH` fd open for every inode.  So if
         // `cfg.inode_file_handles` is false, we do not need this key anyway.
         let handle_altkey = file_or_handle.handle().map(|h| InodeAltKey::Handle(*h));
+
+        Ok((file_or_handle, st, ids_altkey, handle_altkey))
+    }
+
+    fn do_lookup(&self, parent: Inode, name: &CStr) -> io::Result<Entry> {
+        let p = self.inode_map.get(parent)?;
+        let p_file = p.get_file(&self.mount_fds)?;
+        let (file_or_handle, st, ids_altkey, handle_altkey) =
+            self.open_file_or_handle(p_file.as_raw_fd(), name)?;
 
         let mut found = None;
         'search: loop {
@@ -767,9 +774,9 @@ impl<D: AsyncDrive, S: BitmapSlice + Send + Sync> PassthroughFs<D, S> {
 
                     self.inode_map.insert(
                         inode,
+                        InodeData::new(inode, file_or_handle, 1, ids_altkey),
                         ids_altkey,
                         handle_altkey,
-                        InodeData::new(inode, file_or_handle, 1, ids_altkey),
                     );
                     inode
                 }
@@ -785,11 +792,7 @@ impl<D: AsyncDrive, S: BitmapSlice + Send + Sync> PassthroughFs<D, S> {
         })
     }
 
-    fn forget_one(
-        inodes: &mut MultikeyBTreeMap<Inode, InodeAltKey, Arc<InodeData>>,
-        inode: Inode,
-        count: u64,
-    ) {
+    fn forget_one(inodes: &mut MultiKeyMap, inode: Inode, count: u64) {
         // ROOT_ID should not be forgotten, or we're not able to access to files any more.
         if inode == fuse::ROOT_ID {
             return;
@@ -923,13 +926,7 @@ mod tests {
         let fs = PassthroughFs::<AsyncDriver, ()>::new(fs_cfg).unwrap();
         fs.import().unwrap();
 
-        let ctx = Context {
-            uid: 0,
-            gid: 0,
-            pid: 0,
-            #[cfg(feature = "async-io")]
-            drive: 0,
-        };
+        let ctx = Context::default();
 
         // read a few files to inode map.
         let parent = CString::new(parent_path.as_path().to_str().expect("path to string")).unwrap();
