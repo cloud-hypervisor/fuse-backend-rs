@@ -18,6 +18,7 @@ use std::fs::File;
 use std::io;
 use std::marker::PhantomData;
 use std::mem::MaybeUninit;
+use std::ops::{Deref, DerefMut};
 use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -152,10 +153,12 @@ impl InodeMap {
     }
 
     fn clear(&self) {
+        // Do not expect poisoned lock here, so safe to unwrap().
         self.inodes.write().unwrap().clear();
     }
 
     fn get(&self, inode: Inode) -> io::Result<Arc<InodeData>> {
+        // Do not expect poisoned lock here, so safe to unwrap().
         self.inodes
             .read()
             .unwrap()
@@ -169,8 +172,17 @@ impl InodeMap {
         ids_altkey: &InodeAltKey,
         handle_altkey: Option<&InodeAltKey>,
     ) -> Option<Arc<InodeData>> {
+        // Do not expect poisoned lock here, so safe to unwrap().
         let inodes = self.inodes.read().unwrap();
 
+        Self::get_alt_locked(inodes.deref(), ids_altkey, handle_altkey)
+    }
+
+    fn get_alt_locked(
+        inodes: &MultiKeyMap,
+        ids_altkey: &InodeAltKey,
+        handle_altkey: Option<&InodeAltKey>,
+    ) -> Option<Arc<InodeData>> {
         handle_altkey
             .map(|altkey| inodes.get_alt(altkey))
             .flatten()
@@ -191,6 +203,7 @@ impl InodeMap {
     }
 
     fn get_map_mut(&self) -> RwLockWriteGuard<MultiKeyMap> {
+        // Do not expect poisoned lock here, so safe to unwrap().
         self.inodes.write().unwrap()
     }
 
@@ -203,6 +216,16 @@ impl InodeMap {
     ) {
         let mut inodes = self.get_map_mut();
 
+        Self::insert_locked(inodes.deref_mut(), inode, data, ids_altkey, handle_altkey)
+    }
+
+    fn insert_locked(
+        inodes: &mut MultiKeyMap,
+        inode: Inode,
+        data: InodeData,
+        ids_altkey: InodeAltKey,
+        handle_altkey: Option<InodeAltKey>,
+    ) {
         inodes.insert(inode, Arc::new(data));
         inodes.insert_alt(ids_altkey, inode);
         if let Some(altkey) = handle_altkey {
@@ -251,14 +274,17 @@ impl HandleMap {
     }
 
     fn clear(&self) {
+        // Do not expect poisoned lock here, so safe to unwrap().
         self.handles.write().unwrap().clear();
     }
 
     fn insert(&self, handle: Handle, data: HandleData) {
+        // Do not expect poisoned lock here, so safe to unwrap().
         self.handles.write().unwrap().insert(handle, Arc::new(data));
     }
 
     fn release(&self, handle: Handle, inode: Inode) -> io::Result<()> {
+        // Do not expect poisoned lock here, so safe to unwrap().
         let mut handles = self.handles.write().unwrap();
 
         if let btree_map::Entry::Occupied(e) = handles.entry(handle) {
@@ -274,6 +300,7 @@ impl HandleMap {
     }
 
     fn get(&self, handle: Handle, inode: Inode) -> io::Result<Arc<HandleData>> {
+        // Do not expect poisoned lock here, so safe to unwrap().
         self.handles
             .read()
             .unwrap()
@@ -742,11 +769,14 @@ impl<D: AsyncDrive, S: BitmapSlice + Send + Sync> PassthroughFs<D, S> {
         let inode = if let Some(v) = found {
             v
         } else {
+            // Write guard get_alt_locked() and insert_lock() to avoid race conditions.
+            let mut inodes = self.inode_map.get_map_mut();
+
             // Lookup inode_map again after acquiring the inode_map lock, as there might be another
             // racing thread already added an inode with the same altkey while we're not holding
             // the lock. If so just use the newly added inode, otherwise the inode will be replaced
             // and results in EBADF.
-            match self.inode_map.get_alt(&ids_altkey, handle_altkey.as_ref()) {
+            match InodeMap::get_alt_locked(inodes.deref(), &ids_altkey, handle_altkey.as_ref()) {
                 Some(data) => {
                     trace!(
                         "fuse: do_lookup sees existing inode {} ids_altkey {:?}",
@@ -772,7 +802,8 @@ impl<D: AsyncDrive, S: BitmapSlice + Send + Sync> PassthroughFs<D, S> {
                         handle_altkey
                     );
 
-                    self.inode_map.insert(
+                    InodeMap::insert_locked(
+                        inodes.deref_mut(),
                         inode,
                         InodeData::new(inode, file_or_handle, 1, ids_altkey),
                         ids_altkey,

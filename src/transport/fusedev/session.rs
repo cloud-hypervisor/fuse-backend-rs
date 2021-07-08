@@ -487,7 +487,7 @@ mod asyncio {
         }
     }
 
-    #[cfg(test1)]
+    #[cfg(test2)]
     mod tests {
         use std::os::unix::io::AsRawFd;
 
