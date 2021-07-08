@@ -456,7 +456,7 @@ impl<D: AsyncDrive + Sync, S: BitmapSlice + Send + Sync> AsyncFileSystem<D, S>
         name: &CStr,
         args: CreateIn,
     ) -> io::Result<(Entry, Option<<Self as FileSystem<S>>::Handle>, OpenOptions)> {
-        unimplemented!()
+        self.create(ctx, parent, name, args)
         // TODO: implement
         // let (_uid, _gid) = set_creds(ctx.uid, ctx.gid)?;
         // let data = self.inode_map.get(parent)?;

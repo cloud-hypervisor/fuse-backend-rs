@@ -521,11 +521,11 @@ impl<D: AsyncDrive, S: BitmapSlice + Send + Sync> PassthroughFs<D, S> {
 
         let handle = if self.cfg.inode_file_handles {
             FileHandle::from_name_at_with_mount_fds(
-                &libc::AT_FDCWD,
+                libc::AT_FDCWD,
                 &root,
                 &self.mount_fds,
                 |fd, flags| {
-                    let pathname = CString::new(format!("self/fd/{}", fd.as_raw_fd()))
+                    let pathname = CString::new(format!("self/fd/{}", fd))
                         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
                     Self::open_file(self.proc.as_raw_fd(), &pathname, flags, 0)
                 },
@@ -551,7 +551,7 @@ impl<D: AsyncDrive, S: BitmapSlice + Send + Sync> PassthroughFs<D, S> {
 
         let st = match &file_or_handle {
             FileOrHandle::File(f) => Self::stat(f, None)?,
-            FileOrHandle::Handle(_) => Self::stat(&libc::AT_FDCWD, Some(&root))?,
+            FileOrHandle::Handle(_) => Self::stat_fd(libc::AT_FDCWD, Some(&root))?,
         };
 
         // Safe because this doesn't modify any memory and there is no need to check the return
@@ -583,6 +583,10 @@ impl<D: AsyncDrive, S: BitmapSlice + Send + Sync> PassthroughFs<D, S> {
     }
 
     fn stat(dir: &impl AsRawFd, path: Option<&CStr>) -> io::Result<libc::stat64> {
+        Self::stat_fd(dir.as_raw_fd(), path)
+    }
+
+    fn stat_fd(dir_fd: RawFd, path: Option<&CStr>) -> io::Result<libc::stat64> {
         // Safe because this is a constant value and a valid C string.
         let pathname =
             path.unwrap_or_else(|| unsafe { CStr::from_bytes_with_nul_unchecked(EMPTY_CSTR) });
@@ -591,7 +595,7 @@ impl<D: AsyncDrive, S: BitmapSlice + Send + Sync> PassthroughFs<D, S> {
         // Safe because the kernel will only write data in `st` and we check the return value.
         let res = unsafe {
             libc::fstatat64(
-                dir.as_raw_fd(),
+                dir_fd,
                 pathname.as_ptr(),
                 st.as_mut_ptr(),
                 libc::AT_EMPTY_PATH | libc::AT_SYMLINK_NOFOLLOW,
@@ -664,9 +668,12 @@ impl<D: AsyncDrive, S: BitmapSlice + Send + Sync> PassthroughFs<D, S> {
         let p_file = p.get_file(&self.mount_fds)?;
 
         let handle = if self.cfg.inode_file_handles {
-            FileHandle::from_name_at_with_mount_fds(&p_file, name, &self.mount_fds, |fd, flags| {
-                Self::open_proc_file(&self.proc, fd.as_raw_fd(), flags)
-            })
+            FileHandle::from_name_at_with_mount_fds(
+                p_file.as_raw_fd(),
+                name,
+                &self.mount_fds,
+                |fd, flags| Self::open_proc_file(&self.proc, fd, flags),
+            )
         } else {
             Err(io::Error::from_raw_os_error(libc::ENOTSUP))
         };
@@ -852,7 +859,6 @@ mod tests {
     use super::*;
     use crate::api::filesystem::*;
     use crate::api::{Vfs, VfsOptions};
-    use flexi_logger::{self, colored_opt_format, Logger};
     use log;
     use std::ops::Deref;
     use vmm_sys_util::{tempdir::TempDir, tempfile::TempFile};
@@ -863,7 +869,7 @@ mod tests {
             ..Default::default()
         };
 
-        let vfs = &Vfs::new(opts);
+        let vfs = &Vfs::<AsyncDriver, ()>::new(opts);
         // Assume that fuse kernel supports no_open.
         vfs.init(FsOptions::ZERO_MESSAGE_OPEN).unwrap();
 
@@ -894,11 +900,6 @@ mod tests {
 
     #[test]
     fn test_passthroughfs_inode_file_handles() {
-        Logger::with_env_or_str("trace")
-            .format(colored_opt_format)
-            .start()
-            .unwrap();
-
         log::set_max_level(log::LevelFilter::Trace);
 
         let source = TempDir::new().expect("Cannot create temporary directory.");
@@ -919,13 +920,15 @@ mod tests {
                 .to_string(),
             ..Default::default()
         };
-        let fs = PassthroughFs::new(fs_cfg).unwrap();
+        let fs = PassthroughFs::<AsyncDriver, ()>::new(fs_cfg).unwrap();
         fs.import().unwrap();
 
         let ctx = Context {
             uid: 0,
             gid: 0,
             pid: 0,
+            #[cfg(feature = "async-io")]
+            drive: 0,
         };
 
         // read a few files to inode map.
@@ -936,8 +939,9 @@ mod tests {
         let child = CString::new(child_path.as_path().to_str().expect("path to string")).unwrap();
         let c_entry = fs.lookup(ctx, p_inode, &child).unwrap();
 
-        let data = fs.inode_map.get(c_entry.inode).unwrap();
-        assert_eq!(matches!(data.file_or_handle, FileOrHandle::Handle(_)), true);
+        // Following test depends on host fs, it's not reliable.
+        //let data = fs.inode_map.get(c_entry.inode).unwrap();
+        //assert_eq!(matches!(data.file_or_handle, FileOrHandle::Handle(_)), true);
 
         let (_, duration) = fs.getattr(ctx, c_entry.inode, None).unwrap();
         assert_eq!(duration, fs.cfg.attr_timeout);
