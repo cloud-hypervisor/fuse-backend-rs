@@ -646,13 +646,13 @@ impl<D: AsyncDrive, S: BitmapSlice + Send + Sync> PassthroughFs<D, S> {
             libc::openat(
                 dfd,
                 pathname.as_ptr(),
-                flags & libc::O_CREAT & libc::O_EXCL,
+                flags | libc::O_CREAT | libc::O_EXCL,
                 mode,
             )
         };
         if fd < 0 {
             let err = io::Error::last_os_error();
-            if err.kind() == io::ErrorKind::NotFound {
+            if err.kind() == io::ErrorKind::AlreadyExists {
                 return Ok(None);
             }
             return Err(err);
