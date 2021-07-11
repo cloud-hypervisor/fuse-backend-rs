@@ -483,25 +483,26 @@ mod asyncio {
         }
     }
 
-    #[cfg(test2)]
+    #[cfg(test)]
     mod tests {
         use std::os::unix::io::AsRawFd;
 
         use super::*;
         use crate::api::{Vfs, VfsOptions};
-        use crate::async_util::AsyncExecutor;
+        use crate::async_util::{AsyncDriver, AsyncExecutor};
 
         #[test]
         fn test_fuse_task() {
             let state = AsyncExecutorState::new();
-            let fs = Vfs::<AsyncDriver>::new(VfsOptions::default());
-            let server = Arc::new(Server::new(fs));
+            let fs = Vfs::<AsyncDriver, ()>::new(VfsOptions::default());
+            let _server = Arc::new(Server::<Vfs<AsyncDriver, ()>, AsyncDriver, ()>::new(fs));
             let file = vmm_sys_util::tempfile::TempFile::new().unwrap();
-            let fd = file.as_file().as_raw_fd();
+            let _fd = file.as_file().as_raw_fd();
 
             let mut executor = AsyncExecutor::new(32);
             executor.setup().unwrap();
 
+            /*
             // Create three tasks, which could handle three concurrent fuse requests.
             let mut task = FuseDevTask::new(0x1000, fd, server.clone(), state.clone());
             executor
@@ -515,12 +516,20 @@ mod asyncio {
             executor
                 .spawn(async move { task.poll_handler().await })
                 .unwrap();
+             */
 
             for _i in 0..10 {
                 executor.run_once(false).unwrap();
             }
+
+            // Set existing flag
             state.quiesce();
-            executor.run_once(false).unwrap();
+            // Close the fusedev fd, so all pending async io requests will be aborted.
+            drop(file);
+
+            for _i in 0..10 {
+                executor.run_once(false).unwrap();
+            }
         }
     }
 }

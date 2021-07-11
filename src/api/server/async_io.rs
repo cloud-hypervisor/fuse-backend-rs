@@ -684,18 +684,14 @@ mod tests {
         let mut r_buf = [0u8];
         let r = Reader::new(FuseBuf::new(&mut r_buf)).unwrap();
         let file = vmm_sys_util::tempfile::TempFile::new().unwrap();
-        #[cfg(feature = "virtiofs")]
-        let w = Writer::new(file.as_file().as_raw_fd(), 0x1000).unwrap();
-        #[cfg(feature = "fusedev")]
         let mut buf = vec![0x0u8; 1000];
-        #[cfg(feature = "fusedev")]
         let w = Writer::new(file.as_file().as_raw_fd(), &mut buf).unwrap();
 
         let executor = AsyncExecutor::new(32);
         executor.setup().unwrap();
 
         let drive = AsyncDriver::default();
-        let result = block_on(unsafe { server.async_handle_message(drive, r, w, None) });
+        let result = block_on(unsafe { server.async_handle_message(drive, r, w, None, None) });
         assert!(result.is_err());
     }
 }
