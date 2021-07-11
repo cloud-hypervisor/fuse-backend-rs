@@ -10,7 +10,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use vm_memory::ByteValued;
 
-use super::{Server, ServerUtil, MAX_BUFFER_SIZE};
+use super::{MetricsHook, Server, ServerUtil, MAX_BUFFER_SIZE};
 use crate::abi::linux_abi::*;
 use crate::api::filesystem::{
     AsyncFileSystem, AsyncZeroCopyReader, AsyncZeroCopyWriter, Context, ZeroCopyReader,
@@ -125,6 +125,7 @@ impl<F: AsyncFileSystem<D, S> + Sync, D: AsyncDrive, S: BitmapSlice> Server<F, D
         mut r: Reader<'_, S>,
         w: Writer<'_, S>,
         vu_req: Option<&mut dyn FsCacheReqHandler>,
+        hook: Option<&dyn MetricsHook>,
     ) -> Result<usize> {
         let in_header = r.read_obj().map_err(Error::DecodeMessage)?;
         let ctx = AsyncContext::new(in_header, drive);
@@ -140,7 +141,9 @@ impl<F: AsyncFileSystem<D, S> + Sync, D: AsyncDrive, S: BitmapSlice> Server<F, D
             Opcode::from(in_header.opcode),
             in_header
         );
-        match in_header.opcode {
+        hook.map_or((), |h| h.collect(&in_header));
+
+        let res = match in_header.opcode {
             x if x == Opcode::Lookup as u32 => self.async_lookup(r, w, ctx).await,
             x if x == Opcode::Forget as u32 => self.forget(in_header, r), // No reply.
             x if x == Opcode::Getattr as u32 => self.async_getattr(r, w, ctx).await,
@@ -202,7 +205,14 @@ impl<F: AsyncFileSystem<D, S> + Sync, D: AsyncDrive, S: BitmapSlice> Server<F, D
                         .await
                 }
             },
-        }
+        };
+
+        // Pass `None` because current API handler's design does not allow us to catch
+        // the `out_header`. Hopefully, we can reach to `out_header` after some
+        // refactoring work someday.
+        hook.map_or((), |h| h.release(None));
+
+        res
     }
 
     async fn async_lookup(

@@ -11,8 +11,8 @@ use std::time::Duration;
 use vm_memory::ByteValued;
 
 use super::{
-    Server, ServerUtil, ServerVersion, ZcReader, ZcWriter, DIRENT_PADDING, MAX_BUFFER_SIZE,
-    MAX_REQ_PAGES,
+    MetricsHook, Server, ServerUtil, ServerVersion, ZcReader, ZcWriter, DIRENT_PADDING,
+    MAX_BUFFER_SIZE, MAX_REQ_PAGES,
 };
 use crate::abi::linux_abi::*;
 #[cfg(feature = "virtiofs")]
@@ -21,14 +21,6 @@ use crate::api::filesystem::{Context, DirEntry, Entry, FileSystem, GetxattrReply
 use crate::async_util::AsyncDrive;
 use crate::transport::{FsCacheReqHandler, Reader, Writer};
 use crate::{bytes_to_cstr, encode_io_error_kind, BitmapSlice, Error, Result};
-
-/// Provide concrete backend filesystem a way to catch information/metrics from fuse.
-pub trait MetricsHook {
-    /// `collect()` will be invoked before the real request is processed
-    fn collect(&self, ih: &InHeader);
-    /// `release()` will be invoked after the real request is processed
-    fn release(&self, oh: Option<&OutHeader>);
-}
 
 impl<F: FileSystem<S> + Sync, D: AsyncDrive, S: BitmapSlice> Server<F, D, S> {
     /// Main entrance to handle requests from the transport layer.
