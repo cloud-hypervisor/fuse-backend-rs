@@ -116,7 +116,6 @@ impl<F: AsyncFileSystem<D, S> + Sync, D: AsyncDrive, S: BitmapSlice> Server<F, D
     /// `Future` object returned has completed. Other subsystems, such as the transport layer, rely
     /// on the invariant.
     #[allow(unused_variables)]
-    #[allow(clippy::cognitive_complexity)]
     pub async unsafe fn async_handle_message(
         &self,
         drive: D,
@@ -143,59 +142,55 @@ impl<F: AsyncFileSystem<D, S> + Sync, D: AsyncDrive, S: BitmapSlice> Server<F, D
 
         let res = match in_header.opcode {
             x if x == Opcode::Lookup as u32 => self.async_lookup(ctx).await,
-            x if x == Opcode::Forget as u32 => self.forget(in_header, ctx.r), // No reply.
+            x if x == Opcode::Forget as u32 => self.forget(ctx), // No reply.
             x if x == Opcode::Getattr as u32 => self.async_getattr(ctx).await,
             x if x == Opcode::Setattr as u32 => self.async_setattr(ctx).await,
-            x if x == Opcode::Readlink as u32 => self.readlink(in_header, ctx.w),
-            x if x == Opcode::Symlink as u32 => self.symlink(in_header, ctx.r, ctx.w),
-            x if x == Opcode::Mknod as u32 => self.mknod(in_header, ctx.r, ctx.w),
-            x if x == Opcode::Mkdir as u32 => self.mkdir(in_header, ctx.r, ctx.w),
-            x if x == Opcode::Unlink as u32 => self.unlink(in_header, ctx.r, ctx.w),
-            x if x == Opcode::Rmdir as u32 => self.rmdir(in_header, ctx.r, ctx.w),
-            x if x == Opcode::Rename as u32 => self.rename(in_header, ctx.r, ctx.w),
-            x if x == Opcode::Link as u32 => self.link(in_header, ctx.r, ctx.w),
+            x if x == Opcode::Readlink as u32 => self.readlink(ctx),
+            x if x == Opcode::Symlink as u32 => self.symlink(ctx),
+            x if x == Opcode::Mknod as u32 => self.mknod(ctx),
+            x if x == Opcode::Mkdir as u32 => self.mkdir(ctx),
+            x if x == Opcode::Unlink as u32 => self.unlink(ctx),
+            x if x == Opcode::Rmdir as u32 => self.rmdir(ctx),
+            x if x == Opcode::Rename as u32 => self.rename(ctx),
+            x if x == Opcode::Link as u32 => self.link(ctx),
             x if x == Opcode::Open as u32 => self.async_open(ctx).await,
             x if x == Opcode::Read as u32 => self.async_read(ctx).await,
             x if x == Opcode::Write as u32 => self.async_write(ctx).await,
-            x if x == Opcode::Statfs as u32 => self.statfs(in_header, ctx.w),
-            x if x == Opcode::Release as u32 => self.release(in_header, ctx.r, ctx.w),
+            x if x == Opcode::Statfs as u32 => self.statfs(ctx),
+            x if x == Opcode::Release as u32 => self.release(ctx),
             x if x == Opcode::Fsync as u32 => self.async_fsync(ctx).await,
-            x if x == Opcode::Setxattr as u32 => self.setxattr(in_header, ctx.r, ctx.w),
-            x if x == Opcode::Getxattr as u32 => self.getxattr(in_header, ctx.r, ctx.w),
-            x if x == Opcode::Listxattr as u32 => self.listxattr(in_header, ctx.r, ctx.w),
-            x if x == Opcode::Removexattr as u32 => self.removexattr(in_header, ctx.r, ctx.w),
-            x if x == Opcode::Flush as u32 => self.flush(in_header, ctx.r, ctx.w),
-            x if x == Opcode::Init as u32 => self.init(in_header, ctx.r, ctx.w),
-            x if x == Opcode::Opendir as u32 => self.opendir(in_header, ctx.r, ctx.w),
-            x if x == Opcode::Readdir as u32 => self.readdir(in_header, ctx.r, ctx.w),
-            x if x == Opcode::Releasedir as u32 => self.releasedir(in_header, ctx.r, ctx.w),
+            x if x == Opcode::Setxattr as u32 => self.setxattr(ctx),
+            x if x == Opcode::Getxattr as u32 => self.getxattr(ctx),
+            x if x == Opcode::Listxattr as u32 => self.listxattr(ctx),
+            x if x == Opcode::Removexattr as u32 => self.removexattr(ctx),
+            x if x == Opcode::Flush as u32 => self.flush(ctx),
+            x if x == Opcode::Init as u32 => self.init(ctx),
+            x if x == Opcode::Opendir as u32 => self.opendir(ctx),
+            x if x == Opcode::Readdir as u32 => self.readdir(ctx),
+            x if x == Opcode::Releasedir as u32 => self.releasedir(ctx),
             x if x == Opcode::Fsyncdir as u32 => self.async_fsyncdir(ctx).await,
-            x if x == Opcode::Getlk as u32 => self.getlk(in_header, ctx.r, ctx.w),
-            x if x == Opcode::Setlk as u32 => self.setlk(in_header, ctx.r, ctx.w),
-            x if x == Opcode::Setlkw as u32 => self.setlkw(in_header, ctx.r, ctx.w),
-            x if x == Opcode::Access as u32 => self.access(in_header, ctx.r, ctx.w),
+            x if x == Opcode::Getlk as u32 => self.getlk(ctx),
+            x if x == Opcode::Setlk as u32 => self.setlk(ctx),
+            x if x == Opcode::Setlkw as u32 => self.setlkw(ctx),
+            x if x == Opcode::Access as u32 => self.access(ctx),
             x if x == Opcode::Create as u32 => self.async_create(ctx).await,
-            x if x == Opcode::Bmap as u32 => self.bmap(in_header, ctx.r, ctx.w),
-            x if x == Opcode::Ioctl as u32 => self.ioctl(in_header, ctx.r, ctx.w),
-            x if x == Opcode::Poll as u32 => self.poll(in_header, ctx.r, ctx.w),
-            x if x == Opcode::NotifyReply as u32 => self.notify_reply(in_header, ctx.r, ctx.w),
-            x if x == Opcode::BatchForget as u32 => self.batch_forget(in_header, ctx.r, ctx.w),
+            x if x == Opcode::Bmap as u32 => self.bmap(ctx),
+            x if x == Opcode::Ioctl as u32 => self.ioctl(ctx),
+            x if x == Opcode::Poll as u32 => self.poll(ctx),
+            x if x == Opcode::NotifyReply as u32 => self.notify_reply(ctx),
+            x if x == Opcode::BatchForget as u32 => self.batch_forget(ctx),
             x if x == Opcode::Fallocate as u32 => self.async_fallocate(ctx).await,
-            x if x == Opcode::Readdirplus as u32 => self.readdirplus(in_header, ctx.r, ctx.w),
-            x if x == Opcode::Rename2 as u32 => self.rename2(in_header, ctx.r, ctx.w),
-            x if x == Opcode::Lseek as u32 => self.lseek(in_header, ctx.r, ctx.w),
+            x if x == Opcode::Readdirplus as u32 => self.readdirplus(ctx),
+            x if x == Opcode::Rename2 as u32 => self.rename2(ctx),
+            x if x == Opcode::Lseek as u32 => self.lseek(ctx),
             #[cfg(feature = "virtiofs")]
-            x if x == Opcode::SetupMapping as u32 => {
-                self.setupmapping(in_header, ctx.r, ctx.w, vu_req)
-            }
+            x if x == Opcode::SetupMapping as u32 => self.setupmapping(ctx, vu_req),
             #[cfg(feature = "virtiofs")]
-            x if x == Opcode::RemoveMapping as u32 => {
-                self.removemapping(in_header, ctx.r, ctx.w, vu_req)
-            }
+            x if x == Opcode::RemoveMapping as u32 => self.removemapping(ctx, vu_req),
             // Group reqeusts don't need reply together
             x => match x {
                 x if x == Opcode::Interrupt as u32 => {
-                    self.interrupt(in_header);
+                    self.interrupt(ctx);
                     Ok(0)
                 }
                 x if x == Opcode::Destroy as u32 => {
