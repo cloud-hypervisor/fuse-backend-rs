@@ -571,14 +571,14 @@ impl<D: AsyncDrive, S: BitmapSlice + Send + Sync> FileSystem<S> for PassthroughF
         name: &CStr,
         args: CreateIn,
     ) -> io::Result<(Entry, Option<Handle>, OpenOptions)> {
-        let data = self.inode_map.get(parent)?;
-        let data_file = data.get_file(&self.mount_fds)?;
+        let dir = self.inode_map.get(parent)?;
+        let dir_file = dir.get_file(&self.mount_fds)?;
 
         let new_file = {
             let (_uid, _gid) = set_creds(ctx.uid, ctx.gid)?;
 
             Self::create_file_excl(
-                data_file.as_raw_fd(),
+                dir_file.as_raw_fd(),
                 name,
                 args.flags as i32,
                 args.mode & !(args.umask & 0o777),
@@ -603,7 +603,7 @@ impl<D: AsyncDrive, S: BitmapSlice + Send + Sync> FileSystem<S> for PassthroughF
                 let (_uid, _gid) = set_creds(ctx.uid, ctx.gid)?;
 
                 Self::open_file(
-                    data_file.as_raw_fd(),
+                    dir_file.as_raw_fd(),
                     name,
                     args.flags as i32 | libc::O_CREAT | libc::O_CLOEXEC | libc::O_NOFOLLOW,
                     args.mode & !(args.umask & 0o777),

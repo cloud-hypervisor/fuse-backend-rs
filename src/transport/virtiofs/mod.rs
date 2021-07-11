@@ -42,8 +42,6 @@ use std::cmp;
 use std::collections::VecDeque;
 use std::fmt;
 use std::io::{self, IoSlice, Write};
-#[cfg(feature = "async-io")]
-use std::os::unix::io::RawFd;
 use std::ptr::copy_nonoverlapping;
 
 use vm_memory::bitmap::{BitmapSlice, MS};
@@ -54,9 +52,6 @@ use super::{FileReadWriteVolatile, IoBuffers, Reader};
 
 mod fs_cache_req_handler;
 pub use self::fs_cache_req_handler::FsCacheReqHandler;
-
-#[cfg(feature = "async-io")]
-use crate::async_util::{AsyncDrive, AsyncUtil};
 
 /// Error codes for Virtio queue related operations.
 #[derive(Debug)]
@@ -328,7 +323,10 @@ impl<'a, S: BitmapSlice> io::Write for Writer<'a, S> {
 // Just relay the operation to corresponding sync io handler.
 #[cfg(feature = "async-io")]
 mod async_io {
+    use std::os::unix::io::RawFd;
+
     use super::*;
+    use crate::async_util::{AsyncDrive, AsyncUtil};
 
     impl<'a, S: BitmapSlice> Reader<'a, S> {
         /// Reads data from the descriptor chain buffer into a File at offset `off`.
@@ -396,18 +394,6 @@ mod async_io {
 
             Ok(cnt)
         }
-
-        /*
-        /// Write data from a group of buffers into this writer in asynchronous mode, skipping empty
-        /// buffers.
-        pub async fn async_write_vectored<D: AsyncDrive>(
-            &mut self,
-            _drive: D,
-            bufs: &[IoSlice<'_>],
-        ) -> io::Result<usize> {
-            self.write_vectored(bufs)
-        }
-         */
 
         /// Attempts to write an entire buffer into this writer in asynchronous mode.
         pub async fn async_write_all<D: AsyncDrive>(

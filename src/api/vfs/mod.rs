@@ -126,7 +126,9 @@ pub type BackFileSystem<D, S> =
 
 #[cfg(not(feature = "async-io"))]
 /// BackendFileSystem abstracts all backend file systems under vfs
-pub trait BackendFileSystem<D: AsyncDrive, S: BitmapSlice = ()>: FileSystem<S> {
+pub trait BackendFileSystem<D: AsyncDrive = AsyncDriver, S: BitmapSlice = ()>:
+    FileSystem<S>
+{
     /// mount returns the backend file system root inode entry and
     /// the largest inode number it has.
     fn mount(&self) -> Result<(Entry, u64)> {
@@ -900,13 +902,7 @@ mod tests {
     fn test_vfs_lookup() {
         let vfs = Vfs::new(VfsOptions::default());
         let fs = FakeFileSystemOne {};
-        let ctx = Context {
-            uid: 0,
-            gid: 0,
-            pid: 0,
-            #[cfg(feature = "async-io")]
-            drive: 0,
-        };
+        let ctx = Context::new();
 
         assert!(vfs.mount(Box::new(fs), "/x/y").is_ok());
 

@@ -335,6 +335,13 @@ pub struct Context {
     pub drive: usize,
 }
 
+impl Context {
+    /// Create a new 'Context' object.
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
 impl From<&fuse::InHeader> for Context {
     fn from(source: &fuse::InHeader) -> Self {
         Context {
