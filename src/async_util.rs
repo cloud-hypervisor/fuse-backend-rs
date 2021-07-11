@@ -151,8 +151,7 @@ impl<D: AsyncDrive> AsyncUtil<D> {
         let (ReadVectored { bufs, .. }, result) = Submission::new(event, drive).await;
 
         // Manually tear down the fake Box<[Box<[u8]>> object, otherwise it will cause double-free.
-        let mut vec: Vec<Box<[u8]>> = bufs.into();
-        unsafe { vec.set_len(0) };
+        unsafe { bufs.into_vec().set_len(0) };
 
         result.map(|v| v as usize)
     }
@@ -176,8 +175,7 @@ impl<D: AsyncDrive> AsyncUtil<D> {
         let (ReadVectored { bufs, .. }, result) = Submission::new(event, drive).await;
 
         // Manually tear down the fake Box<[Box<[u8]>> object, otherwise it will cause double-free.
-        let mut vec: Vec<Box<[u8]>> = bufs.into();
-        unsafe { vec.set_len(0) };
+        unsafe { bufs.into_vec().set_len(0) };
 
         for buf in slices {
             buf.bitmap().mark_dirty(0, buf.len());
@@ -272,8 +270,7 @@ impl<D: AsyncDrive> AsyncUtil<D> {
         let (WriteVectored { bufs, .. }, result) = Submission::new(event, drive).await;
 
         // Manually tear down the fake Box<[Box<[u8]>> object, otherwise it will cause double-free.
-        let mut vec: Vec<Box<[u8]>> = bufs.into();
-        unsafe { vec.set_len(0) };
+        unsafe { bufs.into_vec().set_len(0) };
 
         result.map(|v| v as usize)
     }
@@ -297,8 +294,7 @@ impl<D: AsyncDrive> AsyncUtil<D> {
         let (WriteVectored { bufs, .. }, result) = Submission::new(event, drive).await;
 
         // Manually tear down the fake Box<[Box<[u8]>> object, otherwise it will cause double-free.
-        let mut vec: Vec<Box<[u8]>> = bufs.into();
-        unsafe { vec.set_len(0) };
+        unsafe { bufs.into_vec().set_len(0) };
 
         result.map(|v| v as usize)
     }
@@ -339,6 +335,7 @@ impl Drive for AsyncDriver {
         count: u32,
         prepare: impl FnOnce(SQEs<'_>, &mut Context<'cx>) -> Completion<'cx>,
     ) -> Poll<Completion<'cx>> {
+        // Do not expected poisoned lock here.
         let mut sq = self.sq.lock().unwrap();
 
         loop {
@@ -352,6 +349,7 @@ impl Drive for AsyncDriver {
     }
 
     fn poll_submit(self: Pin<&mut Self>, _ctx: &mut Context<'_>) -> Poll<std::io::Result<u32>> {
+        // Do not expected poisoned lock here.
         let mut sq = self.sq.lock().unwrap();
 
         Self::poll_submit_inner(&mut *sq)
@@ -361,7 +359,7 @@ impl Drive for AsyncDriver {
 impl Default for AsyncDriver {
     fn default() -> Self {
         ASYNC_EXECUTOR.with(|driver| {
-            // AsyncExecutor::setup() must be called to initialize the driver.
+            // Rely on the AsyncExecutor::setup() to initialize the driver.
             driver.borrow().as_ref().unwrap().clone()
         })
     }
@@ -382,7 +380,9 @@ impl AsyncExecutor {
     pub fn new(entries: u32) -> Self {
         let flags = SetupFlags::empty();
         let features = SetupFeatures::NODROP;
-        let ring = Box::new(IoUring::new_with_flags(entries, flags, features).unwrap());
+        // TODO: We should return error instead of panic here!
+        let ring = IoUring::new_with_flags(entries, flags, features).unwrap();
+        let ring = Box::new(ring);
         let ring = Box::leak(ring);
         let ring_ptr = ring as *const IoUring;
         let (sq, cq, reg) = ring.queues();
@@ -396,7 +396,7 @@ impl AsyncExecutor {
         }
     }
 
-    /// Initialize thread local variable `ASYNC_EXECUTOR`.
+    /// Initialize the thread local variable `ASYNC_EXECUTOR` then AsyncDriver::default() works.
     pub fn setup(&self) -> std::io::Result<()> {
         ASYNC_EXECUTOR.with(|driver| {
             let mut val = driver.borrow_mut();
@@ -409,14 +409,14 @@ impl AsyncExecutor {
         })
     }
 
-    /// Get an instance of `AsyncDriver`.
+    /// Create an instance of `AsyncDriver`, which is associated with this AsyncExecutor.
     pub fn driver(&self) -> AsyncDriver {
         AsyncDriver {
             sq: self.sq.clone(),
         }
     }
 
-    /// Spawns a future that will be run to completion.
+    /// Spawns a future onto the executor.
     pub fn spawn<Fut>(&self, future: Fut) -> Result<(), SpawnError>
     where
         Fut: Future<Output = ()> + 'static,
@@ -446,7 +446,7 @@ impl AsyncExecutor {
 impl Drop for AsyncExecutor {
     fn drop(&mut self) {
         // One reference for ASYNC_EXECUTOR, another for self.sq
-        assert_eq!(Arc::strong_count(&self.sq), 2);
+        assert!(Arc::strong_count(&self.sq) <= 2);
 
         let _ring = unsafe { Box::from_raw(self.ring as *mut IoUring) };
     }
@@ -464,12 +464,11 @@ impl Default for AsyncExecutorState {
 
 impl AsyncExecutorState {
     /// Create a new state object.
-
     pub fn new() -> Self {
         AsyncExecutorState(Arc::new(AtomicU32::new(0)))
     }
 
-    /// Start to quiesce the executor/tasks.
+    /// Notify the executor/tasks to enter quiesce mode.
     pub fn quiesce(&self) {
         let _ = self
             .0
@@ -486,7 +485,7 @@ impl AsyncExecutorState {
         cnt > 0 && self.0.load(Ordering::Relaxed) == cnt
     }
 
-    /// Report that one instance has reached queisce state.
+    /// Report that one instance has reached quiesce state.
     pub fn report(&self) {
         self.0.fetch_add(1, Ordering::SeqCst);
     }

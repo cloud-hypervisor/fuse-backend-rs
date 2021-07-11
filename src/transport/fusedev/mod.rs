@@ -15,8 +15,6 @@ use nix::sys::uio::{pwrite, writev, IoVec};
 use vm_memory::{ByteValued, VolatileMemory, VolatileMemoryError, VolatileSlice};
 
 use super::{FileReadWriteVolatile, IoBuffers, Reader};
-#[cfg(feature = "async-io")]
-use crate::async_util::{AsyncDrive, AsyncUtil};
 use crate::BitmapSlice;
 
 mod session;
@@ -379,12 +377,13 @@ impl<'a, S: BitmapSlice> io::Write for Writer<'a, S> {
 #[cfg(feature = "async-io")]
 mod async_io {
     use super::*;
+    use crate::async_util::{AsyncDrive, AsyncUtil};
 
     impl<'a, S: BitmapSlice> Reader<'a, S> {
-        /// Reads data from the descriptor chain buffer into a File at offset `off`.
-        /// Returns the number of bytes read from the descriptor chain buffer.
-        /// The number of bytes read can be less than `count` if there isn't
-        /// enough data in the descriptor chain buffer.
+        /// Reads data from the data buffer into a File at offset `off` in asynchronous mode.
+        ///
+        /// Returns the number of bytes read from the descriptor chain buffer. The number of bytes
+        /// read can be less than `count` if there isn't enough data in the descriptor chain buffer.
         pub async fn async_read_to_at<D: AsyncDrive>(
             &mut self,
             drive: D,
@@ -400,7 +399,6 @@ mod async_io {
                     AsyncUtil::write(drive, dst, bufs[0].as_ref(), off).await?
                 } else {
                     panic!("fusedev: only one data buffer is supported");
-                    //AsyncUtil::write_vectored(drive, dst, &bufs, off).await?
                 };
                 self.buffers.mark_used(result)?;
                 Ok(result)
@@ -410,6 +408,8 @@ mod async_io {
 
     impl<'a, S: BitmapSlice> Writer<'a, S> {
         /// Write data from a buffer into this writer in asynchronous mode.
+        ///
+        /// Returns the number of bytes written to the writer.
         pub async fn async_write<D: AsyncDrive>(
             &mut self,
             drive: D,
@@ -437,6 +437,8 @@ mod async_io {
         }
 
         /// Write data from two buffers into this writer in asynchronous mode.
+        ///
+        /// Returns the number of bytes written to the writer.
         pub async fn async_write2<D: AsyncDrive>(
             &mut self,
             drive: D,
@@ -467,6 +469,8 @@ mod async_io {
         }
 
         /// Write data from two buffers into this writer in asynchronous mode.
+        ///
+        /// Returns the number of bytes written to the writer.
         pub async fn async_write3<D: AsyncDrive>(
             &mut self,
             drive: D,
@@ -498,39 +502,6 @@ mod async_io {
             }
         }
 
-        /*
-        /// Write data from a group of buffers into this writer in asynchronous mode, skipping empty
-        /// buffers.
-        pub async fn async_write_vectored<D: AsyncDrive>(
-            &mut self,
-            drive: D,
-            bufs: &[IoSlice<'_>],
-        ) -> io::Result<usize> {
-            self.check_available_space(bufs.iter().fold(0, |acc, x| acc + x.len()))?;
-
-            if self.buffered {
-                let count = bufs.iter().filter(|b| !b.is_empty()).fold(0, |acc, b| {
-                    self.buf.extend_from_slice(b);
-                    acc + b.len()
-                });
-                Ok(count)
-            } else if bufs.is_empty() {
-                Ok(0)
-            } else {
-                AsyncUtil::write_vectored(drive, self.fd, bufs, 0)
-                    .await
-                    .map(|x| {
-                        self.account_written(x);
-                        x
-                    })
-                    .map_err(|e| {
-                        error! {"fail to write to fuse device on commit: {}", e};
-                        io::Error::new(io::ErrorKind::Other, format!("{}", e))
-                    })
-            }
-        }
-         */
-
         /// Attempts to write an entire buffer into this writer in asynchronous mode.
         pub async fn async_write_all<D: AsyncDrive>(
             &mut self,
@@ -554,8 +525,9 @@ mod async_io {
             Ok(())
         }
 
-        /// Writes data to the descriptor chain buffer from a File at offset `off`.
-        /// Returns the number of bytes written to the descriptor chain buffer.
+        /// Writes data from a File at offset `off` to the writer in asynchronous mode.
+        ///
+        /// Returns the number of bytes written to the writer.
         pub async fn async_write_from_at<D: AsyncDrive>(
             &mut self,
             drive: D,
@@ -580,7 +552,8 @@ mod async_io {
             }
         }
 
-        /// Commit all internal buffers of self and others
+        /// Commit all internal buffers of the writer and others.
+        ///
         /// We need this because the lifetime of others is usually shorter than self.
         pub async fn async_commit<D: AsyncDrive>(
             &mut self,

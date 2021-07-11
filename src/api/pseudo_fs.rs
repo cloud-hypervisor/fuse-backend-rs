@@ -403,13 +403,7 @@ mod tests {
     use std::ffi::CString;
 
     fn create_fuse_context() -> Context {
-        Context {
-            uid: 0,
-            gid: 0,
-            pid: 0,
-            #[cfg(feature = "async-io")]
-            drive: 0,
-        }
+        Context::new()
     }
 
     #[test]

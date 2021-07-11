@@ -24,7 +24,8 @@ use crate::{bytes_to_cstr, encode_io_error_kind, BitmapSlice, Error, Result};
 struct AsyncZcReader<'a, S: BitmapSlice = ()>(Reader<'a, S>);
 
 // The underlying VolatileSlice contains "*mut u8", which is just a pointer to a u8 array.
-// So safe to send to other threads.
+// Actually we rely on the AsyncExecutor is a single-threaded worker, and we do not really send
+// 'Reader' to other threads.
 unsafe impl<'a, S: BitmapSlice> Send for Reader<'a, S> {}
 
 #[async_trait]
@@ -62,7 +63,8 @@ impl<'a, S: BitmapSlice> io::Read for AsyncZcReader<'a, S> {
 struct AsyncZcWriter<'a, S: BitmapSlice = ()>(Writer<'a, S>);
 
 // The underlying VolatileSlice contains "*mut u8", which is just a pointer to a u8 array.
-// So safe to send to other threads.
+// Actually we rely on the AsyncExecutor is a single-threaded worker, and we do not really send
+// 'Reader' to other threads.
 unsafe impl<'a, S: BitmapSlice> Send for Writer<'a, S> {}
 
 #[async_trait]
@@ -76,9 +78,7 @@ impl<'a, D: AsyncDrive + 'static, S: BitmapSlice> AsyncZeroCopyWriter<D, S>
         count: usize,
         off: u64,
     ) -> io::Result<usize> {
-        let writer = &mut self.0;
-
-        writer.async_write_from_at(drive, f, count, off).await
+        self.0.async_write_from_at(drive, f, count, off).await
     }
 }
 

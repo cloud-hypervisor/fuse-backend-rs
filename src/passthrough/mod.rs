@@ -691,13 +691,14 @@ impl<D: AsyncDrive, S: BitmapSlice + Send + Sync> PassthroughFs<D, S> {
         )
     }
 
+    /// Create a File or File Handle for `name` under directory `dir_fd` to support `lookup()`.
     fn open_file_or_handle(
         &self,
-        fd: RawFd,
+        dir_fd: RawFd,
         name: &CStr,
     ) -> io::Result<(FileOrHandle, libc::stat64, InodeAltKey, Option<InodeAltKey>)> {
         let handle = if self.cfg.inode_file_handles {
-            FileHandle::from_name_at_with_mount_fds(fd, name, &self.mount_fds, |fd, flags| {
+            FileHandle::from_name_at_with_mount_fds(dir_fd, name, &self.mount_fds, |fd, flags| {
                 Self::open_proc_file(&self.proc, fd, flags)
             })
         } else {
@@ -709,7 +710,7 @@ impl<D: AsyncDrive, S: BitmapSlice + Send + Sync> PassthroughFs<D, S> {
             FileOrHandle::Handle(h)
         } else {
             let f = Self::open_file(
-                fd,
+                dir_fd,
                 name,
                 libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC,
                 0,
@@ -720,9 +721,8 @@ impl<D: AsyncDrive, S: BitmapSlice + Send + Sync> PassthroughFs<D, S> {
 
         let st = match &file_or_handle {
             FileOrHandle::File(f) => Self::stat(f, None)?,
-            FileOrHandle::Handle(_) => Self::stat_fd(fd, Some(name))?,
+            FileOrHandle::Handle(_) => Self::stat_fd(dir_fd, Some(name))?,
         };
-
         let ids_altkey = InodeAltKey::ids_from_stat(&st);
 
         // Note that this will always be `None` if `cfg.inode_file_handles` is false, but we only
@@ -734,10 +734,10 @@ impl<D: AsyncDrive, S: BitmapSlice + Send + Sync> PassthroughFs<D, S> {
     }
 
     fn do_lookup(&self, parent: Inode, name: &CStr) -> io::Result<Entry> {
-        let p = self.inode_map.get(parent)?;
-        let p_file = p.get_file(&self.mount_fds)?;
+        let dir = self.inode_map.get(parent)?;
+        let dir_file = dir.get_file(&self.mount_fds)?;
         let (file_or_handle, st, ids_altkey, handle_altkey) =
-            self.open_file_or_handle(p_file.as_raw_fd(), name)?;
+            self.open_file_or_handle(dir_file.as_raw_fd(), name)?;
 
         let mut found = None;
         'search: loop {
