@@ -2,7 +2,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::io;
-use std::marker::PhantomData;
 use std::mem::size_of;
 use std::os::unix::io::RawFd;
 use std::time::Duration;
@@ -10,11 +9,10 @@ use std::time::Duration;
 use async_trait::async_trait;
 use vm_memory::ByteValued;
 
-use super::{MetricsHook, Server, ServerUtil, MAX_BUFFER_SIZE};
+use super::{MetricsHook, Server, ServerUtil, SrvContext, MAX_BUFFER_SIZE};
 use crate::abi::linux_abi::*;
 use crate::api::filesystem::{
-    AsyncFileSystem, AsyncZeroCopyReader, AsyncZeroCopyWriter, Context, ZeroCopyReader,
-    ZeroCopyWriter,
+    AsyncFileSystem, AsyncZeroCopyReader, AsyncZeroCopyWriter, ZeroCopyReader, ZeroCopyWriter,
 };
 use crate::api::CreateIn;
 use crate::async_util::AsyncDrive;
@@ -128,10 +126,10 @@ impl<F: AsyncFileSystem<D, S> + Sync, D: AsyncDrive, S: BitmapSlice> Server<F, D
         hook: Option<&dyn MetricsHook>,
     ) -> Result<usize> {
         let in_header = r.read_obj().map_err(Error::DecodeMessage)?;
-        let mut ctx = AsyncContext::<F, D, S>::new(in_header, r, w, drive);
+        let mut ctx = SrvContext::<F, D, S>::with_drive(in_header, r, w, drive);
         if ctx.in_header.len > MAX_BUFFER_SIZE || ctx.w.available_bytes() < size_of::<OutHeader>() {
             return ctx
-                .do_reply_error(io::Error::from_raw_os_error(libc::ENOMEM), true)
+                .async_do_reply_error(io::Error::from_raw_os_error(libc::ENOMEM), true)
                 .await;
         }
         let in_header = &ctx.in_header;
@@ -205,7 +203,7 @@ impl<F: AsyncFileSystem<D, S> + Sync, D: AsyncDrive, S: BitmapSlice> Server<F, D
                     Ok(0)
                 }
                 _ => {
-                    ctx.reply_error(io::Error::from_raw_os_error(libc::ENOSYS))
+                    ctx.async_reply_error(io::Error::from_raw_os_error(libc::ENOSYS))
                         .await
                 }
             },
@@ -219,7 +217,7 @@ impl<F: AsyncFileSystem<D, S> + Sync, D: AsyncDrive, S: BitmapSlice> Server<F, D
         res
     }
 
-    async fn async_lookup(&self, mut ctx: AsyncContext<'_, F, D, S>) -> Result<usize> {
+    async fn async_lookup(&self, mut ctx: SrvContext<'_, F, D, S>) -> Result<usize> {
         let buf = ServerUtil::get_message_body(&mut ctx.r, &ctx.in_header, 0)?;
         let name = bytes_to_cstr(buf.as_ref())?;
         let result = self
@@ -237,17 +235,17 @@ impl<F: AsyncFileSystem<D, S> + Sync, D: AsyncDrive, S: BitmapSlice> Server<F, D
                     && entry.inode == 0
                 {
                     let e = io::Error::from_raw_os_error(libc::ENOENT);
-                    ctx.reply_error(e).await
+                    ctx.async_reply_error(e).await
                 } else {
                     let out = EntryOut::from(entry);
-                    ctx.reply_ok(Some(out), None).await
+                    ctx.async_reply_ok(Some(out), None).await
                 }
             }
-            Err(e) => ctx.reply_error(e).await,
+            Err(e) => ctx.async_reply_error(e).await,
         }
     }
 
-    async fn async_getattr(&self, mut ctx: AsyncContext<'_, F, D, S>) -> Result<usize> {
+    async fn async_getattr(&self, mut ctx: SrvContext<'_, F, D, S>) -> Result<usize> {
         let GetattrIn { flags, fh, .. } = ctx.r.read_obj().map_err(Error::DecodeMessage)?;
         let handle = if (flags & GETATTR_FH) != 0 {
             Some(fh.into())
@@ -259,10 +257,10 @@ impl<F: AsyncFileSystem<D, S> + Sync, D: AsyncDrive, S: BitmapSlice> Server<F, D
             .async_getattr(ctx.context(), ctx.nodeid(), handle)
             .await;
 
-        ctx.handle_attr_result(result).await
+        ctx.async_handle_attr_result(result).await
     }
 
-    async fn async_setattr(&self, mut ctx: AsyncContext<'_, F, D, S>) -> Result<usize> {
+    async fn async_setattr(&self, mut ctx: SrvContext<'_, F, D, S>) -> Result<usize> {
         let setattr_in: SetattrIn = ctx.r.read_obj().map_err(Error::DecodeMessage)?;
         let handle = if setattr_in.valid & FATTR_FH != 0 {
             Some(setattr_in.fh.into())
@@ -276,10 +274,10 @@ impl<F: AsyncFileSystem<D, S> + Sync, D: AsyncDrive, S: BitmapSlice> Server<F, D
             .async_setattr(ctx.context(), ctx.nodeid(), st, handle, valid)
             .await;
 
-        ctx.handle_attr_result(result).await
+        ctx.async_handle_attr_result(result).await
     }
 
-    async fn async_open(&self, mut ctx: AsyncContext<'_, F, D, S>) -> Result<usize> {
+    async fn async_open(&self, mut ctx: SrvContext<'_, F, D, S>) -> Result<usize> {
         let OpenIn { flags, fuse_flags } = ctx.r.read_obj().map_err(Error::DecodeMessage)?;
         let result = self
             .fs
@@ -293,13 +291,13 @@ impl<F: AsyncFileSystem<D, S> + Sync, D: AsyncDrive, S: BitmapSlice> Server<F, D
                     open_flags: opts.bits(),
                     ..Default::default()
                 };
-                ctx.reply_ok(Some(out), None).await
+                ctx.async_reply_ok(Some(out), None).await
             }
-            Err(e) => ctx.reply_error(e).await,
+            Err(e) => ctx.async_reply_error(e).await,
         }
     }
 
-    async fn async_read(&self, mut ctx: AsyncContext<'_, F, D, S>) -> Result<usize> {
+    async fn async_read(&self, mut ctx: SrvContext<'_, F, D, S>) -> Result<usize> {
         let ReadIn {
             fh,
             offset,
@@ -312,7 +310,7 @@ impl<F: AsyncFileSystem<D, S> + Sync, D: AsyncDrive, S: BitmapSlice> Server<F, D
 
         if size > MAX_BUFFER_SIZE {
             return ctx
-                .do_reply_error(io::Error::from_raw_os_error(libc::ENOMEM), true)
+                .async_do_reply_error(io::Error::from_raw_os_error(libc::ENOMEM), true)
                 .await;
         }
 
@@ -362,11 +360,11 @@ impl<F: AsyncFileSystem<D, S> + Sync, D: AsyncDrive, S: BitmapSlice> Server<F, D
                     .map_err(Error::EncodeMessage)?;
                 Ok(out.len as usize)
             }
-            Err(e) => ctx.reply_error(e).await,
+            Err(e) => ctx.async_reply_error(e).await,
         }
     }
 
-    async fn async_write(&self, mut ctx: AsyncContext<'_, F, D, S>) -> Result<usize> {
+    async fn async_write(&self, mut ctx: SrvContext<'_, F, D, S>) -> Result<usize> {
         let WriteIn {
             fh,
             offset,
@@ -379,7 +377,7 @@ impl<F: AsyncFileSystem<D, S> + Sync, D: AsyncDrive, S: BitmapSlice> Server<F, D
 
         if size > MAX_BUFFER_SIZE {
             return ctx
-                .do_reply_error(io::Error::from_raw_os_error(libc::ENOMEM), true)
+                .async_do_reply_error(io::Error::from_raw_os_error(libc::ENOMEM), true)
                 .await;
         }
 
@@ -413,13 +411,13 @@ impl<F: AsyncFileSystem<D, S> + Sync, D: AsyncDrive, S: BitmapSlice> Server<F, D
                     ..Default::default()
                 };
 
-                ctx.reply_ok(Some(out), None).await
+                ctx.async_reply_ok(Some(out), None).await
             }
-            Err(e) => ctx.reply_error(e).await,
+            Err(e) => ctx.async_reply_error(e).await,
         }
     }
 
-    async fn async_fsync(&self, mut ctx: AsyncContext<'_, F, D, S>) -> Result<usize> {
+    async fn async_fsync(&self, mut ctx: SrvContext<'_, F, D, S>) -> Result<usize> {
         let FsyncIn {
             fh, fsync_flags, ..
         } = ctx.r.read_obj().map_err(Error::DecodeMessage)?;
@@ -430,12 +428,12 @@ impl<F: AsyncFileSystem<D, S> + Sync, D: AsyncDrive, S: BitmapSlice> Server<F, D
             .async_fsync(ctx.context(), ctx.nodeid(), datasync, fh.into())
             .await
         {
-            Ok(()) => ctx.reply_ok(None::<u8>, None).await,
-            Err(e) => ctx.reply_error(e).await,
+            Ok(()) => ctx.async_reply_ok(None::<u8>, None).await,
+            Err(e) => ctx.async_reply_error(e).await,
         }
     }
 
-    async fn async_fsyncdir(&self, mut ctx: AsyncContext<'_, F, D, S>) -> Result<usize> {
+    async fn async_fsyncdir(&self, mut ctx: SrvContext<'_, F, D, S>) -> Result<usize> {
         let FsyncIn {
             fh, fsync_flags, ..
         } = ctx.r.read_obj().map_err(Error::DecodeMessage)?;
@@ -446,12 +444,12 @@ impl<F: AsyncFileSystem<D, S> + Sync, D: AsyncDrive, S: BitmapSlice> Server<F, D
             .await;
 
         match result {
-            Ok(()) => ctx.reply_ok(None::<u8>, None).await,
-            Err(e) => ctx.reply_error(e).await,
+            Ok(()) => ctx.async_reply_ok(None::<u8>, None).await,
+            Err(e) => ctx.async_reply_error(e).await,
         }
     }
 
-    async fn async_create(&self, mut ctx: AsyncContext<'_, F, D, S>) -> Result<usize> {
+    async fn async_create(&self, mut ctx: SrvContext<'_, F, D, S>) -> Result<usize> {
         let args: CreateIn = ctx.r.read_obj().map_err(Error::DecodeMessage)?;
         let buf = ServerUtil::get_message_body(&mut ctx.r, &ctx.in_header, size_of::<CreateIn>())?;
         let name = bytes_to_cstr(&buf)?;
@@ -478,14 +476,14 @@ impl<F: AsyncFileSystem<D, S> + Sync, D: AsyncDrive, S: BitmapSlice> Server<F, D
                 };
 
                 // Kind of a hack to write both structs.
-                ctx.reply_ok(Some(entry_out), Some(open_out.as_slice()))
+                ctx.async_reply_ok(Some(entry_out), Some(open_out.as_slice()))
                     .await
             }
-            Err(e) => ctx.reply_error(e).await,
+            Err(e) => ctx.async_reply_error(e).await,
         }
     }
 
-    async fn async_fallocate(&self, mut ctx: AsyncContext<'_, F, D, S>) -> Result<usize> {
+    async fn async_fallocate(&self, mut ctx: SrvContext<'_, F, D, S>) -> Result<usize> {
         let FallocateIn {
             fh,
             offset,
@@ -499,63 +497,27 @@ impl<F: AsyncFileSystem<D, S> + Sync, D: AsyncDrive, S: BitmapSlice> Server<F, D
             .await;
 
         match result {
-            Ok(()) => ctx.reply_ok(None::<u8>, None).await,
-            Err(e) => ctx.reply_error(e).await,
+            Ok(()) => ctx.async_reply_ok(None::<u8>, None).await,
+            Err(e) => ctx.async_reply_error(e).await,
         }
     }
 }
 
-struct AsyncContext<'a, F, D, S> {
-    drive: D,
-    in_header: InHeader,
-    r: Reader<'a, S>,
-    w: Writer<'a, S>,
-    phantom: PhantomData<F>,
-    phantom2: PhantomData<S>,
-}
+impl<'a, F: AsyncFileSystem<D, S>, D: AsyncDrive, S: BitmapSlice> SrvContext<'a, F, D, S> {
+    fn with_drive(in_header: InHeader, r: Reader<'a, S>, w: Writer<'a, S>, drive: D) -> Self {
+        let mut ctx = Self::new(in_header, r, w);
 
-impl<'a, F: AsyncFileSystem<D, S>, D: AsyncDrive, S: BitmapSlice> AsyncContext<'a, F, D, S> {
-    fn new(in_header: InHeader, r: Reader<'a, S>, w: Writer<'a, S>, drive: D) -> Self {
-        AsyncContext {
-            drive,
-            in_header,
-            r,
-            w,
-            phantom: PhantomData,
-            phantom2: PhantomData,
-        }
-    }
-
-    fn context(&self) -> Context {
-        let mut ctx = Context::from(&self.in_header);
-
-        // Safe because the AsyncContext has longer lifetime than Context object.
-        unsafe { ctx.set_drive(&self.drive) };
+        ctx.drive = Some(drive);
 
         ctx
     }
 
-    fn unique(&self) -> u64 {
-        self.in_header.unique
-    }
-
-    fn nodeid(&self) -> F::Inode {
-        self.in_header.nodeid.into()
-    }
-
-    fn take_reader(&mut self) -> Reader<'a, S> {
-        let mut reader = Reader::default();
-
-        std::mem::swap(&mut self.r, &mut reader);
-
-        reader
-    }
-
     fn drive(&self) -> D {
-        self.drive.clone()
+        // It's illegal to call this method for sync io.
+        self.drive.clone().unwrap()
     }
 
-    async fn reply_ok<T: ByteValued>(
+    async fn async_reply_ok<T: ByteValued>(
         &mut self,
         out: Option<T>,
         data: Option<&[u8]>,
@@ -594,7 +556,7 @@ impl<'a, F: AsyncFileSystem<D, S>, D: AsyncDrive, S: BitmapSlice> AsyncContext<'
         Ok(self.w.bytes_written())
     }
 
-    async fn do_reply_error(&mut self, err: io::Error, internal_err: bool) -> Result<usize> {
+    async fn async_do_reply_error(&mut self, err: io::Error, internal_err: bool) -> Result<usize> {
         let header = OutHeader {
             len: size_of::<OutHeader>() as u32,
             error: -err
@@ -625,11 +587,11 @@ impl<'a, F: AsyncFileSystem<D, S>, D: AsyncDrive, S: BitmapSlice> AsyncContext<'
 
     // reply operation error back to fuse client, don't print error message, as they are not
     // server's internal error, and client could deal with them.
-    async fn reply_error(&mut self, err: io::Error) -> Result<usize> {
-        self.do_reply_error(err, false).await
+    async fn async_reply_error(&mut self, err: io::Error) -> Result<usize> {
+        self.async_do_reply_error(err, false).await
     }
 
-    async fn handle_attr_result(
+    async fn async_handle_attr_result(
         &mut self,
         result: io::Result<(libc::stat64, Duration)>,
     ) -> Result<usize> {
@@ -641,9 +603,9 @@ impl<'a, F: AsyncFileSystem<D, S>, D: AsyncDrive, S: BitmapSlice> AsyncContext<'
                     dummy: 0,
                     attr: st.into(),
                 };
-                self.reply_ok(Some(out), None).await
+                self.async_reply_ok(Some(out), None).await
             }
-            Err(e) => self.reply_error(e).await,
+            Err(e) => self.async_reply_error(e).await,
         }
     }
 }
