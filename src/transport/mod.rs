@@ -41,6 +41,15 @@ struct IoBuffers<'a, S> {
     bytes_consumed: usize,
 }
 
+impl<S: BitmapSlice> Default for IoBuffers<'_, S> {
+    fn default() -> Self {
+        IoBuffers {
+            buffers: VecDeque::new(),
+            bytes_consumed: 0,
+        }
+    }
+}
+
 impl<S: BitmapSlice> IoBuffers<'_, S> {
     fn available_bytes(&self) -> usize {
         // This is guaranteed not to overflow because the total length of the chain
@@ -265,6 +274,14 @@ impl<S: BitmapSlice> IoBuffers<'_, S> {
 #[derive(Clone)]
 pub struct Reader<'a, S = ()> {
     buffers: IoBuffers<'a, S>,
+}
+
+impl<S: BitmapSlice> Default for Reader<'_, S> {
+    fn default() -> Self {
+        Reader {
+            buffers: IoBuffers::default(),
+        }
+    }
 }
 
 impl<S: BitmapSlice> Reader<'_, S> {
