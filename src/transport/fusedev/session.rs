@@ -447,7 +447,7 @@ mod asyncio {
                         let writer = Writer::new(self.fd, buf).unwrap();
                         let result = unsafe {
                             self.server
-                                .async_handle_message(drive.clone(), reader, writer, None)
+                                .async_handle_message(drive.clone(), reader, writer, None, None)
                                 .await
                         };
 

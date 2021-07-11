@@ -33,7 +33,6 @@ use crate::{bytes_to_cstr, BitmapSlice, Error, Result};
 #[cfg(feature = "async-io")]
 mod async_io;
 mod sync_io;
-pub use sync_io::MetricsHook;
 
 const MAX_BUFFER_SIZE: u32 = 1 << 20;
 const MAX_REQ_PAGES: u16 = 256; // 1MB
@@ -149,6 +148,14 @@ impl ServerUtil {
             libc::EINVAL,
         )))
     }
+}
+
+/// Provide concrete backend filesystem a way to catch information/metrics from fuse.
+pub trait MetricsHook {
+    /// `collect()` will be invoked before the real request is processed
+    fn collect(&self, ih: &InHeader);
+    /// `release()` will be invoked after the real request is processed
+    fn release(&self, oh: Option<&OutHeader>);
 }
 
 #[cfg(test)]
