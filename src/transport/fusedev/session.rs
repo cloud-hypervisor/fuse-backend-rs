@@ -239,9 +239,7 @@ impl FuseChannel {
                             return Err(SessionFailure(format!("unexpected epoll event: {}", x,)));
                         }
                     }
-                } else if event.hungup()
-                /*|| event.has_error()*/ // TODO: upgrade to vmm-sys-util v0.8.0
-                {
+                } else if event.hungup() || event.has_error() {
                     info!("FUSE channel already closed!");
                     return Err(SessionFailure("epoll error".to_string()));
                 } else {
