@@ -24,7 +24,7 @@ use std::sync::Arc;
 
 use arc_swap::ArcSwap;
 
-use super::filesystem::{FileSystem, ZeroCopyReader, ZeroCopyWriter};
+use super::filesystem::{Context, FileSystem, ZeroCopyReader, ZeroCopyWriter};
 use crate::abi::linux_abi::*;
 use crate::async_util::{AsyncDrive, AsyncDriver};
 use crate::transport::{FileReadWriteVolatile, Reader, Writer};
@@ -156,6 +156,55 @@ pub trait MetricsHook {
     fn collect(&self, ih: &InHeader);
     /// `release()` will be invoked after the real request is processed
     fn release(&self, oh: Option<&OutHeader>);
+}
+
+struct SrvContext<'a, F, D: AsyncDrive = AsyncDriver, S: BitmapSlice = ()> {
+    drive: Option<D>,
+    in_header: InHeader,
+    r: Reader<'a, S>,
+    w: Writer<'a, S>,
+    phantom: PhantomData<F>,
+    phantom2: PhantomData<S>,
+}
+
+impl<'a, F: FileSystem<S>, D: AsyncDrive, S: BitmapSlice> SrvContext<'a, F, D, S> {
+    fn new(in_header: InHeader, r: Reader<'a, S>, w: Writer<'a, S>) -> Self {
+        SrvContext {
+            drive: None,
+            in_header,
+            r,
+            w,
+            phantom: PhantomData,
+            phantom2: PhantomData,
+        }
+    }
+
+    fn context(&self) -> Context {
+        let mut ctx = Context::from(&self.in_header);
+
+        if self.drive.is_some() {
+            // Safe because the SrvContext has longer lifetime than Context object.
+            unsafe { ctx.set_drive(self.drive.as_ref().unwrap()) };
+        }
+
+        ctx
+    }
+
+    fn unique(&self) -> u64 {
+        self.in_header.unique
+    }
+
+    fn nodeid(&self) -> F::Inode {
+        self.in_header.nodeid.into()
+    }
+
+    fn take_reader(&mut self) -> Reader<'a, S> {
+        let mut reader = Reader::default();
+
+        std::mem::swap(&mut self.r, &mut reader);
+
+        reader
+    }
 }
 
 #[cfg(test)]
