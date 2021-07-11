@@ -611,13 +611,6 @@ mod tests {
     use std::os::unix::io::AsRawFd;
     use vmm_sys_util::tempfile::TempFile;
 
-    #[cfg(feature = "async-io")]
-    use futures::executor::{block_on, ThreadPool};
-    #[cfg(feature = "async-io")]
-    use futures::task::SpawnExt;
-    #[cfg(feature = "async-io")]
-    use ringbahn::drive::demo::DemoDriver;
-
     #[test]
     fn reader_test_simple_chain() {
         let mut buf = [0u8; 106];
@@ -1031,177 +1024,173 @@ mod tests {
     }
 
     #[cfg(feature = "async-io")]
-    #[test]
-    fn async_read_to_at() {
-        let file = TempFile::new().unwrap().into_file();
-        let fd = file.as_raw_fd();
+    mod async_io {
+        use futures::executor::{block_on, ThreadPool};
+        use futures::task::SpawnExt;
+        use ringbahn::drive::demo::DemoDriver;
 
-        let executor = ThreadPool::new().unwrap();
-        let handle = executor
-            .spawn_with_handle(async move {
-                let mut buf2 = [0u8; 48];
-                let mut reader = Reader::<()>::new(FuseBuf::new(&mut buf2)).unwrap();
+        use super::*;
 
-                let drive = DemoDriver::default();
-                reader.async_read_to_at(drive, fd, 48, 16).await
-            })
-            .unwrap();
+        #[test]
+        fn async_read_to_at() {
+            let file = TempFile::new().unwrap().into_file();
+            let fd = file.as_raw_fd();
 
-        let result = block_on(handle).unwrap();
-        assert_eq!(result, 48);
-        // assert_eq!(reader.available_bytes(), 0);
-        // assert_eq!(reader.bytes_read(), 48);
-    }
+            let executor = ThreadPool::new().unwrap();
+            let handle = executor
+                .spawn_with_handle(async move {
+                    let mut buf2 = [0u8; 48];
+                    let mut reader = Reader::<()>::new(FuseBuf::new(&mut buf2)).unwrap();
+                    let drive = DemoDriver::default();
 
-    #[cfg(feature = "async-io")]
-    #[test]
-    fn async_write() {
-        let file = TempFile::new().unwrap().into_file();
+                    reader.async_read_to_at(drive, fd, 48, 16).await
+                })
+                .unwrap();
 
-        let executor = ThreadPool::new().unwrap();
-        let fd = file.as_raw_fd();
-        let handle = executor
-            .spawn_with_handle(async move {
-                let drive = DemoDriver::default();
-                let mut buf = vec![0x0u8; 48];
-                let mut writer = Writer::<()>::new(fd, &mut buf).unwrap();
+            assert_eq!(block_on(handle).unwrap(), 48);
+        }
 
-                let buf = vec![0xdeu8; 64];
-                writer.async_write(drive, &buf[..]).await
-            })
-            .unwrap();
+        #[test]
+        fn async_write() {
+            let file = TempFile::new().unwrap().into_file();
+            let fd = file.as_raw_fd();
 
-        // expect errors
-        block_on(handle).unwrap_err();
+            let executor = ThreadPool::new().unwrap();
+            let handle = executor
+                .spawn_with_handle(async move {
+                    let drive = DemoDriver::default();
+                    let mut buf = vec![0x0u8; 48];
+                    let mut writer = Writer::<()>::new(fd, &mut buf).unwrap();
 
-        let fd = file.as_raw_fd();
-        let handle = executor
-            .spawn_with_handle(async move {
-                let drive = DemoDriver::default();
-                let mut buf = vec![0x0u8; 48];
-                let mut writer2 = Writer::<()>::new(fd, &mut buf).unwrap();
+                    let buf = vec![0xdeu8; 64];
+                    writer.async_write(drive, &buf[..]).await
+                })
+                .unwrap();
 
-                let buf = vec![0xdeu8; 48];
-                writer2.async_write(drive, &buf[..]).await
-            })
-            .unwrap();
+            // expect errors
+            block_on(handle).unwrap_err();
 
-        let result = block_on(handle).unwrap();
-        assert_eq!(result, 48);
-    }
+            let fd = file.as_raw_fd();
+            let handle = executor
+                .spawn_with_handle(async move {
+                    let drive = DemoDriver::default();
+                    let mut buf = vec![0x0u8; 48];
+                    let mut writer2 = Writer::<()>::new(fd, &mut buf).unwrap();
 
-    #[cfg(feature = "async-io")]
-    #[test]
-    fn async_write2() {
-        let file = TempFile::new().unwrap().into_file();
+                    let buf = vec![0xdeu8; 48];
+                    writer2.async_write(drive, &buf[..]).await
+                })
+                .unwrap();
 
-        let executor = ThreadPool::new().unwrap();
-        let fd = file.as_raw_fd();
-        let handle = executor
-            .spawn_with_handle(async move {
-                let drive = DemoDriver::default();
-                let mut buf = vec![0x0u8; 48];
-                let mut writer = Writer::<()>::new(fd, &mut buf).unwrap();
-                let buf = vec![0xdeu8; 48];
+            assert_eq!(block_on(handle).unwrap(), 48);
+        }
 
-                writer.async_write2(drive, &buf[..32], &buf[32..]).await
-            })
-            .unwrap();
+        #[test]
+        fn async_write2() {
+            let file = TempFile::new().unwrap().into_file();
+            let fd = file.as_raw_fd();
 
-        let result = block_on(handle).unwrap();
-        assert_eq!(result, 48);
-    }
+            let executor = ThreadPool::new().unwrap();
+            let handle = executor
+                .spawn_with_handle(async move {
+                    let drive = DemoDriver::default();
+                    let mut buf = vec![0x0u8; 48];
+                    let mut writer = Writer::<()>::new(fd, &mut buf).unwrap();
+                    let buf = vec![0xdeu8; 48];
 
-    #[cfg(feature = "async-io")]
-    #[test]
-    fn async_write3() {
-        let file = TempFile::new().unwrap().into_file();
+                    writer.async_write2(drive, &buf[..32], &buf[32..]).await
+                })
+                .unwrap();
 
-        let executor = ThreadPool::new().unwrap();
-        let fd = file.as_raw_fd();
-        let handle = executor
-            .spawn_with_handle(async move {
-                let drive = DemoDriver::default();
-                let mut buf = vec![0x0u8; 48];
-                let mut writer = Writer::<()>::new(fd, &mut buf).unwrap();
-                let buf = vec![0xdeu8; 48];
+            assert_eq!(block_on(handle).unwrap(), 48);
+        }
 
-                writer
-                    .async_write3(drive, &buf[..32], &buf[32..40], &buf[40..])
-                    .await
-            })
-            .unwrap();
+        #[test]
+        fn async_write3() {
+            let file = TempFile::new().unwrap().into_file();
+            let fd = file.as_raw_fd();
 
-        let result = block_on(handle).unwrap();
-        assert_eq!(result, 48);
-    }
+            let executor = ThreadPool::new().unwrap();
+            let handle = executor
+                .spawn_with_handle(async move {
+                    let drive = DemoDriver::default();
+                    let mut buf = vec![0x0u8; 48];
+                    let mut writer = Writer::<()>::new(fd, &mut buf).unwrap();
+                    let buf = vec![0xdeu8; 48];
 
-    #[cfg(feature = "async-io")]
-    #[test]
-    fn async_write_from_at() {
-        let file1 = TempFile::new().unwrap().into_file();
-        let fd1 = file1.as_raw_fd();
-        let mut file = TempFile::new().unwrap().into_file();
-        let buf = vec![0xdeu8; 64];
+                    writer
+                        .async_write3(drive, &buf[..32], &buf[32..40], &buf[40..])
+                        .await
+                })
+                .unwrap();
 
-        file.write_all(&buf).unwrap();
-        file.seek(SeekFrom::Start(0)).unwrap();
-        let fd = file.as_raw_fd();
+            assert_eq!(block_on(handle).unwrap(), 48);
+        }
 
-        let executor = ThreadPool::new().unwrap();
-        let handle = executor
-            .spawn_with_handle(async move {
-                let drive = DemoDriver::default();
-                let mut buf = vec![0x0u8; 48];
-                let mut writer = Writer::<()>::new(fd1, &mut buf).unwrap();
+        #[test]
+        fn async_write_from_at() {
+            let file1 = TempFile::new().unwrap().into_file();
+            let fd1 = file1.as_raw_fd();
+            let mut file = TempFile::new().unwrap().into_file();
+            let fd = file.as_raw_fd();
+            let buf = vec![0xdeu8; 64];
 
-                writer.async_write_from_at(drive, fd, 40, 16).await
-            })
-            .unwrap();
+            file.write_all(&buf).unwrap();
+            file.seek(SeekFrom::Start(0)).unwrap();
 
-        let result = block_on(handle).unwrap();
-        assert_eq!(result, 40);
-    }
+            let executor = ThreadPool::new().unwrap();
+            let handle = executor
+                .spawn_with_handle(async move {
+                    let drive = DemoDriver::default();
+                    let mut buf = vec![0x0u8; 48];
+                    let mut writer = Writer::<()>::new(fd1, &mut buf).unwrap();
 
-    #[cfg(feature = "async-io")]
-    #[test]
-    fn async_writer_split_commit_all() {
-        let file = TempFile::new().unwrap().into_file();
-        let fd = file.as_raw_fd();
-        let mut buf = vec![0x0u8; 106];
-        let buf = unsafe { std::mem::transmute::<&mut [u8], &'static mut [u8]>(&mut buf) };
-        let mut writer = Writer::<()>::new(fd, buf).unwrap();
-        let mut other = writer.split_at(4).expect("failed to split Writer");
+                    writer.async_write_from_at(drive, fd, 40, 16).await
+                })
+                .unwrap();
 
-        assert_eq!(writer.available_bytes(), 4);
-        assert_eq!(other.available_bytes(), 102);
+            assert_eq!(block_on(handle).unwrap(), 40);
+        }
 
-        writer.write(&[0x1u8; 4]).unwrap();
-        assert_eq!(writer.available_bytes(), 0);
-        assert_eq!(writer.bytes_written(), 4);
+        #[test]
+        fn async_writer_split_commit_all() {
+            let file = TempFile::new().unwrap().into_file();
+            let fd = file.as_raw_fd();
+            let mut buf = vec![0x0u8; 106];
+            let buf = unsafe { std::mem::transmute::<&mut [u8], &'static mut [u8]>(&mut buf) };
+            let mut writer = Writer::<()>::new(fd, buf).unwrap();
+            let mut other = writer.split_at(4).expect("failed to split Writer");
 
-        let buf = vec![0xdeu8; 64];
-        let slices = [
-            IoSlice::new(&buf[..32]),
-            IoSlice::new(&buf[32..48]),
-            IoSlice::new(&buf[48..]),
-        ];
-        assert_eq!(
-            other
-                .write_vectored(&slices)
-                .expect("failed to write from buffer"),
-            64
-        );
+            assert_eq!(writer.available_bytes(), 4);
+            assert_eq!(other.available_bytes(), 102);
 
-        let executor = ThreadPool::new().unwrap();
-        let handle = executor
-            .spawn_with_handle(async move {
-                let drive = DemoDriver::default();
+            writer.write(&[0x1u8; 4]).unwrap();
+            assert_eq!(writer.available_bytes(), 0);
+            assert_eq!(writer.bytes_written(), 4);
 
-                writer.async_commit(drive, Some(&other)).await
-            })
-            .unwrap();
+            let buf = vec![0xdeu8; 64];
+            let slices = [
+                IoSlice::new(&buf[..32]),
+                IoSlice::new(&buf[32..48]),
+                IoSlice::new(&buf[48..]),
+            ];
+            assert_eq!(
+                other
+                    .write_vectored(&slices)
+                    .expect("failed to write from buffer"),
+                64
+            );
 
-        let _result = block_on(handle).unwrap();
+            let executor = ThreadPool::new().unwrap();
+            let handle = executor
+                .spawn_with_handle(async move {
+                    let drive = DemoDriver::default();
+
+                    writer.async_commit(drive, Some(&other)).await
+                })
+                .unwrap();
+
+            let _result = block_on(handle).unwrap();
+        }
     }
 }

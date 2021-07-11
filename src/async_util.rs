@@ -511,7 +511,33 @@ mod tests {
     use vmm_sys_util::tempfile::TempFile;
 
     #[test]
-    fn test_async_read() {}
+    fn test_async_read() {
+        let file = vmm_sys_util::tempfile::TempFile::new().unwrap();
+        let buf = [
+            0x1u8, 0x1u8, 0x2u8, 0x3u8, 0x4u8, 0x5u8, 0x6u8, 0x7u8, 0x8u8, 0x9u8, 0x1u8, 0x2u8,
+            0x3u8, 0x4u8, 0x5u8, 0x6u8, 0x7u8, 0x8u8, 0x9u8,
+        ];
+        file.as_file().write(&buf).unwrap();
+        let fd = file.as_file().as_raw_fd();
+        let executor = ThreadPool::new().unwrap();
+
+        let handle = executor
+            .spawn_with_handle(async move {
+                let mut bufs = [0u8; 18];
+
+                let drive = DemoDriver::default();
+                AsyncUtil::read(drive, fd, &mut bufs, 1).await.map(|v| {
+                    if v == 18 && buf[1..] == bufs {
+                        v
+                    } else {
+                        0
+                    }
+                })
+            })
+            .unwrap();
+
+        assert_eq!(block_on(handle).unwrap(), 18);
+    }
 
     #[test]
     fn test_async_read_vectored() {
@@ -522,7 +548,6 @@ mod tests {
         ];
         file.as_file().write(&buf).unwrap();
         let fd = file.as_file().as_raw_fd();
-
         let executor = ThreadPool::new().unwrap();
 
         let handle = executor
@@ -530,13 +555,13 @@ mod tests {
                 let mut bufs = [0u8; 18];
 
                 let drive = DemoDriver::default();
-                AsyncUtil::read_vectored(drive, fd, &mut [IoSliceMut::new(&mut bufs)], 1).await
-
-                //task.await
+                AsyncUtil::read_vectored(drive, fd, &mut [IoSliceMut::new(&mut bufs)], 1)
+                    .await
+                    .map(|v| if v == 18 && buf[1..] == bufs { v } else { 0 })
             })
             .unwrap();
-        let result = block_on(handle).unwrap();
-        assert_eq!(result, 18);
+
+        assert_eq!(block_on(handle).unwrap(), 18);
     }
 
     #[test]
@@ -556,8 +581,7 @@ mod tests {
                 task.await
             })
             .unwrap();
-        let result = block_on(handle).unwrap();
-        assert_eq!(result, 9);
+        assert_eq!(block_on(handle).unwrap(), 9);
 
         let buf = [
             0x1u8, 0x2u8, 0x3u8, 0x4u8, 0x5u8, 0x6u8, 0x7u8, 0x8u8, 0x9u8,
@@ -590,8 +614,7 @@ mod tests {
                 task.await
             })
             .unwrap();
-        let result = block_on(handle).unwrap();
-        assert_eq!(result, 18);
+        assert_eq!(block_on(handle).unwrap(), 18);
 
         let buf = [
             0x1u8, 0x2u8, 0x3u8, 0x4u8, 0x5u8, 0x6u8, 0x7u8, 0x8u8, 0x9u8,

@@ -496,11 +496,6 @@ mod tests {
     use crate::async_util::AsyncDriver;
     use std::ffi::CString;
 
-    #[cfg(feature = "async-io")]
-    use crate::abi::linux_abi::{OpenOptions, SetattrValid};
-    #[cfg(feature = "async-io")]
-    use async_trait::async_trait;
-
     pub(crate) struct FakeFileSystemOne {}
     impl FileSystem for FakeFileSystemOne {
         type Inode = u64;
@@ -513,168 +508,6 @@ mod tests {
                 attr_timeout: Duration::new(0, 0),
                 entry_timeout: Duration::new(0, 0),
             })
-        }
-    }
-
-    #[cfg(feature = "async-io")]
-    #[allow(unused_variables)]
-    #[async_trait]
-    impl AsyncFileSystem for FakeFileSystemOne {
-        async fn async_lookup(
-            &self,
-            ctx: Context,
-            parent: <Self as FileSystem>::Inode,
-            name: &CStr,
-        ) -> Result<Entry> {
-            Ok(Entry {
-                inode: 0,
-                generation: 0,
-                attr: unsafe { std::mem::zeroed() },
-                attr_timeout: Default::default(),
-                entry_timeout: Default::default(),
-            })
-        }
-
-        async fn async_getattr(
-            &self,
-            ctx: Context,
-            inode: <Self as FileSystem>::Inode,
-            handle: Option<<Self as FileSystem>::Handle>,
-        ) -> Result<(libc::stat64, Duration)> {
-            unimplemented!()
-        }
-
-        async fn async_setattr(
-            &self,
-            ctx: Context,
-            inode: <Self as FileSystem>::Inode,
-            attr: libc::stat64,
-            handle: Option<<Self as FileSystem>::Handle>,
-            valid: SetattrValid,
-        ) -> Result<(libc::stat64, Duration)> {
-            unimplemented!()
-        }
-
-        async fn async_open(
-            &self,
-            ctx: Context,
-            inode: <Self as FileSystem>::Inode,
-            flags: u32,
-            fuse_flags: u32,
-        ) -> Result<(Option<<Self as FileSystem>::Handle>, OpenOptions)> {
-            unimplemented!()
-        }
-
-        async fn async_create(
-            &self,
-            ctx: Context,
-            parent: <Self as FileSystem>::Inode,
-            name: &CStr,
-            args: CreateIn,
-        ) -> Result<(Entry, Option<<Self as FileSystem>::Handle>, OpenOptions)> {
-            unimplemented!()
-        }
-
-        async fn async_read(
-            &self,
-            ctx: Context,
-            inode: <Self as FileSystem>::Inode,
-            handle: <Self as FileSystem>::Handle,
-            w: &mut (dyn AsyncZeroCopyWriter + Send),
-            size: u32,
-            offset: u64,
-            lock_owner: Option<u64>,
-            flags: u32,
-        ) -> Result<usize> {
-            unimplemented!()
-        }
-
-        async fn async_write(
-            &self,
-            ctx: Context,
-            inode: <Self as FileSystem>::Inode,
-            handle: <Self as FileSystem>::Handle,
-            r: &mut (dyn AsyncZeroCopyReader + Send),
-            size: u32,
-            offset: u64,
-            lock_owner: Option<u64>,
-            delayed_write: bool,
-            flags: u32,
-            fuse_flags: u32,
-        ) -> Result<usize> {
-            unimplemented!()
-        }
-
-        async fn async_fsync(
-            &self,
-            ctx: Context,
-            inode: <Self as FileSystem>::Inode,
-            datasync: bool,
-            handle: <Self as FileSystem>::Handle,
-        ) -> Result<()> {
-            unimplemented!()
-        }
-
-        async fn async_fallocate(
-            &self,
-            ctx: Context,
-            inode: <Self as FileSystem>::Inode,
-            handle: <Self as FileSystem>::Handle,
-            mode: u32,
-            offset: u64,
-            length: u64,
-        ) -> Result<()> {
-            unimplemented!()
-        }
-
-        async fn async_fsyncdir(
-            &self,
-            ctx: Context,
-            inode: <Self as FileSystem>::Inode,
-            datasync: bool,
-            handle: <Self as FileSystem>::Handle,
-        ) -> Result<()> {
-            unimplemented!()
-        }
-    }
-
-    #[cfg(feature = "async-io")]
-    impl BackendFileSystem for FakeFileSystemOne {
-        fn mount(&self) -> Result<(Entry, u64)> {
-            Ok((
-                Entry {
-                    inode: 1,
-                    generation: 0,
-                    attr: Attr::default().into(),
-                    attr_timeout: Duration::new(0, 0),
-                    entry_timeout: Duration::new(0, 0),
-                },
-                0,
-            ))
-        }
-
-        fn as_any(&self) -> &dyn Any {
-            self
-        }
-    }
-
-    #[cfg(not(feature = "async-io"))]
-    impl BackendFileSystem<AsyncDriver, ()> for FakeFileSystemOne {
-        fn mount(&self) -> Result<(Entry, u64)> {
-            Ok((
-                Entry {
-                    inode: 1,
-                    generation: 0,
-                    attr: Attr::default().into(),
-                    attr_timeout: Duration::new(0, 0),
-                    entry_timeout: Duration::new(0, 0),
-                },
-                0,
-            ))
-        }
-
-        fn as_any(&self) -> &dyn Any {
-            self
         }
     }
 
@@ -694,123 +527,287 @@ mod tests {
     }
 
     #[cfg(feature = "async-io")]
-    #[allow(unused_variables)]
-    #[async_trait]
-    impl AsyncFileSystem for FakeFileSystemTwo {
-        async fn async_lookup(
-            &self,
-            ctx: Context,
-            parent: <Self as FileSystem>::Inode,
-            name: &CStr,
-        ) -> Result<Entry> {
-            Err(std::io::Error::from_raw_os_error(libc::EINVAL))
+    mod async_io {
+        use super::*;
+        use crate::abi::linux_abi::{OpenOptions, SetattrValid};
+        use async_trait::async_trait;
+
+        #[allow(unused_variables)]
+        #[async_trait]
+        impl AsyncFileSystem for FakeFileSystemOne {
+            async fn async_lookup(
+                &self,
+                ctx: Context,
+                parent: <Self as FileSystem>::Inode,
+                name: &CStr,
+            ) -> Result<Entry> {
+                Ok(Entry {
+                    inode: 0,
+                    generation: 0,
+                    attr: unsafe { std::mem::zeroed() },
+                    attr_timeout: Default::default(),
+                    entry_timeout: Default::default(),
+                })
+            }
+
+            async fn async_getattr(
+                &self,
+                ctx: Context,
+                inode: <Self as FileSystem>::Inode,
+                handle: Option<<Self as FileSystem>::Handle>,
+            ) -> Result<(libc::stat64, Duration)> {
+                unimplemented!()
+            }
+
+            async fn async_setattr(
+                &self,
+                ctx: Context,
+                inode: <Self as FileSystem>::Inode,
+                attr: libc::stat64,
+                handle: Option<<Self as FileSystem>::Handle>,
+                valid: SetattrValid,
+            ) -> Result<(libc::stat64, Duration)> {
+                unimplemented!()
+            }
+
+            async fn async_open(
+                &self,
+                ctx: Context,
+                inode: <Self as FileSystem>::Inode,
+                flags: u32,
+                fuse_flags: u32,
+            ) -> Result<(Option<<Self as FileSystem>::Handle>, OpenOptions)> {
+                unimplemented!()
+            }
+
+            async fn async_create(
+                &self,
+                ctx: Context,
+                parent: <Self as FileSystem>::Inode,
+                name: &CStr,
+                args: CreateIn,
+            ) -> Result<(Entry, Option<<Self as FileSystem>::Handle>, OpenOptions)> {
+                unimplemented!()
+            }
+
+            async fn async_read(
+                &self,
+                ctx: Context,
+                inode: <Self as FileSystem>::Inode,
+                handle: <Self as FileSystem>::Handle,
+                w: &mut (dyn AsyncZeroCopyWriter + Send),
+                size: u32,
+                offset: u64,
+                lock_owner: Option<u64>,
+                flags: u32,
+            ) -> Result<usize> {
+                unimplemented!()
+            }
+
+            async fn async_write(
+                &self,
+                ctx: Context,
+                inode: <Self as FileSystem>::Inode,
+                handle: <Self as FileSystem>::Handle,
+                r: &mut (dyn AsyncZeroCopyReader + Send),
+                size: u32,
+                offset: u64,
+                lock_owner: Option<u64>,
+                delayed_write: bool,
+                flags: u32,
+                fuse_flags: u32,
+            ) -> Result<usize> {
+                unimplemented!()
+            }
+
+            async fn async_fsync(
+                &self,
+                ctx: Context,
+                inode: <Self as FileSystem>::Inode,
+                datasync: bool,
+                handle: <Self as FileSystem>::Handle,
+            ) -> Result<()> {
+                unimplemented!()
+            }
+
+            async fn async_fallocate(
+                &self,
+                ctx: Context,
+                inode: <Self as FileSystem>::Inode,
+                handle: <Self as FileSystem>::Handle,
+                mode: u32,
+                offset: u64,
+                length: u64,
+            ) -> Result<()> {
+                unimplemented!()
+            }
+
+            async fn async_fsyncdir(
+                &self,
+                ctx: Context,
+                inode: <Self as FileSystem>::Inode,
+                datasync: bool,
+                handle: <Self as FileSystem>::Handle,
+            ) -> Result<()> {
+                unimplemented!()
+            }
         }
 
-        async fn async_getattr(
-            &self,
-            ctx: Context,
-            inode: <Self as FileSystem>::Inode,
-            handle: Option<<Self as FileSystem>::Handle>,
-        ) -> Result<(libc::stat64, Duration)> {
-            unimplemented!()
+        impl BackendFileSystem for FakeFileSystemOne {
+            fn mount(&self) -> Result<(Entry, u64)> {
+                Ok((
+                    Entry {
+                        inode: 1,
+                        generation: 0,
+                        attr: Attr::default().into(),
+                        attr_timeout: Duration::new(0, 0),
+                        entry_timeout: Duration::new(0, 0),
+                    },
+                    0,
+                ))
+            }
+
+            fn as_any(&self) -> &dyn Any {
+                self
+            }
         }
 
-        async fn async_setattr(
-            &self,
-            ctx: Context,
-            inode: <Self as FileSystem>::Inode,
-            attr: libc::stat64,
-            handle: Option<<Self as FileSystem>::Handle>,
-            valid: SetattrValid,
-        ) -> Result<(libc::stat64, Duration)> {
-            unimplemented!()
+        #[allow(unused_variables)]
+        #[async_trait]
+        impl AsyncFileSystem for FakeFileSystemTwo {
+            async fn async_lookup(
+                &self,
+                ctx: Context,
+                parent: <Self as FileSystem>::Inode,
+                name: &CStr,
+            ) -> Result<Entry> {
+                Err(std::io::Error::from_raw_os_error(libc::EINVAL))
+            }
+
+            async fn async_getattr(
+                &self,
+                ctx: Context,
+                inode: <Self as FileSystem>::Inode,
+                handle: Option<<Self as FileSystem>::Handle>,
+            ) -> Result<(libc::stat64, Duration)> {
+                unimplemented!()
+            }
+
+            async fn async_setattr(
+                &self,
+                ctx: Context,
+                inode: <Self as FileSystem>::Inode,
+                attr: libc::stat64,
+                handle: Option<<Self as FileSystem>::Handle>,
+                valid: SetattrValid,
+            ) -> Result<(libc::stat64, Duration)> {
+                unimplemented!()
+            }
+
+            async fn async_open(
+                &self,
+                ctx: Context,
+                inode: <Self as FileSystem>::Inode,
+                flags: u32,
+                fuse_flags: u32,
+            ) -> Result<(Option<<Self as FileSystem>::Handle>, OpenOptions)> {
+                unimplemented!()
+            }
+
+            async fn async_create(
+                &self,
+                ctx: Context,
+                parent: <Self as FileSystem>::Inode,
+                name: &CStr,
+                args: CreateIn,
+            ) -> Result<(Entry, Option<<Self as FileSystem>::Handle>, OpenOptions)> {
+                unimplemented!()
+            }
+
+            async fn async_read(
+                &self,
+                ctx: Context,
+                inode: <Self as FileSystem>::Inode,
+                handle: <Self as FileSystem>::Handle,
+                w: &mut (dyn AsyncZeroCopyWriter + Send),
+                size: u32,
+                offset: u64,
+                lock_owner: Option<u64>,
+                flags: u32,
+            ) -> Result<usize> {
+                unimplemented!()
+            }
+
+            async fn async_write(
+                &self,
+                ctx: Context,
+                inode: <Self as FileSystem>::Inode,
+                handle: <Self as FileSystem>::Handle,
+                r: &mut (dyn AsyncZeroCopyReader + Send),
+                size: u32,
+                offset: u64,
+                lock_owner: Option<u64>,
+                delayed_write: bool,
+                flags: u32,
+                fuse_flags: u32,
+            ) -> Result<usize> {
+                unimplemented!()
+            }
+
+            async fn async_fsync(
+                &self,
+                ctx: Context,
+                inode: <Self as FileSystem>::Inode,
+                datasync: bool,
+                handle: <Self as FileSystem>::Handle,
+            ) -> Result<()> {
+                unimplemented!()
+            }
+
+            async fn async_fallocate(
+                &self,
+                ctx: Context,
+                inode: <Self as FileSystem>::Inode,
+                handle: <Self as FileSystem>::Handle,
+                mode: u32,
+                offset: u64,
+                length: u64,
+            ) -> Result<()> {
+                unimplemented!()
+            }
+
+            async fn async_fsyncdir(
+                &self,
+                ctx: Context,
+                inode: <Self as FileSystem>::Inode,
+                datasync: bool,
+                handle: <Self as FileSystem>::Handle,
+            ) -> Result<()> {
+                unimplemented!()
+            }
         }
 
-        async fn async_open(
-            &self,
-            ctx: Context,
-            inode: <Self as FileSystem>::Inode,
-            flags: u32,
-            fuse_flags: u32,
-        ) -> Result<(Option<<Self as FileSystem>::Handle>, OpenOptions)> {
-            unimplemented!()
-        }
-
-        async fn async_create(
-            &self,
-            ctx: Context,
-            parent: <Self as FileSystem>::Inode,
-            name: &CStr,
-            args: CreateIn,
-        ) -> Result<(Entry, Option<<Self as FileSystem>::Handle>, OpenOptions)> {
-            unimplemented!()
-        }
-
-        async fn async_read(
-            &self,
-            ctx: Context,
-            inode: <Self as FileSystem>::Inode,
-            handle: <Self as FileSystem>::Handle,
-            w: &mut (dyn AsyncZeroCopyWriter + Send),
-            size: u32,
-            offset: u64,
-            lock_owner: Option<u64>,
-            flags: u32,
-        ) -> Result<usize> {
-            unimplemented!()
-        }
-
-        async fn async_write(
-            &self,
-            ctx: Context,
-            inode: <Self as FileSystem>::Inode,
-            handle: <Self as FileSystem>::Handle,
-            r: &mut (dyn AsyncZeroCopyReader + Send),
-            size: u32,
-            offset: u64,
-            lock_owner: Option<u64>,
-            delayed_write: bool,
-            flags: u32,
-            fuse_flags: u32,
-        ) -> Result<usize> {
-            unimplemented!()
-        }
-
-        async fn async_fsync(
-            &self,
-            ctx: Context,
-            inode: <Self as FileSystem>::Inode,
-            datasync: bool,
-            handle: <Self as FileSystem>::Handle,
-        ) -> Result<()> {
-            unimplemented!()
-        }
-
-        async fn async_fallocate(
-            &self,
-            ctx: Context,
-            inode: <Self as FileSystem>::Inode,
-            handle: <Self as FileSystem>::Handle,
-            mode: u32,
-            offset: u64,
-            length: u64,
-        ) -> Result<()> {
-            unimplemented!()
-        }
-
-        async fn async_fsyncdir(
-            &self,
-            ctx: Context,
-            inode: <Self as FileSystem>::Inode,
-            datasync: bool,
-            handle: <Self as FileSystem>::Handle,
-        ) -> Result<()> {
-            unimplemented!()
+        impl BackendFileSystem for FakeFileSystemTwo {
+            fn mount(&self) -> Result<(Entry, u64)> {
+                Ok((
+                    Entry {
+                        inode: 1,
+                        generation: 0,
+                        attr: Attr::default().into(),
+                        attr_timeout: Duration::new(0, 0),
+                        entry_timeout: Duration::new(0, 0),
+                    },
+                    0,
+                ))
+            }
+            fn as_any(&self) -> &dyn Any {
+                self
+            }
         }
     }
 
-    #[cfg(feature = "async-io")]
-    impl BackendFileSystem for FakeFileSystemTwo {
+    #[cfg(not(feature = "async-io"))]
+    impl BackendFileSystem<AsyncDriver, ()> for FakeFileSystemOne {
         fn mount(&self) -> Result<(Entry, u64)> {
             Ok((
                 Entry {
@@ -823,6 +820,7 @@ mod tests {
                 0,
             ))
         }
+
         fn as_any(&self) -> &dyn Any {
             self
         }

@@ -1128,4 +1128,199 @@ mod tests {
         assert_eq!(writer.available_bytes(), 0);
         assert_eq!(writer.bytes_written(), 48);
     }
+
+    #[cfg(feature = "async-io")]
+    mod async_io {
+        use futures::executor::{block_on, ThreadPool};
+        use futures::task::SpawnExt;
+        use ringbahn::drive::demo::DemoDriver;
+        use std::os::unix::io::AsRawFd;
+
+        use super::*;
+
+        #[test]
+        fn async_read_to_at() {
+            let file = TempFile::new().unwrap().into_file();
+            let fd = file.as_raw_fd();
+            let executor = ThreadPool::new().unwrap();
+
+            let handle = executor
+                .spawn_with_handle(async move {
+                    use DescriptorType::*;
+
+                    let memory_start_addr = GuestAddress(0x0);
+                    let memory =
+                        GuestMemoryMmap::from_ranges(&vec![(memory_start_addr, 0x10000)]).unwrap();
+
+                    let chain = create_descriptor_chain(
+                        &memory,
+                        GuestAddress(0x0),
+                        GuestAddress(0x100),
+                        vec![(Readable, 16), (Readable, 16), (Readable, 16)],
+                        0,
+                    )
+                    .expect("create_descriptor_chain failed");
+                    let mut reader = Reader::new(&memory, chain).expect("failed to create Writer");
+                    let drive = DemoDriver::default();
+
+                    reader.async_read_to_at(drive, fd, 48, 16).await
+                })
+                .unwrap();
+            assert_eq!(block_on(handle).unwrap(), 48);
+        }
+
+        #[test]
+        fn async_write() {
+            let executor = ThreadPool::new().unwrap();
+            let handle = executor
+                .spawn_with_handle(async move {
+                    use DescriptorType::*;
+
+                    let memory_start_addr = GuestAddress(0x0);
+                    let memory =
+                        GuestMemoryMmap::from_ranges(&vec![(memory_start_addr, 0x10000)]).unwrap();
+
+                    let chain = create_descriptor_chain(
+                        &memory,
+                        GuestAddress(0x0),
+                        GuestAddress(0x100),
+                        vec![(Writable, 16), (Writable, 16), (Writable, 16)],
+                        0,
+                    )
+                    .expect("create_descriptor_chain failed");
+                    let mut writer = Writer::new(&memory, chain).expect("failed to create Writer");
+                    let drive = DemoDriver::default();
+                    let buf = vec![0xdeu8; 64];
+
+                    writer.async_write(drive, &buf[..]).await
+                })
+                .unwrap();
+            // expect errors
+            block_on(handle).unwrap_err();
+
+            let handle = executor
+                .spawn_with_handle(async move {
+                    use DescriptorType::*;
+
+                    let memory_start_addr = GuestAddress(0x0);
+                    let memory =
+                        GuestMemoryMmap::from_ranges(&vec![(memory_start_addr, 0x10000)]).unwrap();
+
+                    let chain = create_descriptor_chain(
+                        &memory,
+                        GuestAddress(0x0),
+                        GuestAddress(0x100),
+                        vec![(Writable, 16), (Writable, 16), (Writable, 16)],
+                        0,
+                    )
+                    .expect("create_descriptor_chain failed");
+                    let mut writer = Writer::new(&memory, chain).expect("failed to create Writer");
+                    let drive = DemoDriver::default();
+
+                    let buf = vec![0xdeu8; 48];
+                    writer.async_write(drive, &buf[..]).await
+                })
+                .unwrap();
+
+            assert_eq!(block_on(handle).unwrap(), 48);
+        }
+
+        #[test]
+        fn async_write2() {
+            let executor = ThreadPool::new().unwrap();
+            let handle = executor
+                .spawn_with_handle(async move {
+                    use DescriptorType::*;
+
+                    let memory_start_addr = GuestAddress(0x0);
+                    let memory =
+                        GuestMemoryMmap::from_ranges(&vec![(memory_start_addr, 0x10000)]).unwrap();
+
+                    let chain = create_descriptor_chain(
+                        &memory,
+                        GuestAddress(0x0),
+                        GuestAddress(0x100),
+                        vec![(Writable, 16), (Writable, 16), (Writable, 16)],
+                        0,
+                    )
+                    .expect("create_descriptor_chain failed");
+                    let mut writer = Writer::new(&memory, chain).expect("failed to create Writer");
+                    let drive = DemoDriver::default();
+                    let buf = vec![0xdeu8; 48];
+
+                    writer.async_write2(drive, &buf[..32], &buf[32..]).await
+                })
+                .unwrap();
+
+            assert_eq!(block_on(handle).unwrap(), 48);
+        }
+
+        #[test]
+        fn async_write3() {
+            let executor = ThreadPool::new().unwrap();
+            let handle = executor
+                .spawn_with_handle(async move {
+                    use DescriptorType::*;
+
+                    let memory_start_addr = GuestAddress(0x0);
+                    let memory =
+                        GuestMemoryMmap::from_ranges(&vec![(memory_start_addr, 0x10000)]).unwrap();
+
+                    let chain = create_descriptor_chain(
+                        &memory,
+                        GuestAddress(0x0),
+                        GuestAddress(0x100),
+                        vec![(Writable, 16), (Writable, 16), (Writable, 16)],
+                        0,
+                    )
+                    .expect("create_descriptor_chain failed");
+                    let mut writer = Writer::new(&memory, chain).expect("failed to create Writer");
+                    let drive = DemoDriver::default();
+                    let buf = vec![0xdeu8; 48];
+
+                    writer
+                        .async_write3(drive, &buf[..32], &buf[32..40], &buf[40..])
+                        .await
+                })
+                .unwrap();
+
+            assert_eq!(block_on(handle).unwrap(), 48);
+        }
+
+        #[test]
+        fn async_write_from_at() {
+            let mut file = TempFile::new().unwrap().into_file();
+            let fd = file.as_raw_fd();
+            let buf = vec![0xdeu8; 64];
+
+            file.write_all(&buf).unwrap();
+            file.seek(SeekFrom::Start(0)).unwrap();
+
+            let executor = ThreadPool::new().unwrap();
+            let handle = executor
+                .spawn_with_handle(async move {
+                    use DescriptorType::*;
+
+                    let memory_start_addr = GuestAddress(0x0);
+                    let memory =
+                        GuestMemoryMmap::from_ranges(&vec![(memory_start_addr, 0x10000)]).unwrap();
+
+                    let chain = create_descriptor_chain(
+                        &memory,
+                        GuestAddress(0x0),
+                        GuestAddress(0x100),
+                        vec![(Writable, 16), (Writable, 16), (Writable, 16)],
+                        0,
+                    )
+                    .expect("create_descriptor_chain failed");
+                    let mut writer = Writer::new(&memory, chain).expect("failed to create Writer");
+                    let drive = DemoDriver::default();
+
+                    writer.async_write_from_at(drive, fd, 40, 16).await
+                })
+                .unwrap();
+
+            assert_eq!(block_on(handle).unwrap(), 40);
+        }
+    }
 }
