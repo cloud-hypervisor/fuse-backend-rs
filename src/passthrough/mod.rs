@@ -101,16 +101,6 @@ impl AsRawFd for InodeFile<'_> {
     }
 }
 
-#[cfg(feature = "async-io")]
-impl InodeFile<'_> {
-    fn get_file_ref(&self) -> &File {
-        match self {
-            Self::Owned(f) => f,
-            Self::Ref(f) => *f,
-        }
-    }
-}
-
 struct InodeData {
     inode: Inode,
     // Most of these aren't actually files but ¯\_(ツ)_/¯.
