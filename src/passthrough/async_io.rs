@@ -186,25 +186,40 @@ impl<D: AsyncDrive, S: BitmapSlice + Send + Sync> PassthroughFs<D, S> {
         &self,
         ctx: &Context,
         inode: Inode,
+        handle: Option<<Self as FileSystem<S>>::Handle>,
     ) -> io::Result<(libc::stat64, Duration)> {
+        let st;
+        let fd;
         let data = self.inode_map.get(inode).map_err(|e| {
             error!("fuse: do_getattr ino {} Not find err {:?}", inode, e);
             e
         })?;
-        let file = data.async_get_file(&self.mount_fds).await?;
 
-        let st = self
-            .async_stat(ctx, file.get_file_ref(), None)
-            .await
-            .map_err(|e| {
-                error!(
-                    "fuse: do_getattr stat failed ino {} fd: {:?} err {:?}",
-                    inode,
-                    file.as_raw_fd(),
-                    e
-                );
-                e
-            })?;
+        if let Some(h) = handle {
+            let hd = self.handle_map.get(h, inode)?;
+            fd = hd.get_handle_raw_fd();
+            st = self.async_stat_fd(ctx, fd, None).await;
+        } else {
+            match &data.file_or_handle {
+                FileOrHandle::File(f) => {
+                    fd = f.as_raw_fd();
+                    st = self.async_stat_fd(ctx, fd, None).await;
+                }
+                FileOrHandle::Handle(_h) => {
+                    let file = data.async_get_file(&self.mount_fds).await?;
+                    fd = file.as_raw_fd();
+                    st = self.async_stat_fd(ctx, fd, None).await;
+                }
+            }
+        }
+
+        let st = st.map_err(|e| {
+            error!(
+                "fuse: do_getattr stat failed ino {} fd: {:?} err {:?}",
+                inode, fd, e
+            );
+            e
+        })?;
 
         Ok((st, self.cfg.attr_timeout))
     }
@@ -368,10 +383,9 @@ impl<D: AsyncDrive + Sync, S: BitmapSlice + Send + Sync> AsyncFileSystem<D, S>
         &self,
         ctx: Context,
         inode: <Self as FileSystem<S>>::Inode,
-        _handle: Option<<Self as FileSystem<S>>::Handle>,
+        handle: Option<<Self as FileSystem<S>>::Handle>,
     ) -> io::Result<(libc::stat64, Duration)> {
-        // TODO: optimize async_do_getattr()
-        self.async_do_getattr(&ctx, inode).await
+        self.async_do_getattr(&ctx, inode, handle).await
     }
 
     async fn async_setattr(
@@ -517,7 +531,7 @@ impl<D: AsyncDrive + Sync, S: BitmapSlice + Send + Sync> AsyncFileSystem<D, S>
             }
         }
 
-        self.async_do_getattr(&ctx, inode).await
+        self.async_do_getattr(&ctx, inode, handle).await
     }
 
     async fn async_open(

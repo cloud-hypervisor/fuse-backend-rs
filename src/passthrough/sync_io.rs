@@ -207,19 +207,40 @@ impl<D: AsyncDrive, S: BitmapSlice + Send + Sync> PassthroughFs<D, S> {
         Ok((Some(handle), opts))
     }
 
-    fn do_getattr(&self, inode: Inode) -> io::Result<(libc::stat64, Duration)> {
+    fn do_getattr(
+        &self,
+        inode: Inode,
+        handle: Option<Handle>,
+    ) -> io::Result<(libc::stat64, Duration)> {
+        let st;
+        let fd;
         let data = self.inode_map.get(inode).map_err(|e| {
             error!("fuse: do_getattr ino {} Not find err {:?}", inode, e);
             e
         })?;
 
-        let file = data.get_file(&self.mount_fds)?;
-        let st = Self::stat(&file, None).map_err(|e| {
+        if let Some(h) = handle {
+            let hd = self.handle_map.get(h, inode)?;
+            fd = hd.get_handle_raw_fd();
+            st = Self::stat_fd(fd, None);
+        } else {
+            match &data.file_or_handle {
+                FileOrHandle::File(f) => {
+                    fd = f.as_raw_fd();
+                    st = Self::stat_fd(fd, None);
+                }
+                FileOrHandle::Handle(_h) => {
+                    let file = data.get_file(&self.mount_fds)?;
+                    fd = file.as_raw_fd();
+                    st = Self::stat_fd(fd, None);
+                }
+            }
+        }
+
+        let st = st.map_err(|e| {
             error!(
                 "fuse: do_getattr stat failed ino {} fd: {:?} err {:?}",
-                inode,
-                file.as_raw_fd(),
-                e
+                inode, fd, e
             );
             e
         })?;
@@ -650,9 +671,9 @@ impl<D: AsyncDrive, S: BitmapSlice + Send + Sync> FileSystem<S> for PassthroughF
         &self,
         _ctx: Context,
         inode: Inode,
-        _handle: Option<Handle>,
+        handle: Option<Handle>,
     ) -> io::Result<(libc::stat64, Duration)> {
-        self.do_getattr(inode)
+        self.do_getattr(inode, handle)
     }
 
     fn setattr(
@@ -797,7 +818,7 @@ impl<D: AsyncDrive, S: BitmapSlice + Send + Sync> FileSystem<S> for PassthroughF
             }
         }
 
-        self.do_getattr(inode)
+        self.do_getattr(inode, handle)
     }
 
     fn rename(
