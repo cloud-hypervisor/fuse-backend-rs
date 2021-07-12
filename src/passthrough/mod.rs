@@ -885,6 +885,89 @@ impl<D: AsyncDrive, S: 'static + BitmapSlice + Send + Sync> BackendFileSystem<D,
     }
 }
 
+macro_rules! scoped_cred {
+    ($name:ident, $ty:ty, $syscall_nr:expr) => {
+        #[derive(Debug)]
+        pub(crate) struct $name;
+
+        impl $name {
+            // Changes the effective uid/gid of the current thread to `val`.  Changes
+            // the thread's credentials back to root when the returned struct is dropped.
+            fn new(val: $ty) -> io::Result<Option<$name>> {
+                if val == 0 {
+                    // Nothing to do since we are already uid 0.
+                    return Ok(None);
+                }
+
+                // We want credential changes to be per-thread because otherwise
+                // we might interfere with operations being carried out on other
+                // threads with different uids/gids.  However, posix requires that
+                // all threads in a process share the same credentials.  To do this
+                // libc uses signals to ensure that when one thread changes its
+                // credentials the other threads do the same thing.
+                //
+                // So instead we invoke the syscall directly in order to get around
+                // this limitation.  Another option is to use the setfsuid and
+                // setfsgid systems calls.   However since those calls have no way to
+                // return an error, it's preferable to do this instead.
+
+                // This call is safe because it doesn't modify any memory and we
+                // check the return value.
+                let res = unsafe { libc::syscall($syscall_nr, -1, val, -1) };
+                if res == 0 {
+                    Ok(Some($name))
+                } else {
+                    Err(io::Error::last_os_error())
+                }
+            }
+        }
+
+        impl Drop for $name {
+            fn drop(&mut self) {
+                let res = unsafe { libc::syscall($syscall_nr, -1, 0, -1) };
+                if res < 0 {
+                    error!(
+                        "fuse: failed to change credentials back to root: {}",
+                        io::Error::last_os_error(),
+                    );
+                }
+            }
+        }
+    };
+}
+scoped_cred!(ScopedUid, libc::uid_t, libc::SYS_setresuid);
+scoped_cred!(ScopedGid, libc::gid_t, libc::SYS_setresgid);
+
+struct CapFsetid {}
+
+impl Drop for CapFsetid {
+    fn drop(&mut self) {
+        if let Err(e) = caps::raise(None, caps::CapSet::Effective, caps::Capability::CAP_FSETID) {
+            error!("fail to restore thread cap_fsetid: {}", e);
+        };
+    }
+}
+
+fn drop_cap_fsetid() -> io::Result<Option<CapFsetid>> {
+    if !caps::has_cap(None, caps::CapSet::Effective, caps::Capability::CAP_FSETID)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?
+    {
+        return Ok(None);
+    }
+    caps::drop(None, caps::CapSet::Effective, caps::Capability::CAP_FSETID)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    Ok(Some(CapFsetid {}))
+}
+
+fn set_creds(
+    uid: libc::uid_t,
+    gid: libc::gid_t,
+) -> io::Result<(Option<ScopedUid>, Option<ScopedGid>)> {
+    // We have to change the gid before we change the uid because if we change the uid first then we
+    // lose the capability to change the gid.  However changing back can happen in any order.
+    ScopedGid::new(gid).and_then(|gid| Ok((ScopedUid::new(uid)?, gid)))
+}
+
 fn ebadf() -> io::Error {
     io::Error::from_raw_os_error(libc::EBADF)
 }

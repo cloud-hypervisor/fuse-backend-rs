@@ -13,8 +13,6 @@ use crate::api::filesystem::{
 use crate::api::CreateIn;
 use crate::async_util::{AsyncDrive, AsyncUtil};
 
-//use crate::passthrough::sync_io::set_creds;
-
 impl<D: AsyncDrive + Sync, S: 'static + BitmapSlice + Send + Sync> BackendFileSystem<D, S>
     for PassthroughFs<D, S>
 {
