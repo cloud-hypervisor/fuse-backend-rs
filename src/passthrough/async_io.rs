@@ -2,11 +2,12 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::io;
+use std::mem::ManuallyDrop;
 
 use async_trait::async_trait;
 
 use super::*;
-use crate::abi::linux_abi::{OpenOptions, SetattrValid};
+use crate::abi::linux_abi::{OpenOptions, SetattrValid, FOPEN_IN_KILL_SUIDGID, WRITE_KILL_PRIV};
 use crate::api::filesystem::{
     AsyncFileSystem, AsyncZeroCopyReader, AsyncZeroCopyWriter, Context, FileSystem,
 };
@@ -26,10 +27,18 @@ impl<D: AsyncDrive + Sync, S: 'static + BitmapSlice + Send + Sync> BackendFileSy
     }
 }
 
+impl<'a> InodeData {
+    async fn async_get_file(&self, mount_fds: &MountFds) -> io::Result<InodeFile<'_>> {
+        // The io_uring doesn't support open_by_handle_at yet, so use sync io.
+        self.get_file(mount_fds)
+    }
+}
+
 impl<D: AsyncDrive, S: BitmapSlice + Send + Sync> PassthroughFs<D, S> {
     async fn async_open_file(
+        &self,
         ctx: &Context,
-        dfd: i32,
+        dir_fd: i32,
         pathname: &'_ CStr,
         flags: i32,
         mode: u32,
@@ -38,28 +47,72 @@ impl<D: AsyncDrive, S: BitmapSlice + Send + Sync> PassthroughFs<D, S> {
             .get_drive::<D>()
             .ok_or_else(|| io::Error::from_raw_os_error(libc::EINVAL))?;
 
-        AsyncUtil::open_at(drive, dfd, pathname, flags, mode)
+        AsyncUtil::open_at(drive, dir_fd, pathname, flags, mode)
             .await
             .map(|fd| unsafe { File::from_raw_fd(fd as i32) })
     }
 
-    async fn async_open_proc_file(
-        &self,
-        ctx: &Context,
-        pathname: &CStr,
-        flags: i32,
-    ) -> io::Result<File> {
+    async fn async_open_proc_file(&self, ctx: &Context, fd: RawFd, flags: i32) -> io::Result<File> {
+        let pathname = CString::new(format!("self/fd/{}", fd))
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+
         // We don't really check `flags` because if the kernel can't handle poorly specified flags
         // then we have much bigger problems. Also, clear the `O_NOFOLLOW` flag if it is set since
         // we need to follow the `/proc/self/fd` symlink to get the file.
-        Self::async_open_file(
+        self.async_open_file(
             ctx,
             self.proc.as_raw_fd(),
-            pathname,
+            pathname.as_c_str(),
             (flags | libc::O_CLOEXEC) & (!libc::O_NOFOLLOW),
             0,
         )
         .await
+    }
+
+    /// Create a File or File Handle for `name` under directory `dir_fd` to support `lookup()`.
+    async fn async_open_file_or_handle(
+        &self,
+        ctx: &Context,
+        dir_fd: RawFd,
+        name: &CStr,
+    ) -> io::Result<(FileOrHandle, libc::stat64, InodeAltKey, Option<InodeAltKey>)> {
+        let handle = if self.cfg.inode_file_handles {
+            FileHandle::from_name_at_with_mount_fds(dir_fd, name, &self.mount_fds, |fd, flags| {
+                Self::open_proc_file(&self.proc, fd, flags)
+            })
+        } else {
+            Err(io::Error::from_raw_os_error(libc::ENOTSUP))
+        };
+
+        // Ignore errors, because having a handle is optional
+        let file_or_handle = if let Ok(h) = handle {
+            FileOrHandle::Handle(h)
+        } else {
+            let f = self
+                .async_open_file(
+                    ctx,
+                    dir_fd,
+                    name,
+                    libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                    0,
+                )
+                .await?;
+
+            FileOrHandle::File(f)
+        };
+
+        let st = match &file_or_handle {
+            FileOrHandle::File(f) => self.async_stat(ctx, f, None).await?,
+            FileOrHandle::Handle(_) => self.async_stat_fd(ctx, dir_fd, Some(name)).await?,
+        };
+        let ids_altkey = InodeAltKey::ids_from_stat(&st);
+
+        // Note that this will always be `None` if `cfg.inode_file_handles` is false, but we only
+        // really need this alt key when we do not have an `O_PATH` fd open for every inode.  So if
+        // `cfg.inode_file_handles` is false, we do not need this key anyway.
+        let handle_altkey = file_or_handle.handle().map(|h| InodeAltKey::Handle(*h));
+
+        Ok((file_or_handle, st, ids_altkey, handle_altkey))
     }
 
     async fn async_open_inode(
@@ -68,11 +121,6 @@ impl<D: AsyncDrive, S: BitmapSlice + Send + Sync> PassthroughFs<D, S> {
         inode: Inode,
         mut flags: i32,
     ) -> io::Result<File> {
-        let data = self.inode_map.get(inode)?;
-        let file = data.get_file(&self.mount_fds)?;
-        let pathname = CString::new(format!("self/fd/{}", file.as_raw_fd()))
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-
         // When writeback caching is enabled, the kernel may send read requests even if the
         // userspace program opened the file write-only. So we need to ensure that we have opened
         // the file for reading as well as writing.
@@ -92,15 +140,11 @@ impl<D: AsyncDrive, S: BitmapSlice + Send + Sync> PassthroughFs<D, S> {
             flags &= !libc::O_APPEND;
         }
 
-        // We don't really check `flags` because if the kernel can't handle poorly specified flags
-        // then we have much bigger problems. Also, clear the `O_NOFOLLOW` flag if it is set since
-        // we need to follow the `/proc/self/fd` symlink to get the file.
-        self.async_open_proc_file(
-            ctx,
-            &pathname,
-            (flags | libc::O_CLOEXEC) & (!libc::O_NOFOLLOW),
-        )
-        .await
+        let data = self.inode_map.get(inode)?;
+        let file = data.async_get_file(&self.mount_fds).await?;
+
+        self.async_open_proc_file(ctx, file.as_raw_fd(), flags)
+            .await
     }
 
     async fn async_do_open(
@@ -108,16 +152,23 @@ impl<D: AsyncDrive, S: BitmapSlice + Send + Sync> PassthroughFs<D, S> {
         ctx: &Context,
         inode: Inode,
         flags: u32,
-        _fuse_flags: u32,
+        fuse_flags: u32,
     ) -> io::Result<(Option<Handle>, OpenOptions)> {
-        // FIXME: handle FOPEN_IN_KILL_SUIDGID properly
+        let killpriv = if self.killpriv_v2.load(Ordering::Relaxed)
+            && (fuse_flags & FOPEN_IN_KILL_SUIDGID != 0)
+        {
+            self::drop_cap_fsetid()?
+        } else {
+            None
+        };
         let file = self.async_open_inode(ctx, inode, flags as i32).await?;
+        drop(killpriv);
+
         let data = HandleData::new(inode, file);
         let handle = self.next_handle.fetch_add(1, Ordering::Relaxed);
+        let mut opts = OpenOptions::empty();
 
         self.handle_map.insert(handle, data);
-
-        let mut opts = OpenOptions::empty();
         match self.cfg.cache_policy {
             // We only set the direct I/O option on files.
             CachePolicy::Never => opts.set(
@@ -131,14 +182,19 @@ impl<D: AsyncDrive, S: BitmapSlice + Send + Sync> PassthroughFs<D, S> {
         Ok((Some(handle), opts))
     }
 
-    async fn async_do_getattr(&self, inode: Inode) -> io::Result<(libc::stat64, Duration)> {
+    async fn async_do_getattr(
+        &self,
+        ctx: &Context,
+        inode: Inode,
+    ) -> io::Result<(libc::stat64, Duration)> {
         let data = self.inode_map.get(inode).map_err(|e| {
             error!("fuse: do_getattr ino {} Not find err {:?}", inode, e);
             e
         })?;
-        let file = data.get_file(&self.mount_fds)?;
+        let file = data.async_get_file(&self.mount_fds).await?;
 
-        let st = Self::async_stat(file.get_file_ref(), None)
+        let st = self
+            .async_stat(ctx, file.get_file_ref(), None)
             .await
             .map_err(|e| {
                 error!(
@@ -153,17 +209,30 @@ impl<D: AsyncDrive, S: BitmapSlice + Send + Sync> PassthroughFs<D, S> {
         Ok((st, self.cfg.attr_timeout))
     }
 
-    async fn async_stat(dir: &impl AsRawFd, path: Option<&CStr>) -> io::Result<libc::stat64> {
+    async fn async_stat(
+        &self,
+        ctx: &Context,
+        dir: &impl AsRawFd,
+        path: Option<&CStr>,
+    ) -> io::Result<libc::stat64> {
+        self.async_stat_fd(&ctx, dir.as_raw_fd(), path).await
+    }
+
+    async fn async_stat_fd(
+        &self,
+        _ctx: &Context,
+        dir_fd: RawFd,
+        path: Option<&CStr>,
+    ) -> io::Result<libc::stat64> {
         // Safe because this is a constant value and a valid C string.
         let pathname =
             path.unwrap_or_else(|| unsafe { CStr::from_bytes_with_nul_unchecked(EMPTY_CSTR) });
         let mut st = MaybeUninit::<libc::stat64>::zeroed();
 
-        // TODO:
         // Safe because the kernel will only write data in `st` and we check the return value.
         let res = unsafe {
             libc::fstatat64(
-                dir.as_raw_fd(),
+                dir_fd,
                 pathname.as_ptr(),
                 st.as_mut_ptr(),
                 libc::AT_EMPTY_PATH | libc::AT_SYMLINK_NOFOLLOW,
@@ -195,7 +264,6 @@ impl<D: AsyncDrive, S: BitmapSlice + Send + Sync> PassthroughFs<D, S> {
 }
 
 #[async_trait]
-#[allow(unused_variables)]
 impl<D: AsyncDrive + Sync, S: BitmapSlice + Send + Sync> AsyncFileSystem<D, S>
     for PassthroughFs<D, S>
 {
@@ -205,19 +273,11 @@ impl<D: AsyncDrive + Sync, S: BitmapSlice + Send + Sync> AsyncFileSystem<D, S>
         parent: <Self as FileSystem<S>>::Inode,
         name: &CStr,
     ) -> io::Result<Entry> {
-        let data = self.inode_map.get(parent)?;
-        let file = data.get_file(&self.mount_fds)?;
-        let f = Self::async_open_file(
-            &ctx,
-            file.as_raw_fd(),
-            name,
-            libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-            0,
-        )
-        .await?;
-        let st = Self::async_stat(&f, None).await?;
-        let ids_altkey = InodeAltKey::ids_from_stat(&st);
-        let handle_altkey: Option<InodeAltKey> = None;
+        let dir = self.inode_map.get(parent)?;
+        let dir_file = dir.async_get_file(&self.mount_fds).await?;
+        let (file_or_handle, st, ids_altkey, handle_altkey) = self
+            .async_open_file_or_handle(&ctx, dir_file.as_raw_fd(), name)
+            .await?;
 
         let mut found = None;
         'search: loop {
@@ -250,30 +310,49 @@ impl<D: AsyncDrive + Sync, S: BitmapSlice + Send + Sync> AsyncFileSystem<D, S>
         let inode = if let Some(v) = found {
             v
         } else {
-            // There is a possible race here where 2 threads end up adding the same file
-            // into the inode list.  However, since each of those will get a unique Inode
-            // value and unique file descriptors this shouldn't be that much of a problem.
-            let inode = self.next_inode.fetch_add(1, Ordering::Relaxed);
-            if inode > VFS_MAX_INO {
-                error!("fuse: max inode number reached: {}", VFS_MAX_INO);
-                return Err(io::Error::new(
-                    io::ErrorKind::Other,
-                    format!("max inode number reached: {}", VFS_MAX_INO),
-                ));
-            }
-            trace!(
-                "fuse: do_lookup new inode {} ids_altkey {:?}",
-                inode,
-                ids_altkey
-            );
-            self.inode_map.insert(
-                inode,
-                InodeData::new(inode, FileOrHandle::File(f), 1, ids_altkey),
-                ids_altkey,
-                handle_altkey,
-            );
+            // Write guard get_alt_locked() and insert_lock() to avoid race conditions.
+            let mut inodes = self.inode_map.get_map_mut();
 
-            inode
+            // Lookup inode_map again after acquiring the inode_map lock, as there might be another
+            // racing thread already added an inode with the same altkey while we're not holding
+            // the lock. If so just use the newly added inode, otherwise the inode will be replaced
+            // and results in EBADF.
+            match InodeMap::get_alt_locked(inodes.deref(), &ids_altkey, handle_altkey.as_ref()) {
+                Some(data) => {
+                    trace!(
+                        "fuse: do_lookup sees existing inode {} ids_altkey {:?}",
+                        data.inode,
+                        ids_altkey
+                    );
+                    data.refcount.fetch_add(1, Ordering::Relaxed);
+                    data.inode
+                }
+                None => {
+                    let inode = self.next_inode.fetch_add(1, Ordering::Relaxed);
+                    if inode > VFS_MAX_INO {
+                        error!("fuse: max inode number reached: {}", VFS_MAX_INO);
+                        return Err(io::Error::new(
+                            io::ErrorKind::Other,
+                            format!("max inode number reached: {}", VFS_MAX_INO),
+                        ));
+                    }
+                    trace!(
+                        "fuse: do_lookup adds new inode {} ids_altkey {:?} handle_altkey {:?}",
+                        inode,
+                        ids_altkey,
+                        handle_altkey
+                    );
+
+                    InodeMap::insert_locked(
+                        inodes.deref_mut(),
+                        inode,
+                        InodeData::new(inode, file_or_handle, 1, ids_altkey),
+                        ids_altkey,
+                        handle_altkey,
+                    );
+                    inode
+                }
+            }
         };
 
         Ok(Entry {
@@ -289,9 +368,10 @@ impl<D: AsyncDrive + Sync, S: BitmapSlice + Send + Sync> AsyncFileSystem<D, S>
         &self,
         ctx: Context,
         inode: <Self as FileSystem<S>>::Inode,
-        handle: Option<<Self as FileSystem<S>>::Handle>,
+        _handle: Option<<Self as FileSystem<S>>::Handle>,
     ) -> io::Result<(libc::stat64, Duration)> {
-        self.async_do_getattr(inode).await
+        // TODO: optimize async_do_getattr()
+        self.async_do_getattr(&ctx, inode).await
     }
 
     async fn async_setattr(
@@ -302,15 +382,14 @@ impl<D: AsyncDrive + Sync, S: BitmapSlice + Send + Sync> AsyncFileSystem<D, S>
         handle: Option<<Self as FileSystem<S>>::Handle>,
         valid: SetattrValid,
     ) -> io::Result<(libc::stat64, Duration)> {
-        let inode_data = self.inode_map.get(inode)?;
-
         enum Data {
             Handle(Arc<HandleData>, RawFd),
             ProcPath(CString),
         }
 
+        let inode_data = self.inode_map.get(inode)?;
+        let file = inode_data.async_get_file(&self.mount_fds).await?;
         let data = if self.no_open.load(Ordering::Relaxed) {
-            let file = inode_data.get_file(&self.mount_fds)?;
             let pathname = CString::new(format!("self/fd/{}", file.as_raw_fd()))
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
             Data::ProcPath(pathname)
@@ -321,7 +400,6 @@ impl<D: AsyncDrive + Sync, S: BitmapSlice + Send + Sync> AsyncFileSystem<D, S>
                 let fd = hd.get_handle_raw_fd();
                 Data::Handle(hd, fd)
             } else {
-                let file = inode_data.get_file(&self.mount_fds)?;
                 let pathname = CString::new(format!("self/fd/{}", file.as_raw_fd()))
                     .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
                 Data::ProcPath(pathname)
@@ -359,7 +437,6 @@ impl<D: AsyncDrive + Sync, S: BitmapSlice + Send + Sync> AsyncFileSystem<D, S>
 
             // Safe because this is a constant value and a valid C string.
             let empty = unsafe { CStr::from_bytes_with_nul_unchecked(EMPTY_CSTR) };
-            let file = inode_data.get_file(&self.mount_fds)?;
 
             // Safe because this doesn't modify any memory and we check the return value.
             let res = unsafe {
@@ -377,10 +454,19 @@ impl<D: AsyncDrive + Sync, S: BitmapSlice + Send + Sync> AsyncFileSystem<D, S>
         }
 
         if valid.contains(SetattrValid::SIZE) {
+            // Cap restored when _killpriv is dropped
+            let _killpriv = if self.killpriv_v2.load(Ordering::Relaxed)
+                && valid.contains(SetattrValid::KILL_SUIDGID)
+            {
+                self::drop_cap_fsetid()?
+            } else {
+                None
+            };
+
             // Safe because this doesn't modify any memory and we check the return value.
             let res = match data {
                 Data::Handle(_, fd) => unsafe { libc::ftruncate(fd, attr.st_size) },
-                _ => {
+                Data::ProcPath(_) => {
                     // There is no `ftruncateat` so we need to get a new fd and truncate it.
                     let f = self
                         .async_open_inode(&ctx, inode, libc::O_NONBLOCK | libc::O_RDWR)
@@ -431,7 +517,7 @@ impl<D: AsyncDrive + Sync, S: BitmapSlice + Send + Sync> AsyncFileSystem<D, S>
             }
         }
 
-        self.async_do_getattr(inode).await
+        self.async_do_getattr(&ctx, inode).await
     }
 
     async fn async_open(
@@ -456,43 +542,66 @@ impl<D: AsyncDrive + Sync, S: BitmapSlice + Send + Sync> AsyncFileSystem<D, S>
         name: &CStr,
         args: CreateIn,
     ) -> io::Result<(Entry, Option<<Self as FileSystem<S>>::Handle>, OpenOptions)> {
-        self.create(ctx, parent, name, args)
-        // TODO: implement
-        // let (_uid, _gid) = set_creds(ctx.uid, ctx.gid)?;
-        // let data = self.inode_map.get(parent)?;
+        let dir = self.inode_map.get(parent)?;
+        let dir_file = dir.async_get_file(&self.mount_fds).await?;
 
-        // // Safe because this doesn't modify any memory and we check the return value. We don't
-        // // really check `flags` because if the kernel can't handle poorly specified flags then we
-        // // have much bigger problems.
-        // let file = Self::async_open_file(
-        //     &ctx,
-        //     data.get_raw_fd(),
-        //     name,
-        //     flags as i32 | libc::O_CREAT | libc::O_CLOEXEC | libc::O_NOFOLLOW,
-        //     mode & !(umask & 0o777),
-        // )
-        // .await?;
+        let new_file = {
+            let (_uid, _gid) = set_creds(ctx.uid, ctx.gid)?;
 
-        // let entry = self.async_lookup(ctx, parent, name).await?;
+            Self::create_file_excl(
+                dir_file.as_raw_fd(),
+                name,
+                args.flags as i32,
+                args.mode & !(args.umask & 0o777),
+            )?
+        };
 
-        // let ret_handle = if !self.no_open.load(Ordering::Relaxed) {
-        //     let handle = self.next_handle.fetch_add(1, Ordering::Relaxed);
-        //     let data = HandleData::new(entry.inode, file);
+        // Safe because this doesn't modify any memory and we check the return value. We don't
+        // really check `flags` because if the kernel can't handle poorly specified flags then we
+        // have much bigger problems.
+        let file = match new_file {
+            Some(f) => f,
+            None => {
+                // Cap restored when _killpriv is dropped
+                let _killpriv = if self.killpriv_v2.load(Ordering::Relaxed)
+                    && (args.fuse_flags & FOPEN_IN_KILL_SUIDGID != 0)
+                {
+                    self::drop_cap_fsetid()?
+                } else {
+                    None
+                };
 
-        //     self.handle_map.insert(handle, data);
-        //     Some(handle)
-        // } else {
-        //     None
-        // };
+                let (_uid, _gid) = set_creds(ctx.uid, ctx.gid)?;
 
-        // let mut opts = OpenOptions::empty();
-        // match self.cfg.cache_policy {
-        //     CachePolicy::Never => opts |= OpenOptions::DIRECT_IO,
-        //     CachePolicy::Always => opts |= OpenOptions::KEEP_CACHE,
-        //     _ => {}
-        // };
+                Self::open_file(
+                    dir_file.as_raw_fd(),
+                    name,
+                    args.flags as i32 | libc::O_CREAT | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+                    args.mode & !(args.umask & 0o777),
+                )?
+            }
+        };
 
-        // Ok((entry, ret_handle, opts))
+        let entry = self.async_lookup(ctx, parent, name).await?;
+
+        let ret_handle = if !self.no_open.load(Ordering::Relaxed) {
+            let handle = self.next_handle.fetch_add(1, Ordering::Relaxed);
+            let data = HandleData::new(entry.inode, file);
+
+            self.handle_map.insert(handle, data);
+            Some(handle)
+        } else {
+            None
+        };
+
+        let mut opts = OpenOptions::empty();
+        match self.cfg.cache_policy {
+            CachePolicy::Never => opts |= OpenOptions::DIRECT_IO,
+            CachePolicy::Always => opts |= OpenOptions::KEEP_CACHE,
+            _ => {}
+        };
+
+        Ok((entry, ret_handle, opts))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -530,18 +639,31 @@ impl<D: AsyncDrive + Sync, S: BitmapSlice + Send + Sync> AsyncFileSystem<D, S>
         _lock_owner: Option<u64>,
         _delayed_write: bool,
         _flags: u32,
-        _fuse_flags: u32,
+        fuse_flags: u32,
     ) -> io::Result<usize> {
         let data = self
             .async_get_data(&ctx, handle, inode, libc::O_RDWR)
             .await?;
-        let drive = ctx
-            .get_drive::<D>()
-            .ok_or_else(|| io::Error::from_raw_os_error(libc::EINVAL))?;
 
-        // FIXME: handle WRITE_KILL_PRIV properly
-        r.async_read_to(drive, data.get_handle_raw_fd(), size as usize, offset)
-            .await
+        // Fallback to sync io if KILLPRIV_V2 is enabled to work around a limitation of io_uring.
+        if self.killpriv_v2.load(Ordering::Relaxed) && (fuse_flags & WRITE_KILL_PRIV != 0) {
+            // Manually implement File::try_clone() by borrowing fd of data.file instead of dup().
+            // It's safe because the `data` variable's lifetime spans the whole function,
+            // so data.file won't be closed.
+            let f = unsafe { File::from_raw_fd(data.get_handle_raw_fd()) };
+            let mut f = ManuallyDrop::new(f);
+            // Cap restored when _killpriv is dropped
+            let _killpriv = self::drop_cap_fsetid()?;
+
+            r.read_to(&mut *f, size as usize, offset)
+        } else {
+            let drive = ctx
+                .get_drive::<D>()
+                .ok_or_else(|| io::Error::from_raw_os_error(libc::EINVAL))?;
+
+            r.async_read_to(drive, data.get_handle_raw_fd(), size as usize, offset)
+                .await
+        }
     }
 
     async fn async_fsync(
@@ -554,7 +676,6 @@ impl<D: AsyncDrive + Sync, S: BitmapSlice + Send + Sync> AsyncFileSystem<D, S>
         let data = self
             .async_get_data(&ctx, handle, inode, libc::O_RDONLY)
             .await?;
-
         let drive = ctx
             .get_drive::<D>()
             .ok_or_else(|| io::Error::from_raw_os_error(libc::EINVAL))?;
@@ -575,7 +696,6 @@ impl<D: AsyncDrive + Sync, S: BitmapSlice + Send + Sync> AsyncFileSystem<D, S>
         let data = self
             .async_get_data(&ctx, handle, inode, libc::O_RDWR)
             .await?;
-
         let drive = ctx
             .get_drive::<D>()
             .ok_or_else(|| io::Error::from_raw_os_error(libc::EINVAL))?;
