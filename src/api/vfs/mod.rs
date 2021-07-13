@@ -466,7 +466,7 @@ impl<D: AsyncDrive, S: BitmapSlice> Vfs<D, S> {
         &self,
         fs: &PseudoFs<S>,
         idata: VfsInode,
-        ctx: Context,
+        ctx: &Context,
         name: &CStr,
     ) -> Result<Entry> {
         trace!("lookup pseudo ino {} name {:?}", idata.ino(), name);
@@ -502,7 +502,7 @@ mod tests {
     impl FileSystem for FakeFileSystemOne {
         type Inode = u64;
         type Handle = u64;
-        fn lookup(&self, _: Context, _: Self::Inode, _: &CStr) -> Result<Entry> {
+        fn lookup(&self, _: &Context, _: Self::Inode, _: &CStr) -> Result<Entry> {
             Ok(Entry {
                 inode: 0,
                 generation: 0,
@@ -517,7 +517,7 @@ mod tests {
     impl FileSystem for FakeFileSystemTwo {
         type Inode = u64;
         type Handle = u64;
-        fn lookup(&self, _: Context, _: Self::Inode, _: &CStr) -> Result<Entry> {
+        fn lookup(&self, _: &Context, _: Self::Inode, _: &CStr) -> Result<Entry> {
             Ok(Entry {
                 inode: 1,
                 generation: 0,
@@ -539,7 +539,7 @@ mod tests {
         impl AsyncFileSystem for FakeFileSystemOne {
             async fn async_lookup(
                 &self,
-                ctx: Context,
+                ctx: &Context,
                 parent: <Self as FileSystem>::Inode,
                 name: &CStr,
             ) -> Result<Entry> {
@@ -554,7 +554,7 @@ mod tests {
 
             async fn async_getattr(
                 &self,
-                ctx: Context,
+                ctx: &Context,
                 inode: <Self as FileSystem>::Inode,
                 handle: Option<<Self as FileSystem>::Handle>,
             ) -> Result<(libc::stat64, Duration)> {
@@ -563,7 +563,7 @@ mod tests {
 
             async fn async_setattr(
                 &self,
-                ctx: Context,
+                ctx: &Context,
                 inode: <Self as FileSystem>::Inode,
                 attr: libc::stat64,
                 handle: Option<<Self as FileSystem>::Handle>,
@@ -574,7 +574,7 @@ mod tests {
 
             async fn async_open(
                 &self,
-                ctx: Context,
+                ctx: &Context,
                 inode: <Self as FileSystem>::Inode,
                 flags: u32,
                 fuse_flags: u32,
@@ -584,7 +584,7 @@ mod tests {
 
             async fn async_create(
                 &self,
-                ctx: Context,
+                ctx: &Context,
                 parent: <Self as FileSystem>::Inode,
                 name: &CStr,
                 args: CreateIn,
@@ -594,7 +594,7 @@ mod tests {
 
             async fn async_read(
                 &self,
-                ctx: Context,
+                ctx: &Context,
                 inode: <Self as FileSystem>::Inode,
                 handle: <Self as FileSystem>::Handle,
                 w: &mut (dyn AsyncZeroCopyWriter + Send),
@@ -608,7 +608,7 @@ mod tests {
 
             async fn async_write(
                 &self,
-                ctx: Context,
+                ctx: &Context,
                 inode: <Self as FileSystem>::Inode,
                 handle: <Self as FileSystem>::Handle,
                 r: &mut (dyn AsyncZeroCopyReader + Send),
@@ -624,7 +624,7 @@ mod tests {
 
             async fn async_fsync(
                 &self,
-                ctx: Context,
+                ctx: &Context,
                 inode: <Self as FileSystem>::Inode,
                 datasync: bool,
                 handle: <Self as FileSystem>::Handle,
@@ -634,7 +634,7 @@ mod tests {
 
             async fn async_fallocate(
                 &self,
-                ctx: Context,
+                ctx: &Context,
                 inode: <Self as FileSystem>::Inode,
                 handle: <Self as FileSystem>::Handle,
                 mode: u32,
@@ -646,7 +646,7 @@ mod tests {
 
             async fn async_fsyncdir(
                 &self,
-                ctx: Context,
+                ctx: &Context,
                 inode: <Self as FileSystem>::Inode,
                 datasync: bool,
                 handle: <Self as FileSystem>::Handle,
@@ -679,7 +679,7 @@ mod tests {
         impl AsyncFileSystem for FakeFileSystemTwo {
             async fn async_lookup(
                 &self,
-                ctx: Context,
+                ctx: &Context,
                 parent: <Self as FileSystem>::Inode,
                 name: &CStr,
             ) -> Result<Entry> {
@@ -688,7 +688,7 @@ mod tests {
 
             async fn async_getattr(
                 &self,
-                ctx: Context,
+                ctx: &Context,
                 inode: <Self as FileSystem>::Inode,
                 handle: Option<<Self as FileSystem>::Handle>,
             ) -> Result<(libc::stat64, Duration)> {
@@ -697,7 +697,7 @@ mod tests {
 
             async fn async_setattr(
                 &self,
-                ctx: Context,
+                ctx: &Context,
                 inode: <Self as FileSystem>::Inode,
                 attr: libc::stat64,
                 handle: Option<<Self as FileSystem>::Handle>,
@@ -708,7 +708,7 @@ mod tests {
 
             async fn async_open(
                 &self,
-                ctx: Context,
+                ctx: &Context,
                 inode: <Self as FileSystem>::Inode,
                 flags: u32,
                 fuse_flags: u32,
@@ -718,7 +718,7 @@ mod tests {
 
             async fn async_create(
                 &self,
-                ctx: Context,
+                ctx: &Context,
                 parent: <Self as FileSystem>::Inode,
                 name: &CStr,
                 args: CreateIn,
@@ -728,7 +728,7 @@ mod tests {
 
             async fn async_read(
                 &self,
-                ctx: Context,
+                ctx: &Context,
                 inode: <Self as FileSystem>::Inode,
                 handle: <Self as FileSystem>::Handle,
                 w: &mut (dyn AsyncZeroCopyWriter + Send),
@@ -742,7 +742,7 @@ mod tests {
 
             async fn async_write(
                 &self,
-                ctx: Context,
+                ctx: &Context,
                 inode: <Self as FileSystem>::Inode,
                 handle: <Self as FileSystem>::Handle,
                 r: &mut (dyn AsyncZeroCopyReader + Send),
@@ -758,7 +758,7 @@ mod tests {
 
             async fn async_fsync(
                 &self,
-                ctx: Context,
+                ctx: &Context,
                 inode: <Self as FileSystem>::Inode,
                 datasync: bool,
                 handle: <Self as FileSystem>::Handle,
@@ -768,7 +768,7 @@ mod tests {
 
             async fn async_fallocate(
                 &self,
-                ctx: Context,
+                ctx: &Context,
                 inode: <Self as FileSystem>::Inode,
                 handle: <Self as FileSystem>::Handle,
                 mode: u32,
@@ -780,7 +780,7 @@ mod tests {
 
             async fn async_fsyncdir(
                 &self,
-                ctx: Context,
+                ctx: &Context,
                 inode: <Self as FileSystem>::Inode,
                 datasync: bool,
                 handle: <Self as FileSystem>::Handle,
@@ -908,14 +908,14 @@ mod tests {
 
         // Lookup inode on pseudo file system.
         let entry1 = vfs
-            .lookup(ctx, ROOT_ID.into(), CString::new("x").unwrap().as_c_str())
+            .lookup(&ctx, ROOT_ID.into(), CString::new("x").unwrap().as_c_str())
             .unwrap();
         assert_eq!(entry1.inode, 0x2);
 
         // Lookup inode on mounted file system.
         let entry2 = vfs
             .lookup(
-                ctx,
+                &ctx,
                 entry1.inode.into(),
                 CString::new("y").unwrap().as_c_str(),
             )
@@ -925,7 +925,7 @@ mod tests {
         // lookup for negative result.
         let entry3 = vfs
             .lookup(
-                ctx,
+                &ctx,
                 entry2.inode.into(),
                 CString::new("z").unwrap().as_c_str(),
             )

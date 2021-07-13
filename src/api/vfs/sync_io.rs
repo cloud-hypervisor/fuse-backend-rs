@@ -60,7 +60,7 @@ impl<D: AsyncDrive, S: BitmapSlice> FileSystem<S> for Vfs<D, S> {
         }
     }
 
-    fn lookup(&self, ctx: Context, parent: VfsInode, name: &CStr) -> Result<Entry> {
+    fn lookup(&self, ctx: &Context, parent: VfsInode, name: &CStr) -> Result<Entry> {
         match self.get_real_rootfs(parent)? {
             (Left(fs), idata) => self.lookup_pseudo(fs, idata, ctx, name),
             (Right(fs), idata) => {
@@ -73,7 +73,7 @@ impl<D: AsyncDrive, S: BitmapSlice> FileSystem<S> for Vfs<D, S> {
         }
     }
 
-    fn forget(&self, ctx: Context, inode: VfsInode, count: u64) {
+    fn forget(&self, ctx: &Context, inode: VfsInode, count: u64) {
         match self.get_real_rootfs(inode) {
             Ok(real_rootfs) => match real_rootfs {
                 (Left(fs), idata) => fs.forget(ctx, idata.ino(), count),
@@ -87,7 +87,7 @@ impl<D: AsyncDrive, S: BitmapSlice> FileSystem<S> for Vfs<D, S> {
 
     fn getattr(
         &self,
-        ctx: Context,
+        ctx: &Context,
         inode: VfsInode,
         handle: Option<VfsHandle>,
     ) -> Result<(libc::stat64, Duration)> {
@@ -99,7 +99,7 @@ impl<D: AsyncDrive, S: BitmapSlice> FileSystem<S> for Vfs<D, S> {
 
     fn setattr(
         &self,
-        ctx: Context,
+        ctx: &Context,
         inode: VfsInode,
         attr: libc::stat64,
         handle: Option<u64>,
@@ -111,7 +111,7 @@ impl<D: AsyncDrive, S: BitmapSlice> FileSystem<S> for Vfs<D, S> {
         }
     }
 
-    fn readlink(&self, ctx: Context, inode: VfsInode) -> Result<Vec<u8>> {
+    fn readlink(&self, ctx: &Context, inode: VfsInode) -> Result<Vec<u8>> {
         match self.get_real_rootfs(inode)? {
             (Left(fs), idata) => fs.readlink(ctx, idata.ino()),
             (Right(fs), idata) => fs.readlink(ctx, idata.ino()),
@@ -120,7 +120,7 @@ impl<D: AsyncDrive, S: BitmapSlice> FileSystem<S> for Vfs<D, S> {
 
     fn symlink(
         &self,
-        ctx: Context,
+        ctx: &Context,
         linkname: &CStr,
         parent: VfsInode,
         name: &CStr,
@@ -136,7 +136,7 @@ impl<D: AsyncDrive, S: BitmapSlice> FileSystem<S> for Vfs<D, S> {
 
     fn mknod(
         &self,
-        ctx: Context,
+        ctx: &Context,
         inode: VfsInode,
         name: &CStr,
         mode: u32,
@@ -157,7 +157,7 @@ impl<D: AsyncDrive, S: BitmapSlice> FileSystem<S> for Vfs<D, S> {
 
     fn mkdir(
         &self,
-        ctx: Context,
+        ctx: &Context,
         parent: VfsInode,
         name: &CStr,
         mode: u32,
@@ -172,14 +172,14 @@ impl<D: AsyncDrive, S: BitmapSlice> FileSystem<S> for Vfs<D, S> {
         }
     }
 
-    fn unlink(&self, ctx: Context, parent: VfsInode, name: &CStr) -> Result<()> {
+    fn unlink(&self, ctx: &Context, parent: VfsInode, name: &CStr) -> Result<()> {
         match self.get_real_rootfs(parent)? {
             (Left(fs), idata) => fs.unlink(ctx, idata.ino(), name),
             (Right(fs), idata) => fs.unlink(ctx, idata.ino(), name),
         }
     }
 
-    fn rmdir(&self, ctx: Context, parent: VfsInode, name: &CStr) -> Result<()> {
+    fn rmdir(&self, ctx: &Context, parent: VfsInode, name: &CStr) -> Result<()> {
         match self.get_real_rootfs(parent)? {
             (Left(fs), idata) => fs.rmdir(ctx, idata.ino(), name),
             (Right(fs), idata) => fs.rmdir(ctx, idata.ino(), name),
@@ -188,7 +188,7 @@ impl<D: AsyncDrive, S: BitmapSlice> FileSystem<S> for Vfs<D, S> {
 
     fn rename(
         &self,
-        ctx: Context,
+        ctx: &Context,
         olddir: VfsInode,
         oldname: &CStr,
         newdir: VfsInode,
@@ -224,7 +224,7 @@ impl<D: AsyncDrive, S: BitmapSlice> FileSystem<S> for Vfs<D, S> {
 
     fn link(
         &self,
-        ctx: Context,
+        ctx: &Context,
         inode: VfsInode,
         newparent: VfsInode,
         newname: &CStr,
@@ -249,7 +249,7 @@ impl<D: AsyncDrive, S: BitmapSlice> FileSystem<S> for Vfs<D, S> {
 
     fn open(
         &self,
-        ctx: Context,
+        ctx: &Context,
         inode: VfsInode,
         flags: u32,
         fuse_flags: u32,
@@ -268,7 +268,7 @@ impl<D: AsyncDrive, S: BitmapSlice> FileSystem<S> for Vfs<D, S> {
 
     fn create(
         &self,
-        ctx: Context,
+        ctx: &Context,
         parent: VfsInode,
         name: &CStr,
         args: CreateIn,
@@ -287,7 +287,7 @@ impl<D: AsyncDrive, S: BitmapSlice> FileSystem<S> for Vfs<D, S> {
 
     fn read(
         &self,
-        ctx: Context,
+        ctx: &Context,
         inode: VfsInode,
         handle: u64,
         w: &mut dyn ZeroCopyWriter<S = S>,
@@ -308,7 +308,7 @@ impl<D: AsyncDrive, S: BitmapSlice> FileSystem<S> for Vfs<D, S> {
 
     fn write(
         &self,
-        ctx: Context,
+        ctx: &Context,
         inode: VfsInode,
         handle: u64,
         r: &mut dyn ZeroCopyReader<S = S>,
@@ -347,14 +347,14 @@ impl<D: AsyncDrive, S: BitmapSlice> FileSystem<S> for Vfs<D, S> {
         }
     }
 
-    fn flush(&self, ctx: Context, inode: VfsInode, handle: u64, lock_owner: u64) -> Result<()> {
+    fn flush(&self, ctx: &Context, inode: VfsInode, handle: u64, lock_owner: u64) -> Result<()> {
         match self.get_real_rootfs(inode)? {
             (Left(fs), idata) => fs.flush(ctx, idata.ino(), handle, lock_owner),
             (Right(fs), idata) => fs.flush(ctx, idata.ino(), handle, lock_owner),
         }
     }
 
-    fn fsync(&self, ctx: Context, inode: VfsInode, datasync: bool, handle: u64) -> Result<()> {
+    fn fsync(&self, ctx: &Context, inode: VfsInode, datasync: bool, handle: u64) -> Result<()> {
         match self.get_real_rootfs(inode)? {
             (Left(fs), idata) => fs.fsync(ctx, idata.ino(), datasync, handle),
             (Right(fs), idata) => fs.fsync(ctx, idata.ino(), datasync, handle),
@@ -363,7 +363,7 @@ impl<D: AsyncDrive, S: BitmapSlice> FileSystem<S> for Vfs<D, S> {
 
     fn fallocate(
         &self,
-        ctx: Context,
+        ctx: &Context,
         inode: VfsInode,
         handle: u64,
         mode: u32,
@@ -378,7 +378,7 @@ impl<D: AsyncDrive, S: BitmapSlice> FileSystem<S> for Vfs<D, S> {
 
     fn release(
         &self,
-        ctx: Context,
+        ctx: &Context,
         inode: VfsInode,
         flags: u32,
         handle: u64,
@@ -408,7 +408,7 @@ impl<D: AsyncDrive, S: BitmapSlice> FileSystem<S> for Vfs<D, S> {
         }
     }
 
-    fn statfs(&self, ctx: Context, inode: VfsInode) -> Result<libc::statvfs64> {
+    fn statfs(&self, ctx: &Context, inode: VfsInode) -> Result<libc::statvfs64> {
         match self.get_real_rootfs(inode)? {
             (Left(fs), idata) => fs.statfs(ctx, idata.ino()),
             (Right(fs), idata) => fs.statfs(ctx, idata.ino()),
@@ -417,7 +417,7 @@ impl<D: AsyncDrive, S: BitmapSlice> FileSystem<S> for Vfs<D, S> {
 
     fn setxattr(
         &self,
-        ctx: Context,
+        ctx: &Context,
         inode: VfsInode,
         name: &CStr,
         value: &[u8],
@@ -431,7 +431,7 @@ impl<D: AsyncDrive, S: BitmapSlice> FileSystem<S> for Vfs<D, S> {
 
     fn getxattr(
         &self,
-        ctx: Context,
+        ctx: &Context,
         inode: VfsInode,
         name: &CStr,
         size: u32,
@@ -442,14 +442,14 @@ impl<D: AsyncDrive, S: BitmapSlice> FileSystem<S> for Vfs<D, S> {
         }
     }
 
-    fn listxattr(&self, ctx: Context, inode: VfsInode, size: u32) -> Result<ListxattrReply> {
+    fn listxattr(&self, ctx: &Context, inode: VfsInode, size: u32) -> Result<ListxattrReply> {
         match self.get_real_rootfs(inode)? {
             (Left(fs), idata) => fs.listxattr(ctx, idata.ino(), size),
             (Right(fs), idata) => fs.listxattr(ctx, idata.ino(), size),
         }
     }
 
-    fn removexattr(&self, ctx: Context, inode: VfsInode, name: &CStr) -> Result<()> {
+    fn removexattr(&self, ctx: &Context, inode: VfsInode, name: &CStr) -> Result<()> {
         match self.get_real_rootfs(inode)? {
             (Left(fs), idata) => fs.removexattr(ctx, idata.ino(), name),
             (Right(fs), idata) => fs.removexattr(ctx, idata.ino(), name),
@@ -458,7 +458,7 @@ impl<D: AsyncDrive, S: BitmapSlice> FileSystem<S> for Vfs<D, S> {
 
     fn opendir(
         &self,
-        ctx: Context,
+        ctx: &Context,
         inode: VfsInode,
         flags: u32,
     ) -> Result<(Option<VfsHandle>, OpenOptions)> {
@@ -476,7 +476,7 @@ impl<D: AsyncDrive, S: BitmapSlice> FileSystem<S> for Vfs<D, S> {
 
     fn readdir(
         &self,
-        ctx: Context,
+        ctx: &Context,
         inode: VfsInode,
         handle: u64,
         size: u32,
@@ -523,7 +523,7 @@ impl<D: AsyncDrive, S: BitmapSlice> FileSystem<S> for Vfs<D, S> {
 
     fn readdirplus(
         &self,
-        ctx: Context,
+        ctx: &Context,
         inode: VfsInode,
         handle: u64,
         size: u32,
@@ -569,21 +569,21 @@ impl<D: AsyncDrive, S: BitmapSlice> FileSystem<S> for Vfs<D, S> {
         }
     }
 
-    fn fsyncdir(&self, ctx: Context, inode: VfsInode, datasync: bool, handle: u64) -> Result<()> {
+    fn fsyncdir(&self, ctx: &Context, inode: VfsInode, datasync: bool, handle: u64) -> Result<()> {
         match self.get_real_rootfs(inode)? {
             (Left(fs), idata) => fs.fsyncdir(ctx, idata.ino(), datasync, handle),
             (Right(fs), idata) => fs.fsyncdir(ctx, idata.ino(), datasync, handle),
         }
     }
 
-    fn releasedir(&self, ctx: Context, inode: VfsInode, flags: u32, handle: u64) -> Result<()> {
+    fn releasedir(&self, ctx: &Context, inode: VfsInode, flags: u32, handle: u64) -> Result<()> {
         match self.get_real_rootfs(inode)? {
             (Left(fs), idata) => fs.releasedir(ctx, idata.ino(), flags, handle),
             (Right(fs), idata) => fs.releasedir(ctx, idata.ino(), flags, handle),
         }
     }
 
-    fn access(&self, ctx: Context, inode: VfsInode, mask: u32) -> Result<()> {
+    fn access(&self, ctx: &Context, inode: VfsInode, mask: u32) -> Result<()> {
         match self.get_real_rootfs(inode)? {
             (Left(fs), idata) => fs.access(ctx, idata.ino(), mask),
             (Right(fs), idata) => fs.access(ctx, idata.ino(), mask),
@@ -593,7 +593,7 @@ impl<D: AsyncDrive, S: BitmapSlice> FileSystem<S> for Vfs<D, S> {
     #[cfg(any(feature = "vhost-user-fs", feature = "virtiofs"))]
     fn setupmapping(
         &self,
-        ctx: Context,
+        ctx: &Context,
         inode: VfsInode,
         handle: u64,
         foffset: u64,
@@ -615,7 +615,7 @@ impl<D: AsyncDrive, S: BitmapSlice> FileSystem<S> for Vfs<D, S> {
     #[cfg(any(feature = "vhost-user-fs", feature = "virtiofs"))]
     fn removemapping(
         &self,
-        ctx: Context,
+        ctx: &Context,
         inode: VfsInode,
         requests: Vec<virtio_fs::RemovemappingOne>,
         req: &mut dyn FsCacheReqHandler,

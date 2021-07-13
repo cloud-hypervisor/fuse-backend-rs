@@ -323,7 +323,7 @@ impl<S: BitmapSlice> FileSystem<S> for PseudoFs<S> {
     type Inode = Inode;
     type Handle = Handle;
 
-    fn lookup(&self, _: Context, parent: u64, name: &CStr) -> Result<Entry> {
+    fn lookup(&self, _: &Context, parent: u64, name: &CStr) -> Result<Entry> {
         let inodes = self.inodes.load();
         let pinode = inodes
             .get(&parent)
@@ -353,7 +353,7 @@ impl<S: BitmapSlice> FileSystem<S> for PseudoFs<S> {
         }
     }
 
-    fn getattr(&self, _: Context, inode: u64, _: Option<u64>) -> Result<(libc::stat64, Duration)> {
+    fn getattr(&self, _: &Context, inode: u64, _: Option<u64>) -> Result<(libc::stat64, Duration)> {
         let ino = self
             .inodes
             .load()
@@ -367,7 +367,7 @@ impl<S: BitmapSlice> FileSystem<S> for PseudoFs<S> {
 
     fn readdir(
         &self,
-        _ctx: Context,
+        _ctx: &Context,
         inode: u64,
         _: u64,
         size: u32,
@@ -379,7 +379,7 @@ impl<S: BitmapSlice> FileSystem<S> for PseudoFs<S> {
 
     fn readdirplus(
         &self,
-        _ctx: Context,
+        _ctx: &Context,
         inode: u64,
         _handle: u64,
         size: u32,
@@ -392,7 +392,7 @@ impl<S: BitmapSlice> FileSystem<S> for PseudoFs<S> {
         })
     }
 
-    fn access(&self, _ctx: Context, _inode: u64, _mask: u32) -> Result<()> {
+    fn access(&self, _ctx: &Context, _inode: u64, _mask: u32) -> Result<()> {
         Ok(())
     }
 }
@@ -453,53 +453,57 @@ mod tests {
 
         assert!(fs
             .lookup(
-                create_fuse_context(),
+                &create_fuse_context(),
                 0x1000_0000,
                 &CString::new(".").unwrap()
             )
             .is_err());
         assert_eq!(
-            fs.lookup(create_fuse_context(), ROOT_ID, &CString::new("..").unwrap())
+            fs.lookup(
+                &create_fuse_context(),
+                ROOT_ID,
+                &CString::new("..").unwrap()
+            )
+            .unwrap()
+            .inode,
+            ROOT_ID
+        );
+        assert_eq!(
+            fs.lookup(&create_fuse_context(), ROOT_ID, &CString::new(".").unwrap())
                 .unwrap()
                 .inode,
             ROOT_ID
         );
         assert_eq!(
-            fs.lookup(create_fuse_context(), ROOT_ID, &CString::new(".").unwrap())
-                .unwrap()
-                .inode,
-            ROOT_ID
-        );
-        assert_eq!(
-            fs.lookup(create_fuse_context(), ROOT_ID, &CString::new("a").unwrap())
+            fs.lookup(&create_fuse_context(), ROOT_ID, &CString::new("a").unwrap())
                 .unwrap()
                 .inode,
             a1
         );
         assert!(fs
             .lookup(
-                create_fuse_context(),
+                &create_fuse_context(),
                 ROOT_ID,
                 &CString::new("a_no").unwrap()
             )
             .is_err());
         assert_eq!(
-            fs.lookup(create_fuse_context(), a1, &CString::new("b").unwrap())
+            fs.lookup(&create_fuse_context(), a1, &CString::new("b").unwrap())
                 .unwrap()
                 .inode,
             b1
         );
         assert!(fs
-            .lookup(create_fuse_context(), a1, &CString::new("b_no").unwrap())
+            .lookup(&create_fuse_context(), a1, &CString::new("b_no").unwrap())
             .is_err());
         assert_eq!(
-            fs.lookup(create_fuse_context(), b1, &CString::new("c").unwrap())
+            fs.lookup(&create_fuse_context(), b1, &CString::new("c").unwrap())
                 .unwrap()
                 .inode,
             c1
         );
         assert!(fs
-            .lookup(create_fuse_context(), b1, &CString::new("c_no").unwrap())
+            .lookup(&create_fuse_context(), b1, &CString::new("c_no").unwrap())
             .is_err());
 
         assert_eq!(fs.path_walk("/a").unwrap(), Some(a1));
@@ -517,9 +521,9 @@ mod tests {
         let fs = PseudoFs::<()>::new();
         let a1 = fs.mount("/a").unwrap();
 
-        fs.getattr(create_fuse_context(), ROOT_ID, None).unwrap();
-        fs.getattr(create_fuse_context(), a1, None).unwrap();
-        assert!(fs.getattr(create_fuse_context(), 0x1000, None).is_err());
+        fs.getattr(&create_fuse_context(), ROOT_ID, None).unwrap();
+        fs.getattr(&create_fuse_context(), a1, None).unwrap();
+        assert!(fs.getattr(&create_fuse_context(), 0x1000, None).is_err());
 
         fs.evict_inode(a1);
         fs.evict_inode(ROOT_ID);
@@ -531,20 +535,20 @@ mod tests {
         let _ = fs.mount("/a").unwrap();
         let _ = fs.mount("/b").unwrap();
 
-        fs.readdir(create_fuse_context(), ROOT_ID, 0, 0, 0, &mut |_| Ok(1))
+        fs.readdir(&create_fuse_context(), ROOT_ID, 0, 0, 0, &mut |_| Ok(1))
             .unwrap();
-        fs.readdir(create_fuse_context(), ROOT_ID, 0, 1, 0, &mut |_| Ok(1))
+        fs.readdir(&create_fuse_context(), ROOT_ID, 0, 1, 0, &mut |_| Ok(1))
             .unwrap();
-        fs.readdir(create_fuse_context(), ROOT_ID, 0, 1, 1, &mut |_| Ok(1))
+        fs.readdir(&create_fuse_context(), ROOT_ID, 0, 1, 1, &mut |_| Ok(1))
             .unwrap();
-        fs.readdir(create_fuse_context(), ROOT_ID, 0, 2, 0, &mut |_| Ok(1))
+        fs.readdir(&create_fuse_context(), ROOT_ID, 0, 2, 0, &mut |_| Ok(1))
             .unwrap();
-        fs.readdir(create_fuse_context(), ROOT_ID, 0, 3, 0, &mut |_| Ok(1))
+        fs.readdir(&create_fuse_context(), ROOT_ID, 0, 3, 0, &mut |_| Ok(1))
             .unwrap();
-        fs.readdir(create_fuse_context(), ROOT_ID, 0, 3, 3, &mut |_| Ok(1))
+        fs.readdir(&create_fuse_context(), ROOT_ID, 0, 3, 3, &mut |_| Ok(1))
             .unwrap();
         assert!(fs
-            .readdir(create_fuse_context(), 0x1000, 0, 3, 0, &mut |_| Ok(1))
+            .readdir(&create_fuse_context(), 0x1000, 0, 3, 0, &mut |_| Ok(1))
             .is_err());
     }
 
@@ -554,20 +558,20 @@ mod tests {
         let _ = fs.mount("/a").unwrap();
         let _ = fs.mount("/b").unwrap();
 
-        fs.readdirplus(create_fuse_context(), ROOT_ID, 0, 0, 0, &mut |_, _| Ok(1))
+        fs.readdirplus(&create_fuse_context(), ROOT_ID, 0, 0, 0, &mut |_, _| Ok(1))
             .unwrap();
-        fs.readdirplus(create_fuse_context(), ROOT_ID, 0, 1, 0, &mut |_, _| Ok(1))
+        fs.readdirplus(&create_fuse_context(), ROOT_ID, 0, 1, 0, &mut |_, _| Ok(1))
             .unwrap();
-        fs.readdirplus(create_fuse_context(), ROOT_ID, 0, 1, 1, &mut |_, _| Ok(1))
+        fs.readdirplus(&create_fuse_context(), ROOT_ID, 0, 1, 1, &mut |_, _| Ok(1))
             .unwrap();
-        fs.readdirplus(create_fuse_context(), ROOT_ID, 0, 2, 0, &mut |_, _| Ok(1))
+        fs.readdirplus(&create_fuse_context(), ROOT_ID, 0, 2, 0, &mut |_, _| Ok(1))
             .unwrap();
-        fs.readdirplus(create_fuse_context(), ROOT_ID, 0, 3, 0, &mut |_, _| Ok(1))
+        fs.readdirplus(&create_fuse_context(), ROOT_ID, 0, 3, 0, &mut |_, _| Ok(1))
             .unwrap();
-        fs.readdirplus(create_fuse_context(), ROOT_ID, 0, 3, 3, &mut |_, _| Ok(1))
+        fs.readdirplus(&create_fuse_context(), ROOT_ID, 0, 3, 3, &mut |_, _| Ok(1))
             .unwrap();
         assert!(fs
-            .readdirplus(create_fuse_context(), 0x1000, 0, 3, 0, &mut |_, _| Ok(1))
+            .readdirplus(&create_fuse_context(), 0x1000, 0, 3, 0, &mut |_, _| Ok(1))
             .is_err());
     }
 
@@ -577,6 +581,6 @@ mod tests {
         let a1 = fs.mount("/a").unwrap();
         let ctx = create_fuse_context();
 
-        fs.access(ctx, a1, 0).unwrap();
+        fs.access(&ctx, a1, 0).unwrap();
     }
 }

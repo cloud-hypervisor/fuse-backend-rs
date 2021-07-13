@@ -72,7 +72,7 @@ pub trait FileSystem<S: BitmapSlice = ()> {
     ///
     /// If this call is successful then the lookup count of the `Inode` associated with the returned
     /// `Entry` must be increased by 1.
-    fn lookup(&self, ctx: Context, parent: Self::Inode, name: &CStr) -> io::Result<Entry> {
+    fn lookup(&self, ctx: &Context, parent: Self::Inode, name: &CStr) -> io::Result<Entry> {
         Err(io::Error::from_raw_os_error(libc::ENOSYS))
     }
 
@@ -81,13 +81,13 @@ pub trait FileSystem<S: BitmapSlice = ()> {
     /// Called when the kernel removes an inode from its internal caches. `count` indicates the
     /// amount by which the lookup count for the inode should be decreased. If reducing the lookup
     /// count by `count` causes it to go to zero, then the implementation may delete the `Inode`.
-    fn forget(&self, ctx: Context, inode: Self::Inode, count: u64) {}
+    fn forget(&self, ctx: &Context, inode: Self::Inode, count: u64) {}
 
     /// Forget about multiple inodes.
     ///
     /// `requests` is a vector of `(inode, count)` pairs. See the documentation for `forget` for
     /// more information.
-    fn batch_forget(&self, ctx: Context, requests: Vec<(Self::Inode, u64)>) {
+    fn batch_forget(&self, ctx: &Context, requests: Vec<(Self::Inode, u64)>) {
         for (inode, count) in requests {
             self.forget(ctx, inode, count)
         }
@@ -109,7 +109,7 @@ pub trait FileSystem<S: BitmapSlice = ()> {
     /// the kernel module has exclusive access), then this should be a very large value.
     fn getattr(
         &self,
-        ctx: Context,
+        ctx: &Context,
         inode: Self::Inode,
         handle: Option<Self::Handle>,
     ) -> io::Result<(libc::stat64, Duration)> {
@@ -135,7 +135,7 @@ pub trait FileSystem<S: BitmapSlice = ()> {
     /// value.
     fn setattr(
         &self,
-        ctx: Context,
+        ctx: &Context,
         inode: Self::Inode,
         attr: libc::stat64,
         handle: Option<Self::Handle>,
@@ -145,7 +145,7 @@ pub trait FileSystem<S: BitmapSlice = ()> {
     }
 
     /// Read a symbolic link.
-    fn readlink(&self, ctx: Context, inode: Self::Inode) -> io::Result<Vec<u8>> {
+    fn readlink(&self, ctx: &Context, inode: Self::Inode) -> io::Result<Vec<u8>> {
         Err(io::Error::from_raw_os_error(libc::ENOSYS))
     }
 
@@ -159,7 +159,7 @@ pub trait FileSystem<S: BitmapSlice = ()> {
     /// `Entry` must be increased by 1.
     fn symlink(
         &self,
-        ctx: Context,
+        ctx: &Context,
         linkname: &CStr,
         parent: Self::Inode,
         name: &CStr,
@@ -180,7 +180,7 @@ pub trait FileSystem<S: BitmapSlice = ()> {
     /// `Entry` must be increased by 1.
     fn mknod(
         &self,
-        ctx: Context,
+        ctx: &Context,
         inode: Self::Inode,
         name: &CStr,
         mode: u32,
@@ -200,7 +200,7 @@ pub trait FileSystem<S: BitmapSlice = ()> {
     /// `Entry` must be increased by 1.
     fn mkdir(
         &self,
-        ctx: Context,
+        ctx: &Context,
         parent: Self::Inode,
         name: &CStr,
         mode: u32,
@@ -214,7 +214,7 @@ pub trait FileSystem<S: BitmapSlice = ()> {
     /// If the file's inode lookup count is non-zero, then the file system is expected to delay
     /// removal of the inode until the lookup count goes to zero. See the documentation of the
     /// `forget` function for more information.
-    fn unlink(&self, ctx: Context, parent: Self::Inode, name: &CStr) -> io::Result<()> {
+    fn unlink(&self, ctx: &Context, parent: Self::Inode, name: &CStr) -> io::Result<()> {
         Err(io::Error::from_raw_os_error(libc::ENOSYS))
     }
 
@@ -223,7 +223,7 @@ pub trait FileSystem<S: BitmapSlice = ()> {
     /// If the directory's inode lookup count is non-zero, then the file system is expected to delay
     /// removal of the inode until the lookup count goes to zero. See the documentation of the
     /// `forget` function for more information.
-    fn rmdir(&self, ctx: Context, parent: Self::Inode, name: &CStr) -> io::Result<()> {
+    fn rmdir(&self, ctx: &Context, parent: Self::Inode, name: &CStr) -> io::Result<()> {
         Err(io::Error::from_raw_os_error(libc::ENOSYS))
     }
 
@@ -241,7 +241,7 @@ pub trait FileSystem<S: BitmapSlice = ()> {
     /// be deleted.
     fn rename(
         &self,
-        ctx: Context,
+        ctx: &Context,
         olddir: Self::Inode,
         oldname: &CStr,
         newdir: Self::Inode,
@@ -259,7 +259,7 @@ pub trait FileSystem<S: BitmapSlice = ()> {
     /// `Entry` must be increased by 1.
     fn link(
         &self,
-        ctx: Context,
+        ctx: &Context,
         inode: Self::Inode,
         newparent: Self::Inode,
         newname: &CStr,
@@ -309,7 +309,7 @@ pub trait FileSystem<S: BitmapSlice = ()> {
     /// be handled by the kernel without being passed on to the file system.
     fn open(
         &self,
-        ctx: Context,
+        ctx: &Context,
         inode: Self::Inode,
         flags: u32,
         fuse_flags: u32,
@@ -334,7 +334,7 @@ pub trait FileSystem<S: BitmapSlice = ()> {
     /// file by 1.
     fn create(
         &self,
-        ctx: Context,
+        ctx: &Context,
         parent: Self::Inode,
         name: &CStr,
         args: CreateIn,
@@ -360,7 +360,7 @@ pub trait FileSystem<S: BitmapSlice = ()> {
     #[allow(clippy::too_many_arguments)]
     fn read(
         &self,
-        ctx: Context,
+        ctx: &Context,
         inode: Self::Inode,
         handle: Self::Handle,
         w: &mut dyn ZeroCopyWriter<S = S>,
@@ -394,7 +394,7 @@ pub trait FileSystem<S: BitmapSlice = ()> {
     #[allow(clippy::too_many_arguments)]
     fn write(
         &self,
-        ctx: Context,
+        ctx: &Context,
         inode: Self::Inode,
         handle: Self::Handle,
         r: &mut dyn ZeroCopyReader<S = S>,
@@ -432,7 +432,7 @@ pub trait FileSystem<S: BitmapSlice = ()> {
     /// file system.
     fn flush(
         &self,
-        ctx: Context,
+        ctx: &Context,
         inode: Self::Inode,
         handle: Self::Handle,
         lock_owner: u64,
@@ -455,7 +455,7 @@ pub trait FileSystem<S: BitmapSlice = ()> {
     /// file system.
     fn fsync(
         &self,
-        ctx: Context,
+        ctx: &Context,
         inode: Self::Inode,
         datasync: bool,
         handle: Self::Handle,
@@ -478,7 +478,7 @@ pub trait FileSystem<S: BitmapSlice = ()> {
     /// to the file system.
     fn fallocate(
         &self,
-        ctx: Context,
+        ctx: &Context,
         inode: Self::Inode,
         handle: Self::Handle,
         mode: u32,
@@ -507,7 +507,7 @@ pub trait FileSystem<S: BitmapSlice = ()> {
     #[allow(clippy::too_many_arguments)]
     fn release(
         &self,
-        ctx: Context,
+        ctx: &Context,
         inode: Self::Inode,
         flags: u32,
         handle: Self::Handle,
@@ -519,7 +519,7 @@ pub trait FileSystem<S: BitmapSlice = ()> {
     }
 
     /// Get information about the file system.
-    fn statfs(&self, ctx: Context, inode: Self::Inode) -> io::Result<libc::statvfs64> {
+    fn statfs(&self, ctx: &Context, inode: Self::Inode) -> io::Result<libc::statvfs64> {
         // Safe because we are zero-initializing a struct with only POD fields.
         let mut st: libc::statvfs64 = unsafe { mem::zeroed() };
 
@@ -541,7 +541,7 @@ pub trait FileSystem<S: BitmapSlice = ()> {
     /// have the same behavior.
     fn setxattr(
         &self,
-        ctx: Context,
+        ctx: &Context,
         inode: Self::Inode,
         name: &CStr,
         value: &[u8],
@@ -563,7 +563,7 @@ pub trait FileSystem<S: BitmapSlice = ()> {
     /// forwarding them to the file system.
     fn getxattr(
         &self,
-        ctx: Context,
+        ctx: &Context,
         inode: Self::Inode,
         name: &CStr,
         size: u32,
@@ -583,7 +583,12 @@ pub trait FileSystem<S: BitmapSlice = ()> {
     /// If this method fails with an `ENOSYS` error, then the kernel will treat that as a permanent
     /// failure. The kernel will return `EOPNOTSUPP` for all future calls to `listxattr` without
     /// forwarding them to the file system.
-    fn listxattr(&self, ctx: Context, inode: Self::Inode, size: u32) -> io::Result<ListxattrReply> {
+    fn listxattr(
+        &self,
+        ctx: &Context,
+        inode: Self::Inode,
+        size: u32,
+    ) -> io::Result<ListxattrReply> {
         Err(io::Error::from_raw_os_error(libc::ENOSYS))
     }
 
@@ -592,7 +597,7 @@ pub trait FileSystem<S: BitmapSlice = ()> {
     /// If this method fails with an `ENOSYS` error, then the kernel will treat that as a permanent
     /// failure. The kernel will return `EOPNOTSUPP` for all future calls to `removexattr` without
     /// forwarding them to the file system.
-    fn removexattr(&self, ctx: Context, inode: Self::Inode, name: &CStr) -> io::Result<()> {
+    fn removexattr(&self, ctx: &Context, inode: Self::Inode, name: &CStr) -> io::Result<()> {
         Err(io::Error::from_raw_os_error(libc::ENOSYS))
     }
 
@@ -614,7 +619,7 @@ pub trait FileSystem<S: BitmapSlice = ()> {
     /// will be handled by the kernel without being passed on to the file system.
     fn opendir(
         &self,
-        ctx: Context,
+        ctx: &Context,
         inode: Self::Inode,
         flags: u32,
     ) -> io::Result<(Option<Self::Handle>, OpenOptions)> {
@@ -651,7 +656,7 @@ pub trait FileSystem<S: BitmapSlice = ()> {
     // `FnMut` for adding entries.
     fn readdir(
         &self,
-        ctx: Context,
+        ctx: &Context,
         inode: Self::Inode,
         handle: Self::Handle,
         size: u32,
@@ -687,7 +692,7 @@ pub trait FileSystem<S: BitmapSlice = ()> {
     /// using an `FnMut` for adding entries.
     fn readdirplus(
         &self,
-        ctx: Context,
+        ctx: &Context,
         inode: Self::Inode,
         handle: Self::Handle,
         size: u32,
@@ -712,7 +717,7 @@ pub trait FileSystem<S: BitmapSlice = ()> {
     /// file system.
     fn fsyncdir(
         &self,
-        ctx: Context,
+        ctx: &Context,
         inode: Self::Inode,
         datasync: bool,
         handle: Self::Handle,
@@ -732,7 +737,7 @@ pub trait FileSystem<S: BitmapSlice = ()> {
     /// `flags` contains used the flags used to open the directory in `opendir`.
     fn releasedir(
         &self,
-        ctx: Context,
+        ctx: &Context,
         inode: Self::Inode,
         flags: u32,
         handle: Self::Handle,
@@ -757,7 +762,7 @@ pub trait FileSystem<S: BitmapSlice = ()> {
     #[allow(clippy::too_many_arguments)]
     fn setupmapping(
         &self,
-        _ctx: Context,
+        _ctx: &Context,
         inode: Self::Inode,
         handle: Self::Handle,
         foffset: u64,
@@ -773,7 +778,7 @@ pub trait FileSystem<S: BitmapSlice = ()> {
     /// Teardown a mapping which was setup for guest DAX style access.
     fn removemapping(
         &self,
-        _ctx: Context,
+        _ctx: &Context,
         _inode: Self::Inode,
         requests: Vec<RemovemappingOne>,
         vu_req: &mut dyn FsCacheReqHandler,
@@ -791,14 +796,14 @@ pub trait FileSystem<S: BitmapSlice = ()> {
     /// If this method returns an `ENOSYS` error, then the kernel will treat it as a permanent
     /// success: all future calls to `access` will return success without being forwarded to the
     /// file system.
-    fn access(&self, ctx: Context, inode: Self::Inode, mask: u32) -> io::Result<()> {
+    fn access(&self, ctx: &Context, inode: Self::Inode, mask: u32) -> io::Result<()> {
         Err(io::Error::from_raw_os_error(libc::ENOSYS))
     }
 
     /// Reposition read/write file offset.
     fn lseek(
         &self,
-        ctx: Context,
+        ctx: &Context,
         inode: Self::Inode,
         handle: Self::Handle,
         offset: u64,
@@ -855,21 +860,21 @@ impl<FS: FileSystem<S>, S: BitmapSlice> FileSystem<S> for Arc<FS> {
         self.deref().destroy()
     }
 
-    fn lookup(&self, ctx: Context, parent: Self::Inode, name: &CStr) -> io::Result<Entry> {
+    fn lookup(&self, ctx: &Context, parent: Self::Inode, name: &CStr) -> io::Result<Entry> {
         self.deref().lookup(ctx, parent, name)
     }
 
-    fn forget(&self, ctx: Context, inode: Self::Inode, count: u64) {
+    fn forget(&self, ctx: &Context, inode: Self::Inode, count: u64) {
         self.deref().forget(ctx, inode, count)
     }
 
-    fn batch_forget(&self, ctx: Context, requests: Vec<(Self::Inode, u64)>) {
+    fn batch_forget(&self, ctx: &Context, requests: Vec<(Self::Inode, u64)>) {
         self.deref().batch_forget(ctx, requests)
     }
 
     fn getattr(
         &self,
-        ctx: Context,
+        ctx: &Context,
         inode: Self::Inode,
         handle: Option<Self::Handle>,
     ) -> io::Result<(libc::stat64, Duration)> {
@@ -878,7 +883,7 @@ impl<FS: FileSystem<S>, S: BitmapSlice> FileSystem<S> for Arc<FS> {
 
     fn setattr(
         &self,
-        ctx: Context,
+        ctx: &Context,
         inode: Self::Inode,
         attr: libc::stat64,
         handle: Option<Self::Handle>,
@@ -887,13 +892,13 @@ impl<FS: FileSystem<S>, S: BitmapSlice> FileSystem<S> for Arc<FS> {
         self.deref().setattr(ctx, inode, attr, handle, valid)
     }
 
-    fn readlink(&self, ctx: Context, inode: Self::Inode) -> io::Result<Vec<u8>> {
+    fn readlink(&self, ctx: &Context, inode: Self::Inode) -> io::Result<Vec<u8>> {
         self.deref().readlink(ctx, inode)
     }
 
     fn symlink(
         &self,
-        ctx: Context,
+        ctx: &Context,
         linkname: &CStr,
         parent: Self::Inode,
         name: &CStr,
@@ -903,7 +908,7 @@ impl<FS: FileSystem<S>, S: BitmapSlice> FileSystem<S> for Arc<FS> {
 
     fn mknod(
         &self,
-        ctx: Context,
+        ctx: &Context,
         inode: Self::Inode,
         name: &CStr,
         mode: u32,
@@ -915,7 +920,7 @@ impl<FS: FileSystem<S>, S: BitmapSlice> FileSystem<S> for Arc<FS> {
 
     fn mkdir(
         &self,
-        ctx: Context,
+        ctx: &Context,
         parent: Self::Inode,
         name: &CStr,
         mode: u32,
@@ -924,17 +929,17 @@ impl<FS: FileSystem<S>, S: BitmapSlice> FileSystem<S> for Arc<FS> {
         self.deref().mkdir(ctx, parent, name, mode, umask)
     }
 
-    fn unlink(&self, ctx: Context, parent: Self::Inode, name: &CStr) -> io::Result<()> {
+    fn unlink(&self, ctx: &Context, parent: Self::Inode, name: &CStr) -> io::Result<()> {
         self.deref().unlink(ctx, parent, name)
     }
 
-    fn rmdir(&self, ctx: Context, parent: Self::Inode, name: &CStr) -> io::Result<()> {
+    fn rmdir(&self, ctx: &Context, parent: Self::Inode, name: &CStr) -> io::Result<()> {
         self.deref().rmdir(ctx, parent, name)
     }
 
     fn rename(
         &self,
-        ctx: Context,
+        ctx: &Context,
         olddir: Self::Inode,
         oldname: &CStr,
         newdir: Self::Inode,
@@ -947,7 +952,7 @@ impl<FS: FileSystem<S>, S: BitmapSlice> FileSystem<S> for Arc<FS> {
 
     fn link(
         &self,
-        ctx: Context,
+        ctx: &Context,
         inode: Self::Inode,
         newparent: Self::Inode,
         newname: &CStr,
@@ -957,7 +962,7 @@ impl<FS: FileSystem<S>, S: BitmapSlice> FileSystem<S> for Arc<FS> {
 
     fn open(
         &self,
-        ctx: Context,
+        ctx: &Context,
         inode: Self::Inode,
         flags: u32,
         fuse_flags: u32,
@@ -967,7 +972,7 @@ impl<FS: FileSystem<S>, S: BitmapSlice> FileSystem<S> for Arc<FS> {
 
     fn create(
         &self,
-        ctx: Context,
+        ctx: &Context,
         parent: Self::Inode,
         name: &CStr,
         args: CreateIn,
@@ -977,7 +982,7 @@ impl<FS: FileSystem<S>, S: BitmapSlice> FileSystem<S> for Arc<FS> {
 
     fn read(
         &self,
-        ctx: Context,
+        ctx: &Context,
         inode: Self::Inode,
         handle: Self::Handle,
         w: &mut dyn ZeroCopyWriter<S = S>,
@@ -993,7 +998,7 @@ impl<FS: FileSystem<S>, S: BitmapSlice> FileSystem<S> for Arc<FS> {
     #[allow(clippy::too_many_arguments)]
     fn write(
         &self,
-        ctx: Context,
+        ctx: &Context,
         inode: Self::Inode,
         handle: Self::Handle,
         r: &mut dyn ZeroCopyReader<S = S>,
@@ -1020,7 +1025,7 @@ impl<FS: FileSystem<S>, S: BitmapSlice> FileSystem<S> for Arc<FS> {
 
     fn flush(
         &self,
-        ctx: Context,
+        ctx: &Context,
         inode: Self::Inode,
         handle: Self::Handle,
         lock_owner: u64,
@@ -1030,7 +1035,7 @@ impl<FS: FileSystem<S>, S: BitmapSlice> FileSystem<S> for Arc<FS> {
 
     fn fsync(
         &self,
-        ctx: Context,
+        ctx: &Context,
         inode: Self::Inode,
         datasync: bool,
         handle: Self::Handle,
@@ -1040,7 +1045,7 @@ impl<FS: FileSystem<S>, S: BitmapSlice> FileSystem<S> for Arc<FS> {
 
     fn fallocate(
         &self,
-        ctx: Context,
+        ctx: &Context,
         inode: Self::Inode,
         handle: Self::Handle,
         mode: u32,
@@ -1054,7 +1059,7 @@ impl<FS: FileSystem<S>, S: BitmapSlice> FileSystem<S> for Arc<FS> {
     #[allow(clippy::too_many_arguments)]
     fn release(
         &self,
-        ctx: Context,
+        ctx: &Context,
         inode: Self::Inode,
         flags: u32,
         handle: Self::Handle,
@@ -1066,13 +1071,13 @@ impl<FS: FileSystem<S>, S: BitmapSlice> FileSystem<S> for Arc<FS> {
             .release(ctx, inode, flags, handle, flush, flock_release, lock_owner)
     }
 
-    fn statfs(&self, ctx: Context, inode: Self::Inode) -> io::Result<libc::statvfs64> {
+    fn statfs(&self, ctx: &Context, inode: Self::Inode) -> io::Result<libc::statvfs64> {
         self.deref().statfs(ctx, inode)
     }
 
     fn setxattr(
         &self,
-        ctx: Context,
+        ctx: &Context,
         inode: Self::Inode,
         name: &CStr,
         value: &[u8],
@@ -1083,7 +1088,7 @@ impl<FS: FileSystem<S>, S: BitmapSlice> FileSystem<S> for Arc<FS> {
 
     fn getxattr(
         &self,
-        ctx: Context,
+        ctx: &Context,
         inode: Self::Inode,
         name: &CStr,
         size: u32,
@@ -1091,17 +1096,22 @@ impl<FS: FileSystem<S>, S: BitmapSlice> FileSystem<S> for Arc<FS> {
         self.deref().getxattr(ctx, inode, name, size)
     }
 
-    fn listxattr(&self, ctx: Context, inode: Self::Inode, size: u32) -> io::Result<ListxattrReply> {
+    fn listxattr(
+        &self,
+        ctx: &Context,
+        inode: Self::Inode,
+        size: u32,
+    ) -> io::Result<ListxattrReply> {
         self.deref().listxattr(ctx, inode, size)
     }
 
-    fn removexattr(&self, ctx: Context, inode: Self::Inode, name: &CStr) -> io::Result<()> {
+    fn removexattr(&self, ctx: &Context, inode: Self::Inode, name: &CStr) -> io::Result<()> {
         self.deref().removexattr(ctx, inode, name)
     }
 
     fn opendir(
         &self,
-        ctx: Context,
+        ctx: &Context,
         inode: Self::Inode,
         flags: u32,
     ) -> io::Result<(Option<Self::Handle>, OpenOptions)> {
@@ -1110,7 +1120,7 @@ impl<FS: FileSystem<S>, S: BitmapSlice> FileSystem<S> for Arc<FS> {
 
     fn readdir(
         &self,
-        ctx: Context,
+        ctx: &Context,
         inode: Self::Inode,
         handle: Self::Handle,
         size: u32,
@@ -1123,7 +1133,7 @@ impl<FS: FileSystem<S>, S: BitmapSlice> FileSystem<S> for Arc<FS> {
 
     fn readdirplus(
         &self,
-        ctx: Context,
+        ctx: &Context,
         inode: Self::Inode,
         handle: Self::Handle,
         size: u32,
@@ -1136,7 +1146,7 @@ impl<FS: FileSystem<S>, S: BitmapSlice> FileSystem<S> for Arc<FS> {
 
     fn fsyncdir(
         &self,
-        ctx: Context,
+        ctx: &Context,
         inode: Self::Inode,
         datasync: bool,
         handle: Self::Handle,
@@ -1146,7 +1156,7 @@ impl<FS: FileSystem<S>, S: BitmapSlice> FileSystem<S> for Arc<FS> {
 
     fn releasedir(
         &self,
-        ctx: Context,
+        ctx: &Context,
         inode: Self::Inode,
         flags: u32,
         handle: Self::Handle,
@@ -1158,7 +1168,7 @@ impl<FS: FileSystem<S>, S: BitmapSlice> FileSystem<S> for Arc<FS> {
     #[allow(clippy::too_many_arguments)]
     fn setupmapping(
         &self,
-        ctx: Context,
+        ctx: &Context,
         inode: Self::Inode,
         handle: Self::Handle,
         foffset: u64,
@@ -1174,7 +1184,7 @@ impl<FS: FileSystem<S>, S: BitmapSlice> FileSystem<S> for Arc<FS> {
     #[cfg(feature = "virtiofs")]
     fn removemapping(
         &self,
-        ctx: Context,
+        ctx: &Context,
         inode: Self::Inode,
         requests: Vec<RemovemappingOne>,
         vu_req: &mut dyn FsCacheReqHandler,
@@ -1182,13 +1192,13 @@ impl<FS: FileSystem<S>, S: BitmapSlice> FileSystem<S> for Arc<FS> {
         self.deref().removemapping(ctx, inode, requests, vu_req)
     }
 
-    fn access(&self, ctx: Context, inode: Self::Inode, mask: u32) -> io::Result<()> {
+    fn access(&self, ctx: &Context, inode: Self::Inode, mask: u32) -> io::Result<()> {
         self.deref().access(ctx, inode, mask)
     }
 
     fn lseek(
         &self,
-        ctx: Context,
+        ctx: &Context,
         inode: Self::Inode,
         handle: Self::Handle,
         offset: u64,

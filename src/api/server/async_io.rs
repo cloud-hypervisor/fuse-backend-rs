@@ -502,6 +502,8 @@ impl<'a, F: AsyncFileSystem<D, S>, D: AsyncDrive, S: BitmapSlice> SrvContext<'a,
     fn with_drive(in_header: InHeader, r: Reader<'a, S>, w: Writer<'a, S>, drive: D) -> Self {
         let mut ctx = Self::new(in_header, r, w);
 
+        // Safe because the SrvContext has longer lifetime than Context object.
+        unsafe { ctx.context.set_drive(&drive) };
         ctx.drive = Some(drive);
 
         ctx

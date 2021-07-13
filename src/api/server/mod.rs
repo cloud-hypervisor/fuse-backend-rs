@@ -161,6 +161,7 @@ pub trait MetricsHook {
 struct SrvContext<'a, F, D: AsyncDrive = AsyncDriver, S: BitmapSlice = ()> {
     drive: Option<D>,
     in_header: InHeader,
+    context: Context,
     r: Reader<'a, S>,
     w: Writer<'a, S>,
     phantom: PhantomData<F>,
@@ -169,9 +170,12 @@ struct SrvContext<'a, F, D: AsyncDrive = AsyncDriver, S: BitmapSlice = ()> {
 
 impl<'a, F: FileSystem<S>, D: AsyncDrive, S: BitmapSlice> SrvContext<'a, F, D, S> {
     fn new(in_header: InHeader, r: Reader<'a, S>, w: Writer<'a, S>) -> Self {
+        let context = Context::from(&in_header);
+
         SrvContext {
             drive: None,
             in_header,
+            context,
             r,
             w,
             phantom: PhantomData,
@@ -179,15 +183,8 @@ impl<'a, F: FileSystem<S>, D: AsyncDrive, S: BitmapSlice> SrvContext<'a, F, D, S
         }
     }
 
-    fn context(&self) -> Context {
-        let mut ctx = Context::from(&self.in_header);
-
-        if self.drive.is_some() {
-            // Safe because the SrvContext has longer lifetime than Context object.
-            unsafe { ctx.set_drive(self.drive.as_ref().unwrap()) };
-        }
-
-        ctx
+    fn context(&self) -> &Context {
+        &self.context
     }
 
     fn unique(&self) -> u64 {

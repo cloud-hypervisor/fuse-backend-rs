@@ -1044,17 +1044,17 @@ mod tests {
 
         // read a few files to inode map.
         let parent = CString::new(parent_path.as_path().to_str().expect("path to string")).unwrap();
-        let p_entry = fs.lookup(ctx, ROOT_ID, &parent).unwrap();
+        let p_entry = fs.lookup(&ctx, ROOT_ID, &parent).unwrap();
         let p_inode = p_entry.inode;
 
         let child = CString::new(child_path.as_path().to_str().expect("path to string")).unwrap();
-        let c_entry = fs.lookup(ctx, p_inode, &child).unwrap();
+        let c_entry = fs.lookup(&ctx, p_inode, &child).unwrap();
 
         // Following test depends on host fs, it's not reliable.
         //let data = fs.inode_map.get(c_entry.inode).unwrap();
         //assert_eq!(matches!(data.file_or_handle, FileOrHandle::Handle(_)), true);
 
-        let (_, duration) = fs.getattr(ctx, c_entry.inode, None).unwrap();
+        let (_, duration) = fs.getattr(&ctx, c_entry.inode, None).unwrap();
         assert_eq!(duration, fs.cfg.attr_timeout);
 
         fs.destroy();
