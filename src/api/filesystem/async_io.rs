@@ -83,7 +83,7 @@ pub trait AsyncFileSystem<D: AsyncDrive = AsyncDriver, S: BitmapSlice = ()>: Fil
     /// `Entry` must be increased by 1.
     async fn async_lookup(
         &self,
-        ctx: Context,
+        ctx: &Context,
         parent: Self::Inode,
         name: &CStr,
     ) -> io::Result<Entry>;
@@ -119,7 +119,7 @@ pub trait AsyncFileSystem<D: AsyncDrive = AsyncDriver, S: BitmapSlice = ()>: Fil
     /// the kernel module has exclusive access), then this should be a very large value.
     async fn async_getattr(
         &self,
-        ctx: Context,
+        ctx: &Context,
         inode: Self::Inode,
         handle: Option<Self::Handle>,
     ) -> io::Result<(libc::stat64, Duration)>;
@@ -143,7 +143,7 @@ pub trait AsyncFileSystem<D: AsyncDrive = AsyncDriver, S: BitmapSlice = ()>: Fil
     /// value.
     async fn async_setattr(
         &self,
-        ctx: Context,
+        ctx: &Context,
         inode: Self::Inode,
         attr: libc::stat64,
         handle: Option<Self::Handle>,
@@ -317,7 +317,7 @@ pub trait AsyncFileSystem<D: AsyncDrive = AsyncDriver, S: BitmapSlice = ()>: Fil
     /// be handled by the kernel without being passed on to the file system.
     async fn async_open(
         &self,
-        ctx: Context,
+        ctx: &Context,
         inode: Self::Inode,
         flags: u32,
         fuse_flags: u32,
@@ -339,7 +339,7 @@ pub trait AsyncFileSystem<D: AsyncDrive = AsyncDriver, S: BitmapSlice = ()>: Fil
     /// file by 1.
     async fn async_create(
         &self,
-        ctx: Context,
+        ctx: &Context,
         parent: Self::Inode,
         name: &CStr,
         args: CreateIn,
@@ -363,7 +363,7 @@ pub trait AsyncFileSystem<D: AsyncDrive = AsyncDriver, S: BitmapSlice = ()>: Fil
     #[allow(clippy::too_many_arguments)]
     async fn async_read(
         &self,
-        ctx: Context,
+        ctx: &Context,
         inode: Self::Inode,
         handle: Self::Handle,
         w: &mut (dyn AsyncZeroCopyWriter<D, S> + Send),
@@ -395,7 +395,7 @@ pub trait AsyncFileSystem<D: AsyncDrive = AsyncDriver, S: BitmapSlice = ()>: Fil
     #[allow(clippy::too_many_arguments)]
     async fn async_write(
         &self,
-        ctx: Context,
+        ctx: &Context,
         inode: Self::Inode,
         handle: Self::Handle,
         r: &mut (dyn AsyncZeroCopyReader<D, S> + Send),
@@ -456,7 +456,7 @@ pub trait AsyncFileSystem<D: AsyncDrive = AsyncDriver, S: BitmapSlice = ()>: Fil
     /// file system.
     async fn async_fsync(
         &self,
-        ctx: Context,
+        ctx: &Context,
         inode: Self::Inode,
         datasync: bool,
         handle: Self::Handle,
@@ -477,7 +477,7 @@ pub trait AsyncFileSystem<D: AsyncDrive = AsyncDriver, S: BitmapSlice = ()>: Fil
     /// to the file system.
     async fn async_fallocate(
         &self,
-        ctx: Context,
+        ctx: &Context,
         inode: Self::Inode,
         handle: Self::Handle,
         mode: u32,
@@ -711,7 +711,7 @@ pub trait AsyncFileSystem<D: AsyncDrive = AsyncDriver, S: BitmapSlice = ()>: Fil
     /// file system.
     async fn async_fsyncdir(
         &self,
-        ctx: Context,
+        ctx: &Context,
         inode: Self::Inode,
         datasync: bool,
         handle: Self::Handle,
@@ -850,36 +850,38 @@ type CreateFuture<'async_trait, H> =
     Box<dyn Future<Output = io::Result<(Entry, Option<H>, OpenOptions)>> + Send + 'async_trait>;
 
 impl<FS: AsyncFileSystem<D, S>, D: AsyncDrive, S: BitmapSlice> AsyncFileSystem<D, S> for Arc<FS> {
-    fn async_lookup<'a, 'b, 'async_trait>(
+    fn async_lookup<'a, 'b, 'c, 'async_trait>(
         &'a self,
-        ctx: Context,
+        ctx: &'b Context,
         parent: Self::Inode,
-        name: &'b CStr,
+        name: &'c CStr,
     ) -> Pin<Box<dyn Future<Output = io::Result<Entry>> + Send + 'async_trait>>
     where
         'a: 'async_trait,
         'b: 'async_trait,
+        'c: 'async_trait,
         Self: 'async_trait,
     {
         self.deref().async_lookup(ctx, parent, name)
     }
 
-    fn async_getattr<'a, 'async_trait>(
+    fn async_getattr<'a, 'b, 'async_trait>(
         &'a self,
-        ctx: Context,
+        ctx: &'b Context,
         inode: Self::Inode,
         handle: Option<Self::Handle>,
     ) -> Pin<AttrFuture<'async_trait>>
     where
         'a: 'async_trait,
+        'b: 'async_trait,
         Self: 'async_trait,
     {
         self.deref().async_getattr(ctx, inode, handle)
     }
 
-    fn async_setattr<'a, 'async_trait>(
+    fn async_setattr<'a, 'b, 'async_trait>(
         &'a self,
-        ctx: Context,
+        ctx: &'b Context,
         inode: Self::Inode,
         attr: libc::stat64,
         handle: Option<Self::Handle>,
@@ -887,46 +889,49 @@ impl<FS: AsyncFileSystem<D, S>, D: AsyncDrive, S: BitmapSlice> AsyncFileSystem<D
     ) -> Pin<AttrFuture<'async_trait>>
     where
         'a: 'async_trait,
+        'b: 'async_trait,
         Self: 'async_trait,
     {
         self.deref().async_setattr(ctx, inode, attr, handle, valid)
     }
 
-    fn async_open<'a, 'async_trait>(
+    fn async_open<'a, 'b, 'async_trait>(
         &'a self,
-        ctx: Context,
+        ctx: &'b Context,
         inode: Self::Inode,
         flags: u32,
         fuse_flags: u32,
     ) -> Pin<OpenFuture<'async_trait, Self::Handle>>
     where
         'a: 'async_trait,
+        'b: 'async_trait,
         Self: 'async_trait,
     {
         self.deref().async_open(ctx, inode, flags, fuse_flags)
     }
 
-    fn async_create<'a, 'b, 'async_trait>(
+    fn async_create<'a, 'b, 'c, 'async_trait>(
         &'a self,
-        ctx: Context,
+        ctx: &'b Context,
         parent: Self::Inode,
-        name: &'b CStr,
+        name: &'c CStr,
         args: CreateIn,
     ) -> Pin<CreateFuture<'async_trait, Self::Handle>>
     where
         'a: 'async_trait,
         'b: 'async_trait,
+        'c: 'async_trait,
         Self: 'async_trait,
     {
         self.deref().async_create(ctx, parent, name, args)
     }
 
-    fn async_read<'a, 'b, 'async_trait>(
+    fn async_read<'a, 'b, 'c, 'async_trait>(
         &'a self,
-        ctx: Context,
+        ctx: &'b Context,
         inode: Self::Inode,
         handle: Self::Handle,
-        w: &'b mut (dyn AsyncZeroCopyWriter<D, S> + Send),
+        w: &'c mut (dyn AsyncZeroCopyWriter<D, S> + Send),
         size: u32,
         offset: u64,
         lock_owner: Option<u64>,
@@ -935,18 +940,19 @@ impl<FS: AsyncFileSystem<D, S>, D: AsyncDrive, S: BitmapSlice> AsyncFileSystem<D
     where
         'a: 'async_trait,
         'b: 'async_trait,
+        'c: 'async_trait,
         Self: 'async_trait,
     {
         self.deref()
             .async_read(ctx, inode, handle, w, size, offset, lock_owner, flags)
     }
 
-    fn async_write<'a, 'b, 'async_trait>(
+    fn async_write<'a, 'b, 'c, 'async_trait>(
         &'a self,
-        ctx: Context,
+        ctx: &'b Context,
         inode: Self::Inode,
         handle: Self::Handle,
-        r: &'b mut (dyn AsyncZeroCopyReader<D, S> + Send),
+        r: &'c mut (dyn AsyncZeroCopyReader<D, S> + Send),
         size: u32,
         offset: u64,
         lock_owner: Option<u64>,
@@ -957,6 +963,7 @@ impl<FS: AsyncFileSystem<D, S>, D: AsyncDrive, S: BitmapSlice> AsyncFileSystem<D
     where
         'a: 'async_trait,
         'b: 'async_trait,
+        'c: 'async_trait,
         Self: 'async_trait,
     {
         self.deref().async_write(
@@ -973,23 +980,24 @@ impl<FS: AsyncFileSystem<D, S>, D: AsyncDrive, S: BitmapSlice> AsyncFileSystem<D
         )
     }
 
-    fn async_fsync<'a, 'async_trait>(
+    fn async_fsync<'a, 'b, 'async_trait>(
         &'a self,
-        ctx: Context,
+        ctx: &'b Context,
         inode: Self::Inode,
         datasync: bool,
         handle: Self::Handle,
     ) -> Pin<Box<dyn Future<Output = io::Result<()>> + Send + 'async_trait>>
     where
         'a: 'async_trait,
+        'b: 'async_trait,
         Self: 'async_trait,
     {
         self.deref().async_fsync(ctx, inode, datasync, handle)
     }
 
-    fn async_fallocate<'a, 'async_trait>(
+    fn async_fallocate<'a, 'b, 'async_trait>(
         &'a self,
-        ctx: Context,
+        ctx: &'b Context,
         inode: Self::Inode,
         handle: Self::Handle,
         mode: u32,
@@ -998,21 +1006,23 @@ impl<FS: AsyncFileSystem<D, S>, D: AsyncDrive, S: BitmapSlice> AsyncFileSystem<D
     ) -> Pin<Box<dyn Future<Output = io::Result<()>> + Send + 'async_trait>>
     where
         'a: 'async_trait,
+        'b: 'async_trait,
         Self: 'async_trait,
     {
         self.deref()
             .async_fallocate(ctx, inode, handle, mode, offset, length)
     }
 
-    fn async_fsyncdir<'a, 'async_trait>(
+    fn async_fsyncdir<'a, 'b, 'async_trait>(
         &'a self,
-        ctx: Context,
+        ctx: &'b Context,
         inode: Self::Inode,
         datasync: bool,
         handle: Self::Handle,
     ) -> Pin<Box<dyn Future<Output = io::Result<()>> + Send + 'async_trait>>
     where
         'a: 'async_trait,
+        'b: 'async_trait,
         Self: 'async_trait,
     {
         self.deref().async_fsyncdir(ctx, inode, datasync, handle)

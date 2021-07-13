@@ -14,7 +14,7 @@ use crate::BitmapSlice;
 impl<D: AsyncDrive + Sync, S: BitmapSlice + Sync> AsyncFileSystem<D, S> for Vfs<D, S> {
     async fn async_lookup(
         &self,
-        ctx: Context,
+        ctx: &Context,
         parent: <Self as FileSystem<S>>::Inode,
         name: &CStr,
     ) -> Result<Entry> {
@@ -32,7 +32,7 @@ impl<D: AsyncDrive + Sync, S: BitmapSlice + Sync> AsyncFileSystem<D, S> for Vfs<
 
     async fn async_getattr(
         &self,
-        ctx: Context,
+        ctx: &Context,
         inode: <Self as FileSystem<S>>::Inode,
         handle: Option<<Self as FileSystem<S>>::Handle>,
     ) -> Result<(libc::stat64, Duration)> {
@@ -44,7 +44,7 @@ impl<D: AsyncDrive + Sync, S: BitmapSlice + Sync> AsyncFileSystem<D, S> for Vfs<
 
     async fn async_setattr(
         &self,
-        ctx: Context,
+        ctx: &Context,
         inode: <Self as FileSystem<S>>::Inode,
         attr: libc::stat64,
         handle: Option<<Self as FileSystem<S>>::Handle>,
@@ -61,7 +61,7 @@ impl<D: AsyncDrive + Sync, S: BitmapSlice + Sync> AsyncFileSystem<D, S> for Vfs<
 
     async fn async_open(
         &self,
-        ctx: Context,
+        ctx: &Context,
         inode: <Self as FileSystem<S>>::Inode,
         flags: u32,
         fuse_flags: u32,
@@ -81,7 +81,7 @@ impl<D: AsyncDrive + Sync, S: BitmapSlice + Sync> AsyncFileSystem<D, S> for Vfs<
 
     async fn async_create(
         &self,
-        ctx: Context,
+        ctx: &Context,
         parent: <Self as FileSystem<S>>::Inode,
         name: &CStr,
         args: CreateIn,
@@ -102,7 +102,7 @@ impl<D: AsyncDrive + Sync, S: BitmapSlice + Sync> AsyncFileSystem<D, S> for Vfs<
     #[allow(clippy::too_many_arguments)]
     async fn async_read(
         &self,
-        ctx: Context,
+        ctx: &Context,
         inode: <Self as FileSystem<S>>::Inode,
         handle: <Self as FileSystem<S>>::Handle,
         w: &mut (dyn AsyncZeroCopyWriter<D, S> + Send),
@@ -123,7 +123,7 @@ impl<D: AsyncDrive + Sync, S: BitmapSlice + Sync> AsyncFileSystem<D, S> for Vfs<
     #[allow(clippy::too_many_arguments)]
     async fn async_write(
         &self,
-        ctx: Context,
+        ctx: &Context,
         inode: <Self as FileSystem<S>>::Inode,
         handle: <Self as FileSystem<S>>::Handle,
         r: &mut (dyn AsyncZeroCopyReader<D, S> + Send),
@@ -156,7 +156,7 @@ impl<D: AsyncDrive + Sync, S: BitmapSlice + Sync> AsyncFileSystem<D, S> for Vfs<
 
     async fn async_fsync(
         &self,
-        ctx: Context,
+        ctx: &Context,
         inode: <Self as FileSystem<S>>::Inode,
         datasync: bool,
         handle: <Self as FileSystem<S>>::Handle,
@@ -169,7 +169,7 @@ impl<D: AsyncDrive + Sync, S: BitmapSlice + Sync> AsyncFileSystem<D, S> for Vfs<
 
     async fn async_fallocate(
         &self,
-        ctx: Context,
+        ctx: &Context,
         inode: <Self as FileSystem<S>>::Inode,
         handle: <Self as FileSystem<S>>::Handle,
         mode: u32,
@@ -187,7 +187,7 @@ impl<D: AsyncDrive + Sync, S: BitmapSlice + Sync> AsyncFileSystem<D, S> for Vfs<
 
     async fn async_fsyncdir(
         &self,
-        ctx: Context,
+        ctx: &Context,
         inode: <Self as FileSystem<S>>::Inode,
         datasync: bool,
         handle: <Self as FileSystem<S>>::Handle,
@@ -224,14 +224,14 @@ mod tests {
         executor.spawn_ok(async move {
             // Lookup inode on pseudo file system.
             let name = CString::new("x").unwrap();
-            let future = vfs.async_lookup(ctx, ROOT_ID.into(), name.as_c_str());
+            let future = vfs.async_lookup(&ctx, ROOT_ID.into(), name.as_c_str());
             let entry1 = future.await.unwrap();
             assert_eq!(entry1.inode, 0x2);
 
             // Lookup inode on mounted file system.
             let entry2 = vfs
                 .async_lookup(
-                    ctx,
+                    &ctx,
                     entry1.inode.into(),
                     CString::new("y").unwrap().as_c_str(),
                 )
@@ -242,7 +242,7 @@ mod tests {
             // lookup for negative result.
             let entry3 = vfs
                 .async_lookup(
-                    ctx,
+                    &ctx,
                     entry2.inode.into(),
                     CString::new("z").unwrap().as_c_str(),
                 )

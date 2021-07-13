@@ -284,7 +284,7 @@ impl<D: AsyncDrive + Sync, S: BitmapSlice + Send + Sync> AsyncFileSystem<D, S>
 {
     async fn async_lookup(
         &self,
-        ctx: Context,
+        ctx: &Context,
         parent: <Self as FileSystem<S>>::Inode,
         name: &CStr,
     ) -> io::Result<Entry> {
@@ -381,7 +381,7 @@ impl<D: AsyncDrive + Sync, S: BitmapSlice + Send + Sync> AsyncFileSystem<D, S>
 
     async fn async_getattr(
         &self,
-        ctx: Context,
+        ctx: &Context,
         inode: <Self as FileSystem<S>>::Inode,
         handle: Option<<Self as FileSystem<S>>::Handle>,
     ) -> io::Result<(libc::stat64, Duration)> {
@@ -390,7 +390,7 @@ impl<D: AsyncDrive + Sync, S: BitmapSlice + Send + Sync> AsyncFileSystem<D, S>
 
     async fn async_setattr(
         &self,
-        ctx: Context,
+        ctx: &Context,
         inode: <Self as FileSystem<S>>::Inode,
         attr: libc::stat64,
         handle: Option<<Self as FileSystem<S>>::Handle>,
@@ -536,7 +536,7 @@ impl<D: AsyncDrive + Sync, S: BitmapSlice + Send + Sync> AsyncFileSystem<D, S>
 
     async fn async_open(
         &self,
-        ctx: Context,
+        ctx: &Context,
         inode: <Self as FileSystem<S>>::Inode,
         flags: u32,
         fuse_flags: u32,
@@ -551,7 +551,7 @@ impl<D: AsyncDrive + Sync, S: BitmapSlice + Send + Sync> AsyncFileSystem<D, S>
 
     async fn async_create(
         &self,
-        ctx: Context,
+        ctx: &Context,
         parent: <Self as FileSystem<S>>::Inode,
         name: &CStr,
         args: CreateIn,
@@ -621,7 +621,7 @@ impl<D: AsyncDrive + Sync, S: BitmapSlice + Send + Sync> AsyncFileSystem<D, S>
     #[allow(clippy::too_many_arguments)]
     async fn async_read(
         &self,
-        ctx: Context,
+        ctx: &Context,
         inode: <Self as FileSystem<S>>::Inode,
         handle: <Self as FileSystem<S>>::Handle,
         w: &mut (dyn AsyncZeroCopyWriter<D, S> + Send),
@@ -644,7 +644,7 @@ impl<D: AsyncDrive + Sync, S: BitmapSlice + Send + Sync> AsyncFileSystem<D, S>
     #[allow(clippy::too_many_arguments)]
     async fn async_write(
         &self,
-        ctx: Context,
+        ctx: &Context,
         inode: <Self as FileSystem<S>>::Inode,
         handle: <Self as FileSystem<S>>::Handle,
         r: &mut (dyn AsyncZeroCopyReader<D, S> + Send),
@@ -682,7 +682,7 @@ impl<D: AsyncDrive + Sync, S: BitmapSlice + Send + Sync> AsyncFileSystem<D, S>
 
     async fn async_fsync(
         &self,
-        ctx: Context,
+        ctx: &Context,
         inode: <Self as FileSystem<S>>::Inode,
         datasync: bool,
         handle: <Self as FileSystem<S>>::Handle,
@@ -699,7 +699,7 @@ impl<D: AsyncDrive + Sync, S: BitmapSlice + Send + Sync> AsyncFileSystem<D, S>
 
     async fn async_fallocate(
         &self,
-        ctx: Context,
+        ctx: &Context,
         inode: <Self as FileSystem<S>>::Inode,
         handle: <Self as FileSystem<S>>::Handle,
         mode: u32,
@@ -719,7 +719,7 @@ impl<D: AsyncDrive + Sync, S: BitmapSlice + Send + Sync> AsyncFileSystem<D, S>
 
     async fn async_fsyncdir(
         &self,
-        ctx: Context,
+        ctx: &Context,
         inode: <Self as FileSystem<S>>::Inode,
         datasync: bool,
         handle: <Self as FileSystem<S>>::Handle,

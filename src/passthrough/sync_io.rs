@@ -342,7 +342,7 @@ impl<D: AsyncDrive, S: BitmapSlice + Send + Sync> FileSystem<S> for PassthroughF
         };
     }
 
-    fn statfs(&self, _ctx: Context, inode: Inode) -> io::Result<libc::statvfs64> {
+    fn statfs(&self, _ctx: &Context, inode: Inode) -> io::Result<libc::statvfs64> {
         let data = self.inode_map.get(inode)?;
         let mut out = MaybeUninit::<libc::statvfs64>::zeroed();
         let file = data.get_file(&self.mount_fds)?;
@@ -355,17 +355,17 @@ impl<D: AsyncDrive, S: BitmapSlice + Send + Sync> FileSystem<S> for PassthroughF
         }
     }
 
-    fn lookup(&self, _ctx: Context, parent: Inode, name: &CStr) -> io::Result<Entry> {
+    fn lookup(&self, _ctx: &Context, parent: Inode, name: &CStr) -> io::Result<Entry> {
         self.do_lookup(parent, name)
     }
 
-    fn forget(&self, _ctx: Context, inode: Inode, count: u64) {
+    fn forget(&self, _ctx: &Context, inode: Inode, count: u64) {
         let mut inodes = self.inode_map.get_map_mut();
 
         Self::forget_one(&mut inodes, inode, count)
     }
 
-    fn batch_forget(&self, _ctx: Context, requests: Vec<(Inode, u64)>) {
+    fn batch_forget(&self, _ctx: &Context, requests: Vec<(Inode, u64)>) {
         let mut inodes = self.inode_map.get_map_mut();
 
         for (inode, count) in requests {
@@ -375,7 +375,7 @@ impl<D: AsyncDrive, S: BitmapSlice + Send + Sync> FileSystem<S> for PassthroughF
 
     fn opendir(
         &self,
-        _ctx: Context,
+        _ctx: &Context,
         inode: Inode,
         flags: u32,
     ) -> io::Result<(Option<Handle>, OpenOptions)> {
@@ -389,7 +389,7 @@ impl<D: AsyncDrive, S: BitmapSlice + Send + Sync> FileSystem<S> for PassthroughF
 
     fn releasedir(
         &self,
-        _ctx: Context,
+        _ctx: &Context,
         inode: Inode,
         _flags: u32,
         handle: Handle,
@@ -399,7 +399,7 @@ impl<D: AsyncDrive, S: BitmapSlice + Send + Sync> FileSystem<S> for PassthroughF
 
     fn mkdir(
         &self,
-        ctx: Context,
+        ctx: &Context,
         parent: Inode,
         name: &CStr,
         mode: u32,
@@ -421,13 +421,13 @@ impl<D: AsyncDrive, S: BitmapSlice + Send + Sync> FileSystem<S> for PassthroughF
         }
     }
 
-    fn rmdir(&self, _ctx: Context, parent: Inode, name: &CStr) -> io::Result<()> {
+    fn rmdir(&self, _ctx: &Context, parent: Inode, name: &CStr) -> io::Result<()> {
         self.do_unlink(parent, name, libc::AT_REMOVEDIR)
     }
 
     fn readdir(
         &self,
-        _ctx: Context,
+        _ctx: &Context,
         inode: Inode,
         handle: Handle,
         size: u32,
@@ -439,7 +439,7 @@ impl<D: AsyncDrive, S: BitmapSlice + Send + Sync> FileSystem<S> for PassthroughF
 
     fn readdirplus(
         &self,
-        _ctx: Context,
+        _ctx: &Context,
         inode: Inode,
         handle: Handle,
         size: u32,
@@ -472,7 +472,7 @@ impl<D: AsyncDrive, S: BitmapSlice + Send + Sync> FileSystem<S> for PassthroughF
 
     fn open(
         &self,
-        _ctx: Context,
+        _ctx: &Context,
         inode: Inode,
         flags: u32,
         fuse_flags: u32,
@@ -487,7 +487,7 @@ impl<D: AsyncDrive, S: BitmapSlice + Send + Sync> FileSystem<S> for PassthroughF
 
     fn release(
         &self,
-        _ctx: Context,
+        _ctx: &Context,
         inode: Inode,
         _flags: u32,
         handle: Handle,
@@ -504,7 +504,7 @@ impl<D: AsyncDrive, S: BitmapSlice + Send + Sync> FileSystem<S> for PassthroughF
 
     fn create(
         &self,
-        ctx: Context,
+        ctx: &Context,
         parent: Inode,
         name: &CStr,
         args: CreateIn,
@@ -571,14 +571,14 @@ impl<D: AsyncDrive, S: BitmapSlice + Send + Sync> FileSystem<S> for PassthroughF
         Ok((entry, ret_handle, opts))
     }
 
-    fn unlink(&self, _ctx: Context, parent: Inode, name: &CStr) -> io::Result<()> {
+    fn unlink(&self, _ctx: &Context, parent: Inode, name: &CStr) -> io::Result<()> {
         self.do_unlink(parent, name, 0)
     }
 
     #[cfg(any(feature = "vhost-user-fs", feature = "virtiofs"))]
     fn setupmapping(
         &self,
-        _ctx: Context,
+        _ctx: &Context,
         inode: Inode,
         _handle: Handle,
         foffset: u64,
@@ -605,7 +605,7 @@ impl<D: AsyncDrive, S: BitmapSlice + Send + Sync> FileSystem<S> for PassthroughF
     #[cfg(any(feature = "vhost-user-fs", feature = "virtiofs"))]
     fn removemapping(
         &self,
-        _ctx: Context,
+        _ctx: &Context,
         _inode: Inode,
         requests: Vec<virtio_fs::RemovemappingOne>,
         vu_req: &mut dyn FsCacheReqHandler,
@@ -615,7 +615,7 @@ impl<D: AsyncDrive, S: BitmapSlice + Send + Sync> FileSystem<S> for PassthroughF
 
     fn read(
         &self,
-        _ctx: Context,
+        _ctx: &Context,
         inode: Inode,
         handle: Handle,
         w: &mut dyn ZeroCopyWriter<S = S>,
@@ -637,7 +637,7 @@ impl<D: AsyncDrive, S: BitmapSlice + Send + Sync> FileSystem<S> for PassthroughF
 
     fn write(
         &self,
-        _ctx: Context,
+        _ctx: &Context,
         inode: Inode,
         handle: Handle,
         r: &mut dyn ZeroCopyReader<S = S>,
@@ -669,7 +669,7 @@ impl<D: AsyncDrive, S: BitmapSlice + Send + Sync> FileSystem<S> for PassthroughF
 
     fn getattr(
         &self,
-        _ctx: Context,
+        _ctx: &Context,
         inode: Inode,
         handle: Option<Handle>,
     ) -> io::Result<(libc::stat64, Duration)> {
@@ -678,7 +678,7 @@ impl<D: AsyncDrive, S: BitmapSlice + Send + Sync> FileSystem<S> for PassthroughF
 
     fn setattr(
         &self,
-        _ctx: Context,
+        _ctx: &Context,
         inode: Inode,
         attr: libc::stat64,
         handle: Option<Handle>,
@@ -823,7 +823,7 @@ impl<D: AsyncDrive, S: BitmapSlice + Send + Sync> FileSystem<S> for PassthroughF
 
     fn rename(
         &self,
-        _ctx: Context,
+        _ctx: &Context,
         olddir: Inode,
         oldname: &CStr,
         newdir: Inode,
@@ -857,7 +857,7 @@ impl<D: AsyncDrive, S: BitmapSlice + Send + Sync> FileSystem<S> for PassthroughF
 
     fn mknod(
         &self,
-        ctx: Context,
+        ctx: &Context,
         parent: Inode,
         name: &CStr,
         mode: u32,
@@ -889,7 +889,7 @@ impl<D: AsyncDrive, S: BitmapSlice + Send + Sync> FileSystem<S> for PassthroughF
 
     fn link(
         &self,
-        _ctx: Context,
+        _ctx: &Context,
         inode: Inode,
         newparent: Inode,
         newname: &CStr,
@@ -921,7 +921,7 @@ impl<D: AsyncDrive, S: BitmapSlice + Send + Sync> FileSystem<S> for PassthroughF
 
     fn symlink(
         &self,
-        ctx: Context,
+        ctx: &Context,
         linkname: &CStr,
         parent: Inode,
         name: &CStr,
@@ -942,7 +942,7 @@ impl<D: AsyncDrive, S: BitmapSlice + Send + Sync> FileSystem<S> for PassthroughF
         }
     }
 
-    fn readlink(&self, _ctx: Context, inode: Inode) -> io::Result<Vec<u8>> {
+    fn readlink(&self, _ctx: &Context, inode: Inode) -> io::Result<Vec<u8>> {
         // Safe because this is a constant value and a valid C string.
         let empty = unsafe { CStr::from_bytes_with_nul_unchecked(EMPTY_CSTR) };
         let mut buf = Vec::<u8>::with_capacity(libc::PATH_MAX as usize);
@@ -970,7 +970,7 @@ impl<D: AsyncDrive, S: BitmapSlice + Send + Sync> FileSystem<S> for PassthroughF
 
     fn flush(
         &self,
-        _ctx: Context,
+        _ctx: &Context,
         inode: Inode,
         handle: Handle,
         _lock_owner: u64,
@@ -998,7 +998,13 @@ impl<D: AsyncDrive, S: BitmapSlice + Send + Sync> FileSystem<S> for PassthroughF
         }
     }
 
-    fn fsync(&self, _ctx: Context, inode: Inode, datasync: bool, handle: Handle) -> io::Result<()> {
+    fn fsync(
+        &self,
+        _ctx: &Context,
+        inode: Inode,
+        datasync: bool,
+        handle: Handle,
+    ) -> io::Result<()> {
         let data = self.get_data(handle, inode, libc::O_RDONLY)?;
         let fd = data.get_handle_raw_fd();
 
@@ -1019,7 +1025,7 @@ impl<D: AsyncDrive, S: BitmapSlice + Send + Sync> FileSystem<S> for PassthroughF
 
     fn fsyncdir(
         &self,
-        ctx: Context,
+        ctx: &Context,
         inode: Inode,
         datasync: bool,
         handle: Handle,
@@ -1027,7 +1033,7 @@ impl<D: AsyncDrive, S: BitmapSlice + Send + Sync> FileSystem<S> for PassthroughF
         self.fsync(ctx, inode, datasync, handle)
     }
 
-    fn access(&self, ctx: Context, inode: Inode, mask: u32) -> io::Result<()> {
+    fn access(&self, ctx: &Context, inode: Inode, mask: u32) -> io::Result<()> {
         let data = self.inode_map.get(inode)?;
         let st = Self::stat(&data.get_file(&self.mount_fds)?, None)?;
         let mode = mask as i32 & (libc::R_OK | libc::W_OK | libc::X_OK);
@@ -1071,7 +1077,7 @@ impl<D: AsyncDrive, S: BitmapSlice + Send + Sync> FileSystem<S> for PassthroughF
 
     fn setxattr(
         &self,
-        _ctx: Context,
+        _ctx: &Context,
         inode: Inode,
         name: &CStr,
         value: &[u8],
@@ -1107,7 +1113,7 @@ impl<D: AsyncDrive, S: BitmapSlice + Send + Sync> FileSystem<S> for PassthroughF
 
     fn getxattr(
         &self,
-        _ctx: Context,
+        _ctx: &Context,
         inode: Inode,
         name: &CStr,
         size: u32,
@@ -1146,7 +1152,7 @@ impl<D: AsyncDrive, S: BitmapSlice + Send + Sync> FileSystem<S> for PassthroughF
         }
     }
 
-    fn listxattr(&self, _ctx: Context, inode: Inode, size: u32) -> io::Result<ListxattrReply> {
+    fn listxattr(&self, _ctx: &Context, inode: Inode, size: u32) -> io::Result<ListxattrReply> {
         if !self.cfg.xattr {
             return Err(io::Error::from_raw_os_error(libc::ENOSYS));
         }
@@ -1180,7 +1186,7 @@ impl<D: AsyncDrive, S: BitmapSlice + Send + Sync> FileSystem<S> for PassthroughF
         }
     }
 
-    fn removexattr(&self, _ctx: Context, inode: Inode, name: &CStr) -> io::Result<()> {
+    fn removexattr(&self, _ctx: &Context, inode: Inode, name: &CStr) -> io::Result<()> {
         if !self.cfg.xattr {
             return Err(io::Error::from_raw_os_error(libc::ENOSYS));
         }
@@ -1203,7 +1209,7 @@ impl<D: AsyncDrive, S: BitmapSlice + Send + Sync> FileSystem<S> for PassthroughF
 
     fn fallocate(
         &self,
-        _ctx: Context,
+        _ctx: &Context,
         inode: Inode,
         handle: Handle,
         mode: u32,
@@ -1232,7 +1238,7 @@ impl<D: AsyncDrive, S: BitmapSlice + Send + Sync> FileSystem<S> for PassthroughF
 
     fn lseek(
         &self,
-        _ctx: Context,
+        _ctx: &Context,
         inode: Inode,
         handle: Handle,
         offset: u64,
