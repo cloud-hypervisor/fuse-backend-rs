@@ -115,6 +115,7 @@ struct InodeData {
     inode: Inode,
     // Most of these aren't actually files but ¯\_(ツ)_/¯.
     file_or_handle: FileOrHandle,
+    #[allow(dead_code)]
     altkey: InodeAltKey,
     refcount: AtomicU64,
 }
@@ -187,7 +188,7 @@ impl InodeMap {
             .map(|altkey| inodes.get_alt(altkey))
             .flatten()
             .or_else(|| {
-                inodes.get_alt(&ids_altkey).filter(|data| {
+                inodes.get_alt(ids_altkey).filter(|data| {
                     // When we have to fall back to looking up an inode by its IDs, ensure that
                     // we hit an entry that does not have a file handle.  Entries with file
                     // handles must also have a handle alt key, so if we have not found it by

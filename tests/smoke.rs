@@ -67,11 +67,11 @@ mod fusedev_tests {
             .output()?;
 
         if !output.status.success() || output.stderr.len() > 0 {
-            panic!(format!(
+            panic!(
                 "exec failed: {}: {}",
                 cmd,
                 std::str::from_utf8(&output.stderr).unwrap()
-            ));
+            );
         }
         let stdout = std::str::from_utf8(&output.stdout).unwrap();
 

@@ -81,7 +81,7 @@ impl<'a> FuseBuf<'a> {
     }
 }
 
-impl<'a, S: BitmapSlice> Reader<'a, S> {
+impl<'a, S: BitmapSlice + Default> Reader<'a, S> {
     /// Construct a new Reader wrapper over `desc_chain`.
     ///
     /// 'request`: Fuse request from clients read from /dev/fuse
@@ -111,10 +111,11 @@ pub struct Writer<'a, S: BitmapSlice = ()> {
     fd: RawFd,
     buffered: bool,
     buf: ManuallyDrop<Vec<u8>>,
+    bitmapslice: S,
     phantom: PhantomData<&'a mut [S]>,
 }
 
-impl<'a, S: BitmapSlice> Writer<'a, S> {
+impl<'a, S: BitmapSlice + Default> Writer<'a, S> {
     /// Construct a new Writer
     pub fn new(fd: RawFd, data_buf: &'a mut [u8]) -> Result<Writer<'a, S>> {
         let buf = unsafe { Vec::from_raw_parts(data_buf.as_mut_ptr(), 0, data_buf.len()) };
@@ -122,10 +123,13 @@ impl<'a, S: BitmapSlice> Writer<'a, S> {
             fd,
             buffered: false,
             buf: ManuallyDrop::new(buf),
+            bitmapslice: S::default(),
             phantom: PhantomData,
         })
     }
+}
 
+impl<'a, S: BitmapSlice> Writer<'a, S> {
     /// Splits this `Writer` into two at the given offset in the buffer.
     /// After the split, `self` will be able to write up to `offset` bytes while the returned
     /// `Writer` can write up to `available_bytes() - offset` bytes.  Returns an error if
@@ -152,6 +156,7 @@ impl<'a, S: BitmapSlice> Writer<'a, S> {
             fd: self.fd,
             buffered: true,
             buf,
+            bitmapslice: self.bitmapslice.clone(),
             phantom: PhantomData,
         })
     }
@@ -218,7 +223,7 @@ impl<'a, S: BitmapSlice> Writer<'a, S> {
                 &[VolatileSlice::with_bitmap(
                     self.buf.as_mut_ptr().add(self.buf.len()),
                     count,
-                    S::default(),
+                    self.bitmapslice.clone(),
                 )]
             },
         )?;
@@ -247,7 +252,7 @@ impl<'a, S: BitmapSlice> Writer<'a, S> {
                 &[VolatileSlice::with_bitmap(
                     self.buf.as_mut_ptr().add(self.buf.len()),
                     count,
-                    S::default(),
+                    self.bitmapslice.clone(),
                 )]
             },
             off,

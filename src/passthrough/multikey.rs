@@ -143,10 +143,6 @@ where
         self.alt.clear();
         self.main.clear()
     }
-
-    pub fn iter(&self) -> Iter<'_, K1, (Vec<K2>, V)> {
-        self.main.iter()
-    }
 }
 
 #[cfg(test)]

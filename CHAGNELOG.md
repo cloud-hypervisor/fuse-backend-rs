@@ -1,4 +1,12 @@
 # Changelog
+## [Unreleased]
+
+### Added
+- Enhance passthrough to reduce active fds by using file handle
+
+### Fixed
+
+### Deprecated 
 
 ## [v0.1.2]
 - support KILLPRIV_v2

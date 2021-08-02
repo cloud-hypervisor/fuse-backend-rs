@@ -168,7 +168,7 @@ impl<D: AsyncDrive> AsyncUtil<D> {
         let bufs: Vec<Box<[u8]>> = slices
             .iter()
             .filter(|b| b.is_empty())
-            .map(|&b| unsafe { Vec::from_raw_parts(b.as_ptr(), b.len(), b.len()).into() })
+            .map(|b| unsafe { Vec::from_raw_parts(b.as_ptr(), b.len(), b.len()).into() })
             .collect();
         let bufs = bufs.into();
 
@@ -289,7 +289,7 @@ impl<D: AsyncDrive> AsyncUtil<D> {
         let bufs: Vec<Box<[u8]>> = slices
             .iter()
             .filter(|b| b.is_empty())
-            .map(|&b| unsafe { Vec::from_raw_parts(b.as_ptr(), b.len(), b.len()).into() })
+            .map(|b| unsafe { Vec::from_raw_parts(b.as_ptr(), b.len(), b.len()).into() })
             .collect();
         let bufs = bufs.into();
 
