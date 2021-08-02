@@ -59,7 +59,7 @@ pub trait FileReadWriteVolatile<S: BitmapSlice = ()> {
     fn read_vectored_volatile(&mut self, bufs: &[VolatileSlice<'_, S>]) -> Result<usize> {
         bufs.iter()
             .find(|b| !b.is_empty())
-            .map(|&b| self.read_volatile(b))
+            .map(|b| self.read_volatile(b.clone()))
             .unwrap_or(Ok(0))
     }
 
@@ -67,7 +67,7 @@ pub trait FileReadWriteVolatile<S: BitmapSlice = ()> {
     /// error is returned.
     fn read_exact_volatile(&mut self, mut slice: VolatileSlice<'_, S>) -> Result<()> {
         while !slice.is_empty() {
-            let bytes_read = self.read_volatile(slice)?;
+            let bytes_read = self.read_volatile(slice.clone())?;
             if bytes_read == 0 {
                 return Err(Error::from(ErrorKind::UnexpectedEof));
             }
@@ -90,7 +90,7 @@ pub trait FileReadWriteVolatile<S: BitmapSlice = ()> {
     fn write_vectored_volatile(&mut self, bufs: &[VolatileSlice<'_, S>]) -> Result<usize> {
         bufs.iter()
             .find(|b| !b.is_empty())
-            .map(|&b| self.write_volatile(b))
+            .map(|b| self.write_volatile(b.clone()))
             .unwrap_or(Ok(0))
     }
 
@@ -98,7 +98,7 @@ pub trait FileReadWriteVolatile<S: BitmapSlice = ()> {
     /// written, or an error is returned.
     fn write_all_volatile(&mut self, mut slice: VolatileSlice<'_, S>) -> Result<()> {
         while !slice.is_empty() {
-            let bytes_written = self.write_volatile(slice)?;
+            let bytes_written = self.write_volatile(slice.clone())?;
             if bytes_written == 0 {
                 return Err(Error::from(ErrorKind::WriteZero));
             }
@@ -123,8 +123,8 @@ pub trait FileReadWriteVolatile<S: BitmapSlice = ()> {
         bufs: &[VolatileSlice<'_, S>],
         offset: u64,
     ) -> Result<usize> {
-        if let Some(&slice) = bufs.first() {
-            self.read_at_volatile(slice, offset)
+        if let Some(slice) = bufs.first() {
+            self.read_at_volatile(slice.clone(), offset)
         } else {
             Ok(0)
         }
@@ -138,7 +138,7 @@ pub trait FileReadWriteVolatile<S: BitmapSlice = ()> {
         mut offset: u64,
     ) -> Result<()> {
         while !slice.is_empty() {
-            match self.read_at_volatile(slice, offset) {
+            match self.read_at_volatile(slice.clone(), offset) {
                 Ok(0) => return Err(Error::from(ErrorKind::UnexpectedEof)),
                 Ok(n) => {
                     // Will panic if read_at_volatile read more bytes than we gave it, which would
@@ -167,8 +167,8 @@ pub trait FileReadWriteVolatile<S: BitmapSlice = ()> {
         bufs: &[VolatileSlice<'_, S>],
         offset: u64,
     ) -> Result<usize> {
-        if let Some(&slice) = bufs.first() {
-            self.write_at_volatile(slice, offset)
+        if let Some(slice) = bufs.first() {
+            self.write_at_volatile(slice.clone(), offset)
         } else {
             Ok(0)
         }
@@ -182,7 +182,7 @@ pub trait FileReadWriteVolatile<S: BitmapSlice = ()> {
         mut offset: u64,
     ) -> Result<()> {
         while !slice.is_empty() {
-            match self.write_at_volatile(slice, offset) {
+            match self.write_at_volatile(slice.clone(), offset) {
                 Ok(0) => return Err(Error::from(ErrorKind::WriteZero)),
                 Ok(n) => {
                     // Will panic if write_at_volatile read more bytes than we gave it, which would

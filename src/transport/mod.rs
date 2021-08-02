@@ -59,7 +59,7 @@ impl<S: BitmapSlice> IoBuffers<'_, S> {
         let mut rem = count;
         let mut bufs = Vec::with_capacity(self.buffers.len());
 
-        for &buf in &self.buffers {
+        for buf in &self.buffers {
             if rem == 0 {
                 break;
             }
@@ -70,9 +70,9 @@ impl<S: BitmapSlice> IoBuffers<'_, S> {
                 // Safe because we just check rem < buf.len()
                 buf.subslice(0, rem).unwrap()
             } else {
-                buf
+                buf.clone()
             };
-            bufs.push(local_buf);
+            bufs.push(local_buf.clone());
 
             // Don't need check_sub() as we just made sure rem >= local_buf.len()
             rem -= local_buf.len() as usize;
@@ -86,7 +86,7 @@ impl<S: BitmapSlice> IoBuffers<'_, S> {
         let mut rem = count;
         let mut bufs = Vec::with_capacity(self.buffers.len());
 
-        for &buf in &self.buffers {
+        for buf in &self.buffers {
             if rem == 0 {
                 break;
             }
@@ -97,7 +97,7 @@ impl<S: BitmapSlice> IoBuffers<'_, S> {
                 // Safe because we just check rem < buf.len()
                 buf.subslice(0, rem).unwrap()
             } else {
-                buf
+                buf.clone()
             };
             // Safe because we just change the interface to access underlying buffers.
             bufs.push(IoSlice::new(unsafe {
@@ -116,7 +116,7 @@ impl<S: BitmapSlice> IoBuffers<'_, S> {
         let mut rem = count;
         let mut bufs = Vec::with_capacity(self.buffers.len());
 
-        for &buf in &self.buffers {
+        for buf in &self.buffers {
             if rem == 0 {
                 break;
             }
@@ -127,7 +127,7 @@ impl<S: BitmapSlice> IoBuffers<'_, S> {
                 // Safe because we just check rem < buf.len()
                 buf.subslice(0, rem).unwrap()
             } else {
-                buf
+                buf.clone()
             };
             // Safe because we just change the interface to access underlying buffers.
             bufs.push(IoSliceMut::new(unsafe {
@@ -145,7 +145,7 @@ impl<S: BitmapSlice> IoBuffers<'_, S> {
     fn mark_dirty(&self, count: usize) {
         let mut rem = count;
 
-        for &buf in &self.buffers {
+        for buf in &self.buffers {
             if rem == 0 {
                 break;
             }
@@ -156,7 +156,7 @@ impl<S: BitmapSlice> IoBuffers<'_, S> {
                 // Safe because we just check rem < buf.len()
                 buf.subslice(0, rem).unwrap()
             } else {
-                buf
+                buf.clone()
             };
             local_buf.bitmap().mark_dirty(0, local_buf.len());
 
@@ -374,33 +374,6 @@ impl<S: BitmapSlice> io::Read for Reader<'_, S> {
             }
             Ok(total)
         })
-    }
-}
-
-/// Returns a subslice of this [`VolatileSlice`](struct.VolatileSlice.html) starting at
-/// `offset` with `count` length.
-///
-/// The returned subslice is a copy of this slice with the address increased by `offset` bytes
-/// and the size set to `count` bytes.
-///
-/// TODO: it's a temporary solution and this method should be added to the vm-memory crate.
-/// https://github.com/rust-vmm/vm-memory/pull/128
-fn vm_memory_subslice<'a>(
-    src: &VolatileSlice<'a>,
-    offset: usize,
-    count: usize,
-) -> vm_memory::volatile_memory::Result<VolatileSlice<'a>> {
-    let mem_end = vm_memory::volatile_memory::compute_offset(offset, count)?;
-    if mem_end > src.len() {
-        return Err(vm_memory::volatile_memory::Error::OutOfBounds { addr: mem_end });
-    }
-    unsafe {
-        // This is safe because the pointer is range-checked by compute_end_offset, and
-        // the lifetime is the same as the original slice.
-        Ok(VolatileSlice::new(
-            (src.as_ptr() as usize + offset) as *mut u8,
-            count,
-        ))
     }
 }
 

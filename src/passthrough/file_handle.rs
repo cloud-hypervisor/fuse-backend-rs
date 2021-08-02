@@ -211,14 +211,6 @@ impl MountFds {
         MountFds::default()
     }
 
-    pub fn get_map(&self) -> RwLockReadGuard<'_, HashMap<u64, std::fs::File>> {
-        self.map.read().unwrap()
-    }
-
-    pub fn get_map_mut(&self) -> RwLockWriteGuard<'_, HashMap<u64, std::fs::File>> {
-        self.map.write().unwrap()
-    }
-
     fn ensure_mount_point<F>(
         &self,
         mnt_id: u64,
