@@ -59,7 +59,7 @@ impl<F: FileSystem + Sync> Server<F> {
             in_header
         );
 
-        hook.map_or((), |h| h.collect(&in_header));
+        hook.map_or((), |h| h.collect(in_header));
 
         let r = match in_header.opcode {
             x if x == Opcode::Lookup as u32 => self.lookup(in_header, r, w),
@@ -139,7 +139,7 @@ impl<F: FileSystem + Sync> Server<F> {
         let version = self.vers.load();
         let result = self
             .fs
-            .lookup(Context::from(in_header), in_header.nodeid.into(), &name);
+            .lookup(Context::from(in_header), in_header.nodeid.into(), name);
 
         match result {
             // before ABI 7.4 inode == 0 was invalid, only ENOENT means negative dentry
