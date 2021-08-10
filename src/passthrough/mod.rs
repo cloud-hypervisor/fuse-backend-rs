@@ -894,6 +894,7 @@ mod tests {
     use super::*;
     use crate::api::filesystem::*;
     use crate::api::{Vfs, VfsOptions};
+    use caps::{CapSet, Capability};
     use log;
     use std::ops::Deref;
     use vmm_sys_util::{tempdir::TempDir, tempfile::TempFile};
@@ -936,6 +937,14 @@ mod tests {
     #[test]
     fn test_passthroughfs_inode_file_handles() {
         log::set_max_level(log::LevelFilter::Trace);
+
+        match caps::has_cap(None, CapSet::Effective, Capability::CAP_DAC_READ_SEARCH) {
+            Ok(false) | Err(_) => {
+                println!("invoking open_by_handle_at needs CAP_DAC_READ_SEARCH");
+                return;
+            }
+            Ok(true) => {}
+        }
 
         let source = TempDir::new().expect("Cannot create temporary directory.");
         let parent_path =
