@@ -60,10 +60,16 @@ impl fmt::Display for Error {
     }
 }
 
+impl std::error::Error for Error {}
+
+impl From<Error> for std::io::Error {
+    fn from(e: Error) -> Self {
+        std::io::Error::new(std::io::ErrorKind::Other, e)
+    }
+}
+
 /// Result for fusedev transport driver related operations.
 pub type Result<T> = std::result::Result<T, Error>;
-
-impl std::error::Error for Error {}
 
 /// Fake trait to simplify implementation when vhost-user-fs is not used.
 pub trait FsCacheReqHandler {}
