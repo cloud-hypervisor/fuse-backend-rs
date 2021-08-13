@@ -51,7 +51,7 @@ extern crate libc;
 #[macro_use]
 extern crate log;
 #[cfg(feature = "vhost-user-fs")]
-extern crate vhost_rs;
+extern crate vhost;
 extern crate vm_memory;
 #[cfg(feature = "virtiofs")]
 extern crate vm_virtio;

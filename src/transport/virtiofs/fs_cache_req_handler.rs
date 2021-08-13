@@ -6,11 +6,11 @@ use std::io;
 use std::os::unix::io::RawFd;
 
 #[cfg(feature = "vhost-user-fs")]
-use vhost_rs::vhost_user::message::{
+use vhost::vhost_user::message::{
     VhostUserFSSlaveMsg, VhostUserFSSlaveMsgFlags, VHOST_USER_FS_SLAVE_ENTRIES,
 };
 #[cfg(feature = "vhost-user-fs")]
-use vhost_rs::vhost_user::{SlaveFsCacheReq, VhostUserMasterReqHandler};
+use vhost::vhost_user::{SlaveFsCacheReq, VhostUserMasterReqHandler};
 
 use crate::abi::virtio_fs::RemovemappingOne;
 #[cfg(feature = "vhost-user-fs")]
@@ -64,7 +64,7 @@ impl FsCacheReqHandler for SlaveFsCacheReq {
             VhostUserFSSlaveMsgFlags::MAP_R
         };
 
-        self.fs_slave_map(&msg, fd)?;
+        self.fs_slave_map(&msg, &fd)?;
 
         Ok(())
     }

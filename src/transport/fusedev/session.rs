@@ -20,7 +20,6 @@ use nix::fcntl::{fcntl, FcntlArg, OFlag};
 use nix::mount::{mount, umount2, MntFlags, MsFlags};
 use nix::poll::{poll, PollFd, PollFlags};
 use nix::unistd::{getgid, getuid, read};
-use nix::Error as nixError;
 use vmm_sys_util::eventfd::EventFd;
 use vmm_sys_util::poll::{PollContext, WatchingEvents};
 
@@ -211,7 +210,7 @@ impl FuseChannel {
                                     let writer = Writer::new(fd, buf).unwrap();
                                     return Ok(Some((reader, writer)));
                                 }
-                                Err(nixError::Sys(e)) => match e {
+                                Err(e) => match e {
                                     Errno::ENOENT => {
                                         // ENOENT means the operation was interrupted, it's safe
                                         // to restart
@@ -233,9 +232,6 @@ impl FuseChannel {
                                         )));
                                     }
                                 },
-                                Err(e) => {
-                                    return Err(SessionFailure(format!("epoll error: {}", e)));
-                                }
                             }
                         }
                         x => {

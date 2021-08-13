@@ -187,9 +187,7 @@ impl<'a, S: BitmapSlice> Writer<'a, S> {
 
         res.map_err(|e| {
             error! {"fail to write to fuse device on commit: {}", e};
-            e.as_errno()
-                .map(|r| io::Error::from_raw_os_error(r as i32))
-                .unwrap_or_else(|| io::Error::new(io::ErrorKind::Other, format!("{}", e)))
+            io::Error::from_raw_os_error(e as i32)
         })
     }
 
