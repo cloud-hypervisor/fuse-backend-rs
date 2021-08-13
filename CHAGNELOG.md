@@ -3,6 +3,8 @@
 
 ### Added
 - Enhance passthrough to reduce active fds by using file handle
+- implement From<fusedev::Error> for std::io::Error
+- Use `vhost` crate from crates.io
 
 ### Fixed
 

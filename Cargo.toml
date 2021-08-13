@@ -7,7 +7,7 @@ description = "A rust library for Fuse(filesystem in userspace) servers and virt
 authors = [
     "Liu Bo <bo.liu@linux.alibaba.com>",
     "Liu Jiang <gerry@linux.alibaba.com>",
-    "Peng Tao <bergwolf@hyper.sh>"
+    "Peng Tao <bergwolf@hyper.sh>",
 ]
 readme = "README.md"
 license = "Apache-2.0 AND BSD-3-Clause"
@@ -24,17 +24,17 @@ caps = "0.5.1"
 #iou = { version = "0.3.3", optional = true }
 libc = ">=0.2.68"
 log = ">=0.4.6"
-nix = "0.18.0"
+nix = "0.22"
 #ringbahn = { version = "0.0.0-experimental.3", optional = true }
-vmm-sys-util = { version = "0.4", optional = true }
+vmm-sys-util = { version = "0.8", optional = true }
 vm-memory = "0.6"
 #vm-virtio = { git = "https://github.com/cloud-hypervisor/vm-virtio.git", branch = "dragonball", optional = true }
-#vhost-rs = { git = "https://github.com/cloud-hypervisor/vhost.git", branch = "dragonball", package = "vhost", optional = true }
+#vhost = { version = "0.1", optional = true }
 
 [dev-dependencies]
 futures = { version = "0.3.0", features = ["thread-pool"]}
 stderrlog = "0.4"
-vmm-sys-util = "0.4"
+vmm-sys-util = "0.8"
 vm-memory = { version = "0.6", features = ["backend-mmap"] }
 
 [features]
