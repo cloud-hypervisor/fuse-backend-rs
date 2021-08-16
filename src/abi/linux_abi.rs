@@ -540,6 +540,12 @@ unsafe impl ByteValued for Attr {}
 
 impl From<libc::stat64> for Attr {
     fn from(st: libc::stat64) -> Attr {
+        Attr::with_flags(st, 0)
+    }
+}
+
+impl Attr {
+    pub fn with_flags(st: libc::stat64, flags: u32) -> Attr {
         Attr {
             ino: st.st_ino,
             size: st.st_size as u64,
@@ -556,7 +562,7 @@ impl From<libc::stat64> for Attr {
             gid: st.st_gid,
             rdev: st.st_rdev as u32,
             blksize: st.st_blksize as u32,
-            ..Default::default()
+            flags: flags as u32,
         }
     }
 }
