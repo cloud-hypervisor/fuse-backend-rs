@@ -282,7 +282,8 @@ impl<F: FileSystem<S> + Sync, D: AsyncDrive, S: BitmapSlice> Server<F, D, S> {
     pub(super) fn rename2(&self, mut ctx: SrvContext<'_, F, D, S>) -> Result<usize> {
         let Rename2In { newdir, flags, .. } = ctx.r.read_obj().map_err(Error::DecodeMessage)?;
 
-        let flags = flags & (libc::RENAME_EXCHANGE | libc::RENAME_NOREPLACE) as u32;
+        let flags =
+            flags & (libc::RENAME_EXCHANGE | libc::RENAME_NOREPLACE | libc::RENAME_WHITEOUT) as u32;
 
         self.do_rename(ctx, size_of::<Rename2In>(), newdir, flags)
     }
