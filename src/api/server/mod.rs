@@ -34,9 +34,12 @@ use crate::{bytes_to_cstr, BitmapSlice, Error, Result};
 mod async_io;
 mod sync_io;
 
+/// Maximum buffer size of FUSE requests.
 const MAX_BUFFER_SIZE: u32 = 1 << 20;
-const MAX_REQ_PAGES: u16 = 256; // 1MB
 const DIRENT_PADDING: [u8; 8] = [0; 8];
+
+/// Maximum number of pages required for FUSE requests.
+pub const MAX_REQ_PAGES: u16 = 256; // 1MB
 
 /// Fuse Server to handle requests from the Fuse client and vhost user master.
 pub struct Server<F: FileSystem<S> + Sync, D: AsyncDrive = AsyncDriver, S: BitmapSlice = ()> {
