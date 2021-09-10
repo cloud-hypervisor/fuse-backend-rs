@@ -47,11 +47,15 @@ const VFS_INDEX_SHIFT: u8 = 56;
 const VFS_PSEUDO_FS_IDX: VfsIndex = 0;
 
 type ArcBackFs<DR, S> = Arc<BackFileSystem<DR, S>>;
+type ArcSuperBlock<D, S> = ArcSwap<Vec<Option<Arc<BackFileSystem<D, S>>>>>;
 type VfsEitherFs<'a, D, S> = Either<&'a PseudoFs<S>, ArcBackFs<D, S>>;
 
 type VfsHandle = u64;
 /// Vfs backend file system index
 pub type VfsIndex = u8;
+
+// VfsIndex is type of 'u8', so maximum 256 entries.
+const MAX_VFS_INDEX: usize = 256;
 
 /// Data struct to store inode number for the VFS filesystem.
 #[derive(Clone, Copy, Eq, PartialEq, Hash, Debug)]
@@ -219,7 +223,7 @@ pub struct Vfs<D: AsyncDrive = AsyncDriver, S: BitmapSlice = ()> {
     // mountpoints maps from pseudo fs inode to mounted fs mountpoint data
     mountpoints: ArcSwap<HashMap<u64, Arc<MountPointData>>>,
     // superblocks keeps track of all mounted file systems
-    superblocks: ArcSwap<HashMap<VfsIndex, Arc<BackFileSystem<D, S>>>>,
+    superblocks: ArcSuperBlock<D, S>,
     opts: ArcSwap<VfsOptions>,
     initialized: AtomicBool,
     lock: Mutex<()>,
@@ -239,7 +243,7 @@ impl<D: AsyncDrive, S: BitmapSlice> Vfs<D, S> {
         Vfs {
             next_super: AtomicU8::new((VFS_PSEUDO_FS_IDX + 1) as u8),
             mountpoints: ArcSwap::new(Arc::new(HashMap::new())),
-            superblocks: ArcSwap::new(Arc::new(HashMap::new())),
+            superblocks: ArcSwap::new(Arc::new(vec![None; MAX_VFS_INDEX])),
             root: PseudoFs::new(),
             opts: ArcSwap::new(Arc::new(opts)),
             lock: Mutex::new(()),
@@ -262,32 +266,30 @@ impl<D: AsyncDrive, S: BitmapSlice> Vfs<D, S> {
         fs_idx: VfsIndex,
         path: &str,
     ) -> Result<()> {
-        let inode = self.root.mount(path)?;
-        entry.inode = self.convert_inode(fs_idx, entry.inode)?;
-
         // The visibility of mountpoints and superblocks:
         // superblock should be committed first because it won't be accessed until
         // a lookup returns a cross mountpoint inode.
         let mut superblocks = self.superblocks.load().deref().deref().clone();
         let mut mountpoints = self.mountpoints.load().deref().deref().clone();
+        let inode = self.root.mount(path)?;
+
+        entry.inode = self.convert_inode(fs_idx, entry.inode)?;
 
         // Over mount would invalidate previous superblock inodes.
         if let Some(mnt) = mountpoints.get(&inode) {
-            superblocks.remove(&mnt.fs_idx);
+            superblocks[mnt.fs_idx as usize] = None;
         }
-        superblocks.insert(fs_idx, Arc::new(fs));
+        superblocks[fs_idx as usize] = Some(Arc::new(fs));
         self.superblocks.store(Arc::new(superblocks));
         trace!("fs_idx {} inode {}", fs_idx, inode);
 
-        mountpoints.insert(
-            inode,
-            Arc::new(MountPointData {
-                fs_idx,
-                ino: ROOT_ID,
-                root_entry: entry,
-                _path: path.to_string(),
-            }),
-        );
+        let mountpoint = Arc::new(MountPointData {
+            fs_idx,
+            ino: ROOT_ID,
+            root_entry: entry,
+            _path: path.to_string(),
+        });
+        mountpoints.insert(inode, mountpoint);
         self.mountpoints.store(Arc::new(mountpoints));
 
         Ok(())
@@ -345,9 +347,8 @@ impl<D: AsyncDrive, S: BitmapSlice> Vfs<D, S> {
             })?;
 
         trace!("fs_idx {}", fs_idx);
-
         let mut superblocks = self.superblocks.load().deref().deref().clone();
-        if let Some(fs) = superblocks.remove(&fs_idx) {
+        if let Some(fs) = superblocks[fs_idx as usize].take() {
             fs.destroy();
         }
         self.superblocks.store(Arc::new(superblocks));
@@ -419,11 +420,12 @@ impl<D: AsyncDrive, S: BitmapSlice> Vfs<D, S> {
                     found = true;
                 }
             }
+
             if index == VFS_PSEUDO_FS_IDX {
                 // Skip the pseudo fs index
                 continue;
             }
-            if superblocks.contains_key(&index) {
+            if (index as usize) < superblocks.len() && superblocks[index as usize].is_some() {
                 // Skip if it's allocated
                 continue;
             } else {
@@ -438,23 +440,24 @@ impl<D: AsyncDrive, S: BitmapSlice> Vfs<D, S> {
     }
 
     fn get_fs_by_idx(&self, fs_idx: VfsIndex) -> Result<Arc<BackFileSystem<D, S>>> {
-        self.superblocks
-            .load()
-            .get(&fs_idx)
-            .map(Arc::clone)
-            .ok_or_else(|| Error::from_raw_os_error(libc::ENOENT))
+        let superblocks = self.superblocks.load();
+
+        if let Some(fs) = &superblocks[fs_idx as usize] {
+            return Ok(fs.clone());
+        }
+
+        Err(Error::from_raw_os_error(libc::ENOENT))
     }
 
     fn get_real_rootfs(&self, inode: VfsInode) -> Result<(VfsEitherFs<'_, D, S>, VfsInode)> {
-        // ROOT_ID is special, we need to check if we have a mountpoint on the vfs root
-        if inode.is_pseudo_fs() && inode.ino() == ROOT_ID {
-            if let Some(mnt) = self.mountpoints.load().get(&inode.ino()).map(Arc::clone) {
-                let fs = self.get_fs_by_idx(mnt.fs_idx)?;
-                return Ok((Right(fs), VfsInode::new(mnt.fs_idx, ROOT_ID)));
-            }
-        }
-
         if inode.is_pseudo_fs() {
+            // ROOT_ID is special, we need to check if we have a mountpoint on the vfs root
+            if inode.ino() == ROOT_ID {
+                if let Some(mnt) = self.mountpoints.load().get(&inode.ino()).map(Arc::clone) {
+                    let fs = self.get_fs_by_idx(mnt.fs_idx)?;
+                    return Ok((Right(fs), VfsInode::new(mnt.fs_idx, ROOT_ID)));
+                }
+            }
             Ok((Left(&self.root), inode))
         } else {
             let fs = self.get_fs_by_idx(inode.fs_idx())?;
@@ -1028,7 +1031,7 @@ mod tests {
             let index = vfs.allocate_fs_idx().unwrap();
             let mut superblocks = vfs.superblocks.load().deref().deref().clone();
 
-            superblocks.insert(index, Arc::new(Box::new(fs)));
+            superblocks[index as usize] = Some(Arc::new(Box::new(fs)));
             vfs.superblocks.store(Arc::new(superblocks));
         }
 

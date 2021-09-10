@@ -40,7 +40,9 @@ impl<D: AsyncDrive, S: BitmapSlice> FileSystem<S> for Vfs<D, S> {
             // Serialize mount operations. Do not expect poisoned lock here.
             // Ensure that every backend fs only get init()ed once.
             let _guard = self.lock.lock().unwrap();
-            for (_, fs) in self.superblocks.load().iter() {
+            let superblocks = self.superblocks.load();
+
+            for fs in superblocks.iter().flatten() {
                 fs.init(n_opts.out_opts)?;
             }
             self.initialized.store(true, Ordering::Release);
@@ -51,10 +53,11 @@ impl<D: AsyncDrive, S: BitmapSlice> FileSystem<S> for Vfs<D, S> {
 
     fn destroy(&self) {
         if self.initialized() {
-            self.superblocks
-                .load()
-                .iter()
-                .for_each(|(_, f)| f.destroy());
+            let superblocks = self.superblocks.load();
+
+            for fs in superblocks.iter().flatten() {
+                fs.destroy();
+            }
 
             self.initialized.store(false, Ordering::Release);
         }
