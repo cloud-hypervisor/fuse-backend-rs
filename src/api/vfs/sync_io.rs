@@ -510,17 +510,7 @@ impl<D: AsyncDrive, S: BitmapSlice> FileSystem<S> for Vfs<D, S> {
                 )
             }
 
-            (Right(fs), idata) => fs.readdir(
-                ctx,
-                idata.ino(),
-                handle,
-                size,
-                offset,
-                &mut |mut dir_entry| {
-                    dir_entry.ino = self.convert_inode(idata.fs_idx(), dir_entry.ino)?;
-                    add_entry(dir_entry)
-                },
-            ),
+            (Right(fs), idata) => fs.readdir(ctx, idata.ino(), handle, size, offset, add_entry),
         }
     }
 
@@ -563,9 +553,8 @@ impl<D: AsyncDrive, S: BitmapSlice> FileSystem<S> for Vfs<D, S> {
                 handle,
                 size,
                 offset,
-                &mut |mut dir_entry, mut entry| {
-                    dir_entry.ino = self.convert_inode(idata.fs_idx(), entry.inode)?;
-                    entry.inode = dir_entry.ino;
+                &mut |dir_entry, mut entry| {
+                    entry.inode = self.convert_inode(idata.fs_idx(), entry.inode)?;
                     add_entry(dir_entry, entry)
                 },
             ),
