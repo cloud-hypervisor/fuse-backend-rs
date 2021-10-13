@@ -76,7 +76,7 @@ impl<D: AsyncDrive, S: BitmapSlice + Send + Sync> PassthroughFs<D, S> {
         dir_fd: RawFd,
         name: &CStr,
         reopen_dir: F,
-    ) -> io::Result<(FileOrHandle, libc::stat64, InodeAltKey, Option<InodeAltKey>)>
+    ) -> io::Result<(FileOrHandle, InodeStat, InodeAltKey, Option<InodeAltKey>)>
     where
         F: FnOnce(RawFd, libc::c_int) -> io::Result<File>,
     {
@@ -104,8 +104,24 @@ impl<D: AsyncDrive, S: BitmapSlice + Send + Sync> PassthroughFs<D, S> {
         };
 
         let st = match &file_or_handle {
-            FileOrHandle::File(f) => self.async_stat(ctx, f, None).await?,
-            FileOrHandle::Handle(_) => self.async_stat_fd(ctx, dir_fd, Some(name)).await?,
+            FileOrHandle::File(f) => {
+                // TODO: use statx(2) to query mntid when 5.8 kernel or later are widely used.
+                //
+                // Some filesystems don't support file handle, for example overlayfs mounted
+                // without index feature, if so just use mntid 0 in that case.
+                let mnt_id = match FileHandle::from_name_at(dir_fd, name) {
+                    Ok(h) => h.mnt_id,
+                    Err(_) => 0,
+                };
+                InodeStat {
+                    stat: self.async_stat(ctx, f, None).await?,
+                    mnt_id,
+                }
+            }
+            FileOrHandle::Handle(h) => InodeStat {
+                stat: self.async_stat_fd(ctx, dir_fd, Some(name)).await?,
+                mnt_id: h.mnt_id,
+            },
         };
         let ids_altkey = InodeAltKey::ids_from_stat(&st);
 
@@ -377,7 +393,7 @@ impl<D: AsyncDrive + Sync, S: BitmapSlice + Send + Sync> AsyncFileSystem<D, S>
         Ok(Entry {
             inode,
             generation: 0,
-            attr: st,
+            attr: st.get_stat(),
             attr_timeout: self.cfg.attr_timeout,
             entry_timeout: self.cfg.entry_timeout,
         })

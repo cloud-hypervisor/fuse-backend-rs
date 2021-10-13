@@ -86,7 +86,7 @@ impl Debug for CFileHandle {
 /// Struct to maintain information for a file handle.
 #[derive(Clone, Copy, PartialOrd, Ord, PartialEq, Eq, Debug)]
 pub struct FileHandle {
-    mnt_id: u64,
+    pub(crate) mnt_id: u64,
     handle: CFileHandle,
 }
 
@@ -110,7 +110,7 @@ extern "C" {
 
 impl FileHandle {
     /// Create a file handle for the given file.
-    fn from_name_at(dir_fd: RawFd, path: &CStr) -> io::Result<Self> {
+    pub fn from_name_at(dir_fd: RawFd, path: &CStr) -> io::Result<Self> {
         let mut mount_id: libc::c_int = 0;
         let mut c_fh = CFileHandle::new();
 
