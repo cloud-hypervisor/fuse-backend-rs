@@ -52,20 +52,39 @@ type Inode = u64;
 type Handle = u64;
 type MultiKeyMap = MultikeyBTreeMap<Inode, InodeAltKey, Arc<InodeData>>;
 
+#[derive(Clone, Copy)]
+struct InodeStat {
+    stat: libc::stat64,
+    mnt_id: u64,
+}
+
+impl InodeStat {
+    fn get_stat(&self) -> libc::stat64 {
+        self.stat
+    }
+
+    fn get_mnt_id(&self) -> u64 {
+        self.mnt_id
+    }
+}
+
 #[derive(Clone, Copy, PartialOrd, Ord, PartialEq, Eq, Debug)]
 enum InodeAltKey {
     Ids {
         ino: libc::ino64_t,
         dev: libc::dev_t,
+        mnt: u64,
     },
     Handle(FileHandle),
 }
 
 impl InodeAltKey {
-    fn ids_from_stat(st: &libc::stat64) -> Self {
+    fn ids_from_stat(ist: &InodeStat) -> Self {
+        let st = ist.get_stat();
         InodeAltKey::Ids {
             ino: st.st_ino,
             dev: st.st_dev,
+            mnt: ist.get_mnt_id(),
         }
     }
 }
@@ -662,7 +681,7 @@ impl<D: AsyncDrive, S: BitmapSlice + Send + Sync> PassthroughFs<D, S> {
         name: &CStr,
         mount_fds: &MountFds,
         reopen_dir: F,
-    ) -> io::Result<(FileOrHandle, libc::stat64, InodeAltKey, Option<InodeAltKey>)>
+    ) -> io::Result<(FileOrHandle, InodeStat, InodeAltKey, Option<InodeAltKey>)>
     where
         F: FnOnce(RawFd, libc::c_int) -> io::Result<File>,
     {
@@ -686,18 +705,35 @@ impl<D: AsyncDrive, S: BitmapSlice + Send + Sync> PassthroughFs<D, S> {
             FileOrHandle::File(f)
         };
 
-        let st = match &file_or_handle {
-            FileOrHandle::File(f) => Self::stat(f, None)?,
-            FileOrHandle::Handle(_) => Self::stat_fd(dir_fd, Some(name))?,
+        let inode_stat = match &file_or_handle {
+            FileOrHandle::File(f) => {
+                // TODO: use statx(2) to query mntid when 5.8 kernel or later are widely used.
+                //
+                // Some filesystems don't support file handle, for example overlayfs mounted
+                // without index feature, if so just use mntid 0 in that case.
+                let mnt_id = match FileHandle::from_name_at(dir_fd, name) {
+                    Ok(h) => h.mnt_id,
+                    Err(_) => 0,
+                };
+                InodeStat {
+                    stat: Self::stat(f, None)?,
+                    mnt_id,
+                }
+            }
+            FileOrHandle::Handle(h) => InodeStat {
+                stat: Self::stat_fd(dir_fd, Some(name))?,
+                mnt_id: h.mnt_id,
+            },
         };
-        let ids_altkey = InodeAltKey::ids_from_stat(&st);
+
+        let ids_altkey = InodeAltKey::ids_from_stat(&inode_stat);
 
         // Note that this will always be `None` if `cfg.inode_file_handles` is false, but we only
         // really need this alt key when we do not have an `O_PATH` fd open for every inode.  So if
         // `cfg.inode_file_handles` is false, we do not need this key anyway.
         let handle_altkey = file_or_handle.handle().map(|h| InodeAltKey::Handle(*h));
 
-        Ok((file_or_handle, st, ids_altkey, handle_altkey))
+        Ok((file_or_handle, inode_stat, ids_altkey, handle_altkey))
     }
 
     fn do_lookup(&self, parent: Inode, name: &CStr) -> io::Result<Entry> {
@@ -794,7 +830,7 @@ impl<D: AsyncDrive, S: BitmapSlice + Send + Sync> PassthroughFs<D, S> {
         Ok(Entry {
             inode,
             generation: 0,
-            attr: st,
+            attr: st.get_stat(),
             attr_timeout: self.cfg.attr_timeout,
             entry_timeout: self.cfg.entry_timeout,
         })
