@@ -537,52 +537,26 @@ impl<D: AsyncDrive, S: BitmapSlice + Send + Sync> PassthroughFs<D, S> {
     pub fn import(&self) -> io::Result<()> {
         let root = CString::new(self.cfg.root_dir.as_str()).expect("CString::new failed");
 
-        let handle = if self.cfg.inode_file_handles {
-            FileHandle::from_name_at_with_mount_fds(
-                libc::AT_FDCWD,
-                &root,
-                &self.mount_fds,
-                |fd, flags| {
-                    let pathname = CString::new(format!("self/fd/{}", fd))
-                        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-                    Self::open_file(self.proc.as_raw_fd(), &pathname, flags, 0)
-                },
-            )
-        } else {
-            Err(io::Error::from_raw_os_error(libc::ENOTSUP))
-        };
-
-        // Ignore errors, because having a handle is optional
-        let file_or_handle = if let Ok(h) = handle {
-            FileOrHandle::Handle(h)
-        } else {
-            // We use `O_PATH` because we just want this for traversing the directory tree
-            // and not for actually reading the contents.
-            let f = Self::open_file(
-                libc::AT_FDCWD,
-                &root,
-                libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-                0,
-            )?;
-            FileOrHandle::File(f)
-        };
-
-        let st = match &file_or_handle {
-            FileOrHandle::File(f) => Self::stat(f, None)?,
-            FileOrHandle::Handle(_) => Self::stat_fd(libc::AT_FDCWD, Some(&root))?,
-        };
+        let (file_or_handle, _st, ids_altkey, handle_altkey) = Self::open_file_or_handle(
+            self.cfg.inode_file_handles,
+            libc::AT_FDCWD,
+            &root,
+            &self.mount_fds,
+            |fd, flags| {
+                let pathname = CString::new(format!("self/fd/{}", fd))
+                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+                Self::open_file(self.proc.as_raw_fd(), &pathname, flags, 0)
+            },
+        )
+        .map_err(|e| {
+            error!("fuse: import: failed to get file or handle: {:?}", e);
+            e
+        })?;
 
         // Safe because this doesn't modify any memory and there is no need to check the return
         // value because this system call always succeeds. We need to clear the umask here because
         // we want the client to be able to set all the bits in the mode.
         unsafe { libc::umask(0o000) };
-
-        let ids_altkey = InodeAltKey::ids_from_stat(&st);
-
-        // Note that this will always be `None` if `cfg.inode_file_handles` is false, but we only
-        // really need this alt key when we do not have an `O_PATH` fd open for every inode.  So if
-        // `cfg.inode_file_handles` is false, we do not need this key anyway.
-        let handle_altkey = file_or_handle.handle().map(|h| InodeAltKey::Handle(*h));
 
         // Not sure why the root inode gets a refcount of 2 but that's what libfuse does.
         self.inode_map.insert(
@@ -682,15 +656,18 @@ impl<D: AsyncDrive, S: BitmapSlice + Send + Sync> PassthroughFs<D, S> {
     }
 
     /// Create a File or File Handle for `name` under directory `dir_fd` to support `lookup()`.
-    fn open_file_or_handle(
-        &self,
+    fn open_file_or_handle<F>(
+        use_handle: bool,
         dir_fd: RawFd,
         name: &CStr,
-    ) -> io::Result<(FileOrHandle, libc::stat64, InodeAltKey, Option<InodeAltKey>)> {
-        let handle = if self.cfg.inode_file_handles {
-            FileHandle::from_name_at_with_mount_fds(dir_fd, name, &self.mount_fds, |fd, flags| {
-                Self::open_proc_file(&self.proc, fd, flags)
-            })
+        mount_fds: &MountFds,
+        reopen_dir: F,
+    ) -> io::Result<(FileOrHandle, libc::stat64, InodeAltKey, Option<InodeAltKey>)>
+    where
+        F: FnOnce(RawFd, libc::c_int) -> io::Result<File>,
+    {
+        let handle = if use_handle {
+            FileHandle::from_name_at_with_mount_fds(dir_fd, name, mount_fds, reopen_dir)
         } else {
             Err(io::Error::from_raw_os_error(libc::ENOTSUP))
         };
@@ -726,8 +703,17 @@ impl<D: AsyncDrive, S: BitmapSlice + Send + Sync> PassthroughFs<D, S> {
     fn do_lookup(&self, parent: Inode, name: &CStr) -> io::Result<Entry> {
         let dir = self.inode_map.get(parent)?;
         let dir_file = dir.get_file(&self.mount_fds)?;
-        let (file_or_handle, st, ids_altkey, handle_altkey) =
-            self.open_file_or_handle(dir_file.as_raw_fd(), name)?;
+        let (file_or_handle, st, ids_altkey, handle_altkey) = Self::open_file_or_handle(
+            self.cfg.inode_file_handles,
+            dir_file.as_raw_fd(),
+            name,
+            &self.mount_fds,
+            |fd, flags| Self::open_proc_file(&self.proc, fd, flags),
+        )
+        .map_err(|e| {
+            error!("fuse: do_lookup: failed to get file or handle: {:?}", e);
+            e
+        })?;
 
         let mut found = None;
         'search: loop {

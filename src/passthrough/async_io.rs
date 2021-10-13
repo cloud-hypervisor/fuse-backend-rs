@@ -70,16 +70,18 @@ impl<D: AsyncDrive, S: BitmapSlice + Send + Sync> PassthroughFs<D, S> {
     }
 
     /// Create a File or File Handle for `name` under directory `dir_fd` to support `lookup()`.
-    async fn async_open_file_or_handle(
+    async fn async_open_file_or_handle<F>(
         &self,
         ctx: &Context,
         dir_fd: RawFd,
         name: &CStr,
-    ) -> io::Result<(FileOrHandle, libc::stat64, InodeAltKey, Option<InodeAltKey>)> {
+        reopen_dir: F,
+    ) -> io::Result<(FileOrHandle, libc::stat64, InodeAltKey, Option<InodeAltKey>)>
+    where
+        F: FnOnce(RawFd, libc::c_int) -> io::Result<File>,
+    {
         let handle = if self.cfg.inode_file_handles {
-            FileHandle::from_name_at_with_mount_fds(dir_fd, name, &self.mount_fds, |fd, flags| {
-                Self::open_proc_file(&self.proc, fd, flags)
-            })
+            FileHandle::from_name_at_with_mount_fds(dir_fd, name, &self.mount_fds, reopen_dir)
         } else {
             Err(io::Error::from_raw_os_error(libc::ENOTSUP))
         };
@@ -291,7 +293,9 @@ impl<D: AsyncDrive + Sync, S: BitmapSlice + Send + Sync> AsyncFileSystem<D, S>
         let dir = self.inode_map.get(parent)?;
         let dir_file = dir.async_get_file(&self.mount_fds).await?;
         let (file_or_handle, st, ids_altkey, handle_altkey) = self
-            .async_open_file_or_handle(&ctx, dir_file.as_raw_fd(), name)
+            .async_open_file_or_handle(&ctx, dir_file.as_raw_fd(), name, |fd, flags| {
+                Self::open_proc_file(&self.proc, fd, flags)
+            })
             .await?;
 
         let mut found = None;
