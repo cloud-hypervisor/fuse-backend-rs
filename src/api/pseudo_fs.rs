@@ -275,6 +275,7 @@ impl<S: BitmapSlice> PseudoFs<S> {
             inode: ino,
             generation: 0,
             attr: attr.into(),
+            attr_flags: 0,
             attr_timeout: Duration::from_secs(PSEUDOFS_DEFAULT_ATTR_TIMEOUT),
             entry_timeout: Duration::from_secs(PSEUDOFS_DEFAULT_ENTRY_TIMEOUT),
         }

@@ -214,7 +214,8 @@ impl Default for VfsOptions {
                 | FsOptions::DO_READDIRPLUS
                 | FsOptions::READDIRPLUS_AUTO
                 | FsOptions::ZERO_MESSAGE_OPENDIR
-                | FsOptions::HANDLE_KILLPRIV_V2,
+                | FsOptions::HANDLE_KILLPRIV_V2
+                | FsOptions::PERFILE_DAX,
         }
     }
 }
@@ -513,6 +514,7 @@ mod tests {
                 inode: 0,
                 generation: 0,
                 attr: Attr::default().into(),
+                attr_flags: 0,
                 attr_timeout: Duration::new(0, 0),
                 entry_timeout: Duration::new(0, 0),
             })
@@ -528,6 +530,7 @@ mod tests {
                 inode: 1,
                 generation: 0,
                 attr: Attr::default().into(),
+                attr_flags: 0,
                 attr_timeout: Duration::new(0, 0),
                 entry_timeout: Duration::new(0, 0),
             })
@@ -822,6 +825,7 @@ mod tests {
                     inode: 1,
                     generation: 0,
                     attr: Attr::default().into(),
+                    attr_flags: 0,
                     attr_timeout: Duration::new(0, 0),
                     entry_timeout: Duration::new(0, 0),
                 },
@@ -842,6 +846,7 @@ mod tests {
                     inode: 1,
                     generation: 0,
                     attr: Attr::default().into(),
+                    attr_flags: 0,
                     attr_timeout: Duration::new(0, 0),
                     entry_timeout: Duration::new(0, 0),
                 },
@@ -870,7 +875,8 @@ mod tests {
             | FsOptions::DO_READDIRPLUS
             | FsOptions::READDIRPLUS_AUTO
             | FsOptions::ZERO_MESSAGE_OPENDIR
-            | FsOptions::HANDLE_KILLPRIV_V2;
+            | FsOptions::HANDLE_KILLPRIV_V2
+            | FsOptions::PERFILE_DAX;
         let opts = vfs.opts.load();
 
         assert_eq!(opts.no_open, true);

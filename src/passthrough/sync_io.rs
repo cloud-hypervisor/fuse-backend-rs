@@ -333,6 +333,11 @@ impl<D: AsyncDrive, S: BitmapSlice + Send + Sync> FileSystem<S> for PassthroughF
             self.killpriv_v2.store(true, Ordering::Relaxed);
         }
 
+        if capable.contains(FsOptions::PERFILE_DAX) {
+            opts |= FsOptions::PERFILE_DAX;
+            self.perfile_dax.store(true, Ordering::Relaxed);
+        }
+
         Ok(opts)
     }
 
