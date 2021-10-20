@@ -314,6 +314,17 @@ impl<D: AsyncDrive + Sync, S: BitmapSlice + Send + Sync> AsyncFileSystem<D, S>
             })
             .await?;
 
+        let mut attr_flags: u32 = 0;
+        if let Some(dax_file_size) = self.cfg.dax_file_size {
+            // st.stat.st_size is i64
+            if self.perfile_dax.load(Ordering::Relaxed)
+                && st.stat.st_size >= 0x0
+                && st.stat.st_size as u64 >= dax_file_size
+            {
+                attr_flags |= fuse::FUSE_ATTR_DAX;
+            }
+        }
+
         let mut found = None;
         'search: loop {
             match self.inode_map.get_alt(&ids_altkey, handle_altkey.as_ref()) {
@@ -394,6 +405,7 @@ impl<D: AsyncDrive + Sync, S: BitmapSlice + Send + Sync> AsyncFileSystem<D, S>
             inode,
             generation: 0,
             attr: st.get_stat(),
+            attr_flags,
             attr_timeout: self.cfg.attr_timeout,
             entry_timeout: self.cfg.entry_timeout,
         })

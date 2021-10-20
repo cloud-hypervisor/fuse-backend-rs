@@ -455,6 +455,13 @@ pub struct Config {
     /// Control whether readdir/readdirplus requests return zero dirent to client, as if the
     /// directory is empty even if it has children.
     pub no_readdir: bool,
+
+    /// What size file supports dax
+    /// * If dax_file_size == None, DAX will disable to all files.
+    /// * If dax_file_size == 0, DAX will enable all files.
+    /// * If dax_file_size == N, DAX will enable only when the file size is greater than or equal
+    /// to N Bytes.
+    pub dax_file_size: Option<u64>,
 }
 
 impl Default for Config {
@@ -472,6 +479,7 @@ impl Default for Config {
             killpriv_v2: false,
             inode_file_handles: false,
             no_readdir: false,
+            dax_file_size: None,
         }
     }
 }
@@ -521,6 +529,10 @@ pub struct PassthroughFs<D: AsyncDrive = AsyncDriver, S: BitmapSlice + Send + Sy
     // Whether no_readdir is enabled.
     no_readdir: AtomicBool,
 
+    // Whether per-file DAX feature is enabled.
+    // Init from guest kernel Init cmd of fuse fs.
+    perfile_dax: AtomicBool,
+
     cfg: Config,
 
     phantom: PhantomData<D>,
@@ -554,6 +566,7 @@ impl<D: AsyncDrive, S: BitmapSlice + Send + Sync> PassthroughFs<D, S> {
             no_opendir: AtomicBool::new(false),
             killpriv_v2: AtomicBool::new(false),
             no_readdir: AtomicBool::new(cfg.no_readdir),
+            perfile_dax: AtomicBool::new(false),
             cfg,
 
             phantom: PhantomData,
@@ -756,6 +769,18 @@ impl<D: AsyncDrive, S: BitmapSlice + Send + Sync> PassthroughFs<D, S> {
             |fd, flags| Self::open_proc_file(&self.proc, fd, flags),
         )?;
 
+        // Whether to enable file DAX according to the value of dax_file_size
+        let mut attr_flags: u32 = 0;
+        if let Some(dax_file_size) = self.cfg.dax_file_size {
+            // st.stat.st_size is i64
+            if self.perfile_dax.load(Ordering::Relaxed)
+                && st.stat.st_size >= 0x0
+                && st.stat.st_size as u64 >= dax_file_size
+            {
+                attr_flags |= fuse::FUSE_ATTR_DAX;
+            }
+        }
+
         let mut found = None;
         'search: loop {
             match self.inode_map.get_alt(&ids_altkey, handle_altkey.as_ref()) {
@@ -836,6 +861,7 @@ impl<D: AsyncDrive, S: BitmapSlice + Send + Sync> PassthroughFs<D, S> {
             inode,
             generation: 0,
             attr: st.get_stat(),
+            attr_flags,
             attr_timeout: self.cfg.attr_timeout,
             entry_timeout: self.cfg.entry_timeout,
         })

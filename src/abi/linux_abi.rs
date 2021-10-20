@@ -182,6 +182,20 @@ const SUBMOUNTS: u32 = 0x800_0000;
 // Filesystem responsible for clearing security.capability xattr and setuid/setgid bits.
 const HANDLE_KILLPRIV_V2: u32 = 0x1000_0000;
 
+// This flag indicates whether the guest kernel enable per-file dax
+const PERFILE_DAX: u32 = 0x4000_0000;
+
+/**
+ *
+ * fuse_attr flags
+ *
+ * upstream kernel use (1 << 0) as FUSE_ATTR_SUBMOUNT,
+ * so FUSE_ATTR_DAX will use (1 << 1)
+ *
+ */
+/// This attribute indicates whether the file supports dax in per-file DAX mode
+pub const FUSE_ATTR_DAX: u32 = 1 << 1;
+
 bitflags! {
     /// A bitfield passed in as a parameter to and returned from the `init` method of the
     /// `FileSystem` trait.
@@ -415,6 +429,12 @@ bitflags! {
         ///  -. create has O_TRUNC and FOPEN_IN_KILL_SUIDGID flag set.
         ///  -. write has WRITE_KILL_PRIV
         const HANDLE_KILLPRIV_V2 = HANDLE_KILLPRIV_V2;
+
+        /// Indicates whether the guest kernel enable per-file dax
+        ///
+        /// If this feature is enabled, filesystem will notify guest kernel whether file
+        /// enable DAX by EntryOut.Attr.flags of inode when lookup
+        const PERFILE_DAX = PERFILE_DAX;
     }
 }
 

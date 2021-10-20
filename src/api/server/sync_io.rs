@@ -607,7 +607,8 @@ impl<F: FileSystem<S> + Sync, D: AsyncDrive, S: BitmapSlice> Server<F, D, S> {
             | FsOptions::ASYNC_DIO
             | FsOptions::HAS_IOCTL_DIR
             | FsOptions::MAX_PAGES
-            | FsOptions::EXPLICIT_INVAL_DATA;
+            | FsOptions::EXPLICIT_INVAL_DATA
+            | FsOptions::PERFILE_DAX;
 
         let capable = FsOptions::from_bits_truncate(flags);
 
