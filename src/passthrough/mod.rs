@@ -451,6 +451,10 @@ pub struct Config {
     ///
     /// The default is `false`.
     pub inode_file_handles: bool,
+
+    /// Control whether readdir/readdirplus requests return zero dirent to client, as if the
+    /// directory is empty even if it has children.
+    pub no_readdir: bool,
 }
 
 impl Default for Config {
@@ -467,6 +471,7 @@ impl Default for Config {
             no_opendir: false,
             killpriv_v2: false,
             inode_file_handles: false,
+            no_readdir: false,
         }
     }
 }
@@ -513,6 +518,9 @@ pub struct PassthroughFs<D: AsyncDrive = AsyncDriver, S: BitmapSlice + Send + Sy
     // Whether kill_priv_v2 is enabled.
     killpriv_v2: AtomicBool,
 
+    // Whether no_readdir is enabled.
+    no_readdir: AtomicBool,
+
     cfg: Config,
 
     phantom: PhantomData<D>,
@@ -545,6 +553,7 @@ impl<D: AsyncDrive, S: BitmapSlice + Send + Sync> PassthroughFs<D, S> {
             no_open: AtomicBool::new(false),
             no_opendir: AtomicBool::new(false),
             killpriv_v2: AtomicBool::new(false),
+            no_readdir: AtomicBool::new(cfg.no_readdir),
             cfg,
 
             phantom: PhantomData,
