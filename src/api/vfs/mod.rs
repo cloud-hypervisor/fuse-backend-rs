@@ -181,6 +181,8 @@ pub struct VfsOptions {
     /// Disable fuse WRITEBACK_CACHE option so that kernel will not cache
     /// buffer writes.
     pub no_writeback: bool,
+    /// Make readdir/readdirplus request return zero dirent even if dir has children.
+    pub no_readdir: bool,
     /// Enable fuse killpriv_v2 support. When enabled, fuse file system makes sure
     /// to remove security.capability xattr and setuid/setgid bits. See details in
     /// comments for HANDLE_KILLPRIV_V2
@@ -197,6 +199,7 @@ impl Default for VfsOptions {
             no_open: true,
             no_opendir: true,
             no_writeback: false,
+            no_readdir: false,
             killpriv_v2: false,
             in_opts: FsOptions::empty(),
             out_opts: FsOptions::ASYNC_READ
@@ -873,6 +876,7 @@ mod tests {
         assert_eq!(opts.no_open, true);
         assert_eq!(opts.no_opendir, true);
         assert_eq!(opts.no_writeback, false);
+        assert_eq!(opts.no_readdir, false);
         assert_eq!(opts.killpriv_v2, false);
         assert_eq!(opts.in_opts.is_empty(), true);
         assert_eq!(opts.out_opts, out_opts);
@@ -884,6 +888,7 @@ mod tests {
         assert_eq!(opts.no_open, false);
         assert_eq!(opts.no_opendir, false);
         assert_eq!(opts.no_writeback, false);
+        assert_eq!(opts.no_readdir, false);
         assert_eq!(opts.killpriv_v2, false);
 
         vfs.destroy();
