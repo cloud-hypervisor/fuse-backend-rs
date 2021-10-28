@@ -78,6 +78,19 @@ impl From<Entry> for fuse::EntryOut {
     }
 }
 
+impl Default for Entry {
+    fn default() -> Self {
+        Entry {
+            inode: 0,
+            generation: 0,
+            attr: unsafe { std::mem::zeroed() },
+            attr_flags: 0,
+            attr_timeout: Duration::default(),
+            entry_timeout: Duration::default(),
+        }
+    }
+}
+
 /// Represents information about an entry in a directory.
 #[derive(Copy, Clone)]
 pub struct DirEntry<'a> {
