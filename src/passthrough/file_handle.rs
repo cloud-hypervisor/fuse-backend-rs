@@ -130,7 +130,6 @@ impl FileHandle {
             })
         } else {
             let e = io::Error::last_os_error();
-            error!("from_name_at failed error {:?}", e);
             Err(e)
         }
     }
@@ -151,7 +150,10 @@ impl FileHandle {
     where
         F: FnOnce(RawFd, libc::c_int) -> io::Result<File>,
     {
-        let handle = Self::from_name_at(dir_fd, path)?;
+        let handle = Self::from_name_at(dir_fd, path).map_err(|e| {
+            error!("from_name_at failed error {:?}", e);
+            e
+        })?;
 
         mount_fds.ensure_mount_point(handle.mnt_id, dir_fd, path, reopen_dir)?;
 

@@ -754,11 +754,7 @@ impl<D: AsyncDrive, S: BitmapSlice + Send + Sync> PassthroughFs<D, S> {
             name,
             &self.mount_fds,
             |fd, flags| Self::open_proc_file(&self.proc, fd, flags),
-        )
-        .map_err(|e| {
-            error!("fuse: do_lookup: failed to get file or handle: {:?}", e);
-            e
-        })?;
+        )?;
 
         let mut found = None;
         'search: loop {
