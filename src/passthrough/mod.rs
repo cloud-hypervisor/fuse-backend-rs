@@ -13,13 +13,15 @@
 
 use std::any::Any;
 use std::collections::{btree_map, BTreeMap};
-use std::ffi::{CStr, CString};
+use std::ffi::{CStr, CString, OsString};
 use std::fs::File;
 use std::io;
 use std::marker::PhantomData;
 use std::mem::MaybeUninit;
 use std::ops::{Deref, DerefMut};
+use std::os::unix::ffi::OsStringExt;
 use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
+use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, RwLock, RwLockWriteGuard};
@@ -627,6 +629,53 @@ impl<D: AsyncDrive, S: BitmapSlice + Send + Sync> PassthroughFs<D, S> {
     /// Get the list of file descriptors which should be reserved across live upgrade.
     pub fn keep_fds(&self) -> Vec<RawFd> {
         vec![self.proc.as_raw_fd()]
+    }
+
+    fn readlinkat(dfd: i32, pathname: &CStr) -> io::Result<PathBuf> {
+        let mut buf = Vec::with_capacity(libc::PATH_MAX as usize);
+
+        // Safe because the kernel will only write data to buf and we check the return value
+        let buf_read = unsafe {
+            libc::readlinkat(
+                dfd,
+                pathname.as_ptr(),
+                buf.as_mut_ptr() as *mut libc::c_char,
+                buf.capacity(),
+            )
+        };
+        if buf_read < 0 {
+            error!("fuse: readlinkat error");
+            return Err(io::Error::last_os_error());
+        }
+
+        // Safe because we know buf len
+        unsafe {
+            buf.set_len(buf_read as usize);
+        }
+
+        if (buf_read as usize) < buf.capacity() {
+            buf.shrink_to_fit();
+
+            return Ok(PathBuf::from(OsString::from_vec(buf)));
+        }
+
+        error!(
+            "fuse: readlinkat return value {} is greater than libc::PATH_MAX({})",
+            buf_read,
+            libc::PATH_MAX
+        );
+        Err(io::Error::from_raw_os_error(libc::EOVERFLOW))
+    }
+
+    /// Get the file pathname corresponding to the Inode
+    /// This function is used by Nydus blobfs
+    pub fn readlinkat_proc_file(&self, inode: Inode) -> io::Result<PathBuf> {
+        let data = self.inode_map.get(inode)?;
+        let file = data.get_file(&self.mount_fds)?;
+        let pathname = CString::new(format!("self/fd/{}", file.as_raw_fd()))
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+
+        Self::readlinkat(self.proc.as_raw_fd(), &pathname)
     }
 
     fn stat(dir: &impl AsRawFd, path: Option<&CStr>) -> io::Result<libc::stat64> {
