@@ -26,23 +26,23 @@ libc = ">=0.2.68"
 log = ">=0.4.6"
 nix = "0.22"
 #ringbahn = { version = "0.0.0-experimental.3", optional = true }
-vmm-sys-util = { version = "0.8", optional = true }
-vm-memory = "0.6"
-#vm-virtio = { git = "https://github.com/cloud-hypervisor/vm-virtio.git", branch = "dragonball", optional = true }
-#vhost = { version = "0.1", optional = true }
+vmm-sys-util = { version = ">=0.8", optional = true }
+vm-memory = { version = "0.6", features = ["backend-atomic"] }
+virtio-queue = { git = "https://github.com/rust-vmm/vm-virtio", rev = "6013dd9", optional = true }
+vhost = { version = "0.2", features = ["vhost-user-slave"], optional = true }
 
 [dev-dependencies]
 futures = { version = "0.3.0", features = ["thread-pool"]}
 stderrlog = "0.4"
-vmm-sys-util = "0.8"
-vm-memory = { version = "0.6", features = ["backend-mmap"] }
+vmm-sys-util = ">=0.8"
+vm-memory = { version = "0.6", features = ["backend-mmap", "backend-atomic"] }
 
 [features]
 default = ["fusedev"]
 #async-io = ["async-trait", "futures", "iou", "ringbahn"]
 fusedev = ["vmm-sys-util"]
-#virtiofs = ["vm-virtio"]
-#vhost-user-fs = ["virtiofs", "vhost-rs/vhost-user-slave"]
+virtiofs = ["virtio-queue"]
+vhost-user-fs = ["virtiofs", "vhost"]
 
 [patch."registry+https://github.com/rust-lang/crates.io-index"]
 #ringbahn = { git = "https://github.com/jiangliu/ringbahn.git", branch = "enhance", optional = true }
