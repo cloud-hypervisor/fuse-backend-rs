@@ -50,11 +50,7 @@ extern crate bitflags;
 extern crate libc;
 #[macro_use]
 extern crate log;
-#[cfg(feature = "vhost-user-fs")]
-extern crate vhost;
 extern crate vm_memory;
-#[cfg(feature = "virtiofs")]
-extern crate vm_virtio;
 
 use std::ffi::{CStr, FromBytesWithNulError};
 use std::io::ErrorKind;

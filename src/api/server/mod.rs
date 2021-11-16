@@ -162,6 +162,7 @@ pub trait MetricsHook {
 }
 
 struct SrvContext<'a, F, D: AsyncDrive = AsyncDriver, S: BitmapSlice = ()> {
+    #[allow(dead_code)]
     drive: Option<D>,
     in_header: InHeader,
     context: Context,
