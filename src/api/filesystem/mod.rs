@@ -22,7 +22,6 @@ pub use fuse::SetattrValid;
 pub use fuse::ROOT_ID;
 
 #[cfg(feature = "async-io")]
-#[doc(inline)]
 mod async_io;
 #[cfg(feature = "async-io")]
 pub use async_io::{AsyncFileSystem, AsyncZeroCopyReader, AsyncZeroCopyWriter};
