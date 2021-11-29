@@ -17,7 +17,7 @@ pub use super::abi::linux_abi::CreateIn;
 mod pseudo_fs;
 
 pub mod vfs;
-pub use vfs::{BackendFileSystem, Vfs, VfsOptions, VFS_MAX_INO};
+pub use vfs::{BackFileSystem, BackendFileSystem, Vfs, VfsIndex, VfsOptions, VFS_MAX_INO};
 
 pub mod filesystem;
 pub mod server;

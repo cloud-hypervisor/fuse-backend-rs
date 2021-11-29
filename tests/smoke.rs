@@ -87,7 +87,6 @@ mod fusedev_tests {
     }
 
     #[test]
-    #[ignore] // it depends on privileged mode to pass through /dev/fuse
     fn integration_test_tree_gitrepo() -> Result<()> {
         // test the fuse-rs repository
         let src = Path::new(".").canonicalize().unwrap();
