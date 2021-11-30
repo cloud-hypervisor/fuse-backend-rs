@@ -55,7 +55,8 @@ impl Daemon {
     /// Mounts a fusedev daemon to the mountpoint, then start service threads to handle
     /// FUSE requests.
     pub fn mount(&mut self) -> Result<()> {
-        let mut se = FuseSession::new(Path::new(&self.mountpoint), "passthru_example", "").unwrap();
+        let mut se =
+            FuseSession::new(Path::new(&self.mountpoint), "passthru_example", "", false).unwrap();
         se.mount().unwrap();
         for _ in 0..self.thread_cnt {
             let mut server = FuseServer {

@@ -42,11 +42,17 @@ pub struct FuseSession {
     subtype: String,
     file: Option<File>,
     bufsize: usize,
+    readonly: bool,
 }
 
 impl FuseSession {
     /// Create a new fuse session, without mounting/connecting to the in kernel fuse driver.
-    pub fn new(mountpoint: &Path, fsname: &str, subtype: &str) -> Result<FuseSession> {
+    pub fn new(
+        mountpoint: &Path,
+        fsname: &str,
+        subtype: &str,
+        readonly: bool,
+    ) -> Result<FuseSession> {
         let dest = mountpoint
             .canonicalize()
             .map_err(|_| SessionFailure(format!("invalid mountpoint {:?}", mountpoint)))?;
@@ -60,13 +66,16 @@ impl FuseSession {
             subtype: subtype.to_owned(),
             file: None,
             bufsize: FUSE_KERN_BUF_SIZE * pagesize() + FUSE_HEADER_SIZE,
+            readonly,
         })
     }
 
     /// Mount the fuse mountpoint, building connection with the in kernel fuse driver.
     pub fn mount(&mut self) -> Result<()> {
-        let flags =
-            MsFlags::MS_NOSUID | MsFlags::MS_NODEV | MsFlags::MS_NOATIME | MsFlags::MS_RDONLY;
+        let mut flags = MsFlags::MS_NOSUID | MsFlags::MS_NODEV | MsFlags::MS_NOATIME;
+        if self.readonly {
+            flags |= MsFlags::MS_RDONLY;
+        }
         let file = fuse_kern_mount(&self.mountpoint, &self.fsname, &self.subtype, flags)?;
 
         fcntl(file.as_raw_fd(), FcntlArg::F_SETFL(OFlag::O_NONBLOCK))
@@ -334,11 +343,11 @@ mod tests {
 
     #[test]
     fn test_new_session() {
-        let se = FuseSession::new(Path::new("haha"), "foo", "bar");
+        let se = FuseSession::new(Path::new("haha"), "foo", "bar", true);
         assert!(se.is_err());
 
         let dir = TempDir::new().unwrap();
-        let se = FuseSession::new(dir.as_path(), "foo", "bar");
+        let se = FuseSession::new(dir.as_path(), "foo", "bar", false);
         assert!(se.is_ok());
     }
 
