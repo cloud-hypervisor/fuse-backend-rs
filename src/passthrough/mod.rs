@@ -33,7 +33,7 @@ use crate::abi::linux_abi as fuse;
 use crate::api::filesystem::Entry;
 use crate::api::{
     validate_path_component, BackendFileSystem, CURRENT_DIR_CSTR, EMPTY_CSTR, PARENT_DIR_CSTR,
-    PROC_CSTR, SLASH_ASCII, VFS_MAX_INO,
+    PROC_SELF_FD_CSTR, SLASH_ASCII, VFS_MAX_INO,
 };
 use crate::BitmapSlice;
 
@@ -517,11 +517,11 @@ pub struct PassthroughFs<D: AsyncDrive = AsyncDriver, S: BitmapSlice + Send + Sy
     // Maps mount IDs to an open FD on the respective ID for the purpose of open_by_handle_at().
     mount_fds: MountFds,
 
-    // File descriptor pointing to the `/proc` directory. This is used to convert an fd from
+    // File descriptor pointing to the `/proc/self/fd` directory. This is used to convert an fd from
     // `inodes` into one that can go into `handles`. This is accomplished by reading the
-    // `self/fd/{}` symlink. We keep an open fd here in case the file system tree that we are meant
-    // to be serving doesn't have access to `/proc`.
-    proc: File,
+    // `/proc/self/fd/{}` symlink. We keep an open fd here in case the file system tree that we are meant
+    // to be serving doesn't have access to `/proc/self/fd`.
+    proc_self_fd: File,
 
     // Whether writeback caching is enabled for this directory. This will only be true when
     // `cfg.writeback` is true and `init` was called with `FsOptions::WRITEBACK_CACHE`.
@@ -553,10 +553,10 @@ impl<D: AsyncDrive, S: BitmapSlice + Send + Sync> PassthroughFs<D, S> {
     /// Create a Passthrough file system instance.
     pub fn new(cfg: Config) -> io::Result<PassthroughFs<D, S>> {
         // Safe because this is a constant value and a valid C string.
-        let proc_cstr = unsafe { CStr::from_bytes_with_nul_unchecked(PROC_CSTR) };
-        let proc = Self::open_file(
+        let proc_self_fd_cstr = unsafe { CStr::from_bytes_with_nul_unchecked(PROC_SELF_FD_CSTR) };
+        let proc_self_fd = Self::open_file(
             libc::AT_FDCWD,
-            proc_cstr,
+            proc_self_fd_cstr,
             libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC,
             0,
         )?;
@@ -569,7 +569,7 @@ impl<D: AsyncDrive, S: BitmapSlice + Send + Sync> PassthroughFs<D, S> {
             next_handle: AtomicU64::new(1),
             mount_fds: MountFds::new(),
 
-            proc,
+            proc_self_fd,
 
             writeback: AtomicBool::new(false),
             no_open: AtomicBool::new(false),
@@ -594,9 +594,9 @@ impl<D: AsyncDrive, S: BitmapSlice + Send + Sync> PassthroughFs<D, S> {
             &root,
             &self.mount_fds,
             |fd, flags, _mode| {
-                let pathname = CString::new(format!("self/fd/{}", fd))
+                let pathname = CString::new(format!("{}", fd))
                     .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-                Self::open_file(self.proc.as_raw_fd(), &pathname, flags, 0)
+                Self::open_file(self.proc_self_fd.as_raw_fd(), &pathname, flags, 0)
             },
         )
         .map_err(|e| {
@@ -628,7 +628,7 @@ impl<D: AsyncDrive, S: BitmapSlice + Send + Sync> PassthroughFs<D, S> {
 
     /// Get the list of file descriptors which should be reserved across live upgrade.
     pub fn keep_fds(&self) -> Vec<RawFd> {
-        vec![self.proc.as_raw_fd()]
+        vec![self.proc_self_fd.as_raw_fd()]
     }
 
     fn readlinkat(dfd: i32, pathname: &CStr) -> io::Result<PathBuf> {
@@ -672,10 +672,10 @@ impl<D: AsyncDrive, S: BitmapSlice + Send + Sync> PassthroughFs<D, S> {
     pub fn readlinkat_proc_file(&self, inode: Inode) -> io::Result<PathBuf> {
         let data = self.inode_map.get(inode)?;
         let file = data.get_file(&self.mount_fds)?;
-        let pathname = CString::new(format!("self/fd/{}", file.as_raw_fd()))
+        let pathname = CString::new(format!("{}", file.as_raw_fd()))
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
 
-        Self::readlinkat(self.proc.as_raw_fd(), &pathname)
+        Self::readlinkat(self.proc_self_fd.as_raw_fd(), &pathname)
     }
 
     fn stat(dir: &impl AsRawFd, path: Option<&CStr>) -> io::Result<libc::stat64> {
@@ -757,7 +757,7 @@ impl<D: AsyncDrive, S: BitmapSlice + Send + Sync> PassthroughFs<D, S> {
             return Err(ebadf());
         }
 
-        let pathname = CString::new(format!("self/fd/{}", fd))
+        let pathname = CString::new(format!("{}", fd))
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
 
         // We don't really check `flags` because if the kernel can't handle poorly specified flags
@@ -849,7 +849,7 @@ impl<D: AsyncDrive, S: BitmapSlice + Send + Sync> PassthroughFs<D, S> {
             dir_file.as_raw_fd(),
             name,
             &self.mount_fds,
-            |fd, flags, mode| Self::open_proc_file(&self.proc, fd, flags, mode),
+            |fd, flags, mode| Self::open_proc_file(&self.proc_self_fd, fd, flags, mode),
         )?;
 
         // Whether to enable file DAX according to the value of dax_file_size
