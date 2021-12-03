@@ -397,7 +397,7 @@ impl<D: AsyncDrive + Sync, S: BitmapSlice + Send + Sync> AsyncFileSystem<D, S>
                     InodeMap::insert_locked(
                         inodes.deref_mut(),
                         inode,
-                        InodeData::new(inode, file_or_handle, 1, ids_altkey),
+                        InodeData::new(inode, file_or_handle, 1, ids_altkey, st.get_stat().st_mode),
                         ids_altkey,
                         handle_altkey,
                     );
