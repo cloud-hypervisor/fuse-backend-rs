@@ -52,7 +52,7 @@ impl<D: AsyncDrive, S: BitmapSlice + Send + Sync> PassthroughFs<D, S> {
         let data = self.inode_map.get(inode)?;
         let file = data.get_file(&self.mount_fds)?;
 
-        Self::open_proc_file(&self.proc, file.as_raw_fd(), flags, data.mode)
+        Self::open_proc_file(&self.proc_self_fd, file.as_raw_fd(), flags, data.mode)
     }
 
     fn do_readdir(
@@ -727,7 +727,7 @@ impl<D: AsyncDrive, S: BitmapSlice + Send + Sync> FileSystem<S> for PassthroughF
 
         let file = inode_data.get_file(&self.mount_fds)?;
         let data = if self.no_open.load(Ordering::Relaxed) {
-            let pathname = CString::new(format!("self/fd/{}", file.as_raw_fd()))
+            let pathname = CString::new(format!("{}", file.as_raw_fd()))
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
             Data::ProcPath(pathname)
         } else {
@@ -737,7 +737,7 @@ impl<D: AsyncDrive, S: BitmapSlice + Send + Sync> FileSystem<S> for PassthroughF
                 let fd = hd.get_handle_raw_fd();
                 Data::Handle(hd, fd)
             } else {
-                let pathname = CString::new(format!("self/fd/{}", file.as_raw_fd()))
+                let pathname = CString::new(format!("{}", file.as_raw_fd()))
                     .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
                 Data::ProcPath(pathname)
             }
@@ -749,7 +749,7 @@ impl<D: AsyncDrive, S: BitmapSlice + Send + Sync> FileSystem<S> for PassthroughF
                 match data {
                     Data::Handle(_, fd) => libc::fchmod(fd, attr.st_mode),
                     Data::ProcPath(ref p) => {
-                        libc::fchmodat(self.proc.as_raw_fd(), p.as_ptr(), attr.st_mode, 0)
+                        libc::fchmodat(self.proc_self_fd.as_raw_fd(), p.as_ptr(), attr.st_mode, 0)
                     }
                 }
             };
@@ -844,7 +844,7 @@ impl<D: AsyncDrive, S: BitmapSlice + Send + Sync> FileSystem<S> for PassthroughF
             let res = match data {
                 Data::Handle(_, fd) => unsafe { libc::futimens(fd, tvs.as_ptr()) },
                 Data::ProcPath(ref p) => unsafe {
-                    libc::utimensat(self.proc.as_raw_fd(), p.as_ptr(), tvs.as_ptr(), 0)
+                    libc::utimensat(self.proc_self_fd.as_raw_fd(), p.as_ptr(), tvs.as_ptr(), 0)
                 },
             };
             if res < 0 {

@@ -44,8 +44,8 @@ pub const CURRENT_DIR_CSTR: &[u8] = b".\0";
 pub const PARENT_DIR_CSTR: &[u8] = b"..\0";
 /// Emptry CSTR
 pub const EMPTY_CSTR: &[u8] = b"\0";
-/// Proc
-pub const PROC_CSTR: &[u8] = b"/proc\0";
+/// Proc fd directory
+pub const PROC_SELF_FD_CSTR: &[u8] = b"/proc/self/fd\0";
 /// ASCII for slash('/')
 pub const SLASH_ASCII: u8 = 47;
 

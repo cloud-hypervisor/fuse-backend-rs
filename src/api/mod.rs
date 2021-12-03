@@ -19,7 +19,7 @@ mod pseudo_fs;
 pub mod vfs;
 pub use vfs::{
     validate_path_component, BackFileSystem, BackendFileSystem, Vfs, VfsIndex, VfsOptions,
-    CURRENT_DIR_CSTR, EMPTY_CSTR, PARENT_DIR_CSTR, PROC_CSTR, SLASH_ASCII, VFS_MAX_INO,
+    CURRENT_DIR_CSTR, EMPTY_CSTR, PARENT_DIR_CSTR, PROC_SELF_FD_CSTR, SLASH_ASCII, VFS_MAX_INO,
 };
 
 pub mod filesystem;
