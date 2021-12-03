@@ -306,6 +306,11 @@ impl<D: AsyncDrive + Sync, S: BitmapSlice + Send + Sync> AsyncFileSystem<D, S>
         parent: <Self as FileSystem<S>>::Inode,
         name: &CStr,
     ) -> io::Result<Entry> {
+        // Don't use is_safe_path_component(), allow "." and ".." for NFS export support
+        if name.to_bytes_with_nul().contains(&SLICE_ASCII) {
+            return Err(io::Error::from_raw_os_error(libc::EINVAL));
+        }
+
         let dir = self.inode_map.get(parent)?;
         let dir_file = dir.async_get_file(&self.mount_fds).await?;
         let (file_or_handle, st, ids_altkey, handle_altkey) = self
@@ -588,6 +593,8 @@ impl<D: AsyncDrive + Sync, S: BitmapSlice + Send + Sync> AsyncFileSystem<D, S>
         name: &CStr,
         args: CreateIn,
     ) -> io::Result<(Entry, Option<<Self as FileSystem<S>>::Handle>, OpenOptions)> {
+        validate_path_component(name)?;
+
         let dir = self.inode_map.get(parent)?;
         let dir_file = dir.async_get_file(&self.mount_fds).await?;
 

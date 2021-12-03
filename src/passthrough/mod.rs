@@ -47,6 +47,7 @@ const CURRENT_DIR_CSTR: &[u8] = b".\0";
 const PARENT_DIR_CSTR: &[u8] = b"..\0";
 const EMPTY_CSTR: &[u8] = b"\0";
 const PROC_CSTR: &[u8] = b"/proc\0";
+const SLICE_ASCII: u8 = 47;
 
 type Inode = u64;
 type Handle = u64;
@@ -1015,6 +1016,30 @@ fn ebadf() -> io::Error {
     io::Error::from_raw_os_error(libc::EBADF)
 }
 
+#[inline]
+fn is_dot_or_dotdot(name: &CStr) -> bool {
+    let bytes = name.to_bytes_with_nul();
+    bytes.starts_with(CURRENT_DIR_CSTR) || bytes.starts_with(PARENT_DIR_CSTR)
+}
+
+// Is `path` a single path component that is not "." or ".."?
+fn is_safe_path_component(name: &CStr) -> bool {
+    let bytes = name.to_bytes_with_nul();
+
+    if bytes.contains(&SLICE_ASCII) {
+        return false;
+    }
+    !is_dot_or_dotdot(name)
+}
+
+#[inline]
+fn validate_path_component(name: &CStr) -> io::Result<()> {
+    match is_safe_path_component(name) {
+        true => Ok(()),
+        false => Err(io::Error::from_raw_os_error(libc::EINVAL)),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1096,11 +1121,27 @@ mod tests {
         let ctx = Context::default();
 
         // read a few files to inode map.
-        let parent = CString::new(parent_path.as_path().to_str().expect("path to string")).unwrap();
+        let parent = CString::new(
+            parent_path
+                .as_path()
+                .file_name()
+                .unwrap()
+                .to_str()
+                .expect("path to string"),
+        )
+        .unwrap();
         let p_entry = fs.lookup(&ctx, ROOT_ID, &parent).unwrap();
         let p_inode = p_entry.inode;
 
-        let child = CString::new(child_path.as_path().to_str().expect("path to string")).unwrap();
+        let child = CString::new(
+            child_path
+                .as_path()
+                .file_name()
+                .unwrap()
+                .to_str()
+                .expect("path to string"),
+        )
+        .unwrap();
         let c_entry = fs.lookup(&ctx, p_inode, &child).unwrap();
 
         // Following test depends on host fs, it's not reliable.
@@ -1111,5 +1152,68 @@ mod tests {
         assert_eq!(duration, fs.cfg.attr_timeout);
 
         fs.destroy();
+    }
+
+    #[test]
+    fn test_is_safe_path_component() {
+        let name = CStr::from_bytes_with_nul(b"normal\0").unwrap();
+        assert!(is_safe_path_component(name), "\"{:?}\"", name);
+
+        let name = CStr::from_bytes_with_nul(b".a\0").unwrap();
+        assert!(is_safe_path_component(name));
+
+        let name = CStr::from_bytes_with_nul(b"a.a\0").unwrap();
+        assert!(is_safe_path_component(name));
+
+        let name = CStr::from_bytes_with_nul(b"a.a\0").unwrap();
+        assert!(is_safe_path_component(name));
+
+        let name = CStr::from_bytes_with_nul(b"/\0").unwrap();
+        assert!(!is_safe_path_component(name));
+
+        let name = CStr::from_bytes_with_nul(b"/a\0").unwrap();
+        assert!(!is_safe_path_component(name));
+
+        let name = CStr::from_bytes_with_nul(b".\0").unwrap();
+        assert!(!is_safe_path_component(name));
+
+        let name = CStr::from_bytes_with_nul(b"..\0").unwrap();
+        assert!(!is_safe_path_component(name));
+
+        let name = CStr::from_bytes_with_nul(b"../.\0").unwrap();
+        assert!(!is_safe_path_component(name));
+
+        let name = CStr::from_bytes_with_nul(b"a/b\0").unwrap();
+        assert!(!is_safe_path_component(name));
+
+        let name = CStr::from_bytes_with_nul(b"./../a\0").unwrap();
+        assert!(!is_safe_path_component(name));
+    }
+
+    #[test]
+    fn test_is_dot_or_dotdot() {
+        let name = CStr::from_bytes_with_nul(b"..\0").unwrap();
+        assert!(is_dot_or_dotdot(name));
+
+        let name = CStr::from_bytes_with_nul(b".\0").unwrap();
+        assert!(is_dot_or_dotdot(name));
+
+        let name = CStr::from_bytes_with_nul(b"...\0").unwrap();
+        assert!(!is_dot_or_dotdot(name));
+
+        let name = CStr::from_bytes_with_nul(b"./.\0").unwrap();
+        assert!(!is_dot_or_dotdot(name));
+
+        let name = CStr::from_bytes_with_nul(b"a\0").unwrap();
+        assert!(!is_dot_or_dotdot(name));
+
+        let name = CStr::from_bytes_with_nul(b"aa\0").unwrap();
+        assert!(!is_dot_or_dotdot(name));
+
+        let name = CStr::from_bytes_with_nul(b"/a\0").unwrap();
+        assert!(!is_dot_or_dotdot(name));
+
+        let name = CStr::from_bytes_with_nul(b"a/\0").unwrap();
+        assert!(!is_dot_or_dotdot(name));
     }
 }
