@@ -125,15 +125,18 @@ struct InodeData {
     #[allow(dead_code)]
     altkey: InodeAltKey,
     refcount: AtomicU64,
+    // File type and mode, not used for now
+    _mode: u32,
 }
 
 impl<'a> InodeData {
-    fn new(inode: Inode, f: FileOrHandle, refcount: u64, altkey: InodeAltKey) -> Self {
+    fn new(inode: Inode, f: FileOrHandle, refcount: u64, altkey: InodeAltKey, mode: u32) -> Self {
         InodeData {
             inode,
             file_or_handle: f,
             altkey,
             refcount: AtomicU64::new(refcount),
+            _mode: mode,
         }
     }
 
@@ -576,7 +579,7 @@ impl<D: AsyncDrive, S: BitmapSlice + Send + Sync> PassthroughFs<D, S> {
     pub fn import(&self) -> io::Result<()> {
         let root = CString::new(self.cfg.root_dir.as_str()).expect("CString::new failed");
 
-        let (file_or_handle, _st, ids_altkey, handle_altkey) = Self::open_file_or_handle(
+        let (file_or_handle, st, ids_altkey, handle_altkey) = Self::open_file_or_handle(
             self.cfg.inode_file_handles,
             libc::AT_FDCWD,
             &root,
@@ -600,7 +603,13 @@ impl<D: AsyncDrive, S: BitmapSlice + Send + Sync> PassthroughFs<D, S> {
         // Not sure why the root inode gets a refcount of 2 but that's what libfuse does.
         self.inode_map.insert(
             fuse::ROOT_ID,
-            InodeData::new(fuse::ROOT_ID, file_or_handle, 2, ids_altkey),
+            InodeData::new(
+                fuse::ROOT_ID,
+                file_or_handle,
+                2,
+                ids_altkey,
+                st.get_stat().st_mode,
+            ),
             ids_altkey,
             handle_altkey,
         );
@@ -854,7 +863,7 @@ impl<D: AsyncDrive, S: BitmapSlice + Send + Sync> PassthroughFs<D, S> {
                     InodeMap::insert_locked(
                         inodes.deref_mut(),
                         inode,
-                        InodeData::new(inode, file_or_handle, 1, ids_altkey),
+                        InodeData::new(inode, file_or_handle, 1, ids_altkey, st.get_stat().st_mode),
                         ids_altkey,
                         handle_altkey,
                     );
