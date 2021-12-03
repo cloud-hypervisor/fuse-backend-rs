@@ -760,6 +760,14 @@ impl<D: AsyncDrive, S: BitmapSlice + Send + Sync> PassthroughFs<D, S> {
     }
 
     fn do_lookup(&self, parent: Inode, name: &CStr) -> io::Result<Entry> {
+        let name =
+            if parent == fuse::ROOT_ID && name.to_bytes_with_nul().starts_with(PARENT_DIR_CSTR) {
+                // Safe as this is a constant value and a valid C string.
+                &CStr::from_bytes_with_nul(CURRENT_DIR_CSTR).unwrap()
+            } else {
+                name
+            };
+
         let dir = self.inode_map.get(parent)?;
         let dir_file = dir.get_file(&self.mount_fds)?;
         let (file_or_handle, st, ids_altkey, handle_altkey) = Self::open_file_or_handle(
@@ -1050,6 +1058,31 @@ mod tests {
     use std::ops::Deref;
     use vmm_sys_util::{tempdir::TempDir, tempfile::TempFile};
 
+    fn prepare_passthroughfs() -> PassthroughFs {
+        let source = TempDir::new().expect("Cannot create temporary directory.");
+        let parent_path =
+            TempDir::new_in(source.as_path()).expect("Cannot create temporary directory.");
+        let _child_path =
+            TempFile::new_in(parent_path.as_path()).expect("Cannot create temporary file.");
+
+        let fs_cfg = Config {
+            writeback: true,
+            do_import: true,
+            no_open: true,
+            inode_file_handles: false,
+            root_dir: source
+                .as_path()
+                .to_str()
+                .expect("source path to string")
+                .to_string(),
+            ..Default::default()
+        };
+        let fs = PassthroughFs::<AsyncDriver, ()>::new(fs_cfg).unwrap();
+        fs.import().unwrap();
+
+        fs
+    }
+
     fn passthroughfs_no_open(cfg: bool) {
         let opts = VfsOptions {
             no_open: cfg,
@@ -1215,5 +1248,15 @@ mod tests {
 
         let name = CStr::from_bytes_with_nul(b"a/\0").unwrap();
         assert!(!is_dot_or_dotdot(name));
+    }
+
+    #[test]
+    fn test_lookup_escape_root() {
+        let fs = prepare_passthroughfs();
+        let ctx = Context::default();
+
+        let name = CString::new("..").unwrap();
+        let entry = fs.lookup(&ctx, ROOT_ID, &name).unwrap();
+        assert_eq!(entry.inode, ROOT_ID);
     }
 }
