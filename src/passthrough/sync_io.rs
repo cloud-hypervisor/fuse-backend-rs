@@ -52,7 +52,7 @@ impl<D: AsyncDrive, S: BitmapSlice + Send + Sync> PassthroughFs<D, S> {
         let data = self.inode_map.get(inode)?;
         let file = data.get_file(&self.mount_fds)?;
 
-        Self::open_proc_file(&self.proc, file.as_raw_fd(), flags)
+        Self::open_proc_file(&self.proc, file.as_raw_fd(), flags, data.mode)
     }
 
     fn do_readdir(
@@ -563,11 +563,12 @@ impl<D: AsyncDrive, S: BitmapSlice + Send + Sync> FileSystem<S> for PassthroughF
             )?
         };
 
-        // Safe because this doesn't modify any memory and we check the return value. We don't
-        // really check `flags` because if the kernel can't handle poorly specified flags then we
-        // have much bigger problems.
+        let entry = self.do_lookup(parent, name)?;
         let file = match new_file {
+            // File didn't exist, now created by create_file_excl()
             Some(f) => f,
+            // File exists, and args.flags doesn't contain O_EXCL. Now let's open it with
+            // open_inode().
             None => {
                 // Cap restored when _killpriv is dropped
                 let _killpriv = if self.killpriv_v2.load(Ordering::Relaxed)
@@ -579,17 +580,9 @@ impl<D: AsyncDrive, S: BitmapSlice + Send + Sync> FileSystem<S> for PassthroughF
                 };
 
                 let (_uid, _gid) = set_creds(ctx.uid, ctx.gid)?;
-
-                Self::open_file(
-                    dir_file.as_raw_fd(),
-                    name,
-                    args.flags as i32 | libc::O_CREAT | libc::O_CLOEXEC | libc::O_NOFOLLOW,
-                    args.mode & !(args.umask & 0o777),
-                )?
+                self.open_inode(entry.inode, args.flags as i32)?
             }
         };
-
-        let entry = self.do_lookup(parent, name)?;
 
         let ret_handle = if !self.no_open.load(Ordering::Relaxed) {
             let handle = self.next_handle.fetch_add(1, Ordering::Relaxed);
