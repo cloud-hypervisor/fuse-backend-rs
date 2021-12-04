@@ -148,7 +148,7 @@ impl FileHandle {
         reopen_dir: F,
     ) -> io::Result<Self>
     where
-        F: FnOnce(RawFd, libc::c_int) -> io::Result<File>,
+        F: FnOnce(RawFd, libc::c_int, u32) -> io::Result<File>,
     {
         let handle = Self::from_name_at(dir_fd, path).map_err(|e| {
             error!("from_name_at failed error {:?}", e);
@@ -221,7 +221,7 @@ impl MountFds {
         reopen_dir: F,
     ) -> io::Result<()>
     where
-        F: FnOnce(RawFd, libc::c_int) -> io::Result<File>,
+        F: FnOnce(RawFd, libc::c_int, u32) -> io::Result<File>,
     {
         if self.map.read().unwrap().contains_key(&mnt_id) {
             return Ok(());
@@ -270,7 +270,11 @@ impl MountFds {
             return Err(io::Error::from_raw_os_error(libc::EIO));
         }
 
-        let file = reopen_dir(path_fd, libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC)?;
+        let file = reopen_dir(
+            path_fd,
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            st.st_mode,
+        )?;
         self.map.write().unwrap().insert(mnt_id, file);
 
         Ok(())

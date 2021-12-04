@@ -126,7 +126,14 @@ struct InodeData {
     altkey: InodeAltKey,
     refcount: AtomicU64,
     // File type and mode, not used for now
-    _mode: u32,
+    mode: u32,
+}
+
+// Returns true if it's safe to open this inode without O_PATH.
+fn is_safe_inode(mode: u32) -> bool {
+    // Only regular files and directories are considered safe to be opened from the file
+    // server without O_PATH.
+    matches!(mode & libc::S_IFMT, libc::S_IFREG | libc::S_IFDIR)
 }
 
 impl<'a> InodeData {
@@ -136,7 +143,7 @@ impl<'a> InodeData {
             file_or_handle: f,
             altkey,
             refcount: AtomicU64::new(refcount),
-            _mode: mode,
+            mode,
         }
     }
 
@@ -584,7 +591,7 @@ impl<D: AsyncDrive, S: BitmapSlice + Send + Sync> PassthroughFs<D, S> {
             libc::AT_FDCWD,
             &root,
             &self.mount_fds,
-            |fd, flags| {
+            |fd, flags, _mode| {
                 let pathname = CString::new(format!("self/fd/{}", fd))
                     .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
                 Self::open_file(self.proc.as_raw_fd(), &pathname, flags, 0)
@@ -655,6 +662,9 @@ impl<D: AsyncDrive, S: BitmapSlice + Send + Sync> PassthroughFs<D, S> {
         flags: i32,
         mode: u32,
     ) -> io::Result<Option<File>> {
+        // Safe because this doesn't modify any memory and we check the return value. We don't
+        // really check `flags` because if the kernel can't handle poorly specified flags then we
+        // have much bigger problems.
         let fd = unsafe {
             libc::openat(
                 dfd,
@@ -664,12 +674,17 @@ impl<D: AsyncDrive, S: BitmapSlice + Send + Sync> PassthroughFs<D, S> {
             )
         };
         if fd < 0 {
+            // Ignore the error if the file exists and O_EXCL is not present in `flags`.
             let err = io::Error::last_os_error();
             if err.kind() == io::ErrorKind::AlreadyExists {
+                if (flags & libc::O_EXCL) != 0 {
+                    return Err(err);
+                }
                 return Ok(None);
             }
             return Err(err);
         }
+        // Safe because we just opened this fd
         Ok(Some(unsafe { File::from_raw_fd(fd) }))
     }
 
@@ -688,7 +703,11 @@ impl<D: AsyncDrive, S: BitmapSlice + Send + Sync> PassthroughFs<D, S> {
         Ok(unsafe { File::from_raw_fd(fd) })
     }
 
-    fn open_proc_file(proc: &File, fd: RawFd, flags: i32) -> io::Result<File> {
+    fn open_proc_file(proc: &File, fd: RawFd, flags: i32, mode: u32) -> io::Result<File> {
+        if !is_safe_inode(mode) {
+            return Err(ebadf());
+        }
+
         let pathname = CString::new(format!("self/fd/{}", fd))
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
 
@@ -712,7 +731,7 @@ impl<D: AsyncDrive, S: BitmapSlice + Send + Sync> PassthroughFs<D, S> {
         reopen_dir: F,
     ) -> io::Result<(FileOrHandle, InodeStat, InodeAltKey, Option<InodeAltKey>)>
     where
-        F: FnOnce(RawFd, libc::c_int) -> io::Result<File>,
+        F: FnOnce(RawFd, libc::c_int, u32) -> io::Result<File>,
     {
         let handle = if use_handle {
             FileHandle::from_name_at_with_mount_fds(dir_fd, name, mount_fds, reopen_dir)
@@ -781,7 +800,7 @@ impl<D: AsyncDrive, S: BitmapSlice + Send + Sync> PassthroughFs<D, S> {
             dir_file.as_raw_fd(),
             name,
             &self.mount_fds,
-            |fd, flags| Self::open_proc_file(&self.proc, fd, flags),
+            |fd, flags, mode| Self::open_proc_file(&self.proc, fd, flags, mode),
         )?;
 
         // Whether to enable file DAX according to the value of dax_file_size
@@ -1177,5 +1196,29 @@ mod tests {
         let name = CString::new("..").unwrap();
         let entry = fs.lookup(&ctx, ROOT_ID, &name).unwrap();
         assert_eq!(entry.inode, ROOT_ID);
+    }
+
+    #[test]
+    fn test_is_safe_inode() {
+        let mode = libc::S_IFREG;
+        assert!(is_safe_inode(mode));
+
+        let mode = libc::S_IFDIR;
+        assert!(is_safe_inode(mode));
+
+        let mode = libc::S_IFBLK;
+        assert!(!is_safe_inode(mode));
+
+        let mode = libc::S_IFCHR;
+        assert!(!is_safe_inode(mode));
+
+        let mode = libc::S_IFIFO;
+        assert!(!is_safe_inode(mode));
+
+        let mode = libc::S_IFLNK;
+        assert!(!is_safe_inode(mode));
+
+        let mode = libc::S_IFSOCK;
+        assert!(!is_safe_inode(mode));
     }
 }
