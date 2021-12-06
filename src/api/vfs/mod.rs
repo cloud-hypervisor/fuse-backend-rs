@@ -549,14 +549,7 @@ mod tests {
         type Inode = u64;
         type Handle = u64;
         fn lookup(&self, _: &Context, _: Self::Inode, _: &CStr) -> Result<Entry> {
-            Ok(Entry {
-                inode: 0,
-                generation: 0,
-                attr: Attr::default().into(),
-                attr_flags: 0,
-                attr_timeout: Duration::new(0, 0),
-                entry_timeout: Duration::new(0, 0),
-            })
+            Ok(Entry::default())
         }
     }
 
@@ -567,11 +560,7 @@ mod tests {
         fn lookup(&self, _: &Context, _: Self::Inode, _: &CStr) -> Result<Entry> {
             Ok(Entry {
                 inode: 1,
-                generation: 0,
-                attr: Attr::default().into(),
-                attr_flags: 0,
-                attr_timeout: Duration::new(0, 0),
-                entry_timeout: Duration::new(0, 0),
+                ..Default::default()
             })
         }
     }
@@ -654,13 +643,7 @@ mod tests {
                 parent: <Self as FileSystem>::Inode,
                 name: &CStr,
             ) -> Result<Entry> {
-                Ok(Entry {
-                    inode: 0,
-                    generation: 0,
-                    attr: unsafe { std::mem::zeroed() },
-                    attr_timeout: Default::default(),
-                    entry_timeout: Default::default(),
-                })
+                Ok(Entry::default())
             }
 
             async fn async_getattr(
@@ -771,10 +754,7 @@ mod tests {
                 Ok((
                     Entry {
                         inode: 1,
-                        generation: 0,
-                        attr: Attr::default().into(),
-                        attr_timeout: Duration::new(0, 0),
-                        entry_timeout: Duration::new(0, 0),
+                        ..Default::default()
                     },
                     0,
                 ))
@@ -905,10 +885,7 @@ mod tests {
                 Ok((
                     Entry {
                         inode: 1,
-                        generation: 0,
-                        attr: Attr::default().into(),
-                        attr_timeout: Duration::new(0, 0),
-                        entry_timeout: Duration::new(0, 0),
+                        ..Default::default()
                     },
                     0,
                 ))
@@ -925,11 +902,7 @@ mod tests {
             Ok((
                 Entry {
                     inode: 1,
-                    generation: 0,
-                    attr: Attr::default().into(),
-                    attr_flags: 0,
-                    attr_timeout: Duration::new(0, 0),
-                    entry_timeout: Duration::new(0, 0),
+                    ..Default::default()
                 },
                 0,
             ))
@@ -946,11 +919,7 @@ mod tests {
             Ok((
                 Entry {
                     inode: 1,
-                    generation: 0,
-                    attr: Attr::default().into(),
-                    attr_flags: 0,
-                    attr_timeout: Duration::new(0, 0),
-                    entry_timeout: Duration::new(0, 0),
+                    ..Default::default()
                 },
                 0,
             ))
