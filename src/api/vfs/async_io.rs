@@ -18,6 +18,11 @@ impl<D: AsyncDrive + Sync, S: BitmapSlice + Sync> AsyncFileSystem<D, S> for Vfs<
         parent: <Self as FileSystem<S>>::Inode,
         name: &CStr,
     ) -> Result<Entry> {
+        // Don't use is_safe_path_component(), allow "." and ".." for NFS export support
+        if name.to_bytes_with_nul().contains(&SLASH_ASCII) {
+            return Err(io::Error::from_raw_os_error(libc::EINVAL));
+        }
+
         match self.get_real_rootfs(parent)? {
             (Left(fs), idata) => self.lookup_pseudo(fs, idata, ctx, name),
             (Right(fs), idata) => {
@@ -86,6 +91,8 @@ impl<D: AsyncDrive + Sync, S: BitmapSlice + Sync> AsyncFileSystem<D, S> for Vfs<
         name: &CStr,
         args: CreateIn,
     ) -> Result<(Entry, Option<<Self as FileSystem<S>>::Handle>, OpenOptions)> {
+        validate_path_component(name)?;
+
         match self.get_real_rootfs(parent)? {
             (Left(fs), idata) => fs.create(ctx, idata.ino(), name, args),
             (Right(fs), idata) => {

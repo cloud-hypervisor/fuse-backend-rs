@@ -307,7 +307,7 @@ impl<D: AsyncDrive + Sync, S: BitmapSlice + Send + Sync> AsyncFileSystem<D, S>
         name: &CStr,
     ) -> io::Result<Entry> {
         // Don't use is_safe_path_component(), allow "." and ".." for NFS export support
-        if name.to_bytes_with_nul().contains(&SLICE_ASCII) {
+        if name.to_bytes_with_nul().contains(&SLASH_ASCII) {
             return Err(io::Error::from_raw_os_error(libc::EINVAL));
         }
 
