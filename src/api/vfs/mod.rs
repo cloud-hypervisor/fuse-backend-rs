@@ -18,6 +18,7 @@
 use std::any::Any;
 use std::collections::HashMap;
 use std::ffi::CStr;
+use std::io;
 use std::io::{Error, ErrorKind, Result};
 use std::marker::PhantomData;
 use std::ops::Deref;
@@ -36,6 +37,17 @@ use crate::BitmapSlice;
 #[cfg(feature = "async-io")]
 mod async_io;
 mod sync_io;
+
+/// Current directory
+pub const CURRENT_DIR_CSTR: &[u8] = b".\0";
+/// Parent directory
+pub const PARENT_DIR_CSTR: &[u8] = b"..\0";
+/// Emptry CSTR
+pub const EMPTY_CSTR: &[u8] = b"\0";
+/// Proc
+pub const PROC_CSTR: &[u8] = b"/proc\0";
+/// ASCII for slash('/')
+pub const SLASH_ASCII: u8 = 47;
 
 /// Maximum inode number supported by the VFS for backend file system
 pub const VFS_MAX_INO: u64 = 0xff_ffff_ffff_ffff;
@@ -82,6 +94,33 @@ pub enum VfsError {
 
 /// Vfs result
 pub type VfsResult<T> = std::result::Result<T, VfsError>;
+
+#[inline]
+fn is_dot_or_dotdot(name: &CStr) -> bool {
+    let bytes = name.to_bytes_with_nul();
+    bytes.starts_with(CURRENT_DIR_CSTR) || bytes.starts_with(PARENT_DIR_CSTR)
+}
+
+// Is `path` a single path component that is not "." or ".."?
+fn is_safe_path_component(name: &CStr) -> bool {
+    let bytes = name.to_bytes_with_nul();
+
+    if bytes.contains(&SLASH_ASCII) {
+        return false;
+    }
+    !is_dot_or_dotdot(name)
+}
+
+/// Validate a path component. A well behaved FUSE client should never send dot, dotdot and path
+/// components containing slash ('/'). The only exception is that LOOKUP might contain dot and
+/// dotdot to support NFS export.
+#[inline]
+pub fn validate_path_component(name: &CStr) -> io::Result<()> {
+    match is_safe_path_component(name) {
+        true => Ok(()),
+        false => Err(io::Error::from_raw_os_error(libc::EINVAL)),
+    }
+}
 
 impl VfsInode {
     fn new(fs_idx: VfsIndex, ino: u64) -> Self {
@@ -535,6 +574,69 @@ mod tests {
                 entry_timeout: Duration::new(0, 0),
             })
         }
+    }
+
+    #[test]
+    fn test_is_safe_path_component() {
+        let name = CStr::from_bytes_with_nul(b"normal\0").unwrap();
+        assert!(is_safe_path_component(name), "\"{:?}\"", name);
+
+        let name = CStr::from_bytes_with_nul(b".a\0").unwrap();
+        assert!(is_safe_path_component(name));
+
+        let name = CStr::from_bytes_with_nul(b"a.a\0").unwrap();
+        assert!(is_safe_path_component(name));
+
+        let name = CStr::from_bytes_with_nul(b"a.a\0").unwrap();
+        assert!(is_safe_path_component(name));
+
+        let name = CStr::from_bytes_with_nul(b"/\0").unwrap();
+        assert!(!is_safe_path_component(name));
+
+        let name = CStr::from_bytes_with_nul(b"/a\0").unwrap();
+        assert!(!is_safe_path_component(name));
+
+        let name = CStr::from_bytes_with_nul(b".\0").unwrap();
+        assert!(!is_safe_path_component(name));
+
+        let name = CStr::from_bytes_with_nul(b"..\0").unwrap();
+        assert!(!is_safe_path_component(name));
+
+        let name = CStr::from_bytes_with_nul(b"../.\0").unwrap();
+        assert!(!is_safe_path_component(name));
+
+        let name = CStr::from_bytes_with_nul(b"a/b\0").unwrap();
+        assert!(!is_safe_path_component(name));
+
+        let name = CStr::from_bytes_with_nul(b"./../a\0").unwrap();
+        assert!(!is_safe_path_component(name));
+    }
+
+    #[test]
+    fn test_is_dot_or_dotdot() {
+        let name = CStr::from_bytes_with_nul(b"..\0").unwrap();
+        assert!(is_dot_or_dotdot(name));
+
+        let name = CStr::from_bytes_with_nul(b".\0").unwrap();
+        assert!(is_dot_or_dotdot(name));
+
+        let name = CStr::from_bytes_with_nul(b"...\0").unwrap();
+        assert!(!is_dot_or_dotdot(name));
+
+        let name = CStr::from_bytes_with_nul(b"./.\0").unwrap();
+        assert!(!is_dot_or_dotdot(name));
+
+        let name = CStr::from_bytes_with_nul(b"a\0").unwrap();
+        assert!(!is_dot_or_dotdot(name));
+
+        let name = CStr::from_bytes_with_nul(b"aa\0").unwrap();
+        assert!(!is_dot_or_dotdot(name));
+
+        let name = CStr::from_bytes_with_nul(b"/a\0").unwrap();
+        assert!(!is_dot_or_dotdot(name));
+
+        let name = CStr::from_bytes_with_nul(b"a/\0").unwrap();
+        assert!(!is_dot_or_dotdot(name));
     }
 
     #[cfg(feature = "async-io")]
