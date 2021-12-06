@@ -432,9 +432,7 @@ mod tests {
             inode: 1,
             generation: 2,
             attr: attr.into(),
-            attr_flags: 0,
-            attr_timeout: Default::default(),
-            entry_timeout: Default::default(),
+            ..Default::default()
         };
         let fuse_entry: fuse::EntryOut = entry.into();
 
