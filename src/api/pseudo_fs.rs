@@ -12,7 +12,6 @@
 use std::collections::HashMap;
 use std::ffi::CStr;
 use std::io::{Error, Result};
-use std::marker::PhantomData;
 use std::ops::Deref;
 use std::path::{Component, Path};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -23,7 +22,6 @@ use arc_swap::ArcSwap;
 
 use crate::abi::linux_abi::Attr;
 use crate::api::filesystem::*;
-use crate::BitmapSlice;
 
 // ID 0 is reserved for invalid entry, and ID 1 is used for ROOT_ID.
 const PSEUDOFS_NEXT_INODE: u64 = 2;
@@ -72,15 +70,14 @@ impl PseudoInode {
     }
 }
 
-pub struct PseudoFs<S: BitmapSlice = ()> {
+pub struct PseudoFs {
     next_inode: AtomicU64,
     root_inode: Arc<PseudoInode>,
     inodes: ArcSwap<HashMap<u64, Arc<PseudoInode>>>,
     lock: Mutex<()>, // Write protect PseudoFs.inodes and PseudoInode.children
-    phantom: PhantomData<S>,
 }
 
-impl<S: BitmapSlice> PseudoFs<S> {
+impl PseudoFs {
     pub fn new() -> Self {
         let root_inode = Arc::new(PseudoInode::new(ROOT_ID, ROOT_ID, String::from("/")));
         let fs = PseudoFs {
@@ -88,7 +85,6 @@ impl<S: BitmapSlice> PseudoFs<S> {
             root_inode: root_inode.clone(),
             inodes: ArcSwap::new(Arc::new(HashMap::new())),
             lock: Mutex::new(()),
-            phantom: PhantomData,
         };
 
         // Create the root inode. We have just created the lock, so it should be safe to unwrap().
@@ -320,7 +316,7 @@ impl<S: BitmapSlice> PseudoFs<S> {
     }
 }
 
-impl<S: BitmapSlice> FileSystem<S> for PseudoFs<S> {
+impl FileSystem for PseudoFs {
     type Inode = Inode;
     type Handle = Handle;
 
@@ -409,7 +405,7 @@ mod tests {
 
     #[test]
     fn test_pseudofs_new() {
-        let fs = PseudoFs::<()>::new();
+        let fs = PseudoFs::new();
 
         assert_eq!(fs.next_inode.load(Ordering::Relaxed), 2);
         assert_eq!(fs.root_inode.ino, ROOT_ID);
@@ -419,7 +415,7 @@ mod tests {
 
     #[test]
     fn test_pseudofs_mount() {
-        let fs = PseudoFs::<()>::new();
+        let fs = PseudoFs::new();
 
         assert_eq!(
             fs.mount("test").unwrap_err().raw_os_error().unwrap(),
@@ -447,7 +443,7 @@ mod tests {
 
     #[test]
     fn test_pseudofs_lookup() {
-        let fs = PseudoFs::<()>::new();
+        let fs = PseudoFs::new();
         let a1 = fs.mount("/a").unwrap();
         let b1 = fs.mount("/a/b").unwrap();
         let c1 = fs.mount("/a/b/c").unwrap();
@@ -519,7 +515,7 @@ mod tests {
 
     #[test]
     fn test_pseudofs_getattr() {
-        let fs = PseudoFs::<()>::new();
+        let fs = PseudoFs::new();
         let a1 = fs.mount("/a").unwrap();
 
         fs.getattr(&create_fuse_context(), ROOT_ID, None).unwrap();
@@ -532,7 +528,7 @@ mod tests {
 
     #[test]
     fn test_pseudofs_readdir() {
-        let fs = PseudoFs::<()>::new();
+        let fs = PseudoFs::new();
         let _ = fs.mount("/a").unwrap();
         let _ = fs.mount("/b").unwrap();
 
@@ -555,7 +551,7 @@ mod tests {
 
     #[test]
     fn test_pseudofs_readdir_plus() {
-        let fs = PseudoFs::<()>::new();
+        let fs = PseudoFs::new();
         let _ = fs.mount("/a").unwrap();
         let _ = fs.mount("/b").unwrap();
 
@@ -578,7 +574,7 @@ mod tests {
 
     #[test]
     fn test_pseudofs_access() {
-        let fs = PseudoFs::<()>::new();
+        let fs = PseudoFs::new();
         let a1 = fs.mount("/a").unwrap();
         let ctx = create_fuse_context();
 

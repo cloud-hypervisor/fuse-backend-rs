@@ -8,14 +8,13 @@ use async_trait::async_trait;
 use super::*;
 use crate::api::CreateIn;
 use crate::async_util::AsyncDrive;
-use crate::BitmapSlice;
 
 #[async_trait]
-impl<D: AsyncDrive + Sync, S: BitmapSlice + Sync> AsyncFileSystem<D, S> for Vfs<D, S> {
+impl<D: AsyncDrive + Sync> AsyncFileSystem<D> for Vfs<D> {
     async fn async_lookup(
         &self,
         ctx: &Context,
-        parent: <Self as FileSystem<S>>::Inode,
+        parent: <Self as FileSystem>::Inode,
         name: &CStr,
     ) -> Result<Entry> {
         // Don't use is_safe_path_component(), allow "." and ".." for NFS export support
@@ -38,8 +37,8 @@ impl<D: AsyncDrive + Sync, S: BitmapSlice + Sync> AsyncFileSystem<D, S> for Vfs<
     async fn async_getattr(
         &self,
         ctx: &Context,
-        inode: <Self as FileSystem<S>>::Inode,
-        handle: Option<<Self as FileSystem<S>>::Handle>,
+        inode: <Self as FileSystem>::Inode,
+        handle: Option<<Self as FileSystem>::Handle>,
     ) -> Result<(libc::stat64, Duration)> {
         match self.get_real_rootfs(inode)? {
             (Left(fs), idata) => fs.getattr(ctx, idata.ino(), handle),
@@ -50,9 +49,9 @@ impl<D: AsyncDrive + Sync, S: BitmapSlice + Sync> AsyncFileSystem<D, S> for Vfs<
     async fn async_setattr(
         &self,
         ctx: &Context,
-        inode: <Self as FileSystem<S>>::Inode,
+        inode: <Self as FileSystem>::Inode,
         attr: libc::stat64,
-        handle: Option<<Self as FileSystem<S>>::Handle>,
+        handle: Option<<Self as FileSystem>::Handle>,
         valid: SetattrValid,
     ) -> Result<(libc::stat64, Duration)> {
         match self.get_real_rootfs(inode)? {
@@ -67,10 +66,10 @@ impl<D: AsyncDrive + Sync, S: BitmapSlice + Sync> AsyncFileSystem<D, S> for Vfs<
     async fn async_open(
         &self,
         ctx: &Context,
-        inode: <Self as FileSystem<S>>::Inode,
+        inode: <Self as FileSystem>::Inode,
         flags: u32,
         fuse_flags: u32,
-    ) -> Result<(Option<<Self as FileSystem<S>>::Handle>, OpenOptions)> {
+    ) -> Result<(Option<<Self as FileSystem>::Handle>, OpenOptions)> {
         if self.opts.load().no_open {
             Err(Error::from_raw_os_error(libc::ENOSYS))
         } else {
@@ -87,10 +86,10 @@ impl<D: AsyncDrive + Sync, S: BitmapSlice + Sync> AsyncFileSystem<D, S> for Vfs<
     async fn async_create(
         &self,
         ctx: &Context,
-        parent: <Self as FileSystem<S>>::Inode,
+        parent: <Self as FileSystem>::Inode,
         name: &CStr,
         args: CreateIn,
-    ) -> Result<(Entry, Option<<Self as FileSystem<S>>::Handle>, OpenOptions)> {
+    ) -> Result<(Entry, Option<<Self as FileSystem>::Handle>, OpenOptions)> {
         validate_path_component(name)?;
 
         match self.get_real_rootfs(parent)? {
@@ -110,9 +109,9 @@ impl<D: AsyncDrive + Sync, S: BitmapSlice + Sync> AsyncFileSystem<D, S> for Vfs<
     async fn async_read(
         &self,
         ctx: &Context,
-        inode: <Self as FileSystem<S>>::Inode,
-        handle: <Self as FileSystem<S>>::Handle,
-        w: &mut (dyn AsyncZeroCopyWriter<D, S> + Send),
+        inode: <Self as FileSystem>::Inode,
+        handle: <Self as FileSystem>::Handle,
+        w: &mut (dyn AsyncZeroCopyWriter<D> + Send),
         size: u32,
         offset: u64,
         lock_owner: Option<u64>,
@@ -131,9 +130,9 @@ impl<D: AsyncDrive + Sync, S: BitmapSlice + Sync> AsyncFileSystem<D, S> for Vfs<
     async fn async_write(
         &self,
         ctx: &Context,
-        inode: <Self as FileSystem<S>>::Inode,
-        handle: <Self as FileSystem<S>>::Handle,
-        r: &mut (dyn AsyncZeroCopyReader<D, S> + Send),
+        inode: <Self as FileSystem>::Inode,
+        handle: <Self as FileSystem>::Handle,
+        r: &mut (dyn AsyncZeroCopyReader<D> + Send),
         size: u32,
         offset: u64,
         lock_owner: Option<u64>,
@@ -164,9 +163,9 @@ impl<D: AsyncDrive + Sync, S: BitmapSlice + Sync> AsyncFileSystem<D, S> for Vfs<
     async fn async_fsync(
         &self,
         ctx: &Context,
-        inode: <Self as FileSystem<S>>::Inode,
+        inode: <Self as FileSystem>::Inode,
         datasync: bool,
-        handle: <Self as FileSystem<S>>::Handle,
+        handle: <Self as FileSystem>::Handle,
     ) -> Result<()> {
         match self.get_real_rootfs(inode)? {
             (Left(fs), idata) => fs.fsync(ctx, idata.ino(), datasync, handle),
@@ -177,8 +176,8 @@ impl<D: AsyncDrive + Sync, S: BitmapSlice + Sync> AsyncFileSystem<D, S> for Vfs<
     async fn async_fallocate(
         &self,
         ctx: &Context,
-        inode: <Self as FileSystem<S>>::Inode,
-        handle: <Self as FileSystem<S>>::Handle,
+        inode: <Self as FileSystem>::Inode,
+        handle: <Self as FileSystem>::Handle,
         mode: u32,
         offset: u64,
         length: u64,
@@ -195,9 +194,9 @@ impl<D: AsyncDrive + Sync, S: BitmapSlice + Sync> AsyncFileSystem<D, S> for Vfs<
     async fn async_fsyncdir(
         &self,
         ctx: &Context,
-        inode: <Self as FileSystem<S>>::Inode,
+        inode: <Self as FileSystem>::Inode,
         datasync: bool,
-        handle: <Self as FileSystem<S>>::Handle,
+        handle: <Self as FileSystem>::Handle,
     ) -> Result<()> {
         match self.get_real_rootfs(inode)? {
             (Left(fs), idata) => fs.fsyncdir(ctx, idata.ino(), datasync, handle),

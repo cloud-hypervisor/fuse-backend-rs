@@ -11,8 +11,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use super::{
-    BitmapSlice, Context, DirEntry, Entry, GetxattrReply, ListxattrReply, ZeroCopyReader,
-    ZeroCopyWriter,
+    Context, DirEntry, Entry, GetxattrReply, ListxattrReply, ZeroCopyReader, ZeroCopyWriter,
 };
 use crate::abi::linux_abi::{CreateIn, FsOptions, OpenOptions, SetattrValid};
 #[cfg(feature = "virtiofs")]
@@ -22,7 +21,7 @@ use crate::transport::virtiofs::FsCacheReqHandler;
 
 /// The main trait that connects a file system with a transport.
 #[allow(unused_variables)]
-pub trait FileSystem<S: BitmapSlice = ()> {
+pub trait FileSystem {
     /// Represents a location in the filesystem tree and can be used to perform operations that act
     /// on the metadata of a file/directory (e.g., `getattr` and `setattr`). Can also be used as the
     /// starting point for looking up paths in the filesystem tree. An `Inode` may support operating
@@ -363,7 +362,7 @@ pub trait FileSystem<S: BitmapSlice = ()> {
         ctx: &Context,
         inode: Self::Inode,
         handle: Self::Handle,
-        w: &mut dyn ZeroCopyWriter<S = S>,
+        w: &mut dyn ZeroCopyWriter,
         size: u32,
         offset: u64,
         lock_owner: Option<u64>,
@@ -397,7 +396,7 @@ pub trait FileSystem<S: BitmapSlice = ()> {
         ctx: &Context,
         inode: Self::Inode,
         handle: Self::Handle,
-        r: &mut dyn ZeroCopyReader<S = S>,
+        r: &mut dyn ZeroCopyReader,
         size: u32,
         offset: u64,
         lock_owner: Option<u64>,
@@ -848,7 +847,7 @@ pub trait FileSystem<S: BitmapSlice = ()> {
     }
 }
 
-impl<FS: FileSystem<S>, S: BitmapSlice> FileSystem<S> for Arc<FS> {
+impl<FS: FileSystem> FileSystem for Arc<FS> {
     type Inode = FS::Inode;
     type Handle = FS::Handle;
 
@@ -985,7 +984,7 @@ impl<FS: FileSystem<S>, S: BitmapSlice> FileSystem<S> for Arc<FS> {
         ctx: &Context,
         inode: Self::Inode,
         handle: Self::Handle,
-        w: &mut dyn ZeroCopyWriter<S = S>,
+        w: &mut dyn ZeroCopyWriter,
         size: u32,
         offset: u64,
         lock_owner: Option<u64>,
@@ -1001,7 +1000,7 @@ impl<FS: FileSystem<S>, S: BitmapSlice> FileSystem<S> for Arc<FS> {
         ctx: &Context,
         inode: Self::Inode,
         handle: Self::Handle,
-        r: &mut dyn ZeroCopyReader<S = S>,
+        r: &mut dyn ZeroCopyReader,
         size: u32,
         offset: u64,
         lock_owner: Option<u64>,

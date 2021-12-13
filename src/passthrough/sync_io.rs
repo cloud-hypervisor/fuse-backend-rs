@@ -28,7 +28,7 @@ use crate::bytes_to_cstr;
 #[cfg(any(feature = "vhost-user-fs", feature = "virtiofs"))]
 use crate::transport::FsCacheReqHandler;
 
-impl<D: AsyncDrive, S: BitmapSlice + Send + Sync> PassthroughFs<D, S> {
+impl<D: AsyncDrive> PassthroughFs<D> {
     fn open_inode(&self, inode: Inode, mut flags: i32) -> io::Result<File> {
         // When writeback caching is enabled, the kernel may send read requests even if the
         // userspace program opened the file write-only. So we need to ensure that we have opened
@@ -294,7 +294,7 @@ impl<D: AsyncDrive, S: BitmapSlice + Send + Sync> PassthroughFs<D, S> {
     }
 }
 
-impl<D: AsyncDrive, S: BitmapSlice + Send + Sync> FileSystem<S> for PassthroughFs<D, S> {
+impl<D: AsyncDrive> FileSystem for PassthroughFs<D> {
     type Inode = Inode;
     type Handle = Handle;
 
@@ -652,7 +652,7 @@ impl<D: AsyncDrive, S: BitmapSlice + Send + Sync> FileSystem<S> for PassthroughF
         _ctx: &Context,
         inode: Inode,
         handle: Handle,
-        w: &mut dyn ZeroCopyWriter<S = S>,
+        w: &mut dyn ZeroCopyWriter,
         size: u32,
         offset: u64,
         _lock_owner: Option<u64>,
@@ -674,7 +674,7 @@ impl<D: AsyncDrive, S: BitmapSlice + Send + Sync> FileSystem<S> for PassthroughF
         _ctx: &Context,
         inode: Inode,
         handle: Handle,
-        r: &mut dyn ZeroCopyReader<S = S>,
+        r: &mut dyn ZeroCopyReader,
         size: u32,
         offset: u64,
         _lock_owner: Option<u64>,
