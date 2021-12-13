@@ -315,6 +315,7 @@ impl<D: AsyncDrive, S: BitmapSlice> Vfs<D, S> {
         let mut superblocks = self.superblocks.load().deref().deref().clone();
         let mut mountpoints = self.mountpoints.load().deref().deref().clone();
         let inode = self.root.mount(path)?;
+        let real_root_ino = entry.inode;
 
         entry.inode = self.convert_inode(fs_idx, entry.inode)?;
 
@@ -328,7 +329,7 @@ impl<D: AsyncDrive, S: BitmapSlice> Vfs<D, S> {
 
         let mountpoint = Arc::new(MountPointData {
             fs_idx,
-            ino: ROOT_ID,
+            ino: real_root_ino,
             root_entry: entry,
             _path: path.to_string(),
         });
@@ -498,7 +499,7 @@ impl<D: AsyncDrive, S: BitmapSlice> Vfs<D, S> {
             if inode.ino() == ROOT_ID {
                 if let Some(mnt) = self.mountpoints.load().get(&inode.ino()).map(Arc::clone) {
                     let fs = self.get_fs_by_idx(mnt.fs_idx)?;
-                    return Ok((Right(fs), VfsInode::new(mnt.fs_idx, ROOT_ID)));
+                    return Ok((Right(fs), VfsInode::new(mnt.fs_idx, mnt.ino)));
                 }
             }
             Ok((Left(&self.root), inode))
