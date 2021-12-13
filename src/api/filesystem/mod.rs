@@ -14,7 +14,6 @@ use std::time::Duration;
 
 use crate::abi::linux_abi as fuse;
 use crate::transport::FileReadWriteVolatile;
-use crate::BitmapSlice;
 
 pub use fuse::FsOptions;
 pub use fuse::OpenOptions;
@@ -143,9 +142,6 @@ pub enum ListxattrReply {
 /// A trait for directly copying data from the fuse transport into a `File` without first storing it
 /// in an intermediate buffer.
 pub trait ZeroCopyReader: io::Read {
-    /// Type for guest memory dirty tracking.
-    type S: BitmapSlice;
-
     /// Copies at most `count` bytes from `self` directly into `f` at offset `off` without storing
     /// it in any intermediate buffers. If the return value is `Ok(n)` then it must be guaranteed
     /// that `0 <= n <= count`. If `n` is `0`, then it can indicate one of 3 possibilities:
@@ -161,7 +157,7 @@ pub trait ZeroCopyReader: io::Read {
     /// an error of the kind `io::ErrorKind::WriteZero`.
     fn read_to(
         &mut self,
-        f: &mut dyn FileReadWriteVolatile<Self::S>,
+        f: &mut dyn FileReadWriteVolatile,
         count: usize,
         off: u64,
     ) -> io::Result<usize>;
@@ -175,7 +171,7 @@ pub trait ZeroCopyReader: io::Read {
     /// will never be more than `count`.
     fn read_exact_to(
         &mut self,
-        f: &mut dyn FileReadWriteVolatile<Self::S>,
+        f: &mut dyn FileReadWriteVolatile,
         mut count: usize,
         mut off: u64,
     ) -> io::Result<()> {
@@ -217,7 +213,7 @@ pub trait ZeroCopyReader: io::Read {
     /// If an error is returned then the number of bytes copied from `self` is unspecified.
     fn copy_to_end(
         &mut self,
-        f: &mut dyn FileReadWriteVolatile<Self::S>,
+        f: &mut dyn FileReadWriteVolatile,
         mut off: u64,
     ) -> io::Result<usize> {
         let mut out = 0;
@@ -238,9 +234,6 @@ pub trait ZeroCopyReader: io::Read {
 /// A trait for directly copying data from a `File` into the fuse transport without first storing
 /// it in an intermediate buffer.
 pub trait ZeroCopyWriter: io::Write {
-    /// Type for guest memory dirty tracking.
-    type S: BitmapSlice;
-
     /// Copies at most `count` bytes from `f` at offset `off` directly into `self` without storing
     /// it in any intermediate buffers. If the return value is `Ok(n)` then it must be guaranteed
     /// that `0 <= n <= count`. If `n` is `0`, then it can indicate one of 3 possibilities:
@@ -256,7 +249,7 @@ pub trait ZeroCopyWriter: io::Write {
     /// error of the kind `io::ErrorKind::UnexpectedEof`.
     fn write_from(
         &mut self,
-        f: &mut dyn FileReadWriteVolatile<Self::S>,
+        f: &mut dyn FileReadWriteVolatile,
         count: usize,
         off: u64,
     ) -> io::Result<usize>;
@@ -270,7 +263,7 @@ pub trait ZeroCopyWriter: io::Write {
     /// well never be more than `count`.
     fn write_all_from(
         &mut self,
-        f: &mut dyn FileReadWriteVolatile<Self::S>,
+        f: &mut dyn FileReadWriteVolatile,
         mut count: usize,
         mut off: u64,
     ) -> io::Result<()> {
@@ -315,7 +308,7 @@ pub trait ZeroCopyWriter: io::Write {
     /// If an error is returned then the number of bytes copied from `f` is unspecified.
     fn copy_to_end(
         &mut self,
-        f: &mut dyn FileReadWriteVolatile<Self::S>,
+        f: &mut dyn FileReadWriteVolatile,
         mut off: u64,
     ) -> io::Result<usize> {
         let mut out = 0;

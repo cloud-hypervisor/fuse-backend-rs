@@ -24,6 +24,8 @@ use crate::BitmapSlice;
 
 pub mod file_traits;
 pub use file_traits::{FileReadWriteVolatile, FileSetLen};
+pub mod file_volatile_slice;
+pub use file_volatile_slice::FileVolatileSlice;
 
 #[cfg(feature = "virtiofs")]
 pub mod virtiofs;
@@ -64,9 +66,9 @@ impl<S: BitmapSlice> IoBuffers<'_, S> {
         self.bytes_consumed
     }
 
-    fn allocate_volatile_slice(&self, count: usize) -> Vec<VolatileSlice<'_, S>> {
+    fn allocate_file_volatile_slice(&self, count: usize) -> Vec<FileVolatileSlice> {
         let mut rem = count;
-        let mut bufs = Vec::with_capacity(self.buffers.len());
+        let mut bufs: Vec<FileVolatileSlice> = Vec::with_capacity(self.buffers.len());
 
         for buf in &self.buffers {
             if rem == 0 {
@@ -77,11 +79,11 @@ impl<S: BitmapSlice> IoBuffers<'_, S> {
             // more data is written out and causes data corruption.
             let local_buf = if buf.len() > rem {
                 // Safe because we just check rem < buf.len()
-                buf.subslice(0, rem).unwrap()
+                FileVolatileSlice::new_from_volatile_slice(&buf.subslice(0, rem).unwrap())
             } else {
-                buf.clone()
+                FileVolatileSlice::new_from_volatile_slice(buf)
             };
-            bufs.push(local_buf.clone());
+            bufs.push(local_buf);
 
             // Don't need check_sub() as we just made sure rem >= local_buf.len()
             rem -= local_buf.len() as usize;
@@ -150,7 +152,6 @@ impl<S: BitmapSlice> IoBuffers<'_, S> {
         bufs
     }
 
-    #[cfg(all(feature = "async-io", feature = "virtiofs"))]
     fn mark_dirty(&self, count: usize) {
         let mut rem = count;
 
@@ -204,26 +205,37 @@ impl<S: BitmapSlice> IoBuffers<'_, S> {
     }
 
     /// Consumes at most `count` bytes from the `DescriptorChain`. Callers must provide a function
-    /// that takes a `&[VolatileSlice]` and returns the total number of bytes consumed. This
-    /// function guarantees that the combined length of all the slices in the `&[VolatileSlice]` is
-    /// less than or equal to `count`.
+    /// that takes a `&[FileVolatileSlice]` and returns the total number of bytes consumed. This
+    /// function guarantees that the combined length of all the slices in the `&[FileVolatileSlice]` is
+    /// less than or equal to `count`. `mark_dirty` is used for tracing dirty pages.
     ///
     /// # Errors
     ///
     /// If the provided function returns any error then no bytes are consumed from the buffer and
     /// the error is returned to the caller.
-    fn consume<F>(&mut self, count: usize, f: F) -> io::Result<usize>
+    fn consume<F>(&mut self, mark_dirty: bool, count: usize, f: F) -> io::Result<usize>
     where
-        F: FnOnce(&[VolatileSlice<'_, S>]) -> io::Result<usize>,
+        F: FnOnce(&[FileVolatileSlice]) -> io::Result<usize>,
     {
-        let bufs = self.allocate_volatile_slice(count);
+        let bufs = self.allocate_file_volatile_slice(count);
         if bufs.is_empty() {
             Ok(0)
         } else {
             let bytes_consumed = f(&*bufs)?;
+            if mark_dirty {
+                self.mark_dirty(bytes_consumed);
+            }
             self.mark_used(bytes_consumed)?;
             Ok(bytes_consumed)
         }
+    }
+
+    /// Consumes for read
+    fn consume_for_read<F>(&mut self, count: usize, f: F) -> io::Result<usize>
+    where
+        F: FnOnce(&[FileVolatileSlice]) -> io::Result<usize>,
+    {
+        self.consume(false, count, f)
     }
 
     fn split_at(&mut self, offset: usize) -> Result<Self> {
@@ -306,31 +318,31 @@ impl<S: BitmapSlice> Reader<'_, S> {
     /// Returns the number of bytes read from the descriptor chain buffer.
     /// The number of bytes read can be less than `count` if there isn't
     /// enough data in the descriptor chain buffer.
-    pub fn read_to<F: FileReadWriteVolatile<S>>(
+    pub fn read_to<F: FileReadWriteVolatile>(
         &mut self,
         mut dst: F,
         count: usize,
     ) -> io::Result<usize> {
         self.buffers
-            .consume(count, |bufs| dst.write_vectored_volatile(bufs))
+            .consume_for_read(count, |bufs| dst.write_vectored_volatile(bufs))
     }
 
     /// Reads data from the descriptor chain buffer into a File at offset `off`.
     /// Returns the number of bytes read from the descriptor chain buffer.
     /// The number of bytes read can be less than `count` if there isn't
     /// enough data in the descriptor chain buffer.
-    pub fn read_to_at<F: FileReadWriteVolatile<S>>(
+    pub fn read_to_at<F: FileReadWriteVolatile>(
         &mut self,
         mut dst: F,
         count: usize,
         off: u64,
     ) -> io::Result<usize> {
         self.buffers
-            .consume(count, |bufs| dst.write_vectored_at_volatile(bufs, off))
+            .consume_for_read(count, |bufs| dst.write_vectored_at_volatile(bufs, off))
     }
 
     /// Reads exactly size of data from the descriptor chain buffer into a file descriptor.
-    pub fn read_exact_to<F: FileReadWriteVolatile<S>>(
+    pub fn read_exact_to<F: FileReadWriteVolatile>(
         &mut self,
         mut dst: F,
         mut count: usize,
@@ -376,7 +388,7 @@ impl<S: BitmapSlice> Reader<'_, S> {
 
 impl<S: BitmapSlice> io::Read for Reader<'_, S> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        self.buffers.consume(buf.len(), |bufs| {
+        self.buffers.consume_for_read(buf.len(), |bufs| {
             let mut rem = buf;
             let mut total = 0;
             for buf in bufs {
@@ -398,7 +410,10 @@ impl<S: BitmapSlice> io::Read for Reader<'_, S> {
 mod tests {
     use crate::transport::IoBuffers;
     use std::collections::VecDeque;
-    use vm_memory::VolatileSlice;
+    use vm_memory::{
+        bitmap::{AtomicBitmap, Bitmap},
+        VolatileSlice,
+    };
 
     #[test]
     fn test_io_buffers() {
@@ -417,7 +432,10 @@ mod tests {
         assert_eq!(buffers.available_bytes(), 32);
         assert_eq!(buffers.bytes_consumed(), 0);
 
-        assert_eq!(buffers.consume(2, |buf| Ok(buf[0].len())).unwrap(), 2);
+        assert_eq!(
+            buffers.consume_for_read(2, |buf| Ok(buf[0].len())).unwrap(),
+            2
+        );
         assert_eq!(buffers.available_bytes(), 30);
         assert_eq!(buffers.bytes_consumed(), 2);
 
@@ -429,13 +447,89 @@ mod tests {
 
         assert_eq!(
             buffers2
-                .consume(10, |buf| Ok(buf[0].len() + buf[1].len()))
+                .consume_for_read(10, |buf| Ok(buf[0].len() + buf[1].len()))
                 .unwrap(),
             10
         );
-        assert_eq!(buffers2.consume(20, |buf| Ok(buf[0].len())).unwrap(), 10);
+        assert_eq!(
+            buffers2
+                .consume_for_read(20, |buf| Ok(buf[0].len()))
+                .unwrap(),
+            10
+        );
 
         let _buffers3 = buffers2.split_at(0).unwrap();
         assert!(buffers2.split_at(1).is_err());
+    }
+
+    #[test]
+    fn test_mark_dirty() {
+        let mut buf1 = vec![0x0u8; 16];
+        let bitmap1 = AtomicBitmap::new(16, 2);
+
+        assert_eq!(bitmap1.len(), 8);
+        for i in 0..8 {
+            assert_eq!(bitmap1.is_bit_set(i), false);
+        }
+
+        let mut buf2 = vec![0x0u8; 16];
+        let bitmap2 = AtomicBitmap::new(16, 2);
+        let mut bufs = VecDeque::new();
+
+        unsafe {
+            bufs.push_back(VolatileSlice::with_bitmap(
+                buf1.as_mut_ptr(),
+                buf1.len(),
+                bitmap1.slice_at(0),
+            ));
+            bufs.push_back(VolatileSlice::with_bitmap(
+                buf2.as_mut_ptr(),
+                buf2.len(),
+                bitmap2.slice_at(0),
+            ));
+        }
+        let mut buffers = IoBuffers {
+            buffers: bufs,
+            bytes_consumed: 0,
+        };
+
+        assert_eq!(buffers.available_bytes(), 32);
+        assert_eq!(buffers.bytes_consumed(), 0);
+
+        assert_eq!(
+            buffers.consume_for_read(8, |buf| Ok(buf[0].len())).unwrap(),
+            8
+        );
+
+        assert_eq!(buffers.available_bytes(), 24);
+        assert_eq!(buffers.bytes_consumed(), 8);
+
+        for i in 0..8 {
+            assert_eq!(bitmap1.is_bit_set(i), false);
+        }
+
+        assert_eq!(
+            buffers
+                .consume(true, 16, |buf| Ok(buf[0].len() + buf[1].len()))
+                .unwrap(),
+            16
+        );
+        assert_eq!(buffers.available_bytes(), 8);
+        assert_eq!(buffers.bytes_consumed(), 24);
+        for i in 0..8 {
+            if i >= 4 {
+                assert_eq!(bitmap1.is_bit_set(i), true);
+                continue;
+            } else {
+                assert_eq!(bitmap1.is_bit_set(i), false);
+            }
+        }
+        for i in 0..8 {
+            if i < 4 {
+                assert_eq!(bitmap2.is_bit_set(i), true);
+            } else {
+                assert_eq!(bitmap2.is_bit_set(i), false);
+            }
+        }
     }
 }

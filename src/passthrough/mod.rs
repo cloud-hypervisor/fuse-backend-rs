@@ -1008,9 +1008,7 @@ impl<D: AsyncDrive, S: BitmapSlice + Send + Sync> PassthroughFs<D, S> {
 }
 
 #[cfg(not(feature = "async-io"))]
-impl<D: AsyncDrive, S: 'static + BitmapSlice + Send + Sync> BackendFileSystem<D, S>
-    for PassthroughFs<D, S>
-{
+impl<D: AsyncDrive> BackendFileSystem<D> for PassthroughFs<D> {
     fn mount(&self) -> io::Result<(Entry, u64)> {
         let entry = self.do_lookup(fuse::ROOT_ID, &CString::new(".").unwrap())?;
         Ok((entry, VFS_MAX_INO))
@@ -1149,7 +1147,7 @@ mod tests {
             ..Default::default()
         };
 
-        let vfs = &Vfs::<AsyncDriver, ()>::new(opts);
+        let vfs = &Vfs::<AsyncDriver>::new(opts);
         // Assume that fuse kernel supports no_open.
         vfs.init(FsOptions::ZERO_MESSAGE_OPEN).unwrap();
 

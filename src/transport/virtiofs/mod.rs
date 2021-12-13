@@ -52,7 +52,7 @@ use vm_memory::{
     VolatileMemory, VolatileMemoryError, VolatileSlice,
 };
 
-use super::{FileReadWriteVolatile, IoBuffers, Reader};
+use super::{FileReadWriteVolatile, FileVolatileSlice, IoBuffers, Reader};
 
 mod fs_cache_req_handler;
 pub use self::fs_cache_req_handler::FsCacheReqHandler;
@@ -102,6 +102,16 @@ impl fmt::Display for Error {
 pub type Result<T> = std::result::Result<T, Error>;
 
 impl std::error::Error for Error {}
+
+impl<S: BitmapSlice> IoBuffers<'_, S> {
+    /// Consumes for write.
+    fn consume_for_write<F>(&mut self, count: usize, f: F) -> io::Result<usize>
+    where
+        F: FnOnce(&[FileVolatileSlice]) -> io::Result<usize>,
+    {
+        self.consume(true, count, f)
+    }
+}
 
 impl<'a> Reader<'a> {
     /// Construct a new Reader wrapper over `desc_chain`.
@@ -205,19 +215,19 @@ impl<'a, S: BitmapSlice> Writer<'a, S> {
 
     /// Writes data to the descriptor chain buffer from a file descriptor.
     /// Returns the number of bytes written to the descriptor chain buffer.
-    pub fn write_from<F: FileReadWriteVolatile<S>>(
+    pub fn write_from<F: FileReadWriteVolatile>(
         &mut self,
         mut src: F,
         count: usize,
     ) -> io::Result<usize> {
         self.check_available_space(count)?;
         self.buffers
-            .consume(count, |bufs| src.read_vectored_volatile(bufs))
+            .consume_for_write(count, |bufs| src.read_vectored_volatile(bufs))
     }
 
     /// Writes data to the descriptor chain buffer from a File at offset `off`.
     /// Returns the number of bytes written to the descriptor chain buffer.
-    pub fn write_from_at<F: FileReadWriteVolatile<S>>(
+    pub fn write_from_at<F: FileReadWriteVolatile>(
         &mut self,
         mut src: F,
         count: usize,
@@ -225,11 +235,11 @@ impl<'a, S: BitmapSlice> Writer<'a, S> {
     ) -> io::Result<usize> {
         self.check_available_space(count)?;
         self.buffers
-            .consume(count, |bufs| src.read_vectored_at_volatile(bufs, off))
+            .consume_for_write(count, |bufs| src.read_vectored_at_volatile(bufs, off))
     }
 
     /// Writes all data to the descriptor chain buffer from a file descriptor.
-    pub fn write_all_from<F: FileReadWriteVolatile<S>>(
+    pub fn write_all_from<F: FileReadWriteVolatile>(
         &mut self,
         mut src: F,
         mut count: usize,
@@ -299,7 +309,7 @@ impl<'a, S: BitmapSlice> io::Write for Writer<'a, S> {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         self.check_available_space(buf.len())?;
 
-        self.buffers.consume(buf.len(), |bufs| {
+        self.buffers.consume_for_write(buf.len(), |bufs| {
             let mut rem = buf;
             let mut total = 0;
             for buf in bufs {
@@ -309,7 +319,6 @@ impl<'a, S: BitmapSlice> io::Write for Writer<'a, S> {
                 unsafe {
                     copy_nonoverlapping(rem.as_ptr(), buf.as_ptr(), copy_len);
                 }
-                buf.bitmap().mark_dirty(0, copy_len);
                 rem = &rem[copy_len..];
                 total += copy_len;
             }
