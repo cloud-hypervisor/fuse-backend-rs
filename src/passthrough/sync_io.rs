@@ -417,7 +417,7 @@ impl<D: AsyncDrive, S: BitmapSlice + Send + Sync> FileSystem<S> for PassthroughF
         mode: u32,
         umask: u32,
     ) -> io::Result<Entry> {
-        validate_path_component(name)?;
+        self.validate_path_component(name)?;
 
         let data = self.inode_map.get(parent)?;
 
@@ -436,7 +436,7 @@ impl<D: AsyncDrive, S: BitmapSlice + Send + Sync> FileSystem<S> for PassthroughF
     }
 
     fn rmdir(&self, _ctx: &Context, parent: Inode, name: &CStr) -> io::Result<()> {
-        validate_path_component(name)?;
+        self.validate_path_component(name)?;
         self.do_unlink(parent, name, libc::AT_REMOVEDIR)
     }
 
@@ -547,7 +547,7 @@ impl<D: AsyncDrive, S: BitmapSlice + Send + Sync> FileSystem<S> for PassthroughF
         name: &CStr,
         args: CreateIn,
     ) -> io::Result<(Entry, Option<Handle>, OpenOptions)> {
-        validate_path_component(name)?;
+        self.validate_path_component(name)?;
 
         let dir = self.inode_map.get(parent)?;
         let dir_file = dir.get_file(&self.mount_fds)?;
@@ -605,7 +605,7 @@ impl<D: AsyncDrive, S: BitmapSlice + Send + Sync> FileSystem<S> for PassthroughF
     }
 
     fn unlink(&self, _ctx: &Context, parent: Inode, name: &CStr) -> io::Result<()> {
-        validate_path_component(name)?;
+        self.validate_path_component(name)?;
         self.do_unlink(parent, name, 0)
     }
 
@@ -864,8 +864,8 @@ impl<D: AsyncDrive, S: BitmapSlice + Send + Sync> FileSystem<S> for PassthroughF
         newname: &CStr,
         flags: u32,
     ) -> io::Result<()> {
-        validate_path_component(oldname)?;
-        validate_path_component(newname)?;
+        self.validate_path_component(oldname)?;
+        self.validate_path_component(newname)?;
 
         let old_inode = self.inode_map.get(olddir)?;
         let new_inode = self.inode_map.get(newdir)?;
@@ -901,7 +901,7 @@ impl<D: AsyncDrive, S: BitmapSlice + Send + Sync> FileSystem<S> for PassthroughF
         rdev: u32,
         umask: u32,
     ) -> io::Result<Entry> {
-        validate_path_component(name)?;
+        self.validate_path_component(name)?;
 
         let data = self.inode_map.get(parent)?;
         let file = data.get_file(&self.mount_fds)?;
@@ -933,7 +933,7 @@ impl<D: AsyncDrive, S: BitmapSlice + Send + Sync> FileSystem<S> for PassthroughF
         newparent: Inode,
         newname: &CStr,
     ) -> io::Result<Entry> {
-        validate_path_component(newname)?;
+        self.validate_path_component(newname)?;
 
         let data = self.inode_map.get(inode)?;
         let new_inode = self.inode_map.get(newparent)?;
@@ -967,7 +967,7 @@ impl<D: AsyncDrive, S: BitmapSlice + Send + Sync> FileSystem<S> for PassthroughF
         parent: Inode,
         name: &CStr,
     ) -> io::Result<Entry> {
-        validate_path_component(name)?;
+        self.validate_path_component(name)?;
 
         let data = self.inode_map.get(parent)?;
 
