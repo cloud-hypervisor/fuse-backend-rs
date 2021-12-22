@@ -603,7 +603,7 @@ impl<D: AsyncDrive + Sync, S: BitmapSlice + Send + Sync> AsyncFileSystem<D, S>
         name: &CStr,
         args: CreateIn,
     ) -> io::Result<(Entry, Option<<Self as FileSystem<S>>::Handle>, OpenOptions)> {
-        validate_path_component(name)?;
+        self.validate_path_component(name)?;
 
         let dir = self.inode_map.get(parent)?;
         let dir_file = dir.async_get_file(&self.mount_fds).await?;

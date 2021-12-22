@@ -995,6 +995,16 @@ impl<D: AsyncDrive, S: BitmapSlice + Send + Sync> PassthroughFs<D, S> {
     fn do_release(&self, inode: Inode, handle: Handle) -> io::Result<()> {
         self.handle_map.release(handle, inode)
     }
+
+    // Validate a path component, same as the one in vfs layer, but only do the validation if this
+    // passthroughfs is used without vfs layer, to avoid double validation.
+    fn validate_path_component(&self, name: &CStr) -> io::Result<()> {
+        // !self.cfg.do_import means we're under vfs, and vfs has already done the validation
+        if !self.cfg.do_import {
+            return Ok(());
+        }
+        validate_path_component(name)
+    }
 }
 
 #[cfg(not(feature = "async-io"))]
