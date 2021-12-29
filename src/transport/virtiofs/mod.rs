@@ -48,8 +48,8 @@ use std::ptr::copy_nonoverlapping;
 use virtio_queue::{DescriptorChain, Error as QueueError};
 use vm_memory::bitmap::BitmapSlice;
 use vm_memory::{
-    Address, ByteValued, GuestMemory, GuestMemoryAtomic, GuestMemoryError, GuestMemoryMmap,
-    GuestMemoryRegion, VolatileMemory, VolatileMemoryError, VolatileSlice,
+    Address, ByteValued, GuestMemory, GuestMemoryError, GuestMemoryMmap, GuestMemoryRegion,
+    VolatileMemory, VolatileMemoryError, VolatileSlice,
 };
 
 use super::{FileReadWriteVolatile, IoBuffers, Reader};
@@ -105,10 +105,11 @@ impl std::error::Error for Error {}
 
 impl<'a> Reader<'a> {
     /// Construct a new Reader wrapper over `desc_chain`.
-    pub fn new(
-        mem: &'a GuestMemoryMmap,
-        desc_chain: DescriptorChain<GuestMemoryAtomic<GuestMemoryMmap>>,
-    ) -> Result<Reader<'a>> {
+    pub fn new<M>(mem: &'a GuestMemoryMmap, desc_chain: DescriptorChain<M>) -> Result<Reader<'a>>
+    where
+        M: Deref,
+        M::Target: GuestMemory + Sized,
+    {
         let mut total_len: usize = 0;
         let buffers = desc_chain
             .readable()
@@ -157,10 +158,11 @@ pub struct Writer<'a, S = ()> {
 
 impl<'a> Writer<'a> {
     /// Construct a new Writer wrapper over `desc_chain`.
-    pub fn new(
-        mem: &'a GuestMemoryMmap,
-        desc_chain: DescriptorChain<GuestMemoryAtomic<GuestMemoryMmap>>,
-    ) -> Result<Writer<'a>> {
+    pub fn new<M>(mem: &'a GuestMemoryMmap, desc_chain: DescriptorChain<M>) -> Result<Writer<'a>>
+    where
+        M: Deref,
+        M::Target: GuestMemory + Sized,
+    {
         let mut total_len: usize = 0;
         let buffers = desc_chain
             .writable()
@@ -486,7 +488,7 @@ mod tests {
         mut buffers_start_addr: GuestAddress,
         descriptors: Vec<(DescriptorType, u32)>,
         spaces_between_regions: u32,
-    ) -> Result<DescriptorChain<GuestMemoryAtomic<GuestMemoryMmap>>> {
+    ) -> Result<DescriptorChain<GuestMemoryMmap>> {
         let descriptors_len = descriptors.len();
         for (index, (type_, size)) in descriptors.into_iter().enumerate() {
             let mut flags = 0;

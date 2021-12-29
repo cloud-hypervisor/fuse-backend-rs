@@ -334,7 +334,7 @@ pub trait ZeroCopyWriter: io::Write {
 }
 
 /// Additional context associated with requests.
-#[derive(Clone, Copy, Debug)]
+#[derive(Default, Clone, Copy, Debug)]
 pub struct Context {
     /// The user ID of the calling process.
     pub uid: libc::uid_t,
@@ -395,18 +395,6 @@ impl Context {
         } else {
             let drive = unsafe { &*(self.drive as *const u8 as *const D) };
             Some(drive.clone())
-        }
-    }
-}
-
-impl Default for Context {
-    fn default() -> Self {
-        Context {
-            uid: 0,
-            gid: 0,
-            pid: 0,
-            #[cfg(feature = "async-io")]
-            drive: 0,
         }
     }
 }
