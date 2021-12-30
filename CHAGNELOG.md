@@ -1,12 +1,20 @@
 # Changelog
-## [Unreleased]
+## [v0.2.0]
 
 ### Added
 - Enhance passthrough to reduce active fds by using file handle
 - implement From<fusedev::Error> for std::io::Error
 - Use `vhost` crate from crates.io
+- Introduce readlinkat_proc_file helper
+- Update vm-memory to 0.7.0
+- Add @eryugey to CODEOWNERS file
 
 ### Fixed
+- Validate path components
+- Prevent ".." escape in do_lookup in passthroughfs
+- Prevent opening of special file in passthroughfs
+- Fix compile error in vfs async test
+- Record real root inode's ino of file system backends in vfs
 
 ### Deprecated 
 
