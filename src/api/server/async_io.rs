@@ -9,7 +9,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use vm_memory::ByteValued;
 
-use super::{MetricsHook, Server, ServerUtil, SrvContext};
+use super::{MetricsHook, Server, ServerUtil, SrvContext, BUFFER_HEADER_SIZE};
 use crate::abi::fuse_abi::*;
 use crate::api::filesystem::{
     AsyncFileSystem, AsyncZeroCopyReader, AsyncZeroCopyWriter, ZeroCopyReader, ZeroCopyWriter,
@@ -121,7 +121,9 @@ impl<F: AsyncFileSystem<D> + Sync, D: AsyncDrive> Server<F, D> {
     ) -> Result<usize> {
         let in_header = r.read_obj().map_err(Error::DecodeMessage)?;
         let mut ctx = SrvContext::<F, D, S>::with_drive(in_header, r, w, drive);
-        if ctx.in_header.len > MAX_BUFFER_SIZE || ctx.w.available_bytes() < size_of::<OutHeader>() {
+        if ctx.in_header.len > (MAX_BUFFER_SIZE + BUFFER_HEADER_SIZE)
+            || ctx.w.available_bytes() < size_of::<OutHeader>()
+        {
             return ctx
                 .async_do_reply_error(io::Error::from_raw_os_error(libc::ENOMEM), true)
                 .await;
