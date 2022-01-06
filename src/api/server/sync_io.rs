@@ -39,7 +39,7 @@ impl<F: FileSystem + Sync, D: AsyncDrive> Server<F, D> {
     ) -> Result<usize> {
         let in_header: InHeader = r.read_obj().map_err(Error::DecodeMessage)?;
         let mut ctx = SrvContext::<F, D, S>::new(in_header, r, w);
-        if ctx.in_header.len > MAX_BUFFER_SIZE {
+        if ctx.in_header.len > (MAX_BUFFER_SIZE + BUFFER_HEADER_SIZE) {
             return ctx.reply_error_explicit(io::Error::from_raw_os_error(libc::ENOMEM));
         }
 
