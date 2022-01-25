@@ -3,7 +3,7 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE-BSD-3-Clause file.
 
-use std::io::{self, IoSlice, Write};
+use std::io::{self, IoSlice, Read, Write};
 use std::mem::size_of;
 use std::sync::Arc;
 use std::time::Duration;
@@ -17,7 +17,9 @@ use super::{
 use crate::abi::linux_abi::*;
 #[cfg(feature = "virtiofs")]
 use crate::abi::virtio_fs::{RemovemappingIn, RemovemappingOne, SetupmappingIn};
-use crate::api::filesystem::{DirEntry, Entry, FileSystem, GetxattrReply, ListxattrReply};
+use crate::api::filesystem::{
+    DirEntry, Entry, FileSystem, GetxattrReply, IoctlData, ListxattrReply,
+};
 use crate::async_util::AsyncDrive;
 use crate::transport::{FsCacheReqHandler, Reader, Writer};
 use crate::{bytes_to_cstr, encode_io_error_kind, BitmapSlice, Error, Result};
@@ -811,26 +813,65 @@ impl<F: FileSystem + Sync, D: AsyncDrive> Server<F, D> {
     }
 
     pub(super) fn getlk<S: BitmapSlice>(&self, mut ctx: SrvContext<'_, F, D, S>) -> Result<usize> {
-        if let Err(e) = self.fs.getlk() {
-            ctx.reply_error(e)
-        } else {
-            Ok(0)
+        let LkIn {
+            fh,
+            owner,
+            lk,
+            lk_flags,
+            ..
+        } = ctx.r.read_obj().map_err(Error::DecodeMessage)?;
+        match self.fs.getlk(
+            ctx.context(),
+            ctx.nodeid(),
+            fh.into(),
+            owner,
+            lk.into(),
+            lk_flags,
+        ) {
+            Ok(l) => ctx.reply_ok(Some(LkOut { lk: l.into() }), None),
+            Err(e) => ctx.reply_error(e),
         }
     }
 
     pub(super) fn setlk<S: BitmapSlice>(&self, mut ctx: SrvContext<'_, F, D, S>) -> Result<usize> {
-        if let Err(e) = self.fs.setlk() {
-            ctx.reply_error(e)
-        } else {
-            Ok(0)
+        let LkIn {
+            fh,
+            owner,
+            lk,
+            lk_flags,
+            ..
+        } = ctx.r.read_obj().map_err(Error::DecodeMessage)?;
+        match self.fs.setlk(
+            ctx.context(),
+            ctx.nodeid(),
+            fh.into(),
+            owner,
+            lk.into(),
+            lk_flags,
+        ) {
+            Ok(()) => ctx.reply_ok(None::<u8>, None),
+            Err(e) => ctx.reply_error(e),
         }
     }
 
     pub(super) fn setlkw<S: BitmapSlice>(&self, mut ctx: SrvContext<'_, F, D, S>) -> Result<usize> {
-        if let Err(e) = self.fs.setlkw() {
-            ctx.reply_error(e)
-        } else {
-            Ok(0)
+        let LkIn {
+            fh,
+            owner,
+            lk,
+            lk_flags,
+            ..
+        } = ctx.r.read_obj().map_err(Error::DecodeMessage)?;
+        match self.fs.setlk(
+            ctx.context(),
+            ctx.nodeid(),
+            fh.into(),
+            owner,
+            lk.into(),
+            lk_flags,
+        ) {
+            Ok(()) => ctx.reply_ok(None::<u8>, None),
+            Err(e) => ctx.reply_error(e),
         }
     }
 
@@ -875,10 +916,13 @@ impl<F: FileSystem + Sync, D: AsyncDrive> Server<F, D> {
     pub(super) fn interrupt<S: BitmapSlice>(&self, _ctx: SrvContext<'_, F, D, S>) {}
 
     pub(super) fn bmap<S: BitmapSlice>(&self, mut ctx: SrvContext<'_, F, D, S>) -> Result<usize> {
-        if let Err(e) = self.fs.bmap() {
-            ctx.reply_error(e)
-        } else {
-            Ok(0)
+        let BmapIn {
+            block, blocksize, ..
+        } = ctx.r.read_obj().map_err(Error::DecodeMessage)?;
+
+        match self.fs.bmap(ctx.context(), ctx.nodeid(), block, blocksize) {
+            Ok(block) => ctx.reply_ok(Some(BmapOut { block }), None),
+            Err(e) => ctx.reply_error(e),
         }
     }
 
@@ -888,18 +932,74 @@ impl<F: FileSystem + Sync, D: AsyncDrive> Server<F, D> {
     }
 
     pub(super) fn ioctl<S: BitmapSlice>(&self, mut ctx: SrvContext<'_, F, D, S>) -> Result<usize> {
-        if let Err(e) = self.fs.ioctl() {
-            ctx.reply_error(e)
-        } else {
-            Ok(0)
+        let IoctlIn {
+            fh,
+            flags,
+            cmd,
+            arg: _,
+            in_size,
+            out_size,
+        } = ctx.r.read_obj().map_err(Error::DecodeMessage)?;
+        // TODO: check fs capability of FUSE_CAP_IOCTL_DIR and return ENOTTY if unsupported.
+        let mut buf = IoctlData {
+            ..Default::default()
+        };
+        let in_size = in_size as usize;
+        // Make sure we have enough bytes to read the ioctl in buffer.
+        if in_size > ctx.r.available_bytes() {
+            return ctx.reply_error(io::Error::from_raw_os_error(libc::ENOTTY));
+        }
+        let mut data = vec![0u8; in_size];
+        if in_size > 0 {
+            let size = ctx.r.read(&mut data).map_err(Error::DecodeMessage)?;
+            if size > 0 {
+                buf.data = Some(&data[..size]);
+            }
+        }
+        match self.fs.ioctl(
+            ctx.context(),
+            ctx.nodeid(),
+            fh.into(),
+            flags,
+            cmd,
+            buf,
+            out_size,
+        ) {
+            Ok(res) => ctx.reply_ok(
+                Some(IoctlOut {
+                    result: res.result,
+                    ..Default::default()
+                }),
+                res.data,
+            ),
+            Err(e) => ctx.reply_error(e),
         }
     }
 
     pub(super) fn poll<S: BitmapSlice>(&self, mut ctx: SrvContext<'_, F, D, S>) -> Result<usize> {
-        if let Err(e) = self.fs.poll() {
-            ctx.reply_error(e)
-        } else {
-            Ok(0)
+        let PollIn {
+            fh,
+            kh,
+            flags,
+            events,
+        } = ctx.r.read_obj().map_err(Error::DecodeMessage)?;
+
+        match self.fs.poll(
+            ctx.context(),
+            ctx.nodeid(),
+            fh.into(),
+            kh.into(),
+            flags,
+            events,
+        ) {
+            Ok(revents) => ctx.reply_ok(
+                Some(PollOut {
+                    revents,
+                    padding: 0,
+                }),
+                None,
+            ),
+            Err(e) => ctx.reply_error(e),
         }
     }
 
