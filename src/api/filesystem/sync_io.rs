@@ -11,7 +11,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use super::{
-    Context, DirEntry, Entry, GetxattrReply, ListxattrReply, ZeroCopyReader, ZeroCopyWriter,
+    Context, DirEntry, Entry, FileLock, GetxattrReply, IoctlData, ListxattrReply, ZeroCopyReader,
+    ZeroCopyWriter,
 };
 use crate::abi::linux_abi::{CreateIn, FsOptions, OpenOptions, SetattrValid};
 #[cfg(feature = "virtiofs")]
@@ -811,33 +812,83 @@ pub trait FileSystem {
         Err(io::Error::from_raw_os_error(libc::ENOSYS))
     }
 
-    /// TODO: support this
-    fn getlk(&self) -> io::Result<()> {
+    /// Query file lock status
+    fn getlk(
+        &self,
+        ctx: &Context,
+        inode: Self::Inode,
+        handle: Self::Handle,
+        owner: u64,
+        lock: FileLock,
+        flags: u32,
+    ) -> io::Result<FileLock> {
         Err(io::Error::from_raw_os_error(libc::ENOSYS))
     }
 
-    /// TODO: support this
-    fn setlk(&self) -> io::Result<()> {
+    /// Grab a file read lock
+    fn setlk(
+        &self,
+        ctx: &Context,
+        inode: Self::Inode,
+        handle: Self::Handle,
+        owner: u64,
+        lock: FileLock,
+        flags: u32,
+    ) -> io::Result<()> {
         Err(io::Error::from_raw_os_error(libc::ENOSYS))
     }
 
-    /// TODO: support this
-    fn setlkw(&self) -> io::Result<()> {
+    /// Grab a file write lock
+    fn setlkw(
+        &self,
+        ctx: &Context,
+        inode: Self::Inode,
+        handle: Self::Handle,
+        owner: u64,
+        lock: FileLock,
+        flags: u32,
+    ) -> io::Result<()> {
         Err(io::Error::from_raw_os_error(libc::ENOSYS))
     }
 
-    /// TODO: support this
-    fn ioctl(&self) -> io::Result<()> {
+    /// send ioctl to the file
+    #[allow(clippy::too_many_arguments)]
+    fn ioctl(
+        &self,
+        ctx: &Context,
+        inode: Self::Inode,
+        handle: Self::Handle,
+        flags: u32,
+        cmd: u32,
+        data: IoctlData,
+        out_size: u32,
+    ) -> io::Result<IoctlData> {
+        // Rather than ENOSYS, let's return ENOTTY so simulate that the ioctl call is implemented
+        // but no ioctl number is supported.
+        Err(io::Error::from_raw_os_error(libc::ENOTTY))
+    }
+
+    /// Query a file's block mapping info
+    fn bmap(
+        &self,
+        ctx: &Context,
+        inode: Self::Inode,
+        block: u64,
+        blocksize: u32,
+    ) -> io::Result<u64> {
         Err(io::Error::from_raw_os_error(libc::ENOSYS))
     }
 
-    /// TODO: support this
-    fn bmap(&self) -> io::Result<()> {
-        Err(io::Error::from_raw_os_error(libc::ENOSYS))
-    }
-
-    /// TODO: support this
-    fn poll(&self) -> io::Result<()> {
+    /// Poll a file's events
+    fn poll(
+        &self,
+        ctx: &Context,
+        inode: Self::Inode,
+        handle: Self::Handle,
+        khandle: Self::Handle,
+        flags: u32,
+        events: u32,
+    ) -> io::Result<u32> {
         Err(io::Error::from_raw_os_error(libc::ENOSYS))
     }
 
@@ -1206,36 +1257,84 @@ impl<FS: FileSystem> FileSystem for Arc<FS> {
         self.deref().lseek(ctx, inode, handle, offset, whence)
     }
 
-    /// These are kept so that we do not forget to update the Arc abstraction when adding
-    /// support to them.
-    /// TODO: support this
-    fn getlk(&self) -> io::Result<()> {
-        self.deref().getlk()
+    /// Query file lock status
+    fn getlk(
+        &self,
+        ctx: &Context,
+        inode: Self::Inode,
+        handle: Self::Handle,
+        owner: u64,
+        lock: FileLock,
+        flags: u32,
+    ) -> io::Result<FileLock> {
+        self.deref().getlk(ctx, inode, handle, owner, lock, flags)
     }
 
-    /// TODO: support this
-    fn setlk(&self) -> io::Result<()> {
-        self.deref().setlk()
+    /// Grab a file read lock
+    fn setlk(
+        &self,
+        ctx: &Context,
+        inode: Self::Inode,
+        handle: Self::Handle,
+        owner: u64,
+        lock: FileLock,
+        flags: u32,
+    ) -> io::Result<()> {
+        self.deref().setlk(ctx, inode, handle, owner, lock, flags)
     }
 
-    /// TODO: support this
-    fn setlkw(&self) -> io::Result<()> {
-        self.deref().setlkw()
+    /// Grab a file write lock
+    fn setlkw(
+        &self,
+        ctx: &Context,
+        inode: Self::Inode,
+        handle: Self::Handle,
+        owner: u64,
+        lock: FileLock,
+        flags: u32,
+    ) -> io::Result<()> {
+        self.deref().setlkw(ctx, inode, handle, owner, lock, flags)
     }
 
-    /// TODO: support this
-    fn ioctl(&self) -> io::Result<()> {
-        self.deref().ioctl()
+    /// send ioctl to the file
+    #[allow(clippy::too_many_arguments)]
+    fn ioctl(
+        &self,
+        ctx: &Context,
+        inode: Self::Inode,
+        handle: Self::Handle,
+        flags: u32,
+        cmd: u32,
+        data: IoctlData,
+        out_size: u32,
+    ) -> io::Result<IoctlData> {
+        self.deref()
+            .ioctl(ctx, inode, handle, flags, cmd, data, out_size)
     }
 
-    /// TODO: support this
-    fn bmap(&self) -> io::Result<()> {
-        self.deref().bmap()
+    /// Query a file's block mapping info
+    fn bmap(
+        &self,
+        ctx: &Context,
+        inode: Self::Inode,
+        block: u64,
+        blocksize: u32,
+    ) -> io::Result<u64> {
+        self.deref().bmap(ctx, inode, block, blocksize)
     }
 
-    /// TODO: support this
-    fn poll(&self) -> io::Result<()> {
-        self.deref().poll()
+    /// Poll a file's events
+    fn poll(
+        &self,
+        ctx: &Context,
+        inode: Self::Inode,
+        handle: Self::Handle,
+        khandle: Self::Handle,
+        flags: u32,
+        events: u32,
+    ) -> io::Result<u32> {
+        self.deref()
+            .poll(ctx, inode, handle, khandle, flags, events)
     }
 
     /// TODO: support this

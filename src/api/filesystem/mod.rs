@@ -111,6 +111,50 @@ pub struct DirEntry<'a> {
     pub name: &'a [u8],
 }
 
+/// Represents a fuse lock
+#[derive(Copy, Clone)]
+pub struct FileLock {
+    /// Lock range start
+    pub start: u64,
+    /// Lock range end, exclusive?
+    pub end: u64,
+    /// Lock type
+    pub lock_type: u32,
+    /// thread id who owns the lock
+    pub pid: u32,
+}
+
+impl From<fuse::FileLock> for FileLock {
+    fn from(l: fuse::FileLock) -> FileLock {
+        FileLock {
+            start: l.start,
+            end: l.end,
+            lock_type: l.type_,
+            pid: l.pid,
+        }
+    }
+}
+
+impl From<FileLock> for fuse::FileLock {
+    fn from(l: FileLock) -> fuse::FileLock {
+        fuse::FileLock {
+            start: l.start,
+            end: l.end,
+            type_: l.lock_type,
+            pid: l.pid,
+        }
+    }
+}
+
+/// ioctl data and result
+#[derive(Default, Clone)]
+pub struct IoctlData<'a> {
+    /// ioctl result
+    pub result: i32,
+    /// ioctl data
+    pub data: Option<&'a [u8]>,
+}
+
 /// A reply to a `getxattr` method call.
 pub enum GetxattrReply {
     /// The value of the requested extended attribute. This can be arbitrary textual or binary data
