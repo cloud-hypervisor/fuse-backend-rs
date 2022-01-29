@@ -19,6 +19,7 @@ use std::io::{self, Read};
 use std::mem::{size_of, MaybeUninit};
 use std::ptr::copy_nonoverlapping;
 
+use lazy_static::lazy_static;
 use vm_memory::{ByteValued, VolatileSlice};
 
 use crate::BitmapSlice;
@@ -407,11 +408,14 @@ impl<S: BitmapSlice> io::Read for Reader<'_, S> {
     }
 }
 
+lazy_static! {
+    static ref PAGESIZE: usize = unsafe { sysconf(_SC_PAGESIZE) as usize };
+}
+
 /// Safe wrapper for `sysconf(_SC_PAGESIZE)`.
 #[inline(always)]
 pub fn pagesize() -> usize {
-    // Trivially safe
-    unsafe { sysconf(_SC_PAGESIZE) as usize }
+    *PAGESIZE
 }
 
 #[cfg(test)]
