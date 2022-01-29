@@ -25,6 +25,7 @@ caps = "0.5.1"
 libc = ">=0.2.68"
 log = ">=0.4.6"
 nix = "0.22"
+lazy_static = "1.4"
 #ringbahn = { version = "0.0.0-experimental.3", optional = true }
 vmm-sys-util = { version = ">=0.9", optional = true }
 vm-memory = { version = "0.7", features = ["backend-mmap"] }
