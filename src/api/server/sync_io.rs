@@ -625,22 +625,11 @@ impl<F: FileSystem + Sync, D: AsyncDrive> Server<F, D> {
             return ctx.reply_ok(Some(out), None);
         }
 
-        // These fuse features are supported by this server by default.
-        let supported = FsOptions::ASYNC_READ
-            | FsOptions::PARALLEL_DIROPS
-            | FsOptions::BIG_WRITES
-            | FsOptions::AUTO_INVAL_DATA
-            | FsOptions::ASYNC_DIO
-            | FsOptions::HAS_IOCTL_DIR
-            | FsOptions::MAX_PAGES
-            | FsOptions::EXPLICIT_INVAL_DATA
-            | FsOptions::PERFILE_DAX;
-
         let capable = FsOptions::from_bits_truncate(flags);
 
         match self.fs.init(capable) {
             Ok(want) => {
-                let enabled = capable & (want | supported);
+                let enabled = capable & want;
                 info!(
                     "FUSE INIT major {} minor {}\n in_opts: {:?}\nout_opts: {:?}",
                     major, minor, capable, enabled

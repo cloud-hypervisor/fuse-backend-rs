@@ -226,6 +226,12 @@ pub struct VfsOptions {
     pub out_opts: FsOptions,
 }
 
+impl VfsOptions {
+    fn new() -> Self {
+        VfsOptions::default()
+    }
+}
+
 impl Default for VfsOptions {
     fn default() -> Self {
         VfsOptions {
@@ -239,13 +245,16 @@ impl Default for VfsOptions {
                 | FsOptions::PARALLEL_DIROPS
                 | FsOptions::BIG_WRITES
                 | FsOptions::ASYNC_DIO
+                | FsOptions::AUTO_INVAL_DATA
                 | FsOptions::HAS_IOCTL_DIR
                 | FsOptions::WRITEBACK_CACHE
                 | FsOptions::ZERO_MESSAGE_OPEN
+                | FsOptions::MAX_PAGES
                 | FsOptions::ATOMIC_O_TRUNC
                 | FsOptions::CACHE_SYMLINKS
                 | FsOptions::DO_READDIRPLUS
                 | FsOptions::READDIRPLUS_AUTO
+                | FsOptions::EXPLICIT_INVAL_DATA
                 | FsOptions::ZERO_MESSAGE_OPENDIR
                 | FsOptions::HANDLE_KILLPRIV_V2
                 | FsOptions::PERFILE_DAX,
@@ -269,7 +278,7 @@ pub struct Vfs<D: AsyncDrive = AsyncDriver> {
 
 impl<D: AsyncDrive> Default for Vfs<D> {
     fn default() -> Self {
-        Self::new(VfsOptions::default())
+        Self::new(VfsOptions::new())
     }
 }
 
@@ -292,6 +301,11 @@ impl<D: AsyncDrive> Vfs<D> {
     /// state of vfs.
     pub fn initialized(&self) -> bool {
         self.initialized.load(Ordering::Acquire)
+    }
+
+    /// Get a snapshot of the current vfs options.
+    pub fn options(&self) -> VfsOptions {
+        *self.opts.load_full()
     }
 
     fn insert_mount_locked(
@@ -927,21 +941,8 @@ mod tests {
         let vfs = Vfs::<AsyncDriver>::default();
         assert_eq!(vfs.initialized(), false);
 
-        let out_opts = FsOptions::ASYNC_READ
-            | FsOptions::PARALLEL_DIROPS
-            | FsOptions::BIG_WRITES
-            | FsOptions::ASYNC_DIO
-            | FsOptions::HAS_IOCTL_DIR
-            | FsOptions::WRITEBACK_CACHE
-            | FsOptions::ZERO_MESSAGE_OPEN
-            | FsOptions::ATOMIC_O_TRUNC
-            | FsOptions::CACHE_SYMLINKS
-            | FsOptions::DO_READDIRPLUS
-            | FsOptions::READDIRPLUS_AUTO
-            | FsOptions::ZERO_MESSAGE_OPENDIR
-            | FsOptions::HANDLE_KILLPRIV_V2
-            | FsOptions::PERFILE_DAX;
         let opts = vfs.opts.load();
+        let out_opts = opts.out_opts;
 
         assert_eq!(opts.no_open, true);
         assert_eq!(opts.no_opendir, true);
@@ -949,7 +950,6 @@ mod tests {
         assert_eq!(opts.no_readdir, false);
         assert_eq!(opts.killpriv_v2, false);
         assert_eq!(opts.in_opts.is_empty(), true);
-        assert_eq!(opts.out_opts, out_opts);
 
         vfs.init(FsOptions::ASYNC_READ).unwrap();
         assert_eq!(vfs.initialized(), true);
