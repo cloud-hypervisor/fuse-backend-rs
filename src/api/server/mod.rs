@@ -36,6 +36,8 @@ mod sync_io;
 
 /// Maximum buffer size of FUSE requests.
 const MAX_BUFFER_SIZE: u32 = 1 << 20;
+const MIN_READ_BUFFER: u32 = 8192;
+const BUFFER_HEADER_SIZE: u32 = 0x1000;
 const DIRENT_PADDING: [u8; 8] = [0; 8];
 
 /// Maximum number of pages required for FUSE requests.
