@@ -33,7 +33,7 @@ vhost = { version = "0.3", features = ["vhost-user-slave"], optional = true }
 
 [dev-dependencies]
 futures = { version = "0.3.0", features = ["thread-pool"]}
-stderrlog = "0.4"
+stderrlog = ">=0.5.0"
 vmm-sys-util = ">=0.9.0"
 vm-memory = { version = "0.7", features = ["backend-mmap", "backend-bitmap"] }
 

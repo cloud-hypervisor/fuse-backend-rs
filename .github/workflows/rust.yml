@@ -18,3 +18,10 @@ jobs:
       run: make check
     - name: smoke
       run: make docker-smoke
+  deny:
+    name: Cargo Deny
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v2
+      - uses: EmbarkStudios/cargo-deny-action@v1
