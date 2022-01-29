@@ -14,7 +14,6 @@ use std::os::unix::fs::PermissionsExt;
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 
-use libc::{sysconf, _SC_PAGESIZE};
 use nix::errno::Errno;
 use nix::fcntl::{fcntl, FcntlArg, OFlag};
 use nix::mount::{mount, umount2, MntFlags, MsFlags};
@@ -23,7 +22,7 @@ use nix::unistd::{getgid, getuid, read};
 use vmm_sys_util::eventfd::EventFd;
 use vmm_sys_util::poll::{PollContext, WatchingEvents};
 
-use super::{Error::SessionFailure, FuseBuf, Reader, Result, Writer};
+use super::{super::pagesize, Error::SessionFailure, FuseBuf, Reader, Result, Writer};
 
 // These follows definition from libfuse.
 const FUSE_KERN_BUF_SIZE: usize = 256;
@@ -258,13 +257,6 @@ impl FuseChannel {
             }
         }
     }
-}
-
-/// Safe wrapper for `sysconf(_SC_PAGESIZE)`.
-#[inline(always)]
-fn pagesize() -> usize {
-    // Trivially safe
-    unsafe { sysconf(_SC_PAGESIZE) as usize }
 }
 
 /// Mount a fuse file system

@@ -11,8 +11,8 @@ use std::time::Duration;
 use vm_memory::ByteValued;
 
 use super::{
-    MetricsHook, Server, ServerUtil, ServerVersion, SrvContext, ZcReader, ZcWriter, DIRENT_PADDING,
-    MAX_BUFFER_SIZE, MAX_REQ_PAGES,
+    MetricsHook, Server, ServerUtil, ServerVersion, SrvContext, ZcReader, ZcWriter,
+    BUFFER_HEADER_SIZE, DIRENT_PADDING, MAX_BUFFER_SIZE, MAX_REQ_PAGES, MIN_READ_BUFFER,
 };
 use crate::abi::linux_abi::*;
 #[cfg(feature = "virtiofs")]
@@ -21,7 +21,7 @@ use crate::api::filesystem::{
     DirEntry, Entry, FileSystem, GetxattrReply, IoctlData, ListxattrReply,
 };
 use crate::async_util::AsyncDrive;
-use crate::transport::{FsCacheReqHandler, Reader, Writer};
+use crate::transport::{pagesize, FsCacheReqHandler, Reader, Writer};
 use crate::{bytes_to_cstr, encode_io_error_kind, BitmapSlice, Error, Result};
 
 impl<F: FileSystem + Sync, D: AsyncDrive> Server<F, D> {
@@ -635,18 +635,21 @@ impl<F: FileSystem + Sync, D: AsyncDrive> Server<F, D> {
                     major, minor, capable, enabled
                 );
 
-                let out = InitOut {
+                let mut out = InitOut {
                     major: KERNEL_VERSION,
                     minor: KERNEL_MINOR_VERSION,
                     max_readahead,
                     flags: enabled.bits(),
                     max_background: ::std::u16::MAX,
                     congestion_threshold: (::std::u16::MAX / 4) * 3,
-                    max_write: MAX_BUFFER_SIZE,
-                    time_gran: 1,             // nanoseconds
-                    max_pages: MAX_REQ_PAGES, // 1MB
+                    max_write: MIN_READ_BUFFER - BUFFER_HEADER_SIZE,
+                    time_gran: 1, // nanoseconds
                     ..Default::default()
                 };
+                if enabled.contains(FsOptions::MAX_PAGES) {
+                    out.max_pages = MAX_REQ_PAGES;
+                    out.max_write = MAX_REQ_PAGES as u32 * pagesize() as u32; // 1MB
+                }
                 let vers = ServerVersion { major, minor };
                 self.vers.store(Arc::new(vers));
                 if minor < KERNEL_MINOR_VERSION_INIT_OUT_SIZE {

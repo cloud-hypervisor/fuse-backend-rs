@@ -8,6 +8,7 @@
 
 //! Fuse transport drivers to receive requests from/send reply to Fuse clients.
 
+use libc::{sysconf, _SC_PAGESIZE};
 use std::cmp;
 use std::collections::VecDeque;
 #[cfg(feature = "async-io")]
@@ -404,6 +405,13 @@ impl<S: BitmapSlice> io::Read for Reader<'_, S> {
             Ok(total)
         })
     }
+}
+
+/// Safe wrapper for `sysconf(_SC_PAGESIZE)`.
+#[inline(always)]
+pub fn pagesize() -> usize {
+    // Trivially safe
+    unsafe { sysconf(_SC_PAGESIZE) as usize }
 }
 
 #[cfg(test)]
