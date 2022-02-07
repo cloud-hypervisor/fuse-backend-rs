@@ -1,6 +1,16 @@
 # Changelog
-## [v0.2.0]
+## [v0.3.0]
+### Added
+- Optionally enable MAX_PAGES feature
+- Allow customizing the default FUSE features before creating a new vfs structure
+- Support more FUSE server APIs
 
+### Changed
+- The FUSE server has no default FUSE feature set now. The default feature set is only
+  defined in VfsOptions. Non VFS users have to define the default FUSE feature set in
+  the init() method.
+
+## [v0.2.0]
 ### Added
 - Enhance passthrough to reduce active fds by using file handle
 - implement From<fusedev::Error> for std::io::Error
