@@ -1,15 +1,15 @@
-// Copyright 2020-2021 Ant Group. All rights reserved.
+// Copyright 2020-2022 Ant Group. All rights reserved.
 //
 // SPDX-License-Identifier: Apache-2.0
 //
 
-#[cfg(all(feature = "fusedev", not(feature = "virtiofs")))]
+#[cfg(all(feature = "fusedev", not(feature = "virtiofs"), target_os = "linux"))]
 #[macro_use]
 extern crate log;
 
 mod example;
 
-#[cfg(all(feature = "fusedev", not(feature = "virtiofs")))]
+#[cfg(all(feature = "fusedev", not(feature = "virtiofs"), target_os = "linux"))]
 mod fusedev_tests {
     extern crate stderrlog;
 

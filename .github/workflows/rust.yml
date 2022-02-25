@@ -18,6 +18,14 @@ jobs:
       run: make check
     - name: smoke
       run: make docker-smoke
+  Macos-CI:
+    runs-on: macos-latest
+    steps:
+      - name: Install macfuse
+        run: brew install --cask macfuse
+      - uses: actions/checkout@v2
+      - name: build and check
+        run: make check-macos
   deny:
     name: Cargo Deny
     runs-on: ubuntu-latest

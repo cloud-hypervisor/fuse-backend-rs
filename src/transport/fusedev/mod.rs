@@ -12,13 +12,21 @@ use std::mem::ManuallyDrop;
 use std::os::unix::io::RawFd;
 
 use nix::sys::uio::{pwrite, writev, IoVec};
+use nix::unistd::write;
 use vm_memory::{ByteValued, VolatileMemory, VolatileMemoryError, VolatileSlice};
 
 use super::{FileReadWriteVolatile, FileVolatileSlice, IoBuffers, Reader};
 use crate::BitmapSlice;
 
-mod session;
-pub use session::*;
+#[cfg(target_os = "linux")]
+mod linux_session;
+#[cfg(target_os = "linux")]
+pub use linux_session::*;
+
+#[cfg(target_os = "macos")]
+mod macos_session;
+#[cfg(target_os = "macos")]
+pub use macos_session::*;
 
 /// Error codes for Virtio queue related operations.
 #[derive(Debug)]
@@ -175,8 +183,14 @@ impl<'a, S: BitmapSlice> Writer<'a, S> {
         let o = other.map(|v| v.buf.as_slice()).unwrap_or(&[]);
         let res = match (self.buf.len(), o.len()) {
             (0, 0) => Ok(0),
+            #[cfg(target_os = "linux")]
             (0, _) => pwrite(self.fd, o, 0),
+            #[cfg(target_os = "linux")]
             (_, 0) => pwrite(self.fd, self.buf.as_slice(), 0),
+            #[cfg(target_os = "macos")]
+            (0, _) => write(self.fd, o),
+            #[cfg(target_os = "macos")]
+            (_, 0) => write(self.fd, self.buf.as_slice()),
             (_, _) => {
                 let bufs = [IoVec::from_slice(self.buf.as_slice()), IoVec::from_slice(o)];
                 writev(self.fd, &bufs)
@@ -308,7 +322,12 @@ impl<'a, S: BitmapSlice> Writer<'a, S> {
     }
 
     fn do_write(fd: RawFd, data: &[u8]) -> io::Result<usize> {
-        pwrite(fd, data, 0).map_err(|e| {
+        #[cfg(target_os = "linux")]
+        let res = pwrite(fd, data, 0);
+        #[cfg(target_os = "macos")]
+        let res = write(fd, data);
+
+        res.map_err(|e| {
             error! {"fail to write to fuse device fd {}: {}, {:?}", fd, e, data};
             io::Error::new(io::ErrorKind::Other, format!("{}", e))
         })
