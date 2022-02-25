@@ -2,12 +2,11 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 
+use log::{error, info, warn};
 use std::io::Result;
 use std::path::Path;
 use std::sync::Arc;
 use std::thread;
-
-use vmm_sys_util::eventfd::EventFd;
 
 use fuse_backend_rs::api::{server::Server, Vfs, VfsOptions};
 use fuse_backend_rs::async_util::AsyncDriver;
@@ -19,7 +18,6 @@ pub struct Daemon {
     mountpoint: String,
     server: Arc<Server<Arc<Vfs<AsyncDriver>>>>,
     thread_cnt: u32,
-    event_fd: EventFd,
     session: Option<FuseSession>,
 }
 
@@ -47,7 +45,6 @@ impl Daemon {
             mountpoint: mountpoint.to_string(),
             server: Arc::new(Server::new(Arc::new(vfs))),
             thread_cnt,
-            event_fd: EventFd::new(0).unwrap(),
             session: None,
         })
     }
@@ -61,7 +58,7 @@ impl Daemon {
         for _ in 0..self.thread_cnt {
             let mut server = FuseServer {
                 server: self.server.clone(),
-                ch: se.new_channel(self.event_fd.try_clone().unwrap()).unwrap(),
+                ch: se.new_channel().unwrap(),
             };
             let _thread = thread::Builder::new()
                 .name("fuse_server".to_string())
@@ -80,8 +77,8 @@ impl Daemon {
     pub fn umount(&mut self) -> Result<()> {
         if let Some(mut se) = self.session.take() {
             se.umount().unwrap();
+            se.wake().unwrap();
         }
-        self.event_fd.write(1)?;
         Ok(())
     }
 }
