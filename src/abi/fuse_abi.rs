@@ -11,13 +11,27 @@ use std::mem;
 use bitflags::bitflags;
 use vm_memory::ByteValued;
 
-use libc::{blksize_t, nlink_t};
+#[cfg(target_os = "linux")]
+pub use libc::{
+    blksize_t, dev_t, ino64_t, mode_t, nlink_t, off64_t, pread64, preadv64, pwrite64, pwritev64,
+    stat64, statvfs64,
+};
+
+#[cfg(target_os = "macos")]
+pub use libc::{
+    blksize_t, dev_t, ino_t as ino64_t, mode_t, nlink_t, off_t as off64_t, pread as pread64,
+    preadv as preadv64, pwrite as pwrite64, pwritev as pwritev64, stat as stat64,
+    statvfs as statvfs64,
+};
 
 /// Version number of this interface.
 pub const KERNEL_VERSION: u32 = 7;
 
 /// Minor version number of this interface.
+#[cfg(target_os = "linux")]
 pub const KERNEL_MINOR_VERSION: u32 = 33;
+#[cfg(target_os = "macos")]
+pub const KERNEL_MINOR_VERSION: u32 = 19;
 
 /// Init reply size is FUSE_COMPAT_INIT_OUT_SIZE
 pub const KERNEL_MINOR_VERSION_INIT_OUT_SIZE: u32 = 5;
@@ -545,27 +559,36 @@ pub struct Attr {
     pub atime: u64,
     pub mtime: u64,
     pub ctime: u64,
+    #[cfg(target_os = "macos")]
+    pub crtime: u64,
     pub atimensec: u32,
     pub mtimensec: u32,
     pub ctimensec: u32,
+    #[cfg(target_os = "macos")]
+    pub crtimensec: u32,
     pub mode: u32,
     pub nlink: u32,
     pub uid: u32,
     pub gid: u32,
     pub rdev: u32,
-    pub blksize: u32,
+    #[cfg(target_os = "macos")]
     pub flags: u32,
+    pub blksize: u32,
+    #[cfg(target_os = "linux")]
+    pub flags: u32,
+    #[cfg(target_os = "macos")]
+    pub padding: u32,
 }
 unsafe impl ByteValued for Attr {}
 
-impl From<libc::stat64> for Attr {
-    fn from(st: libc::stat64) -> Attr {
+impl From<stat64> for Attr {
+    fn from(st: stat64) -> Attr {
         Attr::with_flags(st, 0)
     }
 }
 
 impl Attr {
-    pub fn with_flags(st: libc::stat64, flags: u32) -> Attr {
+    pub fn with_flags(st: stat64, flags: u32) -> Attr {
         Attr {
             ino: st.st_ino,
             size: st.st_size as u64,
@@ -576,21 +599,27 @@ impl Attr {
             atimensec: st.st_atime_nsec as u32,
             mtimensec: st.st_mtime_nsec as u32,
             ctimensec: st.st_ctime_nsec as u32,
-            mode: st.st_mode,
+            mode: st.st_mode as u32,
             nlink: st.st_nlink as u32,
             uid: st.st_uid,
             gid: st.st_gid,
             rdev: st.st_rdev as u32,
             blksize: st.st_blksize as u32,
             flags: flags as u32,
+            #[cfg(target_os = "macos")]
+            crtime: 0,
+            #[cfg(target_os = "macos")]
+            crtimensec: 0,
+            #[cfg(target_os = "macos")]
+            padding: 0,
         }
     }
 }
 
-impl From<Attr> for libc::stat64 {
-    fn from(attr: Attr) -> libc::stat64 {
+impl From<Attr> for stat64 {
+    fn from(attr: Attr) -> stat64 {
         // Safe because we are zero-initializing a struct
-        let mut out: libc::stat64 = unsafe { mem::zeroed() };
+        let mut out: stat64 = unsafe { mem::zeroed() };
         out.st_ino = attr.ino;
         out.st_size = attr.size as i64;
         out.st_blocks = attr.blocks as i64;
@@ -600,11 +629,11 @@ impl From<Attr> for libc::stat64 {
         out.st_atime_nsec = attr.atimensec as i64;
         out.st_mtime_nsec = attr.mtimensec as i64;
         out.st_ctime_nsec = attr.ctimensec as i64;
-        out.st_mode = attr.mode;
+        out.st_mode = attr.mode as mode_t;
         out.st_nlink = attr.nlink as nlink_t;
         out.st_uid = attr.uid;
         out.st_gid = attr.gid;
-        out.st_rdev = attr.rdev as u64;
+        out.st_rdev = attr.rdev as dev_t;
         out.st_blksize = attr.blksize as blksize_t;
 
         out
@@ -627,14 +656,14 @@ pub struct Kstatfs {
 }
 unsafe impl ByteValued for Kstatfs {}
 
-impl From<libc::statvfs64> for Kstatfs {
-    fn from(st: libc::statvfs64) -> Self {
+impl From<statvfs64> for Kstatfs {
+    fn from(st: statvfs64) -> Self {
         Kstatfs {
-            blocks: st.f_blocks,
-            bfree: st.f_bfree,
-            bavail: st.f_bavail,
-            files: st.f_files,
-            ffree: st.f_ffree,
+            blocks: st.f_blocks as u64,
+            bfree: st.f_bfree as u64,
+            bavail: st.f_bavail as u64,
+            files: st.f_files as u64,
+            ffree: st.f_ffree as u64,
             bsize: st.f_bsize as u32,
             namelen: st.f_namemax as u32,
             frsize: st.f_frsize as u32,
@@ -808,6 +837,10 @@ unsafe impl ByteValued for MkdirIn {}
 #[derive(Debug, Default, Copy, Clone)]
 pub struct RenameIn {
     pub newdir: u64,
+    #[cfg(target_os = "macos")]
+    pub flags: u32,
+    #[cfg(target_os = "macos")]
+    pub padding: u32,
 }
 unsafe impl ByteValued for RenameIn {}
 
@@ -849,11 +882,11 @@ pub struct SetattrIn {
 }
 unsafe impl ByteValued for SetattrIn {}
 
-impl From<SetattrIn> for libc::stat64 {
-    fn from(setattr: SetattrIn) -> libc::stat64 {
+impl From<SetattrIn> for stat64 {
+    fn from(setattr: SetattrIn) -> stat64 {
         // Safe because we are zero-initializing a struct with only POD fields.
-        let mut out: libc::stat64 = unsafe { mem::zeroed() };
-        out.st_mode = setattr.mode;
+        let mut out: stat64 = unsafe { mem::zeroed() };
+        out.st_mode = setattr.mode as mode_t;
         out.st_uid = setattr.uid;
         out.st_gid = setattr.gid;
         out.st_size = setattr.size as i64;
@@ -978,6 +1011,10 @@ unsafe impl ByteValued for SetxattrIn {}
 pub struct GetxattrIn {
     pub size: u32,
     pub padding: u32,
+    #[cfg(target_os = "macos")]
+    pub position: u32,
+    #[cfg(target_os = "macos")]
+    pub padding2: u32,
 }
 unsafe impl ByteValued for GetxattrIn {}
 
@@ -1272,15 +1309,24 @@ mod tests {
 
     #[test]
     fn test_struct_size() {
+        #[cfg(target_os = "linux")]
         assert_eq!(std::mem::size_of::<Attr>(), 88);
+        #[cfg(target_os = "macos")]
+        assert_eq!(std::mem::size_of::<Attr>(), 104);
         assert_eq!(std::mem::size_of::<Kstatfs>(), 80);
         assert_eq!(std::mem::size_of::<FileLock>(), 24);
+        #[cfg(target_os = "linux")]
         assert_eq!(std::mem::size_of::<EntryOut>(), 128);
+        #[cfg(target_os = "macos")]
+        assert_eq!(std::mem::size_of::<EntryOut>(), 144);
         assert_eq!(std::mem::size_of::<ForgetIn>(), 8);
         assert_eq!(std::mem::size_of::<ForgetOne>(), 16);
         assert_eq!(std::mem::size_of::<BatchForgetIn>(), 8);
         assert_eq!(std::mem::size_of::<GetattrIn>(), 16);
+        #[cfg(target_os = "linux")]
         assert_eq!(std::mem::size_of::<AttrOut>(), 104);
+        #[cfg(target_os = "macos")]
+        assert_eq!(std::mem::size_of::<AttrOut>(), 120);
         assert_eq!(std::mem::size_of::<MknodIn>(), 16);
         assert_eq!(std::mem::size_of::<MkdirIn>(), 8);
         assert_eq!(std::mem::size_of::<InHeader>(), 40);

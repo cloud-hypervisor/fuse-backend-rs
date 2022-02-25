@@ -9,11 +9,12 @@ use std::time::Duration;
 use async_trait::async_trait;
 use vm_memory::ByteValued;
 
-use super::{MetricsHook, Server, ServerUtil, SrvContext, MAX_BUFFER_SIZE};
-use crate::abi::linux_abi::*;
+use super::{MetricsHook, Server, ServerUtil, SrvContext};
+use crate::abi::fuse_abi::*;
 use crate::api::filesystem::{
     AsyncFileSystem, AsyncZeroCopyReader, AsyncZeroCopyWriter, ZeroCopyReader, ZeroCopyWriter,
 };
+use crate::api::server::MAX_BUFFER_SIZE;
 use crate::api::CreateIn;
 use crate::async_util::AsyncDrive;
 use crate::transport::{FileReadWriteVolatile, FsCacheReqHandler, Reader, Writer};
@@ -266,7 +267,7 @@ impl<F: AsyncFileSystem<D> + Sync, D: AsyncDrive> Server<F, D> {
             None
         };
         let valid = SetattrValid::from_bits_truncate(setattr_in.valid);
-        let st: libc::stat64 = setattr_in.into();
+        let st: stat64 = setattr_in.into();
         let result = self
             .fs
             .async_setattr(ctx.context(), ctx.nodeid(), st, handle, valid)
@@ -602,7 +603,7 @@ impl<'a, F: AsyncFileSystem<D>, D: AsyncDrive, S: BitmapSlice> SrvContext<'a, F,
 
     async fn async_handle_attr_result(
         &mut self,
-        result: io::Result<(libc::stat64, Duration)>,
+        result: io::Result<(stat64, Duration)>,
     ) -> Result<usize> {
         match result {
             Ok((st, timeout)) => {

@@ -7,7 +7,7 @@ use std::mem::ManuallyDrop;
 use async_trait::async_trait;
 
 use super::*;
-use crate::abi::linux_abi::{OpenOptions, SetattrValid, FOPEN_IN_KILL_SUIDGID, WRITE_KILL_PRIV};
+use crate::abi::fuse_abi::{OpenOptions, SetattrValid, FOPEN_IN_KILL_SUIDGID, WRITE_KILL_PRIV};
 use crate::api::filesystem::{
     AsyncFileSystem, AsyncZeroCopyReader, AsyncZeroCopyWriter, Context, FileSystem,
 };

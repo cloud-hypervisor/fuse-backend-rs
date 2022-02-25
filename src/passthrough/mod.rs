@@ -29,7 +29,7 @@ use std::time::Duration;
 
 use vm_memory::ByteValued;
 
-use crate::abi::linux_abi as fuse;
+use crate::abi::fuse_abi as fuse;
 use crate::api::filesystem::Entry;
 use crate::api::{
     validate_path_component, BackendFileSystem, CURRENT_DIR_CSTR, EMPTY_CSTR, PARENT_DIR_CSTR,

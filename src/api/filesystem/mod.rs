@@ -12,13 +12,15 @@ use std::convert::TryInto;
 use std::io;
 use std::time::Duration;
 
-use crate::abi::linux_abi as fuse;
+use crate::abi::fuse_abi as fuse;
 use crate::transport::FileReadWriteVolatile;
 
 pub use fuse::FsOptions;
 pub use fuse::OpenOptions;
 pub use fuse::SetattrValid;
 pub use fuse::ROOT_ID;
+
+use crate::abi::fuse_abi::{ino64_t, stat64};
 
 #[cfg(feature = "async-io")]
 mod async_io;
@@ -47,7 +49,7 @@ pub struct Entry {
     /// Inode attributes. Even if `attr_timeout` is zero, `attr` must be correct. For example, for
     /// `open()`, FUSE uses `attr.st_size` from `lookup()` to determine how many bytes to request.
     /// If this value is not correct, incorrect data will be returned.
-    pub attr: libc::stat64,
+    pub attr: stat64,
 
     /// Flags for 'fuse::Attr.flags'
     pub attr_flags: u32,
@@ -95,7 +97,7 @@ pub struct DirEntry<'a> {
     /// The inode number for this entry. This does NOT have to be the same as the `Inode` for this
     /// directory entry. However, it must be the same as the `attr.st_ino` field of the `Entry` that
     /// would be returned by a `lookup` request in the parent directory for `name`.
-    pub ino: libc::ino64_t,
+    pub ino: ino64_t,
 
     /// Any non-zero value that the kernel can use to identify the current point in the directory
     /// entry stream. It does not need to be the actual physical position. A value of `0` is
@@ -439,7 +441,7 @@ impl Context {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::abi::linux_abi::Attr;
+    use crate::abi::fuse_abi::Attr;
 
     #[test]
     fn test_from_fuse_header() {
