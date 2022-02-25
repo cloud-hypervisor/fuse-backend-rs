@@ -3,22 +3,21 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE-BSD-3-Clause file.
 
+use super::{
+    Context, DirEntry, Entry, FileLock, GetxattrReply, IoctlData, ListxattrReply, ZeroCopyReader,
+    ZeroCopyWriter,
+};
+use crate::abi::fuse_abi::{stat64, statvfs64, CreateIn, FsOptions, OpenOptions, SetattrValid};
+#[cfg(feature = "virtiofs")]
+pub use crate::abi::virtio_fs::RemovemappingOne;
+#[cfg(feature = "virtiofs")]
+use crate::transport::virtiofs::FsCacheReqHandler;
 use std::ffi::CStr;
 use std::io;
 use std::mem;
 use std::ops::Deref;
 use std::sync::Arc;
 use std::time::Duration;
-
-use super::{
-    Context, DirEntry, Entry, FileLock, GetxattrReply, IoctlData, ListxattrReply, ZeroCopyReader,
-    ZeroCopyWriter,
-};
-use crate::abi::linux_abi::{CreateIn, FsOptions, OpenOptions, SetattrValid};
-#[cfg(feature = "virtiofs")]
-pub use crate::abi::virtio_fs::RemovemappingOne;
-#[cfg(feature = "virtiofs")]
-use crate::transport::virtiofs::FsCacheReqHandler;
 
 /// The main trait that connects a file system with a transport.
 #[allow(unused_variables)]
@@ -112,7 +111,7 @@ pub trait FileSystem {
         ctx: &Context,
         inode: Self::Inode,
         handle: Option<Self::Handle>,
-    ) -> io::Result<(libc::stat64, Duration)> {
+    ) -> io::Result<(stat64, Duration)> {
         Err(io::Error::from_raw_os_error(libc::ENOSYS))
     }
 
@@ -137,10 +136,10 @@ pub trait FileSystem {
         &self,
         ctx: &Context,
         inode: Self::Inode,
-        attr: libc::stat64,
+        attr: stat64,
         handle: Option<Self::Handle>,
         valid: SetattrValid,
-    ) -> io::Result<(libc::stat64, Duration)> {
+    ) -> io::Result<(stat64, Duration)> {
         Err(io::Error::from_raw_os_error(libc::ENOSYS))
     }
 
@@ -519,9 +518,9 @@ pub trait FileSystem {
     }
 
     /// Get information about the file system.
-    fn statfs(&self, ctx: &Context, inode: Self::Inode) -> io::Result<libc::statvfs64> {
+    fn statfs(&self, ctx: &Context, inode: Self::Inode) -> io::Result<statvfs64> {
         // Safe because we are zero-initializing a struct with only POD fields.
-        let mut st: libc::statvfs64 = unsafe { mem::zeroed() };
+        let mut st: statvfs64 = unsafe { mem::zeroed() };
 
         // This matches the behavior of libfuse as it returns these values if the
         // filesystem doesn't implement this method.
@@ -927,7 +926,7 @@ impl<FS: FileSystem> FileSystem for Arc<FS> {
         ctx: &Context,
         inode: Self::Inode,
         handle: Option<Self::Handle>,
-    ) -> io::Result<(libc::stat64, Duration)> {
+    ) -> io::Result<(stat64, Duration)> {
         self.deref().getattr(ctx, inode, handle)
     }
 
@@ -935,10 +934,10 @@ impl<FS: FileSystem> FileSystem for Arc<FS> {
         &self,
         ctx: &Context,
         inode: Self::Inode,
-        attr: libc::stat64,
+        attr: stat64,
         handle: Option<Self::Handle>,
         valid: SetattrValid,
-    ) -> io::Result<(libc::stat64, Duration)> {
+    ) -> io::Result<(stat64, Duration)> {
         self.deref().setattr(ctx, inode, attr, handle, valid)
     }
 
@@ -1121,7 +1120,7 @@ impl<FS: FileSystem> FileSystem for Arc<FS> {
             .release(ctx, inode, flags, handle, flush, flock_release, lock_owner)
     }
 
-    fn statfs(&self, ctx: &Context, inode: Self::Inode) -> io::Result<libc::statvfs64> {
+    fn statfs(&self, ctx: &Context, inode: Self::Inode) -> io::Result<statvfs64> {
         self.deref().statfs(ctx, inode)
     }
 

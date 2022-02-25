@@ -7,14 +7,13 @@ use std::io::{self, IoSlice, Read, Write};
 use std::mem::size_of;
 use std::sync::Arc;
 use std::time::Duration;
-
 use vm_memory::ByteValued;
 
 use super::{
     MetricsHook, Server, ServerUtil, ServerVersion, SrvContext, ZcReader, ZcWriter,
     BUFFER_HEADER_SIZE, DIRENT_PADDING, MAX_BUFFER_SIZE, MAX_REQ_PAGES, MIN_READ_BUFFER,
 };
-use crate::abi::linux_abi::*;
+use crate::abi::fuse_abi::*;
 #[cfg(feature = "virtiofs")]
 use crate::abi::virtio_fs::{RemovemappingIn, RemovemappingOne, SetupmappingIn};
 use crate::api::filesystem::{
@@ -173,7 +172,7 @@ impl<F: FileSystem + Sync, D: AsyncDrive> Server<F, D> {
             None
         };
         let valid = SetattrValid::from_bits_truncate(setattr_in.valid);
-        let st: libc::stat64 = setattr_in.into();
+        let st: stat64 = setattr_in.into();
         let result = self
             .fs
             .setattr(ctx.context(), ctx.nodeid(), st, handle, valid);
@@ -282,7 +281,7 @@ impl<F: FileSystem + Sync, D: AsyncDrive> Server<F, D> {
     }
 
     pub(super) fn rename<S: BitmapSlice>(&self, mut ctx: SrvContext<'_, F, D, S>) -> Result<usize> {
-        let RenameIn { newdir } = ctx.r.read_obj().map_err(Error::DecodeMessage)?;
+        let RenameIn { newdir, .. } = ctx.r.read_obj().map_err(Error::DecodeMessage)?;
 
         self.do_rename(ctx, size_of::<RenameIn>(), newdir, 0)
     }
@@ -293,8 +292,12 @@ impl<F: FileSystem + Sync, D: AsyncDrive> Server<F, D> {
     ) -> Result<usize> {
         let Rename2In { newdir, flags, .. } = ctx.r.read_obj().map_err(Error::DecodeMessage)?;
 
+        #[cfg(target_os = "linux")]
         let flags =
             flags & (libc::RENAME_EXCHANGE | libc::RENAME_NOREPLACE | libc::RENAME_WHITEOUT) as u32;
+
+        #[cfg(target_os = "macos")]
+        let flags = flags & (libc::RENAME_EXCL | libc::RENAME_SWAP) as u32;
 
         self.do_rename(ctx, size_of::<Rename2In>(), newdir, flags)
     }
@@ -638,6 +641,9 @@ impl<F: FileSystem + Sync, D: AsyncDrive> Server<F, D> {
                 let mut out = InitOut {
                     major: KERNEL_VERSION,
                     minor: KERNEL_MINOR_VERSION,
+                    #[cfg(target_os = "macos")]
+                    max_readahead: 0,
+                    #[cfg(target_os = "linux")]
                     max_readahead,
                     flags: enabled.bits(),
                     max_background: ::std::u16::MAX,
@@ -1222,10 +1228,7 @@ impl<'a, F: FileSystem, D: AsyncDrive, S: BitmapSlice> SrvContext<'a, F, D, S> {
         self.do_reply_error(err, true)
     }
 
-    fn handle_attr_result(
-        &mut self,
-        result: io::Result<(libc::stat64, Duration)>,
-    ) -> Result<usize> {
+    fn handle_attr_result(&mut self, result: io::Result<(stat64, Duration)>) -> Result<usize> {
         match result {
             Ok((st, timeout)) => {
                 let out = AttrOut {

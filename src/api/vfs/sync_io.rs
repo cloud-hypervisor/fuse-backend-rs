@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::*;
+use crate::abi::fuse_abi::{stat64, statvfs64};
 #[cfg(any(feature = "vhost-user-fs", feature = "virtiofs"))]
 use crate::abi::virtio_fs;
 use crate::async_util::AsyncDrive;
@@ -98,7 +99,7 @@ impl<D: AsyncDrive> FileSystem for Vfs<D> {
         ctx: &Context,
         inode: VfsInode,
         handle: Option<VfsHandle>,
-    ) -> Result<(libc::stat64, Duration)> {
+    ) -> Result<(stat64, Duration)> {
         match self.get_real_rootfs(inode)? {
             (Left(fs), idata) => fs.getattr(ctx, idata.ino(), handle),
             (Right(fs), idata) => fs.getattr(ctx, idata.ino(), handle),
@@ -109,10 +110,10 @@ impl<D: AsyncDrive> FileSystem for Vfs<D> {
         &self,
         ctx: &Context,
         inode: VfsInode,
-        attr: libc::stat64,
+        attr: stat64,
         handle: Option<u64>,
         valid: SetattrValid,
-    ) -> Result<(libc::stat64, Duration)> {
+    ) -> Result<(stat64, Duration)> {
         match self.get_real_rootfs(inode)? {
             (Left(fs), idata) => fs.setattr(ctx, idata.ino(), attr, handle, valid),
             (Right(fs), idata) => fs.setattr(ctx, idata.ino(), attr, handle, valid),
@@ -433,7 +434,7 @@ impl<D: AsyncDrive> FileSystem for Vfs<D> {
         }
     }
 
-    fn statfs(&self, ctx: &Context, inode: VfsInode) -> Result<libc::statvfs64> {
+    fn statfs(&self, ctx: &Context, inode: VfsInode) -> Result<statvfs64> {
         match self.get_real_rootfs(inode)? {
             (Left(fs), idata) => fs.statfs(ctx, idata.ino()),
             (Right(fs), idata) => fs.statfs(ctx, idata.ino()),

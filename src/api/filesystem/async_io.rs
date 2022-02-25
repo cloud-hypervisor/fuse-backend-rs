@@ -13,7 +13,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 
 use super::{Context, Entry, FileSystem, ZeroCopyReader, ZeroCopyWriter};
-use crate::abi::linux_abi::{OpenOptions, SetattrValid};
+use crate::abi::fuse_abi::{stat64, OpenOptions, SetattrValid};
 use crate::api::CreateIn;
 use crate::async_util::{AsyncDrive, AsyncDriver};
 
@@ -118,7 +118,7 @@ pub trait AsyncFileSystem<D: AsyncDrive = AsyncDriver>: FileSystem {
         ctx: &Context,
         inode: Self::Inode,
         handle: Option<Self::Handle>,
-    ) -> io::Result<(libc::stat64, Duration)>;
+    ) -> io::Result<(stat64, Duration)>;
 
     /// Set attributes for a file / directory.
     ///
@@ -141,10 +141,10 @@ pub trait AsyncFileSystem<D: AsyncDrive = AsyncDriver>: FileSystem {
         &self,
         ctx: &Context,
         inode: Self::Inode,
-        attr: libc::stat64,
+        attr: stat64,
         handle: Option<Self::Handle>,
         valid: SetattrValid,
-    ) -> io::Result<(libc::stat64, Duration)>;
+    ) -> io::Result<(stat64, Duration)>;
 
     /*
         /// Read a symbolic link.
@@ -839,7 +839,7 @@ pub trait AsyncFileSystem<D: AsyncDrive = AsyncDriver>: FileSystem {
 }
 
 type AttrFuture<'async_trait> =
-    Box<dyn Future<Output = io::Result<(libc::stat64, Duration)>> + Send + 'async_trait>;
+    Box<dyn Future<Output = io::Result<(stat64, Duration)>> + Send + 'async_trait>;
 type OpenFuture<'async_trait, H> =
     Box<dyn Future<Output = io::Result<(Option<H>, OpenOptions)>> + Send + 'async_trait>;
 type CreateFuture<'async_trait, H> =
@@ -879,7 +879,7 @@ impl<FS: AsyncFileSystem<D>, D: AsyncDrive> AsyncFileSystem<D> for Arc<FS> {
         &'a self,
         ctx: &'b Context,
         inode: Self::Inode,
-        attr: libc::stat64,
+        attr: stat64,
         handle: Option<Self::Handle>,
         valid: SetattrValid,
     ) -> Pin<AttrFuture<'async_trait>>

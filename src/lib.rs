@@ -102,6 +102,8 @@ pub type Result<T> = ::std::result::Result<T, Error>;
 
 pub mod abi;
 pub mod api;
+
+#[cfg(all(any(feature = "fusedev", feature = "virtiofs"), target_os = "linux"))]
 pub mod passthrough;
 pub mod transport;
 

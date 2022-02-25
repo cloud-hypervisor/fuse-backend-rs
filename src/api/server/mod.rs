@@ -25,7 +25,7 @@ use std::sync::Arc;
 use arc_swap::ArcSwap;
 
 use super::filesystem::{Context, FileSystem, ZeroCopyReader, ZeroCopyWriter};
-use crate::abi::linux_abi::*;
+use crate::abi::fuse_abi::*;
 use crate::async_util::{AsyncDrive, AsyncDriver};
 use crate::transport::{FileReadWriteVolatile, Reader, Writer};
 use crate::{bytes_to_cstr, BitmapSlice, Error, Result};
@@ -35,7 +35,11 @@ mod async_io;
 mod sync_io;
 
 /// Maximum buffer size of FUSE requests.
-const MAX_BUFFER_SIZE: u32 = 1 << 20;
+#[cfg(target_os = "linux")]
+pub const MAX_BUFFER_SIZE: u32 = 1 << 20;
+/// Maximum buffer size of FUSE requests.
+#[cfg(target_os = "macos")]
+pub const MAX_BUFFER_SIZE: u32 = 1 << 25;
 const MIN_READ_BUFFER: u32 = 8192;
 const BUFFER_HEADER_SIZE: u32 = 0x1000;
 const DIRENT_PADDING: [u8; 8] = [0; 8];
