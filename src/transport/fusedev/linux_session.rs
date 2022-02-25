@@ -8,18 +8,20 @@
 //! sequentially. A FUSE session is a connection from a FUSE mountpoint to a FUSE server daemon.
 //! A FUSE session can have multiple FUSE channels so that FUSE requests are handled in parallel.
 
+use mio::unix::SourceFd;
+use mio::{Events, Interest, Poll, Token, Waker};
 use std::fs::{File, OpenOptions};
 use std::ops::Deref;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 use nix::errno::Errno;
 use nix::fcntl::{fcntl, FcntlArg, OFlag};
 use nix::mount::{mount, umount2, MntFlags, MsFlags};
 use nix::poll::{poll, PollFd, PollFlags};
 use nix::unistd::{getgid, getuid, read};
-use vmm_sys_util::eventfd::EventFd;
 use vmm_sys_util::poll::{PollContext, WatchingEvents};
 
 use super::{super::pagesize, Error::SessionFailure, FuseBuf, Reader, Result, Writer};
@@ -27,12 +29,13 @@ use super::{super::pagesize, Error::SessionFailure, FuseBuf, Reader, Result, Wri
 // These follows definition from libfuse.
 const FUSE_KERN_BUF_SIZE: usize = 256;
 const FUSE_HEADER_SIZE: usize = 0x1000;
+const POLL_EVENTS_CAPACITY: usize = 1024;
 
 const FUSE_DEVICE: &str = "/dev/fuse";
 const FUSE_FSTYPE: &str = "fuse";
 
-const FUSE_DEV_EVENT: u32 = 0;
-const EXIT_FUSE_EVENT: u32 = 1;
+const EXIT_FUSE_EVENT: Token = Token(0);
+const FUSE_DEV_EVENT: Token = Token(1);
 
 /// A fuse session manager to manage the connection with the in kernel fuse driver.
 pub struct FuseSession {
@@ -42,6 +45,7 @@ pub struct FuseSession {
     file: Option<File>,
     bufsize: usize,
     readonly: bool,
+    wakers: Mutex<Vec<Arc<Waker>>>,
 }
 
 impl FuseSession {
@@ -66,6 +70,7 @@ impl FuseSession {
             file: None,
             bufsize: FUSE_KERN_BUF_SIZE * pagesize() + FUSE_HEADER_SIZE,
             readonly,
+            wakers: Mutex::new(Vec::new()),
         })
     }
 
@@ -128,15 +133,42 @@ impl FuseSession {
     }
 
     /// Create a new fuse message channel.
-    pub fn new_channel(&self, evtfd: EventFd) -> Result<FuseChannel> {
+    pub fn new_channel(&self) -> Result<FuseChannel> {
         if let Some(file) = &self.file {
             let file = file
                 .try_clone()
                 .map_err(|e| SessionFailure(format!("dup fd: {}", e)))?;
-            FuseChannel::new(file, evtfd, self.bufsize)
+            let channel = FuseChannel::new(file, self.bufsize)?;
+            let waker = channel.get_waker();
+            self.add_waker(waker);
+
+            Ok(channel)
         } else {
             Err(SessionFailure("invalid fuse session".to_string()))
         }
+    }
+
+    fn add_waker(&self, waker: Arc<Waker>) -> Result<()> {
+        let mut wakers = self
+            .wakers
+            .lock()
+            .map_err(|e| SessionFailure(format!("lock wakers: {}", e)))?;
+        wakers.push(waker);
+        Ok(())
+    }
+
+    /// Wake channel loop and exit
+    pub fn wake(&self) -> Result<()> {
+        let wakers = self
+            .wakers
+            .lock()
+            .map_err(|e| SessionFailure(format!("lock wakers: {}", e)))?;
+        for waker in wakers.iter() {
+            waker
+                .wake()
+                .map_err(|e| SessionFailure(format!("wake channel: {}", e)))?;
+        }
+        Ok(())
     }
 }
 
@@ -149,27 +181,34 @@ impl Drop for FuseSession {
 /// A fuse channel abstruction. Each session can hold multiple channels.
 pub struct FuseChannel {
     file: File,
-    poll_ctx: PollContext<u32>,
+    poll: Poll,
+    waker: Arc<Waker>,
     buf: Vec<u8>,
 }
 
 impl FuseChannel {
-    fn new(file: File, evtfd: EventFd, bufsize: usize) -> Result<Self> {
-        let poll_ctx =
-            PollContext::new().map_err(|e| SessionFailure(format!("epoll create: {}", e)))?;
-
-        poll_ctx
-            .add_fd_with_events(&file, WatchingEvents::empty().set_read(), FUSE_DEV_EVENT)
+    fn new(file: File, bufsize: usize) -> Result<Self> {
+        let poll = Poll::new().map_err(|e| SessionFailure(format!("epoll create: {}", e)))?;
+        let waker = Waker::new(poll.registry(), EXIT_FUSE_EVENT)
             .map_err(|e| SessionFailure(format!("epoll register session fd: {}", e)))?;
-        poll_ctx
-            .add_fd_with_events(&evtfd, WatchingEvents::empty().set_read(), EXIT_FUSE_EVENT)
-            .map_err(|e| SessionFailure(format!("epoll register exit fd: {}", e)))?;
+        let waker = Arc::new(waker);
+
+        poll.registry().register(
+            &mut SourceFd(&file.as_raw_fd()),
+            FUSE_DEV_EVENT,
+            Interest::READABLE,
+        );
 
         Ok(FuseChannel {
             file,
-            poll_ctx,
+            poll,
+            waker,
             buf: vec![0x0u8; bufsize],
         })
+    }
+
+    fn get_waker(&self) -> Arc<Waker> {
+        self.waker.clone()
     }
 
     /// Get next available FUSE request from the underlying fuse device file.
@@ -179,14 +218,14 @@ impl FuseChannel {
     /// - Ok(Some((reader, writer))): reader to receive request and writer to send reply
     /// - Err(e): error message
     pub fn get_request(&mut self) -> Result<Option<(Reader, Writer)>> {
+        let mut events = Events::with_capacity(POLL_EVENTS_CAPACITY);
         loop {
-            let events = self
-                .poll_ctx
-                .wait()
+            self.poll
+                .poll(&mut events, None)
                 .map_err(|e| SessionFailure(format!("epoll wait: {}", e)))?;
 
             for event in events.iter() {
-                if event.readable() {
+                if event.is_readable() {
                     let fd = self.file.as_raw_fd();
                     match event.token() {
                         EXIT_FUSE_EVENT => {
@@ -244,10 +283,10 @@ impl FuseChannel {
                         }
                         x => {
                             error!("unexpected epoll event");
-                            return Err(SessionFailure(format!("unexpected epoll event: {}", x,)));
+                            return Err(SessionFailure(format!("unexpected epoll event: {}", x.0)));
                         }
                     }
-                } else if event.hungup() || event.has_error() {
+                } else if event.is_error() {
                     info!("FUSE channel already closed!");
                     return Err(SessionFailure("epoll error".to_string()));
                 } else {
@@ -345,11 +384,7 @@ mod tests {
 
     #[test]
     fn test_new_channel() {
-        let ch = FuseChannel::new(
-            unsafe { File::from_raw_fd(EventFd::new(0).unwrap().as_raw_fd()) },
-            EventFd::new(0).unwrap(),
-            3,
-        );
+        let ch = FuseChannel::new(unsafe { File::from_raw_fd(0) }, 3);
         assert!(ch.is_ok());
     }
 }
