@@ -19,7 +19,6 @@ homepage = "https://github.com/cloud-hypervisor/"
 arc-swap = ">=0.4.6"
 #async-trait = { version = "0.1.42", optional = true }
 bitflags = ">=1.1.0"
-caps = "0.5.1"
 #futures = { version = "0.3", optional = true }
 #iou = { version = "0.3.3", optional = true }
 libc = ">=0.2.68"
@@ -32,6 +31,13 @@ vm-memory = { version = "0.7", features = ["backend-mmap"] }
 virtio-queue = { version = "0.1.0", optional = true }
 vhost = { version = "0.3", features = ["vhost-user-slave"], optional = true }
 
+[target.'cfg(target_os = "macos")'.dependencies]
+core-foundation-sys = { version = "0.2.3", optional = true }
+diskarbitration-sys = { version = "0.0.4", optional = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+caps = { version = "0.5.1", optional = true }
+
 [dev-dependencies]
 futures = { version = "0.3.0", features = ["thread-pool"]}
 stderrlog = ">=0.5.0"
@@ -40,10 +46,10 @@ vm-memory = { version = "0.7", features = ["backend-mmap", "backend-bitmap"] }
 
 [features]
 default = ["fusedev"]
-#async-io = ["async-trait", "futures", "iou", "ringbahn"]
-fusedev = ["vmm-sys-util"]
-virtiofs = ["virtio-queue"]
-vhost-user-fs = ["virtiofs", "vhost"]
+#async-io = ["async-trait", "futures", "iou", "ringbahn", "caps]
+fusedev = ["vmm-sys-util", "caps", "core-foundation-sys", "diskarbitration-sys"]
+virtiofs = ["virtio-queue", "caps"]
+vhost-user-fs = ["virtiofs", "vhost", "caps"]
 
 [patch."registry+https://github.com/rust-lang/crates.io-index"]
 #ringbahn = { git = "https://github.com/jiangliu/ringbahn.git", branch = "enhance", optional = true }

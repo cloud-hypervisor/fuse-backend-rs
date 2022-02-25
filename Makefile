@@ -5,6 +5,14 @@ build:
 	cargo build --features="virtiofs"
 	cargo build --features="vhost-user-fs"
 
+build-macos:
+	cargo build --features="fusedev"
+
+check-macos: build-macos
+	cargo fmt -- --check
+	cargo clippy --features="fusedev" -- -Dclippy::all
+	cargo test --features="fusedev" -- --nocapture --skip integration
+
 check: build
 	cargo fmt -- --check
 	cargo clippy --features="fusedev" -- -Dclippy::all
@@ -15,6 +23,9 @@ check: build
 	cargo test --features="vhost-user-fs" -- --nocapture --skip integration
 
 smoke: check
+	cargo test --features="fusedev" -- --nocapture
+
+smoke-macos: check-macos
 	cargo test --features="fusedev" -- --nocapture
 
 docker-smoke:
