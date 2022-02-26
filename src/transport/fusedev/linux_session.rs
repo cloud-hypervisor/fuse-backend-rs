@@ -22,9 +22,10 @@ use nix::fcntl::{fcntl, FcntlArg, OFlag};
 use nix::mount::{mount, umount2, MntFlags, MsFlags};
 use nix::poll::{poll, PollFd, PollFlags};
 use nix::unistd::{getgid, getuid, read};
-use vmm_sys_util::poll::{PollContext, WatchingEvents};
 
-use super::{super::pagesize, Error::SessionFailure, FuseBuf, Reader, Result, Writer};
+use super::{
+    super::pagesize, Error::IoError, Error::SessionFailure, FuseBuf, Reader, Result, Writer,
+};
 
 // These follows definition from libfuse.
 const FUSE_KERN_BUF_SIZE: usize = 256;
@@ -140,7 +141,7 @@ impl FuseSession {
                 .map_err(|e| SessionFailure(format!("dup fd: {}", e)))?;
             let channel = FuseChannel::new(file, self.bufsize)?;
             let waker = channel.get_waker();
-            self.add_waker(waker);
+            self.add_waker(waker)?;
 
             Ok(channel)
         } else {
@@ -193,11 +194,13 @@ impl FuseChannel {
             .map_err(|e| SessionFailure(format!("epoll register session fd: {}", e)))?;
         let waker = Arc::new(waker);
 
-        poll.registry().register(
-            &mut SourceFd(&file.as_raw_fd()),
-            FUSE_DEV_EVENT,
-            Interest::READABLE,
-        );
+        poll.registry()
+            .register(
+                &mut SourceFd(&file.as_raw_fd()),
+                FUSE_DEV_EVENT,
+                Interest::READABLE,
+            )
+            .map_err(IoError)?;
 
         Ok(FuseChannel {
             file,
@@ -384,7 +387,11 @@ mod tests {
 
     #[test]
     fn test_new_channel() {
-        let ch = FuseChannel::new(unsafe { File::from_raw_fd(0) }, 3);
+        let ch = FuseChannel::new(
+            // Provide a valid FD to allow poll register to work.
+            unsafe { File::from_raw_fd(std::io::stdout().as_raw_fd()) },
+            3,
+        );
         assert!(ch.is_ok());
     }
 }
