@@ -204,8 +204,7 @@ impl InodeMap {
         handle_altkey: Option<&InodeAltKey>,
     ) -> Option<Arc<InodeData>> {
         handle_altkey
-            .map(|altkey| inodes.get_alt(altkey))
-            .flatten()
+            .and_then(|altkey| inodes.get_alt(altkey))
             .or_else(|| {
                 inodes.get_alt(ids_altkey).filter(|data| {
                     // When we have to fall back to looking up an inode by its IDs, ensure that
@@ -837,7 +836,7 @@ impl<D: AsyncDrive, S: BitmapSlice + Send + Sync> PassthroughFs<D, S> {
         let name =
             if parent == fuse::ROOT_ID && name.to_bytes_with_nul().starts_with(PARENT_DIR_CSTR) {
                 // Safe as this is a constant value and a valid C string.
-                &CStr::from_bytes_with_nul(CURRENT_DIR_CSTR).unwrap()
+                CStr::from_bytes_with_nul(CURRENT_DIR_CSTR).unwrap()
             } else {
                 name
             };
