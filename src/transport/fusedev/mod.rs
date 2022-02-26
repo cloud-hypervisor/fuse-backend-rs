@@ -11,7 +11,7 @@ use std::marker::PhantomData;
 use std::mem::ManuallyDrop;
 use std::os::unix::io::RawFd;
 
-use nix::sys::uio::{pwrite, writev, IoVec};
+use nix::sys::uio::{writev, IoVec};
 use nix::unistd::write;
 use vm_memory::{ByteValued, VolatileMemory, VolatileMemoryError, VolatileSlice};
 
@@ -183,13 +183,7 @@ impl<'a, S: BitmapSlice> Writer<'a, S> {
         let o = other.map(|v| v.buf.as_slice()).unwrap_or(&[]);
         let res = match (self.buf.len(), o.len()) {
             (0, 0) => Ok(0),
-            #[cfg(target_os = "linux")]
-            (0, _) => pwrite(self.fd, o, 0),
-            #[cfg(target_os = "linux")]
-            (_, 0) => pwrite(self.fd, self.buf.as_slice(), 0),
-            #[cfg(target_os = "macos")]
             (0, _) => write(self.fd, o),
-            #[cfg(target_os = "macos")]
             (_, 0) => write(self.fd, self.buf.as_slice()),
             (_, _) => {
                 let bufs = [IoVec::from_slice(self.buf.as_slice()), IoVec::from_slice(o)];
@@ -322,9 +316,6 @@ impl<'a, S: BitmapSlice> Writer<'a, S> {
     }
 
     fn do_write(fd: RawFd, data: &[u8]) -> io::Result<usize> {
-        #[cfg(target_os = "linux")]
-        let res = pwrite(fd, data, 0);
-        #[cfg(target_os = "macos")]
         let res = write(fd, data);
 
         res.map_err(|e| {
