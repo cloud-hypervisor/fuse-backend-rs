@@ -14,6 +14,7 @@ use fuse_backend_rs::passthrough::{Config, PassthroughFs};
 use fuse_backend_rs::transport::fusedev::{FuseChannel, FuseSession};
 
 /// A fusedev daemon example
+#[allow(dead_code)]
 pub struct Daemon {
     mountpoint: String,
     server: Arc<Server<Arc<Vfs<AsyncDriver>>>>,
@@ -21,6 +22,7 @@ pub struct Daemon {
     session: Option<FuseSession>,
 }
 
+#[allow(dead_code)]
 impl Daemon {
     /// Creates a fusedev daemon instance
     pub fn new(src: &str, mountpoint: &str, thread_cnt: u32) -> Result<Self> {
