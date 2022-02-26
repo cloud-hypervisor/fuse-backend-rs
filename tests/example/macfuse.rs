@@ -7,7 +7,6 @@ use log::{error, info, warn};
 use std::any::Any;
 use std::ffi::CStr;
 use std::io::Result;
-use std::os::unix::io::RawFd;
 use std::path::Path;
 use std::sync::Arc;
 use std::thread;
@@ -25,6 +24,7 @@ pub(crate) struct HelloFileSystem {}
 impl FileSystem for HelloFileSystem {
     type Inode = u64;
     type Handle = u64;
+    #[allow(unused_variables)]
     fn lookup(&self, _: &Context, parent: Self::Inode, name: &CStr) -> Result<Entry> {
         let content = "hello, fuse".as_bytes();
         let now = SystemTime::now();
@@ -69,6 +69,7 @@ impl FileSystem for HelloFileSystem {
         })
     }
 
+    #[allow(unused_variables)]
     fn readdir(
         &self,
         ctx: &Context,
@@ -104,10 +105,11 @@ impl FileSystem for HelloFileSystem {
             type_: libc::DT_REG as u32,
             name: "hello".as_bytes(),
         };
-        add_entry(entry);
+        add_entry(entry).unwrap();
         Ok(())
     }
 
+    #[allow(unused_variables)]
     fn read(
         &self,
         ctx: &Context,
@@ -130,10 +132,11 @@ impl FileSystem for HelloFileSystem {
         };
         let read_end = (offset as usize) + read_size;
         buf.extend_from_slice(&content[(offset as usize)..(read_end as usize)]);
-        w.write(buf.as_slice());
+        w.write(buf.as_slice())?;
         Ok(read_size)
     }
 
+    #[allow(unused_variables)]
     fn getattr(
         &self,
         ctx: &Context,
@@ -222,6 +225,7 @@ impl FileSystem for HelloFileSystem {
         }
     }
 
+    #[allow(unused_variables)]
     fn access(&self, ctx: &Context, inode: Self::Inode, mask: u32) -> Result<()> {
         return Ok(());
     }
@@ -248,6 +252,7 @@ impl BackendFileSystem for HelloFileSystem {
 }
 
 /// A fusedev daemon example
+#[allow(dead_code)]
 pub struct Daemon {
     mountpoint: String,
     server: Arc<Server<Arc<Vfs<AsyncDriver>>>>,
@@ -255,6 +260,7 @@ pub struct Daemon {
     session: Option<FuseSession>,
 }
 
+#[allow(dead_code)]
 impl Daemon {
     /// Creates a fusedev daemon instance
     pub fn new(mountpoint: &str, thread_cnt: u32) -> Result<Self> {
@@ -265,7 +271,6 @@ impl Daemon {
             ..Default::default()
         });
 
-        let (rx, sx) = nix::unistd::pipe().unwrap();
         let fs = HelloFileSystem {};
         vfs.mount(Box::new(fs), "/").unwrap();
 
