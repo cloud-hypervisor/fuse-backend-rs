@@ -638,13 +638,16 @@ impl<F: FileSystem + Sync, D: AsyncDrive> Server<F, D> {
                     major, minor, capable, enabled
                 );
 
+                let readahead = if cfg!(target_os = "macos") {
+                    0
+                } else {
+                    max_readahead
+                };
+
                 let mut out = InitOut {
                     major: KERNEL_VERSION,
                     minor: KERNEL_MINOR_VERSION,
-                    #[cfg(target_os = "macos")]
-                    max_readahead: 0,
-                    #[cfg(target_os = "linux")]
-                    max_readahead,
+                    max_readahead: readahead,
                     flags: enabled.bits(),
                     max_background: ::std::u16::MAX,
                     congestion_threshold: (::std::u16::MAX / 4) * 3,

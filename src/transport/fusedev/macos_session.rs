@@ -10,34 +10,27 @@
 
 use core_foundation_sys::base::{CFIndex, CFRelease};
 use core_foundation_sys::string::{kCFStringEncodingUTF8, CFStringCreateWithBytes};
-use core_foundation_sys::url::{
-    kCFURLPOSIXPathStyle, CFURLCreateWithFileSystemPath, CFURLPathStyle,
-};
+use core_foundation_sys::url::{kCFURLPOSIXPathStyle, CFURLCreateWithFileSystemPath};
 use diskarbitration_sys::base::{kDADiskUnmountOptionForce, DADiskUnmount};
 use diskarbitration_sys::disk::{DADiskCreateFromVolumePath, DADiskRef};
 use diskarbitration_sys::session::{DASessionCreate, DASessionRef};
 use std::ffi::CString;
-use std::fmt::format;
-use std::fs::{File, OpenOptions};
-use std::io::Read;
-use std::ops::Deref;
+use std::fs::File;
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::PermissionsExt;
 use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
+use std::sync::atomic::{AtomicPtr, Ordering};
 use std::sync::{Arc, Mutex};
 
-use libc::{c_void, proc_pidpath, setenv, sysconf, PROC_PIDPATHINFO_MAXSIZE, _SC_PAGESIZE};
-use nix::errno::{errno, Errno};
-use nix::fcntl::{fcntl, FcntlArg, FdFlag, OFlag, F_SETFD};
-use nix::poll::{poll, PollFd, PollFlags};
+use libc::{c_void, proc_pidpath, PROC_PIDPATHINFO_MAXSIZE};
+use nix::errno::Errno;
+use nix::fcntl::{fcntl, FdFlag, F_SETFD};
 use nix::sys::signal::{signal, SigHandler, Signal};
 use nix::sys::socket::{
     recvmsg, socketpair, AddressFamily, ControlMessageOwned, MsgFlags, SockFlag, SockType,
 };
 use nix::sys::uio::IoVec;
-use nix::unistd::{close, execv, fork, getgid, getpid, getuid, read, ForkResult};
+use nix::unistd::{close, execv, fork, getpid, read, ForkResult};
 use nix::{cmsg_space, NixPath};
 
 use super::{Error::SessionFailure, FuseBuf, Reader, Result, Writer};
@@ -46,9 +39,6 @@ use crate::transport::pagesize;
 // These follows definition from libfuse.
 const FUSE_KERN_BUF_SIZE: usize = 256;
 const FUSE_HEADER_SIZE: usize = 0x1000;
-
-const FUSE_DEV_EVENT: u32 = 0;
-const EXIT_FUSE_EVENT: u32 = 1;
 
 const OSXFUSE_MOUNT_PROG: &str = "/Library/Filesystems/macfuse.fs/Contents/Resources/mount_macfuse";
 
@@ -129,7 +119,7 @@ impl FuseSession {
     /// Destroy a fuse session.
     pub fn umount(&mut self) -> Result<()> {
         if let Some(file) = self.file.take() {
-            if let Some(mountpoint) = self.mountpoint.to_str() {
+            if self.mountpoint.to_str().is_some() {
                 let mut disk = self.disk.lock().expect("lock disk failed");
                 fuse_kern_umount(file, disk.take())
             } else {
@@ -272,9 +262,9 @@ fn receive_fd(sock_fd: RawFd) -> Result<RawFd> {
 }
 
 fn fuse_kern_mount(mountpoint: &Path, fsname: &str, subtype: &str, rd_only: bool) -> Result<File> {
-    unsafe {
-        signal(Signal::SIGCHLD, SigHandler::SigDfl);
-    }
+    unsafe { signal(Signal::SIGCHLD, SigHandler::SigDfl) }
+        .map_err(|e| SessionFailure(format!("fail to reset SIGCHLD handler{:?}", e)))?;
+
     let (fd0, fd1) = socketpair(
         AddressFamily::Unix,
         SockType::Stream,
@@ -382,8 +372,9 @@ fn create_disk(mountpoint: &Path, dasession: DASessionRef) -> DADiskRef {
 /// Umount a fuse file system
 fn fuse_kern_umount(file: File, disk: Option<DADiskRef>) -> Result<()> {
     if let Err(e) = set_fuse_fd_dead(file.as_raw_fd()) {
-        return Err(SessionFailure(String::from(
-            "ioctl set fuse deamon dead failed",
+        return Err(SessionFailure(format!(
+            "ioctl set fuse deamon dead failed: {}",
+            e
         )));
     }
     drop(file);
@@ -410,7 +401,7 @@ fn set_fuse_fd_dead(fd: RawFd) -> std::io::Result<()> {
 mod tests {
     use super::*;
     use std::fs::File;
-    use std::os::unix::io::{FromRawFd, RawFd};
+    use std::os::unix::io::FromRawFd;
     use std::path::Path;
     use vmm_sys_util::tempdir::TempDir;
 

@@ -14,7 +14,6 @@ mod macfuse_tests {
     extern crate stderrlog;
 
     use std::io::Result;
-    use std::path::Path;
     use std::process::Command;
 
     use vmm_sys_util::tempdir::TempDir;
