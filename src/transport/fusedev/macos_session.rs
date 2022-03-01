@@ -165,7 +165,7 @@ impl FuseSession {
     /// Wake channel loop
     /// After macfuse unmount, read will throw ENODEV
     /// So wakers is no need for macfuse to interrupt channel
-    pub fn wake() -> Result<()> {
+    pub fn wake(&self) -> Result<()> {
         Ok(())
     }
 }
