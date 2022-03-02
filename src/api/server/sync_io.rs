@@ -105,7 +105,7 @@ impl<F: FileSystem + Sync, D: AsyncDrive> Server<F, D> {
                     Ok(0)
                 }
                 x if x == Opcode::Destroy as u32 => {
-                    self.destroy();
+                    self.destroy(ctx);
                     Ok(0)
                 }
                 _ => ctx.reply_error(io::Error::from_raw_os_error(libc::ENOSYS)),
@@ -927,9 +927,11 @@ impl<F: FileSystem + Sync, D: AsyncDrive> Server<F, D> {
         }
     }
 
-    pub(super) fn destroy(&self) {
-        // No reply to this function.
+    pub(super) fn destroy<S: BitmapSlice>(&self, mut ctx: SrvContext<'_, F, D, S>) {
         self.fs.destroy();
+        if let Err(e) = ctx.reply_ok(None::<u8>, None) {
+            warn!("fuse channel reply destroy failed {:?}", e);
+        }
     }
 
     pub(super) fn ioctl<S: BitmapSlice>(&self, mut ctx: SrvContext<'_, F, D, S>) -> Result<usize> {
