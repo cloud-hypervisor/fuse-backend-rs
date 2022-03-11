@@ -386,7 +386,11 @@ impl<D: AsyncDrive> Vfs<D> {
             .get(&inode)
             .map(Arc::clone)
             .map(|x| {
-                self.root.evict_inode(inode);
+                // Do not remove pseudofs inode. We keep all pseudofs inode so that
+                // 1. they can be reused later on
+                // 2. during live upgrade, it is easier reconstruct pseudofs inodes since
+                //    we do not have to track pseudofs deletions
+                //self.root.evict_inode(inode);
                 mountpoints.remove(&inode);
                 self.mountpoints.store(Arc::new(mountpoints));
                 x.fs_idx
