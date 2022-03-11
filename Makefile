@@ -25,8 +25,11 @@ check: build
 smoke: check
 	cargo test --features="fusedev" -- --nocapture
 
+smoke-all: smoke
+	cargo test --features="fusedev" -- --nocapture --ignored
+
 smoke-macos: check-macos
 	cargo test --features="fusedev" -- --nocapture
 
 docker-smoke:
-	docker run --rm --privileged -v ${current_dir}:/fuse-rs rust:1.58.1 sh -c "rustup component add clippy rustfmt; cd /fuse-rs; make smoke"
+	docker run --rm --privileged -v ${current_dir}:/fuse-rs rust:1.58.1 sh -c "rustup component add clippy rustfmt; cd /fuse-rs; make smoke-all"
