@@ -21,6 +21,7 @@ use nix::errno::Errno;
 use nix::fcntl::{fcntl, FcntlArg, OFlag};
 use nix::mount::{mount, umount2, MntFlags, MsFlags};
 use nix::poll::{poll, PollFd, PollFlags};
+use nix::sys::epoll::{epoll_ctl, EpollEvent, EpollFlags, EpollOp};
 use nix::unistd::{getgid, getuid, read};
 
 use super::{
@@ -194,13 +195,18 @@ impl FuseChannel {
             .map_err(|e| SessionFailure(format!("epoll register session fd: {}", e)))?;
         let waker = Arc::new(waker);
 
-        poll.registry()
-            .register(
-                &mut SourceFd(&file.as_raw_fd()),
-                FUSE_DEV_EVENT,
-                Interest::READABLE,
-            )
-            .map_err(IoError)?;
+        // mio default add EPOLLET to event flags, so epoll will use edge-triggered mode.
+        // It may let poll miss some event, so manually register the fd with only EPOLLIN flag
+        // to use level-triggered mode.
+        let epoll = poll.as_raw_fd();
+        let mut event = EpollEvent::new(EpollFlags::EPOLLIN, usize::from(FUSE_DEV_EVENT) as u64);
+        epoll_ctl(
+            epoll,
+            EpollOp::EpollCtlAdd,
+            file.as_raw_fd(),
+            Some(&mut event),
+        )
+        .map_err(|e| SessionFailure(format!("epoll register channel fd: {}", e)))?;
 
         Ok(FuseChannel {
             file,
