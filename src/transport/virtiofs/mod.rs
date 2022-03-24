@@ -46,10 +46,10 @@ use std::ops::Deref;
 use std::ptr::copy_nonoverlapping;
 
 use virtio_queue::{DescriptorChain, Error as QueueError};
-use vm_memory::bitmap::BitmapSlice;
+use vm_memory::bitmap::{BitmapSlice, MS};
 use vm_memory::{
-    Address, ByteValued, GuestMemory, GuestMemoryError, GuestMemoryMmap, GuestMemoryRegion,
-    VolatileMemory, VolatileMemoryError, VolatileSlice,
+    Address, ByteValued, GuestMemory, GuestMemoryError, GuestMemoryRegion, MemoryRegionAddress,
+    VolatileMemoryError, VolatileSlice,
 };
 
 use super::{FileReadWriteVolatile, FileVolatileSlice, IoBuffers, Reader};
@@ -115,7 +115,10 @@ impl<S: BitmapSlice> IoBuffers<'_, S> {
 
 impl<'a> Reader<'a> {
     /// Construct a new Reader wrapper over `desc_chain`.
-    pub fn new<M>(mem: &'a GuestMemoryMmap, desc_chain: DescriptorChain<M>) -> Result<Reader<'a>>
+    pub fn new<M>(
+        mem: &'a M::Target,
+        desc_chain: DescriptorChain<M>,
+    ) -> Result<Reader<'a, MS<'a, M::Target>>>
     where
         M: Deref,
         M::Target: GuestMemory + Sized,
@@ -139,11 +142,10 @@ impl<'a> Reader<'a> {
                     .checked_sub(region.start_addr().raw_value())
                     .unwrap();
                 region
-                    .deref()
-                    .get_slice(offset.raw_value() as usize, desc.len() as usize)
-                    .map_err(Error::VolatileMemoryError)
+                    .get_slice(MemoryRegionAddress(offset.raw_value()), desc.len() as usize)
+                    .map_err(Error::GuestMemoryError)
             })
-            .collect::<Result<VecDeque<VolatileSlice<'a>>>>()?;
+            .collect::<Result<VecDeque<VolatileSlice<'a, MS<M::Target>>>>>()?;
 
         Ok(Reader {
             buffers: IoBuffers {
@@ -168,7 +170,10 @@ pub struct Writer<'a, S = ()> {
 
 impl<'a> Writer<'a> {
     /// Construct a new Writer wrapper over `desc_chain`.
-    pub fn new<M>(mem: &'a GuestMemoryMmap, desc_chain: DescriptorChain<M>) -> Result<Writer<'a>>
+    pub fn new<M>(
+        mem: &'a M::Target,
+        desc_chain: DescriptorChain<M>,
+    ) -> Result<Writer<'a, MS<'a, M::Target>>>
     where
         M: Deref,
         M::Target: GuestMemory + Sized,
@@ -192,11 +197,10 @@ impl<'a> Writer<'a> {
                     .checked_sub(region.start_addr().raw_value())
                     .unwrap();
                 region
-                    .deref()
-                    .get_slice(offset.raw_value() as usize, desc.len() as usize)
-                    .map_err(Error::VolatileMemoryError)
+                    .get_slice(MemoryRegionAddress(offset.raw_value()), desc.len() as usize)
+                    .map_err(Error::GuestMemoryError)
             })
-            .collect::<Result<VecDeque<VolatileSlice<'a>>>>()?;
+            .collect::<Result<VecDeque<VolatileSlice<'a, MS<M::Target>>>>>()?;
 
         Ok(Writer {
             buffers: IoBuffers {
