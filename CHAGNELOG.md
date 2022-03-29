@@ -1,6 +1,16 @@
 # Changelog
 ## [v0.3.0]
 ### Added
+- MacOS support
+
+### Changed
+- linux_abi renamed to fuse_abi
+- switch from epoll to mio for cross-platform support
+- VFS umount no longer evicts pseudofs inodes
+- virtiofs transport Reader/Writer takes generic typed memory argument
+
+## [v0.3.0]
+### Added
 - Optionally enable MAX_PAGES feature
 - Allow customizing the default FUSE features before creating a new vfs structure
 - Support more FUSE server APIs
