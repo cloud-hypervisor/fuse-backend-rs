@@ -228,67 +228,21 @@ impl FuseChannel {
     /// - Err(e): error message
     pub fn get_request(&mut self) -> Result<Option<(Reader, Writer)>> {
         let mut events = Events::with_capacity(POLL_EVENTS_CAPACITY);
+        let mut need_exit = false;
         loop {
+            let mut fusereq_available = false;
             self.poll
                 .poll(&mut events, None)
                 .map_err(|e| SessionFailure(format!("epoll wait: {}", e)))?;
 
             for event in events.iter() {
                 if event.is_readable() {
-                    let fd = self.file.as_raw_fd();
                     match event.token() {
                         EXIT_FUSE_EVENT => {
-                            // Directly returning from here is reliable as we handle only one
-                            // epoll event which is `Read` or `Exit`.
-                            // One more trick, we don't read the event fd so as to make all
-                            // fuse threads exit. It relies on a LEVEL triggered event fd.
-                            info!("Will exit from fuse service");
-                            return Ok(None);
+                            need_exit = true;
                         }
                         FUSE_DEV_EVENT => {
-                            match read(fd, &mut self.buf) {
-                                Ok(len) => {
-                                    // ###############################################
-                                    // Note: it's a heavy hack to reuse the same underlying data
-                                    // buffer for both Reader and Writer, in order to reduce memory
-                                    // consumption. Here we assume Reader won't be used anymore once
-                                    // we start to write to the Writer. To get rid of this hack,
-                                    // just allocate a dedicated data buffer for Writer.
-                                    let buf = unsafe {
-                                        std::slice::from_raw_parts_mut(
-                                            self.buf.as_mut_ptr(),
-                                            self.buf.len(),
-                                        )
-                                    };
-                                    // Reader::new() and Writer::new() should always return success.
-                                    let reader =
-                                        Reader::new(FuseBuf::new(&mut self.buf[..len])).unwrap();
-                                    let writer = Writer::new(fd, buf).unwrap();
-                                    return Ok(Some((reader, writer)));
-                                }
-                                Err(e) => match e {
-                                    Errno::ENOENT => {
-                                        // ENOENT means the operation was interrupted, it's safe
-                                        // to restart
-                                        trace!("restart reading");
-                                        continue;
-                                    }
-                                    Errno::EAGAIN | Errno::EINTR => {
-                                        continue;
-                                    }
-                                    Errno::ENODEV => {
-                                        info!("fuse filesystem umounted");
-                                        return Ok(None);
-                                    }
-                                    e => {
-                                        warn! {"read fuse dev failed on fd {}: {}", fd, e};
-                                        return Err(SessionFailure(format!(
-                                            "read new request: {:?}",
-                                            e
-                                        )));
-                                    }
-                                },
-                            }
+                            fusereq_available = true;
                         }
                         x => {
                             error!("unexpected epoll event");
@@ -301,6 +255,52 @@ impl FuseChannel {
                 } else {
                     // We should not step into this branch as other event is not registered.
                     panic!("unknown epoll result events");
+                }
+            }
+
+            // Handle wake up event first. We don't read the event fd so that a LEVEL triggered
+            // event can still be delivered to other threads/daemons.
+            if need_exit {
+                info!("Will exit from fuse service");
+                return Ok(None);
+            }
+            if fusereq_available {
+                let fd = self.file.as_raw_fd();
+                match read(fd, &mut self.buf) {
+                    Ok(len) => {
+                        // ###############################################
+                        // Note: it's a heavy hack to reuse the same underlying data
+                        // buffer for both Reader and Writer, in order to reduce memory
+                        // consumption. Here we assume Reader won't be used anymore once
+                        // we start to write to the Writer. To get rid of this hack,
+                        // just allocate a dedicated data buffer for Writer.
+                        let buf = unsafe {
+                            std::slice::from_raw_parts_mut(self.buf.as_mut_ptr(), self.buf.len())
+                        };
+                        // Reader::new() and Writer::new() should always return success.
+                        let reader = Reader::new(FuseBuf::new(&mut self.buf[..len])).unwrap();
+                        let writer = Writer::new(fd, buf).unwrap();
+                        return Ok(Some((reader, writer)));
+                    }
+                    Err(e) => match e {
+                        Errno::ENOENT => {
+                            // ENOENT means the operation was interrupted, it's safe
+                            // to restart
+                            trace!("restart reading");
+                            continue;
+                        }
+                        Errno::EAGAIN | Errno::EINTR => {
+                            continue;
+                        }
+                        Errno::ENODEV => {
+                            info!("fuse filesystem umounted");
+                            return Ok(None);
+                        }
+                        e => {
+                            warn! {"read fuse dev failed on fd {}: {}", fd, e};
+                            return Err(SessionFailure(format!("read new request: {:?}", e)));
+                        }
+                    },
                 }
             }
         }
