@@ -8,8 +8,7 @@
 //! sequentially. A FUSE session is a connection from a FUSE mountpoint to a FUSE server daemon.
 //! A FUSE session can have multiple FUSE channels so that FUSE requests are handled in parallel.
 
-use mio::unix::SourceFd;
-use mio::{Events, Interest, Poll, Token, Waker};
+use mio::{Events, Poll, Token, Waker};
 use std::fs::{File, OpenOptions};
 use std::ops::Deref;
 use std::os::unix::fs::PermissionsExt;
@@ -24,9 +23,7 @@ use nix::poll::{poll, PollFd, PollFlags};
 use nix::sys::epoll::{epoll_ctl, EpollEvent, EpollFlags, EpollOp};
 use nix::unistd::{getgid, getuid, read};
 
-use super::{
-    super::pagesize, Error::IoError, Error::SessionFailure, FuseBuf, Reader, Result, Writer,
-};
+use super::{super::pagesize, Error::SessionFailure, FuseBuf, Reader, Result, Writer};
 
 // These follows definition from libfuse.
 const FUSE_KERN_BUF_SIZE: usize = 256;

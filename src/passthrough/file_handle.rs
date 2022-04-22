@@ -213,10 +213,12 @@ impl MountFds {
         MountFds::default()
     }
 
+    #[allow(dead_code)]
     pub fn get_map(&self) -> RwLockReadGuard<'_, HashMap<u64, std::fs::File>> {
         self.map.read().unwrap()
     }
 
+    #[allow(dead_code)]
     pub fn get_map_mut(&self) -> RwLockWriteGuard<'_, HashMap<u64, std::fs::File>> {
         self.map.write().unwrap()
     }

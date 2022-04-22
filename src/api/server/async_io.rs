@@ -135,7 +135,7 @@ impl<F: AsyncFileSystem<D> + Sync, D: AsyncDrive> Server<F, D> {
             Opcode::from(in_header.opcode),
             in_header
         );
-        hook.map_or((), |h| h.collect(&in_header));
+        hook.map_or((), |h| h.collect(in_header));
 
         let res = match in_header.opcode {
             x if x == Opcode::Lookup as u32 => self.async_lookup(ctx).await,
@@ -217,7 +217,7 @@ impl<F: AsyncFileSystem<D> + Sync, D: AsyncDrive> Server<F, D> {
         let name = bytes_to_cstr(buf.as_ref())?;
         let result = self
             .fs
-            .async_lookup(ctx.context(), ctx.nodeid(), &name)
+            .async_lookup(ctx.context(), ctx.nodeid(), name)
             .await;
 
         match result {

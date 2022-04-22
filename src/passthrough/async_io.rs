@@ -256,7 +256,7 @@ impl<D: AsyncDrive> PassthroughFs<D> {
         dir: &impl AsRawFd,
         path: Option<&CStr>,
     ) -> io::Result<libc::stat64> {
-        self.async_stat_fd(&ctx, dir.as_raw_fd(), path).await
+        self.async_stat_fd(ctx, dir.as_raw_fd(), path).await
     }
 
     async fn async_stat_fd(
@@ -320,7 +320,7 @@ impl<D: AsyncDrive + Sync> AsyncFileSystem<D> for PassthroughFs<D> {
         let dir = self.inode_map.get(parent)?;
         let dir_file = dir.async_get_file(&self.mount_fds).await?;
         let (file_or_handle, st, ids_altkey, handle_altkey) = self
-            .async_open_file_or_handle(&ctx, dir_file.as_raw_fd(), name, |fd, flags, mode| {
+            .async_open_file_or_handle(ctx, dir_file.as_raw_fd(), name, |fd, flags, mode| {
                 Self::open_proc_file(&self.proc_self_fd, fd, flags, mode)
             })
             .await?;
@@ -428,7 +428,7 @@ impl<D: AsyncDrive + Sync> AsyncFileSystem<D> for PassthroughFs<D> {
         inode: <Self as FileSystem>::Inode,
         handle: Option<<Self as FileSystem>::Handle>,
     ) -> io::Result<(libc::stat64, Duration)> {
-        self.async_do_getattr(&ctx, inode, handle).await
+        self.async_do_getattr(ctx, inode, handle).await
     }
 
     async fn async_setattr(
@@ -526,7 +526,7 @@ impl<D: AsyncDrive + Sync> AsyncFileSystem<D> for PassthroughFs<D> {
                 Data::ProcPath(_) => {
                     // There is no `ftruncateat` so we need to get a new fd and truncate it.
                     let f = self
-                        .async_open_inode(&ctx, inode, libc::O_NONBLOCK | libc::O_RDWR)
+                        .async_open_inode(ctx, inode, libc::O_NONBLOCK | libc::O_RDWR)
                         .await?;
                     unsafe { libc::ftruncate(f.as_raw_fd(), attr.st_size) }
                 }
@@ -574,7 +574,7 @@ impl<D: AsyncDrive + Sync> AsyncFileSystem<D> for PassthroughFs<D> {
             }
         }
 
-        self.async_do_getattr(&ctx, inode, handle).await
+        self.async_do_getattr(ctx, inode, handle).await
     }
 
     async fn async_open(
@@ -588,7 +588,7 @@ impl<D: AsyncDrive + Sync> AsyncFileSystem<D> for PassthroughFs<D> {
             info!("fuse: open is not supported.");
             Err(io::Error::from_raw_os_error(libc::ENOSYS))
         } else {
-            self.async_do_open(&ctx, inode, flags, fuse_flags).await
+            self.async_do_open(ctx, inode, flags, fuse_flags).await
         }
     }
 
@@ -670,7 +670,7 @@ impl<D: AsyncDrive + Sync> AsyncFileSystem<D> for PassthroughFs<D> {
         _flags: u32,
     ) -> io::Result<usize> {
         let data = self
-            .async_get_data(&ctx, handle, inode, libc::O_RDONLY)
+            .async_get_data(ctx, handle, inode, libc::O_RDONLY)
             .await?;
         let drive = ctx
             .get_drive::<D>()
@@ -695,7 +695,7 @@ impl<D: AsyncDrive + Sync> AsyncFileSystem<D> for PassthroughFs<D> {
         fuse_flags: u32,
     ) -> io::Result<usize> {
         let data = self
-            .async_get_data(&ctx, handle, inode, libc::O_RDWR)
+            .async_get_data(ctx, handle, inode, libc::O_RDWR)
             .await?;
 
         // Fallback to sync io if KILLPRIV_V2 is enabled to work around a limitation of io_uring.
@@ -727,7 +727,7 @@ impl<D: AsyncDrive + Sync> AsyncFileSystem<D> for PassthroughFs<D> {
         handle: <Self as FileSystem>::Handle,
     ) -> io::Result<()> {
         let data = self
-            .async_get_data(&ctx, handle, inode, libc::O_RDONLY)
+            .async_get_data(ctx, handle, inode, libc::O_RDONLY)
             .await?;
         let drive = ctx
             .get_drive::<D>()
@@ -747,7 +747,7 @@ impl<D: AsyncDrive + Sync> AsyncFileSystem<D> for PassthroughFs<D> {
     ) -> io::Result<()> {
         // Let the Arc<HandleData> in scope, otherwise fd may get invalid.
         let data = self
-            .async_get_data(&ctx, handle, inode, libc::O_RDWR)
+            .async_get_data(ctx, handle, inode, libc::O_RDWR)
             .await?;
         let drive = ctx
             .get_drive::<D>()

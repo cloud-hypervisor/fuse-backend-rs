@@ -235,6 +235,7 @@ impl PseudoFs {
         self.inodes.store(Arc::new(hashmap));
     }
 
+    #[allow(dead_code)]
     pub fn evict_inode(&self, ino: u64) {
         let _guard = self.lock.lock();
         let inodes = self.inodes.load();
