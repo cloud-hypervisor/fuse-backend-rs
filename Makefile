@@ -10,14 +10,14 @@ build-macos:
 
 check-macos: build-macos
 	cargo fmt -- --check
-	cargo clippy --features="fusedev" -- -Dclippy::all
+	cargo clippy --features="fusedev" -- -Dwarnings
 	cargo test --features="fusedev" -- --nocapture --skip integration
 
 check: build
 	cargo fmt -- --check
-	cargo clippy --features="fusedev" -- -Dclippy::all
-	cargo clippy --features="virtiofs" -- -Dclippy::all
-	cargo clippy --features="vhost-user-fs" -- -Dclippy::all
+	cargo clippy --features="fusedev" -- -Dwarnings
+	cargo clippy --features="virtiofs" -- -Dwarnings
+	cargo clippy --features="vhost-user-fs" -- -Dwarnings
 	cargo test --features="virtiofs" -- --nocapture --skip integration
 	cargo test --features="fusedev" -- --nocapture --skip integration
 	cargo test --features="vhost-user-fs" -- --nocapture --skip integration
