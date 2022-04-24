@@ -23,7 +23,7 @@ bitflags = ">=1.1.0"
 #iou = { version = "0.3.3", optional = true }
 libc = ">=0.2.68"
 log = ">=0.4.6"
-nix = "0.22"
+nix = "0.23.1"
 lazy_static = "1.4"
 #ringbahn = { version = "0.0.0-experimental.3", optional = true }
 vmm-sys-util = { version = ">=0.9", optional = true }
