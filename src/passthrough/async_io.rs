@@ -221,8 +221,11 @@ impl<D: AsyncDrive> PassthroughFs<D> {
             e
         })?;
 
-        if let Some(h) = handle {
-            let hd = self.handle_map.get(h, inode)?;
+        // kernel sends 0 as handle in case of no_open, and it depends on fuse server to handle
+        // this case correctly.
+        if !self.no_open.load(Ordering::Relaxed) && handle.is_some() {
+            // Safe as we just checked handle
+            let hd = self.handle_map.get(handle.unwrap(), inode)?;
             fd = hd.get_handle_raw_fd();
             st = self.async_stat_fd(ctx, fd, None).await;
         } else {
