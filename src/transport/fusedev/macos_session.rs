@@ -33,7 +33,7 @@ use nix::sys::uio::IoVec;
 use nix::unistd::{close, execv, fork, getpid, read, ForkResult};
 use nix::{cmsg_space, NixPath};
 
-use super::{Error::SessionFailure, FuseBuf, Reader, Result, Writer};
+use super::{Error::IoError, Error::SessionFailure, FuseBuf, Reader, Result, Writer};
 use crate::transport::pagesize;
 
 // These follows definition from libfuse.
@@ -222,8 +222,12 @@ impl FuseChannel {
                         trace!("restart reading");
                         continue;
                     }
-                    Errno::EAGAIN | Errno::EINTR => {
+                    Errno::EINTR => {
                         continue;
+                    }
+                    // EAGIN requires the caller to handle it, and the current implementation assumes that FD is blocking.
+                    Errno::EAGAIN => {
+                        return Err(IoError(e.into()));
                     }
                     Errno::ENODEV => {
                         info!("fuse filesystem umounted");

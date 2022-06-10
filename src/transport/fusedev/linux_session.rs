@@ -228,9 +228,13 @@ impl FuseChannel {
         let mut need_exit = false;
         loop {
             let mut fusereq_available = false;
-            self.poll
-                .poll(&mut events, None)
-                .map_err(|e| SessionFailure(format!("epoll wait: {}", e)))?;
+            match self.poll.poll(&mut events, None) {
+                Ok(_) => {}
+                Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => {
+                    continue;
+                }
+                Err(e) => return Err(SessionFailure(format!("epoll wait: {}", e))),
+            }
 
             for event in events.iter() {
                 if event.is_readable() {
@@ -286,7 +290,8 @@ impl FuseChannel {
                             trace!("restart reading");
                             continue;
                         }
-                        Errno::EAGAIN | Errno::EINTR => {
+                        Errno::EINTR => {
+                            trace!("syscall interrupted");
                             continue;
                         }
                         Errno::ENODEV => {
