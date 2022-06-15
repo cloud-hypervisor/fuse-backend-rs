@@ -1,4 +1,10 @@
 # Changelog
+
+## [0.9.1]
+
+### Fixed
+- [#74](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/74): Fixed some issues about EINTR and EAGIN handled incorrectly
+
 ## [v0.4.0]
 ### Added
 - MacOS support
