@@ -1,10 +1,15 @@
 # Changelog
 
+## [0.9.2]
+
+### Added
+
+- [#77](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/77): Implement Sync for FileVolatileSlice
+
 ## [0.9.1]
 
 ### Fixed
 - [#74](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/74): Fixed some issues about EINTR and EAGIN handled incorrectly
-- [#77](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/77): Implement Sync for FileVolatileSlice
 
 ## [v0.4.0]
 ### Added
