@@ -56,6 +56,8 @@ pub struct FileVolatileSlice<'a> {
     phantom: PhantomData<&'a u8>,
 }
 
+unsafe impl<'a> Sync for FileVolatileSlice<'a> {}
+
 impl<'a> FileVolatileSlice<'a> {
     /// Create a new instance
     ///
