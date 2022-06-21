@@ -1083,12 +1083,16 @@ impl Drop for CapFsetid {
 
 fn drop_cap_fsetid() -> io::Result<Option<CapFsetid>> {
     if !caps::has_cap(None, caps::CapSet::Effective, caps::Capability::CAP_FSETID)
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?
+        .map_err(|_e| io::Error::new(io::ErrorKind::PermissionDenied, "no CAP_FSETID capability"))?
     {
         return Ok(None);
     }
-    caps::drop(None, caps::CapSet::Effective, caps::Capability::CAP_FSETID)
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    caps::drop(None, caps::CapSet::Effective, caps::Capability::CAP_FSETID).map_err(|_e| {
+        io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "failed to drop CAP_FSETID capability",
+        )
+    })?;
     Ok(Some(CapFsetid {}))
 }
 
