@@ -1,6 +1,6 @@
 [package]
 name = "fuse-backend-rs"
-version = "0.9.2"
+version = "0.9.3"
 keywords = ["fuse", "virtio", "virtio-fs", "vhost-user-fs"]
 categories = ["filesystem", "os::linux-apis"]
 description = "A rust library for Fuse(filesystem in userspace) servers and virtio-fs devices"
@@ -18,17 +18,17 @@ homepage = "https://github.com/cloud-hypervisor/"
 [dependencies]
 arc-swap = ">=0.4.6"
 #async-trait = { version = "0.1.42", optional = true }
-bitflags = ">=1.1.0"
+bitflags = "1.1"
 #futures = { version = "0.3", optional = true }
 #iou = { version = "0.3.3", optional = true }
-libc = ">=0.2.68"
-log = ">=0.4.6"
-nix = "0.23.1"
+libc = "0.2.68"
+log = "0.4.6"
+nix = "0.23"
 lazy_static = "1.4"
 #ringbahn = { version = "0.0.0-experimental.3", optional = true }
-vmm-sys-util = { version = ">=0.9", optional = true }
+vmm-sys-util = { version = "0.9", optional = true }
 vm-memory = { version = "0.7", features = ["backend-mmap"] }
-virtio-queue = { version = "0.1.0", optional = true }
+virtio-queue = { version = "0.1", optional = true }
 vhost = { version = "0.3", features = ["vhost-user-slave"], optional = true }
 mio = { version = "0.8", features = ["os-poll", "os-ext"]}
 
@@ -37,12 +37,12 @@ core-foundation-sys = { version = "0.2.3", optional = true }
 diskarbitration-sys = { version = "0.0.4", optional = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
-caps = { version = "0.5.1", optional = true }
+caps = { version = "0.3", optional = true }
 
 [dev-dependencies]
-futures = { version = "0.3.0", features = ["thread-pool"]}
-stderrlog = ">=0.5.0"
-vmm-sys-util = ">=0.9.0"
+futures = { version = "0.3", features = ["thread-pool"]}
+stderrlog = "0.5"
+vmm-sys-util = "0.9"
 vm-memory = { version = "0.7", features = ["backend-mmap", "backend-bitmap"] }
 
 [features]
