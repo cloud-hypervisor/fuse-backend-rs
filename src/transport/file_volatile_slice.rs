@@ -29,7 +29,7 @@ pub enum Error {
     /// Taking a slice at `base` with `offset` would overflow `usize`.
     Overflow { base: usize, offset: usize },
     /// The error of VolatileSlice.
-    VolatileSliceError(VError),
+    VolatileSlice(VError),
 }
 
 impl fmt::Display for Error {
@@ -41,7 +41,7 @@ impl fmt::Display for Error {
                 "address 0x{:x} offset by 0x{:x} would overflow",
                 base, offset
             ),
-            Error::VolatileSliceError(e) => write!(f, "{}", e),
+            Error::VolatileSlice(e) => write!(f, "{}", e),
         }
     }
 }
@@ -56,13 +56,10 @@ impl error::Error for Error {}
 /// [`vm_memory::VolatileSlice`](https://docs.rs/vm-memory/latest/vm_memory/volatile_memory/struct.VolatileSlice.html)
 #[derive(Clone, Copy, Debug)]
 pub struct FileVolatileSlice<'a> {
-    addr: *mut u8,
+    addr: usize,
     size: usize,
     phantom: PhantomData<&'a u8>,
 }
-
-// Safe because the field `FileVolatileSlice::addr` is used as data buffer.
-unsafe impl<'a> Sync for FileVolatileSlice<'a> {}
 
 impl<'a> FileVolatileSlice<'a> {
     /// Create a new instance of [`FileVolatileSlice`] from a raw pointer.
@@ -95,7 +92,7 @@ impl<'a> FileVolatileSlice<'a> {
     /// ```
     pub unsafe fn new(addr: *mut u8, size: usize) -> Self {
         Self {
-            addr,
+            addr: addr as usize,
             size,
             phantom: PhantomData,
         }
@@ -111,13 +108,13 @@ impl<'a> FileVolatileSlice<'a> {
 
     /// Create a [`vm_memory::VolatileSlice`](https://docs.rs/vm-memory/latest/vm_memory/volatile_memory/struct.VolatileSlice.html)
     /// from [FileVolatileSlice] without dirty page tracking.
-    pub fn as_volatile_slice(&self) -> VolatileSlice<'_, ()> {
+    pub fn as_volatile_slice(&self) -> VolatileSlice<'a, ()> {
         unsafe { VolatileSlice::new(self.as_ptr(), self.len()) }
     }
 
     /// Return a pointer to the start of the slice.
     pub fn as_ptr(&self) -> *mut u8 {
-        self.addr
+        self.addr as *mut u8
     }
 
     /// Get the size of the slice.
