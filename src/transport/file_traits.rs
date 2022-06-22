@@ -24,6 +24,7 @@ use crate::abi::fuse_abi::{off64_t, pread64, preadv64, pwrite64, pwritev64};
 use crate::transport::FileVolatileSlice;
 
 /// A trait for setting the size of a file.
+///
 /// This is equivalent to File's `set_len` method, but wrapped in a trait so that it can be
 /// implemented for other types.
 pub trait FileSetLen {
@@ -39,7 +40,7 @@ impl FileSetLen for File {
     }
 }
 
-/// A trait similar to `Read` and `Write`, but uses volatile memory as buffers.
+/// A trait similar to `Read` and `Write`, but uses [FileVolatileSlice] objects as data buffers.
 pub trait FileReadWriteVolatile {
     /// Read bytes from this file into the given slice, returning the number of bytes read on
     /// success.
@@ -445,6 +446,607 @@ macro_rules! volatile_impl {
 }
 
 volatile_impl!(File);
+
+#[cfg(feature = "async_io")]
+pub use async_io::AsyncFileReadWriteVolatile;
+
+#[cfg(feature = "async_io")]
+mod async_io {
+    use futures::join;
+    use std::sync::Arc;
+    use tokio_uring::buf::IoBuf;
+    use tokio_uring::fs::File;
+
+    use super::*;
+    use crate::transport::file_volatile_slice::FileVolatileBuf;
+
+    /// Extension of [FileReadWriteVolatile] to support io-uring based asynchronous IO.
+    ///
+    /// The asynchronous IO framework provided by [tokio-uring](https://docs.rs/tokio-uring/latest/tokio_uring/)
+    /// needs to take ownership of data buffers during asynchronous IO operations.
+    /// The [AsyncFileReadWriteVolatile] trait is designed to support io-uring based asynchronous IO.
+    #[async_trait::async_trait(?Send)]
+    pub trait AsyncFileReadWriteVolatile {
+        /// Read bytes from this file at `offset` into the given slice in asynchronous mode.
+        ///
+        /// Return the number of bytes read on success.
+        async fn async_read_at_volatile(
+            &self,
+            buf: FileVolatileBuf,
+            offset: u64,
+        ) -> (Result<usize>, FileVolatileBuf);
+
+        /// Asynchronous version of [FileReadWriteVolatile::read_vectored_at_volatile], to read data
+        /// into [FileVolatileSlice] buffers.
+        ///
+        /// Like `async_read_at_volatile()`, except it reads to a slice of buffers. Data is copied
+        /// to fill each buffer in order, with the final buffer written to possibly being only
+        /// partially filled. This method must behave as a single call to `read_at_volatile` with
+        /// the buffers concatenated would.
+        ///
+        /// Returns `Ok(0)` if none exists.
+        async fn async_read_vectored_at_volatile(
+            &self,
+            bufs: Vec<FileVolatileBuf>,
+            offset: u64,
+        ) -> (Result<usize>, Vec<FileVolatileBuf>);
+
+        /// Asynchronous version of [FileReadWriteVolatile::write_at_volatile], to write
+        /// data from a [FileVolatileSlice] buffer.
+        async fn async_write_at_volatile(
+            &self,
+            buf: FileVolatileBuf,
+            offset: u64,
+        ) -> (Result<usize>, FileVolatileBuf);
+
+        /// Asynchronous version of [FileReadWriteVolatile::write_vectored_at_volatile], to write
+        /// data from [FileVolatileSlice] buffers.
+        async fn async_write_vectored_at_volatile(
+            &self,
+            bufs: Vec<FileVolatileBuf>,
+            offset: u64,
+        ) -> (Result<usize>, Vec<FileVolatileBuf>);
+    }
+
+    #[async_trait::async_trait(?Send)]
+    impl AsyncFileReadWriteVolatile for File {
+        async fn async_read_at_volatile(
+            &self,
+            buf: FileVolatileBuf,
+            offset: u64,
+        ) -> (Result<usize>, FileVolatileBuf) {
+            self.read_at(buf, offset).await
+        }
+
+        async fn async_read_vectored_at_volatile(
+            &self,
+            mut bufs: Vec<FileVolatileBuf>,
+            mut offset: u64,
+        ) -> (Result<usize>, Vec<FileVolatileBuf>) {
+            if bufs.len() == 0 {
+                return (Ok(0), bufs);
+            } else if bufs.len() == 1 {
+                let (res, buf) = self.async_read_at_volatile(bufs[0], offset).await;
+                bufs[0] = buf;
+                return (res, bufs);
+            }
+
+            let mut count = 0;
+            let mut pos = 0;
+            while bufs.len() - pos >= 4 {
+                let op1 = self.async_read_at_volatile(bufs[pos], offset);
+                offset += bufs[pos].bytes_total() as u64;
+                let op2 = self.async_read_at_volatile(bufs[pos + 1], offset);
+                offset += bufs[pos + 1].bytes_total() as u64;
+                let op3 = self.async_read_at_volatile(bufs[pos + 2], offset);
+                offset += bufs[pos + 2].bytes_total() as u64;
+                let op4 = self.async_read_at_volatile(bufs[pos + 3], offset);
+                offset += bufs[pos + 3].bytes_total() as u64;
+                let (res1, res2, res3, res4) = join!(op1, op2, op3, op4);
+
+                match res1 {
+                    (Err(e), _) => return (Err(e), bufs),
+                    (Ok(cnt), buf) => {
+                        count += cnt;
+                        bufs[pos] = buf;
+                        if cnt < bufs[pos].bytes_total() {
+                            return (Ok(count), bufs);
+                        }
+                    }
+                }
+                match res2 {
+                    (Err(e), _) => return (Err(e), bufs),
+                    (Ok(cnt), buf) => {
+                        count += cnt;
+                        bufs[pos + 1] = buf;
+                        if cnt < bufs[pos + 1].bytes_total() {
+                            return (Ok(count), bufs);
+                        }
+                    }
+                }
+                match res3 {
+                    (Err(e), _) => return (Err(e), bufs),
+                    (Ok(cnt), buf) => {
+                        count += cnt;
+                        bufs[pos + 2] = buf;
+                        if cnt < bufs[pos + 2].bytes_total() {
+                            return (Ok(count), bufs);
+                        }
+                    }
+                }
+                match res4 {
+                    (Err(e), _) => return (Err(e), bufs),
+                    (Ok(cnt), buf) => {
+                        count += cnt;
+                        bufs[pos + 3] = buf;
+                        if cnt < bufs[pos + 3].bytes_total() {
+                            return (Ok(count), bufs);
+                        }
+                    }
+                }
+                pos += 4;
+            }
+
+            if bufs.len() - pos == 3 {
+                let op1 = self.async_read_at_volatile(bufs[pos], offset);
+                offset += bufs[pos].bytes_total() as u64;
+                let op2 = self.async_read_at_volatile(bufs[pos + 1], offset);
+                offset += bufs[pos + 1].bytes_total() as u64;
+                let op3 = self.async_read_at_volatile(bufs[pos + 2], offset);
+                let (res1, res2, res3) = join!(op1, op2, op3);
+
+                match res1 {
+                    (Ok(cnt), buf) => {
+                        count += cnt;
+                        bufs[pos] = buf;
+                        if cnt < bufs[pos].bytes_total() {
+                            return (Ok(count), bufs);
+                        }
+                    }
+                    (Err(e), _) => return (Err(e), bufs),
+                }
+                match res2 {
+                    (Ok(cnt), buf) => {
+                        count += cnt;
+                        bufs[pos + 1] = buf;
+                        if cnt < bufs[pos + 1].bytes_total() {
+                            return (Ok(count), bufs);
+                        }
+                    }
+                    (Err(e), _) => return (Err(e), bufs),
+                }
+                match res3 {
+                    (Ok(cnt), buf) => {
+                        count += cnt;
+                        bufs[pos + 2] = buf;
+                        if cnt < bufs[pos + 2].bytes_total() {
+                            return (Ok(count), bufs);
+                        }
+                    }
+                    (Err(e), _) => return (Err(e), bufs),
+                }
+            } else if bufs.len() - pos == 2 {
+                let op1 = self.async_read_at_volatile(bufs[pos], offset);
+                offset += bufs[pos].bytes_total() as u64;
+                let op2 = self.async_read_at_volatile(bufs[pos + 1], offset);
+                let (res1, res2) = join!(op1, op2);
+
+                match res1 {
+                    (Ok(cnt), buf) => {
+                        count += cnt;
+                        bufs[pos] = buf;
+                        if cnt < bufs[pos].bytes_total() {
+                            return (Ok(count), bufs);
+                        }
+                    }
+                    (Err(e), _) => return (Err(e), bufs),
+                }
+                match res2 {
+                    (Ok(cnt), buf) => {
+                        count += cnt;
+                        bufs[pos + 1] = buf;
+                        if cnt < bufs[pos + 1].bytes_total() {
+                            return (Ok(count), bufs);
+                        }
+                    }
+                    (Err(e), _) => return (Err(e), bufs),
+                }
+            } else if bufs.len() - pos == 1 {
+                let res1 = self.async_read_at_volatile(bufs[pos], offset).await;
+                match res1 {
+                    (Ok(cnt), buf) => {
+                        count += cnt;
+                        bufs[pos] = buf;
+                        if cnt < bufs[pos].bytes_total() {
+                            return (Ok(count), bufs);
+                        }
+                    }
+                    (Err(e), _) => return (Err(e), bufs),
+                }
+            }
+
+            (Ok(count), bufs)
+        }
+
+        async fn async_write_at_volatile(
+            &self,
+            buf: FileVolatileBuf,
+            offset: u64,
+        ) -> (Result<usize>, FileVolatileBuf) {
+            self.write_at(buf, offset).await
+        }
+
+        async fn async_write_vectored_at_volatile(
+            &self,
+            mut bufs: Vec<FileVolatileBuf>,
+            mut offset: u64,
+        ) -> (Result<usize>, Vec<FileVolatileBuf>) {
+            if bufs.len() == 0 {
+                return (Ok(0), bufs);
+            } else if bufs.len() == 1 {
+                let (res, buf) = self.async_write_at_volatile(bufs[0], offset).await;
+                bufs[0] = buf;
+                return (res, bufs);
+            }
+
+            let mut count = 0;
+            let mut pos = 0;
+            while bufs.len() - pos >= 4 {
+                let op1 = self.async_write_at_volatile(bufs[pos], offset);
+                offset += bufs[pos].bytes_total() as u64;
+                let op2 = self.async_write_at_volatile(bufs[pos + 1], offset);
+                offset += bufs[pos + 1].bytes_total() as u64;
+                let op3 = self.async_write_at_volatile(bufs[pos + 2], offset);
+                offset += bufs[pos + 2].bytes_total() as u64;
+                let op4 = self.async_write_at_volatile(bufs[pos + 3], offset);
+                offset += bufs[pos + 3].bytes_total() as u64;
+                let (res1, res2, res3, res4) = join!(op1, op2, op3, op4);
+
+                match res1 {
+                    (Err(e), _) => return (Err(e), bufs),
+                    (Ok(cnt), buf) => {
+                        count += cnt;
+                        bufs[pos] = buf;
+                        if cnt < bufs[pos].bytes_total() {
+                            return (Ok(count), bufs);
+                        }
+                    }
+                }
+                match res2 {
+                    (Err(e), _) => return (Err(e), bufs),
+                    (Ok(cnt), buf) => {
+                        count += cnt;
+                        bufs[pos + 1] = buf;
+                        if cnt < bufs[pos + 1].bytes_total() {
+                            return (Ok(count), bufs);
+                        }
+                    }
+                }
+                match res3 {
+                    (Err(e), _) => return (Err(e), bufs),
+                    (Ok(cnt), buf) => {
+                        count += cnt;
+                        bufs[pos + 2] = buf;
+                        if cnt < bufs[pos + 2].bytes_total() {
+                            return (Ok(count), bufs);
+                        }
+                    }
+                }
+                match res4 {
+                    (Err(e), _) => return (Err(e), bufs),
+                    (Ok(cnt), buf) => {
+                        count += cnt;
+                        bufs[pos + 3] = buf;
+                        if cnt < bufs[pos + 3].bytes_total() {
+                            return (Ok(count), bufs);
+                        }
+                    }
+                }
+                pos += 4;
+            }
+
+            if bufs.len() - pos == 3 {
+                let op1 = self.async_write_at_volatile(bufs[pos], offset);
+                offset += bufs[pos].bytes_total() as u64;
+                let op2 = self.async_write_at_volatile(bufs[pos + 1], offset);
+                offset += bufs[pos + 1].bytes_total() as u64;
+                let op3 = self.async_write_at_volatile(bufs[pos + 2], offset);
+                let (res1, res2, res3) = join!(op1, op2, op3);
+
+                match res1 {
+                    (Ok(cnt), buf) => {
+                        count += cnt;
+                        bufs[pos] = buf;
+                        if cnt < bufs[pos].bytes_total() {
+                            return (Ok(count), bufs);
+                        }
+                    }
+                    (Err(e), _) => return (Err(e), bufs),
+                }
+                match res2 {
+                    (Ok(cnt), buf) => {
+                        count += cnt;
+                        bufs[pos + 1] = buf;
+                        if cnt < bufs[pos + 1].bytes_total() {
+                            return (Ok(count), bufs);
+                        }
+                    }
+                    (Err(e), _) => return (Err(e), bufs),
+                }
+                match res3 {
+                    (Ok(cnt), buf) => {
+                        count += cnt;
+                        bufs[pos + 2] = buf;
+                        if cnt < bufs[pos + 2].bytes_total() {
+                            return (Ok(count), bufs);
+                        }
+                    }
+                    (Err(e), _) => return (Err(e), bufs),
+                }
+            } else if bufs.len() - pos == 2 {
+                let op1 = self.async_write_at_volatile(bufs[pos], offset);
+                offset += bufs[pos].bytes_total() as u64;
+                let op2 = self.async_write_at_volatile(bufs[pos + 1], offset);
+                let (res1, res2) = join!(op1, op2);
+
+                match res1 {
+                    (Ok(cnt), buf) => {
+                        count += cnt;
+                        bufs[pos] = buf;
+                        if cnt < bufs[pos].bytes_total() {
+                            return (Ok(count), bufs);
+                        }
+                    }
+                    (Err(e), _) => return (Err(e), bufs),
+                }
+                match res2 {
+                    (Ok(cnt), buf) => {
+                        count += cnt;
+                        bufs[pos + 1] = buf;
+                        if cnt < bufs[pos + 1].bytes_total() {
+                            return (Ok(count), bufs);
+                        }
+                    }
+                    (Err(e), _) => return (Err(e), bufs),
+                }
+            } else if bufs.len() - pos == 1 {
+                let res1 = self.async_write_at_volatile(bufs[pos], offset).await;
+                match res1 {
+                    (Ok(cnt), buf) => {
+                        count += cnt;
+                        bufs[pos] = buf;
+                        if cnt < bufs[pos].bytes_total() {
+                            return (Ok(count), bufs);
+                        }
+                    }
+                    (Err(e), _) => return (Err(e), bufs),
+                }
+            }
+
+            (Ok(count), bufs)
+        }
+    }
+
+    #[async_trait::async_trait(?Send)]
+    impl<T: AsyncFileReadWriteVolatile + ?Sized> AsyncFileReadWriteVolatile for Arc<T> {
+        async fn async_read_at_volatile(
+            &self,
+            buf: FileVolatileBuf,
+            offset: u64,
+        ) -> (Result<usize>, FileVolatileBuf) {
+            self.async_read_at_volatile(buf, offset).await
+        }
+
+        async fn async_read_vectored_at_volatile(
+            &self,
+            bufs: Vec<FileVolatileBuf>,
+            offset: u64,
+        ) -> (Result<usize>, Vec<FileVolatileBuf>) {
+            self.async_read_vectored_at_volatile(bufs, offset).await
+        }
+
+        async fn async_write_at_volatile(
+            &self,
+            buf: FileVolatileBuf,
+            offset: u64,
+        ) -> (Result<usize>, FileVolatileBuf) {
+            self.async_write_at_volatile(buf, offset).await
+        }
+
+        async fn async_write_vectored_at_volatile(
+            &self,
+            bufs: Vec<FileVolatileBuf>,
+            offset: u64,
+        ) -> (Result<usize>, Vec<FileVolatileBuf>) {
+            self.async_write_vectored_at_volatile(bufs, offset).await
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn io_uring_async_read_at_volatile() {
+            let tmpfile = vmm_sys_util::tempdir::TempDir::new().unwrap();
+            let path = tmpfile.as_path().to_path_buf().join("test.txt");
+            std::fs::write(&path, b"this is a test").unwrap();
+
+            let mut buf = vec![0; 4096];
+            tokio_uring::start(async {
+                let vslice = unsafe { FileVolatileSlice::new(buf.as_mut_ptr(), buf.len()) };
+                let vbuf = unsafe { vslice.borrow_mut() };
+                let file = File::open(&path).await.unwrap();
+                let (res, vbuf) = file.async_read_at_volatile(vbuf, 4).await;
+                assert_eq!(res.unwrap(), 10);
+                assert_eq!(vbuf.bytes_init(), 10);
+                file.close().await.unwrap();
+            });
+            assert_eq!(buf[0], b' ');
+            assert_eq!(buf[9], b't');
+        }
+
+        #[test]
+        fn io_uring_async_read_vectored_at_volatile() {
+            let tmpfile = vmm_sys_util::tempdir::TempDir::new().unwrap();
+            let path = tmpfile.as_path().to_path_buf().join("test.txt");
+            std::fs::write(&path, b"this is a test").unwrap();
+
+            let mut buf1 = vec![0; 4];
+            let mut buf2 = vec![0; 4];
+
+            tokio_uring::start(async {
+                let vslice1 = unsafe { FileVolatileSlice::new(buf1.as_mut_ptr(), buf1.len()) };
+                let vslice2 = unsafe { FileVolatileSlice::new(buf2.as_mut_ptr(), buf2.len()) };
+                let vbufs = vec![unsafe { vslice1.borrow_mut() }, unsafe {
+                    vslice2.borrow_mut()
+                }];
+                let file = File::open(&path).await.unwrap();
+                let (res, vbufs) = file.async_read_vectored_at_volatile(vbufs, 4).await;
+                assert_eq!(res.unwrap(), 8);
+                assert_eq!(vbufs.len(), 2);
+            });
+            assert_eq!(buf1[0], b' ');
+            assert_eq!(buf2[3], b'e');
+
+            let mut buf1 = vec![0; 1024];
+            let mut buf2 = vec![0; 4];
+
+            tokio_uring::start(async {
+                let vslice1 = unsafe { FileVolatileSlice::new(buf1.as_mut_ptr(), buf1.len()) };
+                let vslice2 = unsafe { FileVolatileSlice::new(buf2.as_mut_ptr(), buf2.len()) };
+                let vbufs = vec![unsafe { vslice1.borrow_mut() }, unsafe {
+                    vslice2.borrow_mut()
+                }];
+                let file = File::open(&path).await.unwrap();
+                let (res, vbufs) = file.async_read_vectored_at_volatile(vbufs, 4).await;
+                assert_eq!(res.unwrap(), 10);
+                assert_eq!(vbufs.len(), 2);
+                assert_eq!(vbufs[0].bytes_init(), 10);
+                assert_eq!(vbufs[1].bytes_init(), 0);
+            });
+            assert_eq!(buf1[0], b' ');
+            assert_eq!(buf1[9], b't');
+
+            tokio_uring::start(async {
+                let vslice1 = unsafe { FileVolatileSlice::new(buf1.as_mut_ptr(), buf1.len()) };
+                let vbufs = vec![unsafe { vslice1.borrow_mut() }];
+                let file = File::open(&path).await.unwrap();
+                let (res, _vbufs) = file.async_read_vectored_at_volatile(vbufs, 14).await;
+                assert_eq!(res.unwrap(), 0);
+            });
+
+            tokio_uring::start(async {
+                let vbufs = vec![];
+                let file = File::open(&path).await.unwrap();
+                let (res, _vbufs) = file.async_read_vectored_at_volatile(vbufs, 0).await;
+                assert_eq!(res.unwrap(), 0);
+            });
+
+            tokio_uring::start(async {
+                let vslice1 = unsafe { FileVolatileSlice::new(buf1.as_mut_ptr(), 1) };
+                let vslice2 = unsafe { FileVolatileSlice::new(buf1.as_mut_ptr().add(1), 1) };
+                let vslice3 = unsafe { FileVolatileSlice::new(buf1.as_mut_ptr().add(2), 1) };
+                let vslice4 = unsafe { FileVolatileSlice::new(buf1.as_mut_ptr().add(3), 1) };
+                let vslice5 = unsafe { FileVolatileSlice::new(buf1.as_mut_ptr().add(4), 1) };
+                let vslice6 = unsafe { FileVolatileSlice::new(buf1.as_mut_ptr().add(5), 1) };
+                let vslice7 = unsafe { FileVolatileSlice::new(buf1.as_mut_ptr().add(6), 1) };
+                let vbufs = vec![
+                    unsafe { vslice1.borrow_mut() },
+                    unsafe { vslice2.borrow_mut() },
+                    unsafe { vslice3.borrow_mut() },
+                    unsafe { vslice4.borrow_mut() },
+                    unsafe { vslice5.borrow_mut() },
+                    unsafe { vslice6.borrow_mut() },
+                    unsafe { vslice7.borrow_mut() },
+                ];
+                let file = File::open(&path).await.unwrap();
+                let (res, vbufs) = file.async_read_vectored_at_volatile(vbufs, 4).await;
+                assert_eq!(res.unwrap(), 7);
+                assert_eq!(vbufs.len(), 7);
+                assert_eq!(buf1[0], b' ');
+                assert_eq!(buf1[1], b'i');
+                assert_eq!(buf1[2], b's');
+                assert_eq!(buf1[3], b' ');
+                assert_eq!(buf1[4], b'a');
+                assert_eq!(buf1[5], b' ');
+                assert_eq!(buf1[6], b't');
+            });
+
+            tokio_uring::start(async {
+                let vslice1 = unsafe { FileVolatileSlice::new(buf1.as_mut_ptr(), 1) };
+                let vslice2 = unsafe { FileVolatileSlice::new(buf1.as_mut_ptr().add(1), 1) };
+                let vslice3 = unsafe { FileVolatileSlice::new(buf1.as_mut_ptr().add(2), 1) };
+                let vslice4 = unsafe { FileVolatileSlice::new(buf1.as_mut_ptr().add(3), 1) };
+                let vslice5 = unsafe { FileVolatileSlice::new(buf1.as_mut_ptr().add(4), 1) };
+                let vslice6 = unsafe { FileVolatileSlice::new(buf1.as_mut_ptr().add(5), 1) };
+                let vbufs = vec![
+                    unsafe { vslice1.borrow_mut() },
+                    unsafe { vslice2.borrow_mut() },
+                    unsafe { vslice3.borrow_mut() },
+                    unsafe { vslice4.borrow_mut() },
+                    unsafe { vslice5.borrow_mut() },
+                    unsafe { vslice6.borrow_mut() },
+                ];
+                let file = File::open(&path).await.unwrap();
+                let (res, vbufs) = file.async_read_vectored_at_volatile(vbufs, 4).await;
+                assert_eq!(res.unwrap(), 6);
+                assert_eq!(vbufs.len(), 6);
+            });
+
+            tokio_uring::start(async {
+                let vslice1 = unsafe { FileVolatileSlice::new(buf1.as_mut_ptr(), 1) };
+                let vslice2 = unsafe { FileVolatileSlice::new(buf1.as_mut_ptr().add(1), 1) };
+                let vslice3 = unsafe { FileVolatileSlice::new(buf1.as_mut_ptr().add(2), 1) };
+                let vslice4 = unsafe { FileVolatileSlice::new(buf1.as_mut_ptr().add(3), 1) };
+                let vslice5 = unsafe { FileVolatileSlice::new(buf1.as_mut_ptr().add(4), 1) };
+                let vbufs = vec![
+                    unsafe { vslice1.borrow_mut() },
+                    unsafe { vslice2.borrow_mut() },
+                    unsafe { vslice3.borrow_mut() },
+                    unsafe { vslice4.borrow_mut() },
+                    unsafe { vslice5.borrow_mut() },
+                ];
+                let file = File::open(&path).await.unwrap();
+                let (res, vbufs) = file.async_read_vectored_at_volatile(vbufs, 4).await;
+                assert_eq!(res.unwrap(), 5);
+                assert_eq!(vbufs.len(), 5);
+            });
+
+            tokio_uring::start(async {
+                let vslice1 = unsafe { FileVolatileSlice::new(buf1.as_mut_ptr(), 1) };
+                let vslice2 = unsafe { FileVolatileSlice::new(buf1.as_mut_ptr().add(1), 1) };
+                let vslice3 = unsafe { FileVolatileSlice::new(buf1.as_mut_ptr().add(2), 1) };
+                let vslice4 = unsafe { FileVolatileSlice::new(buf1.as_mut_ptr().add(3), 1) };
+                let vbufs = vec![
+                    unsafe { vslice1.borrow_mut() },
+                    unsafe { vslice2.borrow_mut() },
+                    unsafe { vslice3.borrow_mut() },
+                    unsafe { vslice4.borrow_mut() },
+                ];
+                let file = File::open(&path).await.unwrap();
+                let (res, vbufs) = file.async_read_vectored_at_volatile(vbufs, 4).await;
+                assert_eq!(res.unwrap(), 4);
+                assert_eq!(vbufs.len(), 4);
+            });
+
+            tokio_uring::start(async {
+                let vslice1 = unsafe { FileVolatileSlice::new(buf1.as_mut_ptr(), 1) };
+                let vslice2 = unsafe { FileVolatileSlice::new(buf1.as_mut_ptr().add(1), 1) };
+                let vslice3 = unsafe { FileVolatileSlice::new(buf1.as_mut_ptr().add(2), 1) };
+                let vbufs = vec![
+                    unsafe { vslice1.borrow_mut() },
+                    unsafe { vslice2.borrow_mut() },
+                    unsafe { vslice3.borrow_mut() },
+                ];
+                let file = File::open(&path).await.unwrap();
+                let (res, vbufs) = file.async_read_vectored_at_volatile(vbufs, 4).await;
+                assert_eq!(res.unwrap(), 3);
+                assert_eq!(vbufs.len(), 3);
+            });
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests {

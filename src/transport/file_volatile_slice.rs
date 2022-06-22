@@ -65,7 +65,7 @@ impl<'a> FileVolatileSlice<'a> {
     /// Create a new instance of [`FileVolatileSlice`] from a raw pointer.
     ///
     /// # Safety
-    /// To use this safely, the caller must guarantee that the memory at addr is size bytes long
+    /// To use this safely, the caller must guarantee that the memory at `addr` is `size` bytes long
     /// and is available for the duration of the lifetime of the new [FileVolatileSlice].
     /// The caller must also guarantee that all other users of the given chunk of memory are using
     /// volatile accesses.
@@ -196,6 +196,107 @@ impl<'a> Bytes<usize> for FileVolatileSlice<'a> {
 
     fn load<T: AtomicAccess>(&self, addr: usize, order: Ordering) -> Result<T, Self::E> {
         VolatileSlice::load(&self.as_volatile_slice(), addr, order)
+    }
+}
+
+#[cfg(feature = "async_io")]
+pub use async_io::FileVolatileBuf;
+
+#[cfg(feature = "async_io")]
+mod async_io {
+    use super::*;
+    use tokio_uring::buf::{IoBuf, IoBufMut};
+
+    /// An adapter structure to support `io-uring` based asynchronous IO.
+    ///
+    /// The `tokio-uring` framework needs to take ownership of data buffers during asynchronous IO
+    /// operations. The [FileVolatileBuf] converts a referenced buffer to a buffer compatible with
+    /// the `tokio-uring` APIs.
+    ///
+    /// # Safety
+    /// The buffer is borrowed without a lifetime parameter, so the caller must ensure that
+    /// the [FileVolatileBuf] object doesn't out-live the borrowed buffer. And during the lifetime
+    /// of the [FileVolatileBuf] object, the referenced buffer must be stable.
+    #[derive(Clone, Copy, Debug)]
+    pub struct FileVolatileBuf {
+        addr: usize,
+        size: usize,
+        cap: usize,
+    }
+
+    impl FileVolatileBuf {
+        /// Create a [FileVolatileBuf] object from a buffer.
+        pub unsafe fn new(buf: &mut [u8]) -> Self {
+            Self {
+                addr: buf.as_mut_ptr() as usize,
+                size: 0,
+                cap: buf.len(),
+            }
+        }
+
+        /// Create a [FileVolatileBuf] object from a raw pointer.
+        pub unsafe fn from_raw(addr: *mut u8, size: usize, cap: usize) -> Self {
+            Self {
+                addr: addr as usize,
+                size,
+                cap,
+            }
+        }
+    }
+
+    unsafe impl IoBuf for FileVolatileBuf {
+        fn stable_ptr(&self) -> *const u8 {
+            self.addr as *const u8
+        }
+
+        fn bytes_init(&self) -> usize {
+            self.size
+        }
+
+        fn bytes_total(&self) -> usize {
+            self.cap
+        }
+    }
+
+    unsafe impl IoBufMut for FileVolatileBuf {
+        fn stable_mut_ptr(&mut self) -> *mut u8 {
+            self.addr as *mut u8
+        }
+
+        unsafe fn set_init(&mut self, pos: usize) {
+            self.size = pos;
+        }
+    }
+
+    impl<'a> FileVolatileSlice<'a> {
+        /// Borrow a [FileVolatileSlice] to temporarily elide the lifetime parameter.
+        ///
+        /// # Safety
+        /// The [FileVolatileSlice] is borrowed without a lifetime parameter, so the caller must
+        /// ensure that [FileVolatileBuf] doesn't out-live the borrowed [FileVolatileSlice] object.
+        pub unsafe fn borrow_mut(&self) -> FileVolatileBuf {
+            FileVolatileBuf {
+                addr: self.addr,
+                size: 0,
+                cap: self.size,
+            }
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn test_new_file_volatile_buf() {
+            let mut buf = [0u8; 1024];
+            let mut buf2 = unsafe { FileVolatileBuf::new(&mut buf) };
+            assert_eq!(buf2.bytes_total(), 1024);
+            assert_eq!(buf2.bytes_init(), 0);
+            assert_eq!(buf2.stable_ptr(), buf.as_ptr());
+            unsafe { *buf2.stable_mut_ptr() = b'a' };
+            assert_eq!(buf[0], b'a');
+        }
     }
 }
 
