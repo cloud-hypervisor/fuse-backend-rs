@@ -11,7 +11,7 @@ use std::marker::PhantomData;
 use std::mem::ManuallyDrop;
 use std::os::unix::io::RawFd;
 
-use nix::sys::uio::{writev, IoVec};
+use nix::sys::uio::writev;
 use nix::unistd::write;
 use vm_memory::{ByteValued, VolatileMemory, VolatileMemoryError, VolatileSlice};
 
@@ -186,7 +186,7 @@ impl<'a, S: BitmapSlice> Writer<'a, S> {
             (0, _) => write(self.fd, o),
             (_, 0) => write(self.fd, self.buf.as_slice()),
             (_, _) => {
-                let bufs = [IoVec::from_slice(self.buf.as_slice()), IoVec::from_slice(o)];
+                let bufs = [IoSlice::new(self.buf.as_slice()), IoSlice::new(o)];
                 writev(self.fd, &bufs)
             }
         };
@@ -351,16 +351,10 @@ impl<'a, S: BitmapSlice> io::Write for Writer<'a, S> {
             });
             Ok(count)
         } else {
-            let buf: Vec<IoVec<&[u8]>> = bufs
-                .iter()
-                .filter(|b| !b.is_empty())
-                .map(|b| IoVec::from_slice(b))
-                .collect();
-
-            if buf.is_empty() {
+            if bufs.is_empty() {
                 return Ok(0);
             }
-            writev(self.fd, buf.as_slice())
+            writev(self.fd, bufs)
                 .map(|x| {
                     self.account_written(x);
                     x

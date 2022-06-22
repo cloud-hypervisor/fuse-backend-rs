@@ -1,6 +1,6 @@
 [package]
 name = "fuse-backend-rs"
-version = "0.9.3"
+version = "0.9.4"
 keywords = ["fuse", "virtio", "virtio-fs", "vhost-user-fs"]
 categories = ["filesystem", "os::linux-apis"]
 description = "A rust library for Fuse(filesystem in userspace) servers and virtio-fs devices"
@@ -14,6 +14,7 @@ license = "Apache-2.0 AND BSD-3-Clause"
 edition = "2018"
 repository = "https://github.com/cloud-hypervisor/fuse-backend-rs"
 homepage = "https://github.com/cloud-hypervisor/"
+build = "build.rs"
 
 [dependencies]
 arc-swap = ">=0.4.6"
@@ -23,7 +24,7 @@ bitflags = "1.1"
 #iou = { version = "0.3.3", optional = true }
 libc = "0.2.68"
 log = "0.4.6"
-nix = "0.23"
+nix = "0.24"
 lazy_static = "1.4"
 #ringbahn = { version = "0.0.0-experimental.3", optional = true }
 vmm-sys-util = { version = "0.9", optional = true }
@@ -33,8 +34,7 @@ vhost = { version = "0.3", features = ["vhost-user-slave"], optional = true }
 mio = { version = "0.8", features = ["os-poll", "os-ext"]}
 
 [target.'cfg(target_os = "macos")'.dependencies]
-core-foundation-sys = { version = "0.2.3", optional = true }
-diskarbitration-sys = { version = "0.0.4", optional = true }
+core-foundation-sys = { version = ">=0.8", optional = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 caps = { version = "0.3", optional = true }
@@ -48,7 +48,7 @@ vm-memory = { version = "0.7", features = ["backend-mmap", "backend-bitmap"] }
 [features]
 default = ["fusedev"]
 #async-io = ["async-trait", "futures", "iou", "ringbahn", "caps]
-fusedev = ["vmm-sys-util", "caps", "core-foundation-sys", "diskarbitration-sys"]
+fusedev = ["vmm-sys-util", "caps", "core-foundation-sys"]
 virtiofs = ["virtio-queue", "caps"]
 vhost-user-fs = ["virtiofs", "vhost", "caps"]
 

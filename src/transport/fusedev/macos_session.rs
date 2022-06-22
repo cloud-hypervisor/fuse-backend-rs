@@ -8,14 +8,12 @@
 //! sequentially. A FUSE session is a connection from a FUSE mountpoint to a FUSE server daemon.
 //! A FUSE session can have multiple FUSE channels so that FUSE requests are handled in parallel.
 
-use core_foundation_sys::base::{CFIndex, CFRelease};
+use core_foundation_sys::base::{CFAllocatorRef, CFIndex, CFRelease};
 use core_foundation_sys::string::{kCFStringEncodingUTF8, CFStringCreateWithBytes};
-use core_foundation_sys::url::{kCFURLPOSIXPathStyle, CFURLCreateWithFileSystemPath};
-use diskarbitration_sys::base::{kDADiskUnmountOptionForce, DADiskUnmount};
-use diskarbitration_sys::disk::{DADiskCreateFromVolumePath, DADiskRef};
-use diskarbitration_sys::session::{DASessionCreate, DASessionRef};
+use core_foundation_sys::url::{kCFURLPOSIXPathStyle, CFURLCreateWithFileSystemPath, CFURLRef};
 use std::ffi::CString;
 use std::fs::File;
+use std::io::IoSliceMut;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
 use std::path::{Path, PathBuf};
@@ -27,9 +25,9 @@ use nix::errno::Errno;
 use nix::fcntl::{fcntl, FdFlag, F_SETFD};
 use nix::sys::signal::{signal, SigHandler, Signal};
 use nix::sys::socket::{
-    recvmsg, socketpair, AddressFamily, ControlMessageOwned, MsgFlags, SockFlag, SockType,
+    recvmsg, socketpair, AddressFamily, ControlMessageOwned, MsgFlags, RecvMsg, SockFlag, SockType,
+    UnixAddr,
 };
-use nix::sys::uio::IoVec;
 use nix::unistd::{close, execv, fork, getpid, read, ForkResult};
 use nix::{cmsg_space, NixPath};
 
@@ -41,6 +39,37 @@ const FUSE_KERN_BUF_SIZE: usize = 256;
 const FUSE_HEADER_SIZE: usize = 0x1000;
 
 const OSXFUSE_MOUNT_PROG: &str = "/Library/Filesystems/macfuse.fs/Contents/Resources/mount_macfuse";
+
+static K_DADISK_UNMOUNT_OPTION_FORCE: u64 = 524288;
+
+#[repr(C)]
+struct __DADisk(c_void);
+type DADiskRef = *const __DADisk;
+#[repr(C)]
+struct __DADissenter(c_void);
+type DADissenterRef = *const __DADissenter;
+#[repr(C)]
+struct __DASession(c_void);
+type DASessionRef = *const __DASession;
+
+type DADiskUnmountCallback = ::std::option::Option<
+    unsafe extern "C" fn(disk: DADiskRef, dissenter: DADissenterRef, context: *mut c_void),
+>;
+
+extern "C" {
+    fn DADiskUnmount(
+        disk: DADiskRef,
+        options: u64,
+        callback: DADiskUnmountCallback,
+        context: *mut c_void,
+    );
+    fn DADiskCreateFromVolumePath(
+        allocator: CFAllocatorRef,
+        session: DASessionRef,
+        path: CFURLRef,
+    ) -> DADiskRef;
+    fn DASessionCreate(allocator: CFAllocatorRef) -> DASessionRef;
+}
 
 mod ioctl {
     use nix::ioctl_write_ptr;
@@ -247,8 +276,9 @@ impl FuseChannel {
 fn receive_fd(sock_fd: RawFd) -> Result<RawFd> {
     let mut buffer = vec![0u8; 4];
     let mut cmsgspace = cmsg_space!(RawFd);
-    let iov = [IoVec::from_mut_slice(&mut buffer)];
-    let r = recvmsg(sock_fd, &iov, Some(&mut cmsgspace), MsgFlags::empty()).unwrap();
+    let mut iov = [IoSliceMut::new(&mut buffer)];
+    let r: RecvMsg<UnixAddr> =
+        recvmsg(sock_fd, &mut iov, Some(&mut cmsgspace), MsgFlags::empty()).unwrap();
     if let Some(msg) = r.cmsgs().next() {
         match msg {
             ControlMessageOwned::ScmRights(fds) => {
@@ -362,7 +392,6 @@ fn create_disk(mountpoint: &Path, dasession: DASessionRef) -> DADiskRef {
             path_len as CFIndex,
             kCFStringEncodingUTF8,
             1u8,
-            std::ptr::null(),
         );
         let url =
             CFURLCreateWithFileSystemPath(std::ptr::null(), url_str, kCFURLPOSIXPathStyle, 1u8);
@@ -385,7 +414,12 @@ fn fuse_kern_umount(file: File, disk: Option<DADiskRef>) -> Result<()> {
 
     if let Some(disk) = disk {
         unsafe {
-            DADiskUnmount(disk, kDADiskUnmountOptionForce, None, std::ptr::null_mut());
+            DADiskUnmount(
+                disk,
+                K_DADISK_UNMOUNT_OPTION_FORCE,
+                None,
+                std::ptr::null_mut(),
+            );
             CFRelease(std::mem::transmute(disk));
         }
     }
