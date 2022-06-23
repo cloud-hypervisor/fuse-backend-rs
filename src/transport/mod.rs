@@ -6,20 +6,22 @@
 //
 // SPDX-License-Identifier: Apache-2.0 AND BSD-3-Clause
 
-//! Fuse transport drivers to receive requests from/send reply to Fuse clients.
+//! FUSE/Virtiofs transport drivers to receive requests from/send reply to Fuse/Virtiofs clients.
+//!
+//! Originally a FUSE server communicates with the FUSE driver through the device `/dev/fuse`,
+//! and the communication protocol is called as FUSE protocol. Later the FUSE protocol is extended
+//! to support Virtio-fs device. So there are two transport layers supported:
+//! - fusedev: communicate with the FUSE driver through `/dev/fuse`
+//! - virtiofs: communicate with the virtiofsd on host side by using virtio descriptors.
 
-use libc::{sysconf, _SC_PAGESIZE};
-use std::cmp;
 use std::collections::VecDeque;
-#[cfg(feature = "async-io")]
-use std::io::IoSlice;
-#[cfg(all(feature = "async-io", feature = "virtiofs"))]
-use std::io::IoSliceMut;
 use std::io::{self, Read};
 use std::mem::{size_of, MaybeUninit};
 use std::ptr::copy_nonoverlapping;
+use std::{cmp, fmt};
 
 use lazy_static::lazy_static;
+use libc::{sysconf, _SC_PAGESIZE};
 use vm_memory::{ByteValued, VolatileSlice};
 
 use crate::BitmapSlice;
@@ -29,15 +31,76 @@ pub use file_traits::{FileReadWriteVolatile, FileSetLen};
 pub mod file_volatile_slice;
 pub use file_volatile_slice::FileVolatileSlice;
 
+mod fs_cache_req_handler;
+pub use fs_cache_req_handler::FsCacheReqHandler;
+
 #[cfg(feature = "virtiofs")]
 pub mod virtiofs;
 #[cfg(feature = "virtiofs")]
-pub use self::virtiofs::{Error, FsCacheReqHandler, Result, Writer};
+pub use self::virtiofs::Writer;
 
 #[cfg(all(feature = "fusedev", not(feature = "virtiofs")))]
 pub mod fusedev;
+
 #[cfg(all(feature = "fusedev", not(feature = "virtiofs")))]
-pub use self::fusedev::{Error, FsCacheReqHandler, FuseBuf, FuseSession, Result, Writer};
+pub use self::fusedev::{FuseBuf, FuseSession, Writer};
+
+/// Transport layer specific error codes.
+#[derive(Debug)]
+pub enum Error {
+    /// Virtio queue descriptor chain overflows.
+    DescriptorChainOverflow,
+    /// Failed to find memory region for guest physical address.
+    FindMemoryRegion,
+    /// Invalid virtio queue descriptor chain.
+    InvalidChain,
+    /// Generic IO error.
+    IoError(io::Error),
+    /// Out of bounds when splitting VolatileSplice.
+    SplitOutOfBounds(usize),
+    /// Failed to access volatile memory.
+    VolatileMemoryError(vm_memory::VolatileMemoryError),
+    #[cfg(feature = "fusedev")]
+    /// Session errors
+    SessionFailure(String),
+    #[cfg(feature = "virtiofs")]
+    /// Failed to access guest memory.
+    GuestMemoryError(vm_memory::GuestMemoryError),
+    #[cfg(feature = "virtiofs")]
+    /// Invalid Indirect Virtio descriptors.
+    ConvertIndirectDescriptor(virtio_queue::Error),
+}
+
+impl fmt::Display for Error {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        use self::Error::*;
+
+        match self {
+            DescriptorChainOverflow => write!(
+                f,
+                "the combined length of all the buffers in a `DescriptorChain` would overflow"
+            ),
+            FindMemoryRegion => write!(f, "no memory region for this address range"),
+            InvalidChain => write!(f, "invalid descriptor chain"),
+            IoError(e) => write!(f, "descriptor I/O error: {}", e),
+            SplitOutOfBounds(off) => write!(f, "`DescriptorChain` split is out of bounds: {}", off),
+            VolatileMemoryError(e) => write!(f, "volatile memory error: {}", e),
+
+            #[cfg(feature = "fusedev")]
+            SessionFailure(e) => write!(f, "fuse session failure: {}", e),
+
+            #[cfg(feature = "virtiofs")]
+            ConvertIndirectDescriptor(e) => write!(f, "invalid indirect descriptor: {}", e),
+            #[cfg(feature = "virtiofs")]
+            GuestMemoryError(e) => write!(f, "descriptor guest memory error: {}", e),
+        }
+    }
+}
+
+/// Specialized version of [std::result::Result] for transport layer operations.
+pub type Result<T> = std::result::Result<T, Error>;
+
+impl std::error::Error for Error {}
 
 #[derive(Clone)]
 struct IoBuffers<'a, S> {
@@ -232,7 +295,6 @@ impl<S: BitmapSlice> IoBuffers<'_, S> {
         }
     }
 
-    /// Consumes for read
     fn consume_for_read<F>(&mut self, count: usize, f: F) -> io::Result<usize>
     where
         F: FnOnce(&[FileVolatileSlice]) -> io::Result<usize>,
@@ -278,8 +340,7 @@ impl<S: BitmapSlice> IoBuffers<'_, S> {
     }
 }
 
-/// Provides high-level interface over the sequence of memory regions
-/// defined by readable descriptors in the descriptor chain.
+/// Reader to access FUSE requests from the transport layer data buffers.
 ///
 /// Note that virtio spec requires driver to place any device-writable
 /// descriptors after any device-readable descriptors (2.6.4.2 in Virtio Spec v1.1).
@@ -366,8 +427,10 @@ impl<S: BitmapSlice> Reader<'_, S> {
         Ok(())
     }
 
-    /// Returns number of bytes available for reading.  May return an error if the combined
-    /// lengths of all the buffers in the DescriptorChain would cause an integer overflow.
+    /// Returns number of bytes available for reading.
+    ///
+    /// May return an error if the combined lengths of all the buffers in the DescriptorChain
+    /// would cause an integer overflow.
     pub fn available_bytes(&self) -> usize {
         self.buffers.available_bytes()
     }

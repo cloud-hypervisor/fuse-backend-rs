@@ -6,7 +6,7 @@
 //
 // SPDX-License-Identifier: Apache-2.0 AND BSD-3-Clause
 
-//! Traits and Structs to implement the virtio-fs Fuse transport layer.
+//! Traits and Structs to implement the virtiofs transport driver.
 //!
 //! Virtio-fs is a shared file system that lets virtual machines access a directory tree
 //! on the host. Unlike existing approaches, it is designed to offer local file system
@@ -40,68 +40,17 @@
 
 use std::cmp;
 use std::collections::VecDeque;
-use std::fmt;
 use std::io::{self, IoSlice, Write};
 use std::ops::Deref;
 use std::ptr::copy_nonoverlapping;
 
-use virtio_queue::{DescriptorChain, Error as QueueError};
+use virtio_queue::DescriptorChain;
 use vm_memory::bitmap::{BitmapSlice, MS};
 use vm_memory::{
-    Address, ByteValued, GuestMemory, GuestMemoryError, GuestMemoryRegion, MemoryRegionAddress,
-    VolatileMemoryError, VolatileSlice,
+    Address, ByteValued, GuestMemory, GuestMemoryRegion, MemoryRegionAddress, VolatileSlice,
 };
 
-use super::{FileReadWriteVolatile, FileVolatileSlice, IoBuffers, Reader};
-
-mod fs_cache_req_handler;
-pub use self::fs_cache_req_handler::FsCacheReqHandler;
-
-/// Error codes for Virtio queue related operations.
-#[derive(Debug)]
-pub enum Error {
-    /// Virtio queue descriptor chain overflows.
-    DescriptorChainOverflow,
-    /// Failed to find memory region for guest physical address.
-    FindMemoryRegion,
-    /// Failed to access guest memory.
-    GuestMemoryError(GuestMemoryError),
-    /// Invalid virtio queue descriptor chain.
-    InvalidChain,
-    /// Invalid Indirect Virtio descriptors.
-    ConvertIndirectDescriptor(QueueError),
-    /// Generic IO error.
-    IoError(io::Error),
-    /// Out of bounds when splitting VolatileSplice.
-    SplitOutOfBounds(usize),
-    /// Failed to access volatile memory.
-    VolatileMemoryError(VolatileMemoryError),
-}
-
-impl fmt::Display for Error {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        use self::Error::*;
-
-        match self {
-            ConvertIndirectDescriptor(e) => write!(f, "invalid indirect descriptor: {}", e),
-            DescriptorChainOverflow => write!(
-                f,
-                "the combined length of all the buffers in a `DescriptorChain` would overflow"
-            ),
-            FindMemoryRegion => write!(f, "no memory region for this address range"),
-            GuestMemoryError(e) => write!(f, "descriptor guest memory error: {}", e),
-            InvalidChain => write!(f, "invalid descriptor chain"),
-            IoError(e) => write!(f, "descriptor I/O error: {}", e),
-            SplitOutOfBounds(off) => write!(f, "`DescriptorChain` split is out of bounds: {}", off),
-            VolatileMemoryError(e) => write!(f, "volatile memory error: {}", e),
-        }
-    }
-}
-
-/// Result for Virtio queue related operations.
-pub type Result<T> = std::result::Result<T, Error>;
-
-impl std::error::Error for Error {}
+use super::{Error, FileReadWriteVolatile, FileVolatileSlice, IoBuffers, Reader, Result};
 
 impl<S: BitmapSlice> IoBuffers<'_, S> {
     /// Consumes for write.
@@ -115,7 +64,7 @@ impl<S: BitmapSlice> IoBuffers<'_, S> {
 
 impl<'a> Reader<'a> {
     /// Construct a new Reader wrapper over `desc_chain`.
-    pub fn new<M>(
+    pub fn from_descriptor_chain<M>(
         mem: &'a M::Target,
         desc_chain: DescriptorChain<M>,
     ) -> Result<Reader<'a, MS<'a, M::Target>>>
@@ -156,8 +105,8 @@ impl<'a> Reader<'a> {
     }
 }
 
-/// Provides high-level interface over the sequence of memory regions
-/// defined by writable descriptors in the descriptor chain.
+/// Provide high-level interface over the sequence of memory regions
+/// defined by writable descriptors in the Virtio descriptor chain.
 ///
 /// Note that virtio spec requires driver to place any device-writable
 /// descriptors after any device-readable descriptors (2.6.4.2 in Virtio Spec v1.1).
@@ -169,7 +118,7 @@ pub struct Writer<'a, S = ()> {
 }
 
 impl<'a> Writer<'a> {
-    /// Construct a new Writer wrapper over `desc_chain`.
+    /// Construct a new [Writer] wrapper over `desc_chain`.
     pub fn new<M>(
         mem: &'a M::Target,
         desc_chain: DescriptorChain<M>,
@@ -212,13 +161,14 @@ impl<'a> Writer<'a> {
 }
 
 impl<'a, S: BitmapSlice> Writer<'a, S> {
-    /// Writes an object to the descriptor chain buffer.
+    /// Write an object to the descriptor chain buffer.
     pub fn write_obj<T: ByteValued>(&mut self, val: T) -> io::Result<()> {
         self.write_all(val.as_slice())
     }
 
-    /// Writes data to the descriptor chain buffer from a file descriptor.
-    /// Returns the number of bytes written to the descriptor chain buffer.
+    /// Write data to the descriptor chain buffer from a file descriptor.
+    ///
+    /// Return the number of bytes written to the descriptor chain buffer.
     pub fn write_from<F: FileReadWriteVolatile>(
         &mut self,
         mut src: F,
@@ -229,8 +179,9 @@ impl<'a, S: BitmapSlice> Writer<'a, S> {
             .consume_for_write(count, |bufs| src.read_vectored_volatile(bufs))
     }
 
-    /// Writes data to the descriptor chain buffer from a File at offset `off`.
-    /// Returns the number of bytes written to the descriptor chain buffer.
+    /// Write data to the descriptor chain buffer from a File at offset `off`.
+    ///
+    /// Return the number of bytes written to the descriptor chain buffer.
     pub fn write_from_at<F: FileReadWriteVolatile>(
         &mut self,
         mut src: F,
@@ -242,7 +193,7 @@ impl<'a, S: BitmapSlice> Writer<'a, S> {
             .consume_for_write(count, |bufs| src.read_vectored_at_volatile(bufs, off))
     }
 
-    /// Writes all data to the descriptor chain buffer from a file descriptor.
+    /// Write all data to the descriptor chain buffer from a file descriptor.
     pub fn write_all_from<F: FileReadWriteVolatile>(
         &mut self,
         mut src: F,
@@ -266,18 +217,20 @@ impl<'a, S: BitmapSlice> Writer<'a, S> {
         Ok(())
     }
 
-    /// Returns number of bytes available for writing.  May return an error if the combined
-    /// lengths of all the buffers in the DescriptorChain would cause an overflow.
+    /// Return number of bytes available for writing.
+    ///
+    /// May return an error if the combined lengths of all the buffers in the DescriptorChain would
+    /// cause an overflow.
     pub fn available_bytes(&self) -> usize {
         self.buffers.available_bytes()
     }
 
-    /// Returns number of bytes already written to the descriptor chain buffer.
+    /// Return number of bytes already written to the descriptor chain buffer.
     pub fn bytes_written(&self) -> usize {
         self.buffers.bytes_consumed()
     }
 
-    /// Splits this `Writer` into two at the given offset in the `DescriptorChain` buffer.
+    /// Split this `Writer` into two at the given offset in the `DescriptorChain` buffer.
     /// After the split, `self` will be able to write up to `offset` bytes while the returned
     /// `Writer` can write up to `available_bytes() - offset` bytes.  Returns an error if
     /// `offset > self.available_bytes()`.
