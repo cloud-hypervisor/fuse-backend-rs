@@ -279,7 +279,8 @@ impl FuseChannel {
                             std::slice::from_raw_parts_mut(self.buf.as_mut_ptr(), self.buf.len())
                         };
                         // Reader::new() and Writer::new() should always return success.
-                        let reader = Reader::new(FuseBuf::new(&mut self.buf[..len])).unwrap();
+                        let reader =
+                            Reader::from_fuse_buffer(FuseBuf::new(&mut self.buf[..len])).unwrap();
                         let writer = Writer::new(fd, buf).unwrap();
                         return Ok(Some((reader, writer)));
                     }

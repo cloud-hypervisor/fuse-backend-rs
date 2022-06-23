@@ -2,10 +2,12 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 
-//! Traits and Structs to implement the /dev/fuse Fuse transport layer.
+//! Traits and Structs to implement the fusedev transport driver.
+//!
+//! With fusedev transport driver, requests received from `/dev/fuse` will be stored in an internal
+//! buffer and the whole reply message must be written all at once.
 
 use std::collections::VecDeque;
-use std::fmt;
 use std::io::{self, IoSlice, Write};
 use std::marker::PhantomData;
 use std::mem::ManuallyDrop;
@@ -13,9 +15,9 @@ use std::os::unix::io::RawFd;
 
 use nix::sys::uio::writev;
 use nix::unistd::write;
-use vm_memory::{ByteValued, VolatileMemory, VolatileMemoryError, VolatileSlice};
+use vm_memory::{ByteValued, VolatileMemory, VolatileSlice};
 
-use super::{FileReadWriteVolatile, FileVolatileSlice, IoBuffers, Reader};
+use super::{Error, FileReadWriteVolatile, FileVolatileSlice, IoBuffers, Reader, Result};
 use crate::BitmapSlice;
 
 #[cfg(target_os = "linux")]
@@ -27,58 +29,6 @@ pub use linux_session::*;
 mod macos_session;
 #[cfg(target_os = "macos")]
 pub use macos_session::*;
-
-/// Error codes for Virtio queue related operations.
-#[derive(Debug)]
-pub enum Error {
-    /// Virtio queue descriptor chain overflows.
-    DescriptorChainOverflow,
-    /// Failed to find memory region for guest physical address.
-    FindMemoryRegion,
-    /// Invalid virtio queue descriptor chain.
-    InvalidChain,
-    /// Generic IO error.
-    IoError(io::Error),
-    /// Out of bounds when splitting VolatileSplice.
-    SplitOutOfBounds(usize),
-    /// Failed to access volatile memory.
-    VolatileMemoryError(VolatileMemoryError),
-    /// Session errors
-    SessionFailure(String),
-}
-
-impl fmt::Display for Error {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        use self::Error::*;
-
-        match self {
-            DescriptorChainOverflow => write!(
-                f,
-                "the combined length of all the buffers in a `DescriptorChain` would overflow"
-            ),
-            FindMemoryRegion => write!(f, "no memory region for this address range"),
-            InvalidChain => write!(f, "invalid descriptor chain"),
-            IoError(e) => write!(f, "descriptor I/O error: {}", e),
-            SplitOutOfBounds(off) => write!(f, "`DescriptorChain` split is out of bounds: {}", off),
-            VolatileMemoryError(e) => write!(f, "volatile memory error: {}", e),
-            SessionFailure(e) => write!(f, "fuse session failure: {}", e),
-        }
-    }
-}
-
-impl std::error::Error for Error {}
-
-impl From<Error> for std::io::Error {
-    fn from(e: Error) -> Self {
-        std::io::Error::new(std::io::ErrorKind::Other, e)
-    }
-}
-
-/// Result for fusedev transport driver related operations.
-pub type Result<T> = std::result::Result<T, Error>;
-
-/// Fake trait to simplify implementation when vhost-user-fs is not used.
-pub trait FsCacheReqHandler {}
 
 /// A buffer reference wrapper for fuse requests.
 #[derive(Debug)]
@@ -97,7 +47,7 @@ impl<'a, S: BitmapSlice + Default> Reader<'a, S> {
     /// Construct a new Reader wrapper over `desc_chain`.
     ///
     /// 'request`: Fuse request from clients read from /dev/fuse
-    pub fn new(buf: FuseBuf<'a>) -> Result<Reader<'a, S>> {
+    pub fn from_fuse_buffer(buf: FuseBuf<'a>) -> Result<Reader<'a, S>> {
         let mut buffers: VecDeque<VolatileSlice<'a, S>> = VecDeque::new();
         // Safe because Reader has the same lifetime with buf.
         buffers.push_back(unsafe {
@@ -113,7 +63,9 @@ impl<'a, S: BitmapSlice + Default> Reader<'a, S> {
     }
 }
 
-/// A writer for fuse request. There are a few special properties to follow:
+/// Writer to send FUSE reply to the FUSE driver.
+///
+/// There are a few special properties to follow:
 /// 1. A fuse device request MUST be written to the fuse device in one shot.
 /// 2. If the writer is split, a final commit() MUST be called to issue the
 ///    device write operation.
@@ -128,7 +80,7 @@ pub struct Writer<'a, S: BitmapSlice = ()> {
 }
 
 impl<'a, S: BitmapSlice + Default> Writer<'a, S> {
-    /// Construct a new Writer
+    /// Construct a new [Writer].
     pub fn new(fd: RawFd, data_buf: &'a mut [u8]) -> Result<Writer<'a, S>> {
         let buf = unsafe { Vec::from_raw_parts(data_buf.as_mut_ptr(), 0, data_buf.len()) };
         Ok(Writer {
@@ -142,7 +94,8 @@ impl<'a, S: BitmapSlice + Default> Writer<'a, S> {
 }
 
 impl<'a, S: BitmapSlice> Writer<'a, S> {
-    /// Splits this `Writer` into two at the given offset in the buffer.
+    /// Split the [Writer] at the given offset.
+    ///
     /// After the split, `self` will be able to write up to `offset` bytes while the returned
     /// `Writer` can write up to `available_bytes() - offset` bytes.  Returns an error if
     /// `offset > self.available_bytes()`.
@@ -173,8 +126,7 @@ impl<'a, S: BitmapSlice> Writer<'a, S> {
         })
     }
 
-    /// Commit all internal buffers of self and others
-    /// We need this because the lifetime of others is usually shorter than self.
+    /// Compose the FUSE reply message and send the message to `/dev/fuse`.
     pub fn commit(&mut self, other: Option<&Writer<'a, S>>) -> io::Result<usize> {
         if !self.buffered {
             return Ok(0);
@@ -197,12 +149,12 @@ impl<'a, S: BitmapSlice> Writer<'a, S> {
         })
     }
 
-    /// Returns number of bytes already written to the internal buffer.
+    /// Return number of bytes already written to the internal buffer.
     pub fn bytes_written(&self) -> usize {
         self.buf.len()
     }
 
-    /// Returns number of bytes available for writing.
+    /// Return number of bytes available for writing.
     pub fn available_bytes(&self) -> usize {
         self.buf.capacity() - self.buf.len()
     }
@@ -213,13 +165,14 @@ impl<'a, S: BitmapSlice> Writer<'a, S> {
         unsafe { self.buf.set_len(new_len) };
     }
 
-    /// Writes an object to the writer.
+    /// Write an object to the writer.
     pub fn write_obj<T: ByteValued>(&mut self, val: T) -> io::Result<()> {
         self.write_all(val.as_slice())
     }
 
-    /// Writes data to the writer from a file descriptor.
-    /// Returns the number of bytes written to the writer.
+    /// Write data to the writer from a file descriptor.
+    ///
+    /// Return the number of bytes written to the writer.
     pub fn write_from<F: FileReadWriteVolatile>(
         &mut self,
         mut src: F,
@@ -245,8 +198,8 @@ impl<'a, S: BitmapSlice> Writer<'a, S> {
         }
     }
 
-    /// Writes data to the writer from a File at offset `off`.
-    /// Returns the number of bytes written to the writer.
+    /// Write data to the writer from a File at offset `off`.
+    /// Return the number of bytes written to the writer.
     pub fn write_from_at<F: FileReadWriteVolatile>(
         &mut self,
         mut src: F,
@@ -274,7 +227,7 @@ impl<'a, S: BitmapSlice> Writer<'a, S> {
         }
     }
 
-    /// Writes all data to the writer from a file descriptor.
+    /// Write all data to the writer from a file descriptor.
     pub fn write_all_from<F: FileReadWriteVolatile>(
         &mut self,
         mut src: F,
@@ -316,9 +269,7 @@ impl<'a, S: BitmapSlice> Writer<'a, S> {
     }
 
     fn do_write(fd: RawFd, data: &[u8]) -> io::Result<usize> {
-        let res = write(fd, data);
-
-        res.map_err(|e| {
+        write(fd, data).map_err(|e| {
             error! {"fail to write to fuse device fd {}: {}, {:?}", fd, e, data};
             io::Error::new(io::ErrorKind::Other, format!("{}", e))
         })
@@ -589,7 +540,7 @@ mod tests {
     #[test]
     fn reader_test_simple_chain() {
         let mut buf = [0u8; 106];
-        let mut reader = Reader::<()>::new(FuseBuf::new(&mut buf)).unwrap();
+        let mut reader = Reader::<()>::from_fuse_buffer(FuseBuf::new(&mut buf)).unwrap();
 
         assert_eq!(reader.available_bytes(), 106);
         assert_eq!(reader.bytes_read(), 0);
@@ -672,7 +623,7 @@ mod tests {
     #[test]
     fn reader_unexpected_eof() {
         let mut buf = [0u8; 106];
-        let mut reader = Reader::<()>::new(FuseBuf::new(&mut buf)).unwrap();
+        let mut reader = Reader::<()>::from_fuse_buffer(FuseBuf::new(&mut buf)).unwrap();
 
         let mut buf2 = Vec::with_capacity(1024);
         buf2.resize(1024, 0);
@@ -689,7 +640,7 @@ mod tests {
     #[test]
     fn reader_split_border() {
         let mut buf = [0u8; 128];
-        let mut reader = Reader::<()>::new(FuseBuf::new(&mut buf)).unwrap();
+        let mut reader = Reader::<()>::from_fuse_buffer(FuseBuf::new(&mut buf)).unwrap();
         let other = reader.split_at(32).expect("failed to split Reader");
 
         assert_eq!(reader.available_bytes(), 32);
@@ -699,7 +650,7 @@ mod tests {
     #[test]
     fn reader_split_outofbounds() {
         let mut buf = [0u8; 128];
-        let mut reader = Reader::<()>::new(FuseBuf::new(&mut buf)).unwrap();
+        let mut reader = Reader::<()>::from_fuse_buffer(FuseBuf::new(&mut buf)).unwrap();
 
         if let Ok(_) = reader.split_at(256) {
             panic!("successfully split Reader with out of bounds offset");
@@ -800,7 +751,7 @@ mod tests {
     #[test]
     fn read_full() {
         let mut buf2 = [0u8; 48];
-        let mut reader = Reader::<()>::new(FuseBuf::new(&mut buf2)).unwrap();
+        let mut reader = Reader::<()>::from_fuse_buffer(FuseBuf::new(&mut buf2)).unwrap();
         let mut buf = vec![0u8; 64];
 
         assert_eq!(
@@ -848,7 +799,7 @@ mod tests {
     #[test]
     fn read_obj() {
         let mut buf2 = [0u8; 9];
-        let mut reader = Reader::<()>::new(FuseBuf::new(&mut buf2)).unwrap();
+        let mut reader = Reader::<()>::from_fuse_buffer(FuseBuf::new(&mut buf2)).unwrap();
 
         let _val: u64 = reader.read_obj().expect("failed to read to file");
 
@@ -860,7 +811,7 @@ mod tests {
     #[test]
     fn read_exact_to() {
         let mut buf2 = [0u8; 48];
-        let mut reader = Reader::<()>::new(FuseBuf::new(&mut buf2)).unwrap();
+        let mut reader = Reader::<()>::from_fuse_buffer(FuseBuf::new(&mut buf2)).unwrap();
         let mut file = TempFile::new().unwrap().into_file();
 
         reader
@@ -874,7 +825,7 @@ mod tests {
     #[test]
     fn read_to_at() {
         let mut buf2 = [0u8; 48];
-        let mut reader = Reader::<()>::new(FuseBuf::new(&mut buf2)).unwrap();
+        let mut reader = Reader::<()>::from_fuse_buffer(FuseBuf::new(&mut buf2)).unwrap();
         let mut file = TempFile::new().unwrap().into_file();
 
         assert_eq!(

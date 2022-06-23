@@ -11,7 +11,7 @@ use crate::abi::fuse_abi::{stat64, statvfs64, CreateIn, FsOptions, OpenOptions, 
 #[cfg(feature = "virtiofs")]
 pub use crate::abi::virtio_fs::RemovemappingOne;
 #[cfg(feature = "virtiofs")]
-use crate::transport::virtiofs::FsCacheReqHandler;
+use crate::transport::FsCacheReqHandler;
 use std::ffi::CStr;
 use std::io;
 use std::mem;
