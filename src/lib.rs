@@ -107,10 +107,6 @@ pub mod api;
 pub mod passthrough;
 pub mod transport;
 
-#[cfg(feature = "async-io")]
-pub mod async_util;
-
-#[cfg(not(feature = "async-io"))]
 /// This provides async_utils generaic type declaration.
 pub mod async_util {
     /// A helper trait to simplify generic type declaration

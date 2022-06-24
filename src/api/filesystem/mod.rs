@@ -22,9 +22,9 @@ pub use fuse::ROOT_ID;
 
 use crate::abi::fuse_abi::{ino64_t, stat64};
 
-#[cfg(feature = "async-io")]
+#[cfg(feature = "async_io")]
 mod async_io;
-#[cfg(feature = "async-io")]
+#[cfg(feature = "async_io")]
 pub use async_io::{AsyncFileSystem, AsyncZeroCopyReader, AsyncZeroCopyWriter};
 
 mod sync_io;
@@ -384,7 +384,7 @@ pub struct Context {
     /// The thread group ID of the calling process.
     pub pid: libc::pid_t,
 
-    #[cfg(feature = "async-io")]
+    #[cfg(feature = "async_io")]
     /// Asynchronous event drive
     pub drive: usize,
 }
@@ -402,7 +402,7 @@ impl From<&fuse::InHeader> for Context {
             uid: source.uid,
             gid: source.gid,
             pid: source.pid as i32,
-            #[cfg(feature = "async-io")]
+            #[cfg(feature = "async_io")]
             drive: 0,
         }
     }
@@ -410,7 +410,7 @@ impl From<&fuse::InHeader> for Context {
 
 // The design is very ugly, but it helps to avoid adding a generic type parameter "D: AsyncDrive"
 // to the FileSystem trait.
-#[cfg(feature = "async-io")]
+#[cfg(feature = "async_io")]
 impl Context {
     /// Set the asynchronous event drive.
     ///

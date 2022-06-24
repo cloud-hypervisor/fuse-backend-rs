@@ -37,7 +37,7 @@ use crate::api::{
 };
 use crate::BitmapSlice;
 
-#[cfg(feature = "async-io")]
+#[cfg(feature = "async_io")]
 mod async_io;
 mod file_handle;
 mod multikey;
@@ -1006,7 +1006,7 @@ impl<D: AsyncDrive, S: BitmapSlice + Send + Sync> PassthroughFs<D, S> {
     }
 }
 
-#[cfg(not(feature = "async-io"))]
+#[cfg(not(feature = "async_io"))]
 impl<D: AsyncDrive> BackendFileSystem<D> for PassthroughFs<D> {
     fn mount(&self) -> io::Result<(Entry, u64)> {
         let entry = self.do_lookup(fuse::ROOT_ID, &CString::new(".").unwrap())?;

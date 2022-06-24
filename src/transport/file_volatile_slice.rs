@@ -199,10 +199,10 @@ impl<'a> Bytes<usize> for FileVolatileSlice<'a> {
     }
 }
 
-#[cfg(feature = "async_io")]
+#[cfg(feature = "async-io")]
 pub use async_io::FileVolatileBuf;
 
-#[cfg(feature = "async_io")]
+#[cfg(feature = "async-io")]
 mod async_io {
     use super::*;
     use tokio_uring::buf::{IoBuf, IoBufMut};

@@ -330,31 +330,37 @@ impl<'a, S: BitmapSlice> io::Write for Writer<'a, S> {
 #[cfg(feature = "async-io")]
 mod async_io {
     use super::*;
-    use crate::async_util::{AsyncDrive, AsyncUtil};
+    use crate::transport::file_volatile_slice::FileVolatileBuf;
+    use crate::transport::AsyncFileReadWriteVolatile;
 
     impl<'a, S: BitmapSlice> Reader<'a, S> {
         /// Reads data from the data buffer into a File at offset `off` in asynchronous mode.
         ///
         /// Returns the number of bytes read from the descriptor chain buffer. The number of bytes
         /// read can be less than `count` if there isn't enough data in the descriptor chain buffer.
-        pub async fn async_read_to_at<D: AsyncDrive>(
+        pub async fn async_read_to_at<F: AsyncFileReadWriteVolatile>(
             &mut self,
-            drive: D,
-            dst: RawFd,
+            dst: &F,
             count: usize,
             off: u64,
         ) -> io::Result<usize> {
-            let bufs = self.buffers.allocate_io_slice(count);
+            // Safe because `bufs` doesn't out-live `self`.
+            let bufs = unsafe { self.buffers.prepare_io_buf(count) };
             if bufs.is_empty() {
                 Ok(0)
             } else {
-                let result = if bufs.len() == 1 {
-                    AsyncUtil::write(drive, dst, bufs[0].as_ref(), off).await?
+                if bufs.len() == 1 {
+                    let (res, _) = dst.async_write_at_volatile(bufs[0], off).await;
+                    match res {
+                        Ok(cnt) => {
+                            self.buffers.mark_used(cnt)?;
+                            Ok(cnt)
+                        }
+                        Err(e) => Err(e),
+                    }
                 } else {
                     panic!("fusedev: only one data buffer is supported");
-                };
-                self.buffers.mark_used(result)?;
-                Ok(result)
+                }
             }
         }
     }
@@ -362,12 +368,8 @@ mod async_io {
     impl<'a, S: BitmapSlice> Writer<'a, S> {
         /// Write data from a buffer into this writer in asynchronous mode.
         ///
-        /// Returns the number of bytes written to the writer.
-        pub async fn async_write<D: AsyncDrive>(
-            &mut self,
-            drive: D,
-            data: &[u8],
-        ) -> io::Result<usize> {
+        /// Return the number of bytes written to the writer.
+        pub async fn async_write(&mut self, data: &[u8]) -> io::Result<usize> {
             self.check_available_space(data.len())?;
 
             if self.buffered {
@@ -375,15 +377,13 @@ mod async_io {
                 self.buf.extend_from_slice(data);
                 Ok(data.len())
             } else {
-                // write to fd, can only happen once per instance
-                AsyncUtil::write(drive, self.fd, data, 0)
-                    .await
+                nix::sys::uio::pwrite(self.fd, data, 0)
                     .map(|x| {
                         self.account_written(x);
                         x
                     })
                     .map_err(|e| {
-                        error! {"fail to write to fuse device fd {}: {}, {:?}", self.fd, e, data};
+                        error! {"fail to write to fuse device fd {}: {}", self.fd, e};
                         io::Error::new(io::ErrorKind::Other, format!("{}", e))
                     })
             }
@@ -391,13 +391,8 @@ mod async_io {
 
         /// Write data from two buffers into this writer in asynchronous mode.
         ///
-        /// Returns the number of bytes written to the writer.
-        pub async fn async_write2<D: AsyncDrive>(
-            &mut self,
-            drive: D,
-            data: &[u8],
-            data2: &[u8],
-        ) -> io::Result<usize> {
+        /// Return the number of bytes written to the writer.
+        pub async fn async_write2(&mut self, data: &[u8], data2: &[u8]) -> io::Result<usize> {
             let len = data.len() + data2.len();
             self.check_available_space(len)?;
 
@@ -407,15 +402,14 @@ mod async_io {
                 self.buf.extend_from_slice(data2);
                 Ok(len)
             } else {
-                // write to fd, can only happen once per instance
-                AsyncUtil::write2(drive, self.fd, data, data2, 0)
-                    .await
+                let bufs = [std::io::IoSlice::new(data), std::io::IoSlice::new(data2)];
+                writev(self.fd, &bufs)
                     .map(|x| {
                         self.account_written(x);
                         x
                     })
                     .map_err(|e| {
-                        error! {"fail to write to fuse device fd {}: {}, {:?}", self.fd, e, data};
+                        error! {"fail to write to fuse device fd {}: {}", self.fd, e};
                         io::Error::new(io::ErrorKind::Other, format!("{}", e))
                     })
             }
@@ -423,10 +417,9 @@ mod async_io {
 
         /// Write data from two buffers into this writer in asynchronous mode.
         ///
-        /// Returns the number of bytes written to the writer.
-        pub async fn async_write3<D: AsyncDrive>(
+        /// Return the number of bytes written to the writer.
+        pub async fn async_write3(
             &mut self,
-            drive: D,
             data: &[u8],
             data2: &[u8],
             data3: &[u8],
@@ -441,28 +434,27 @@ mod async_io {
                 self.buf.extend_from_slice(data3);
                 Ok(len)
             } else {
-                // write to fd, can only happen once per instance
-                AsyncUtil::write3(drive, self.fd, data, data2, data3, 0)
-                    .await
+                let bufs = [
+                    std::io::IoSlice::new(data),
+                    std::io::IoSlice::new(data2),
+                    std::io::IoSlice::new(data3),
+                ];
+                writev(self.fd, &bufs)
                     .map(|x| {
                         self.account_written(x);
                         x
                     })
                     .map_err(|e| {
-                        error! {"fail to write to fuse device fd {}: {}, {:?}", self.fd, e, data};
+                        error! {"fail to write to fuse device fd {}: {}", self.fd, e};
                         io::Error::new(io::ErrorKind::Other, format!("{}", e))
                     })
             }
         }
 
         /// Attempts to write an entire buffer into this writer in asynchronous mode.
-        pub async fn async_write_all<D: AsyncDrive>(
-            &mut self,
-            drive: D,
-            mut buf: &[u8],
-        ) -> io::Result<()> {
+        pub async fn async_write_all(&mut self, mut buf: &[u8]) -> io::Result<()> {
             while !buf.is_empty() {
-                match self.async_write(drive.clone(), buf).await {
+                match self.async_write(buf).await {
                     Ok(0) => {
                         return Err(io::Error::new(
                             io::ErrorKind::WriteZero,
@@ -478,48 +470,62 @@ mod async_io {
             Ok(())
         }
 
-        /// Writes data from a File at offset `off` to the writer in asynchronous mode.
+        /// Write data from a File at offset `off` to the writer in asynchronous mode.
         ///
-        /// Returns the number of bytes written to the writer.
-        pub async fn async_write_from_at<D: AsyncDrive>(
+        /// Return the number of bytes written to the writer.
+        pub async fn async_write_from_at<F: AsyncFileReadWriteVolatile>(
             &mut self,
-            drive: D,
-            src: RawFd,
+            src: &F,
             count: usize,
             off: u64,
         ) -> io::Result<usize> {
             self.check_available_space(count)?;
 
-            let drive2 = drive.clone();
-            let buf = unsafe {
-                std::slice::from_raw_parts_mut(self.buf.as_mut_ptr().add(self.buf.len()), count)
-            };
-            let cnt = AsyncUtil::read(drive2, src, buf, off).await?;
-            self.account_written(cnt);
-
-            if self.buffered {
-                Ok(cnt)
-            } else {
-                // write to fd
-                AsyncUtil::write(drive, self.fd, &self.buf[..cnt], 0).await
+            let buf = unsafe { FileVolatileBuf::from_raw(self.buf.as_mut_ptr(), 0, count) };
+            let (res, _) = src.async_read_at_volatile(buf, off).await;
+            match res {
+                Ok(cnt) => {
+                    self.account_written(cnt);
+                    if self.buffered {
+                        Ok(cnt)
+                    } else {
+                        // write to fd, can only happen once per instance
+                        nix::sys::uio::pwrite(self.fd, &self.buf[..cnt], 0).map_err(|e| {
+                            error! {"fail to write to fuse device fd {}: {}", self.fd, e};
+                            io::Error::new(io::ErrorKind::Other, format!("{}", e))
+                        })
+                    }
+                }
+                Err(e) => Err(e),
             }
         }
 
         /// Commit all internal buffers of the writer and others.
         ///
         /// We need this because the lifetime of others is usually shorter than self.
-        pub async fn async_commit<D: AsyncDrive>(
-            &mut self,
-            drive: D,
-            other: Option<&Writer<'a, S>>,
-        ) -> io::Result<usize> {
+        pub async fn async_commit(&mut self, other: Option<&Writer<'a, S>>) -> io::Result<usize> {
             let o = other.map(|v| v.buf.as_slice()).unwrap_or(&[]);
 
             let res = match (self.buf.len(), o.len()) {
                 (0, 0) => Ok(0),
-                (0, _) => AsyncUtil::write(drive, self.fd, o, 0).await,
-                (_, 0) => AsyncUtil::write(drive, self.fd, self.buf.as_slice(), 0).await,
-                (_, _) => AsyncUtil::write2(drive, self.fd, self.buf.as_slice(), o, 0).await,
+                (0, _) => nix::sys::uio::pwrite(self.fd, o, 0).map_err(|e| {
+                    error! {"fail to write to fuse device fd {}: {}", self.fd, e};
+                    io::Error::new(io::ErrorKind::Other, format!("{}", e))
+                }),
+                (_, 0) => nix::sys::uio::pwrite(self.fd, self.buf.as_slice(), 0).map_err(|e| {
+                    error! {"fail to write to fuse device fd {}: {}", self.fd, e};
+                    io::Error::new(io::ErrorKind::Other, format!("{}", e))
+                }),
+                (_, _) => {
+                    let bufs = [
+                        std::io::IoSlice::new(self.buf.as_slice()),
+                        std::io::IoSlice::new(o),
+                    ];
+                    writev(self.fd, &bufs).map_err(|e| {
+                        error! {"fail to write to fuse device fd {}: {}", self.fd, e};
+                        io::Error::new(io::ErrorKind::Other, format!("{}", e))
+                    })
+                }
             };
 
             res.map_err(|e| {
@@ -843,10 +849,11 @@ mod tests {
         let file1 = TempFile::new().unwrap().into_file();
         let mut buf = vec![0x0u8; 48];
         let mut writer = Writer::<()>::new(file1.as_raw_fd(), &mut buf).unwrap();
+        let _writer2 = writer.split_at(40).unwrap();
         let val = 0x1u64;
 
         writer.write_obj(val).expect("failed to write from buffer");
-        assert_eq!(writer.available_bytes(), 40);
+        assert_eq!(writer.available_bytes(), 32);
     }
 
     #[test]
@@ -951,131 +958,94 @@ mod tests {
 
     #[cfg(feature = "async-io")]
     mod async_io {
-        use futures::executor::{block_on, ThreadPool};
-        use futures::task::SpawnExt;
-        use ringbahn::drive::demo::DemoDriver;
+        use tokio_uring::fs::OpenOptions;
+        use vmm_sys_util::tempdir::TempDir;
 
         use super::*;
 
         #[test]
         fn async_read_to_at() {
-            let file = TempFile::new().unwrap().into_file();
-            let fd = file.as_raw_fd();
+            let dir = TempDir::new().unwrap();
+            let path = dir.as_path().to_path_buf().join("test.txt");
+            std::fs::write(&path, b"this is a test").unwrap();
 
-            let executor = ThreadPool::new().unwrap();
-            let handle = executor
-                .spawn_with_handle(async move {
-                    let mut buf2 = [0u8; 48];
-                    let mut reader = Reader::<()>::new(FuseBuf::new(&mut buf2)).unwrap();
-                    let drive = DemoDriver::default();
+            let mut buf2 = [0u8; 48];
+            let mut reader = Reader::<()>::from_fuse_buffer(FuseBuf::new(&mut buf2)).unwrap();
 
-                    reader.async_read_to_at(drive, fd, 48, 16).await
-                })
-                .unwrap();
-
-            assert_eq!(block_on(handle).unwrap(), 48);
+            tokio_uring::start(async {
+                let file = OpenOptions::new().write(true).open(&path).await.unwrap();
+                let res = reader.async_read_to_at(&file, 48, 0).await.unwrap();
+                assert_eq!(res, 48);
+            })
         }
 
         #[test]
         fn async_write() {
+            let dir = TempDir::new().unwrap();
+            let path = dir.as_path().to_path_buf().join("test.txt");
+            std::fs::write(&path, b"this is a test").unwrap();
+
             let file = TempFile::new().unwrap().into_file();
             let fd = file.as_raw_fd();
-
-            let executor = ThreadPool::new().unwrap();
-            let handle = executor
-                .spawn_with_handle(async move {
-                    let drive = DemoDriver::default();
-                    let mut buf = vec![0x0u8; 48];
-                    let mut writer = Writer::<()>::new(fd, &mut buf).unwrap();
-
-                    let buf = vec![0xdeu8; 64];
-                    writer.async_write(drive, &buf[..]).await
-                })
-                .unwrap();
-
-            // expect errors
-            block_on(handle).unwrap_err();
+            let mut buf = vec![0x0u8; 48];
+            let mut writer = Writer::<()>::new(fd, &mut buf).unwrap();
+            let buf = vec![0xdeu8; 64];
+            let res = tokio_uring::start(async { writer.async_write(&buf[..]).await });
+            assert!(res.is_err());
 
             let fd = file.as_raw_fd();
-            let handle = executor
-                .spawn_with_handle(async move {
-                    let drive = DemoDriver::default();
-                    let mut buf = vec![0x0u8; 48];
-                    let mut writer2 = Writer::<()>::new(fd, &mut buf).unwrap();
-
-                    let buf = vec![0xdeu8; 48];
-                    writer2.async_write(drive, &buf[..]).await
-                })
-                .unwrap();
-
-            assert_eq!(block_on(handle).unwrap(), 48);
+            let mut buf = vec![0x0u8; 48];
+            let mut writer2 = Writer::<()>::new(fd, &mut buf).unwrap();
+            let buf = vec![0xdeu8; 48];
+            let res = tokio_uring::start(async { writer2.async_write(&buf[..]).await });
+            assert_eq!(res.unwrap(), 48);
         }
 
         #[test]
         fn async_write2() {
             let file = TempFile::new().unwrap().into_file();
             let fd = file.as_raw_fd();
-
-            let executor = ThreadPool::new().unwrap();
-            let handle = executor
-                .spawn_with_handle(async move {
-                    let drive = DemoDriver::default();
-                    let mut buf = vec![0x0u8; 48];
-                    let mut writer = Writer::<()>::new(fd, &mut buf).unwrap();
-                    let buf = vec![0xdeu8; 48];
-
-                    writer.async_write2(drive, &buf[..32], &buf[32..]).await
-                })
-                .unwrap();
-
-            assert_eq!(block_on(handle).unwrap(), 48);
+            let mut buf = vec![0x0u8; 48];
+            let mut writer = Writer::<()>::new(fd, &mut buf).unwrap();
+            let buf = vec![0xdeu8; 48];
+            let res =
+                tokio_uring::start(async { writer.async_write2(&buf[..32], &buf[32..]).await });
+            assert_eq!(res.unwrap(), 48);
         }
 
         #[test]
         fn async_write3() {
             let file = TempFile::new().unwrap().into_file();
             let fd = file.as_raw_fd();
-
-            let executor = ThreadPool::new().unwrap();
-            let handle = executor
-                .spawn_with_handle(async move {
-                    let drive = DemoDriver::default();
-                    let mut buf = vec![0x0u8; 48];
-                    let mut writer = Writer::<()>::new(fd, &mut buf).unwrap();
-                    let buf = vec![0xdeu8; 48];
-
-                    writer
-                        .async_write3(drive, &buf[..32], &buf[32..40], &buf[40..])
-                        .await
-                })
-                .unwrap();
-
-            assert_eq!(block_on(handle).unwrap(), 48);
+            let mut buf = vec![0x0u8; 48];
+            let mut writer = Writer::<()>::new(fd, &mut buf).unwrap();
+            let buf = vec![0xdeu8; 48];
+            let res = tokio_uring::start(async {
+                writer
+                    .async_write3(&buf[..32], &buf[32..40], &buf[40..])
+                    .await
+            });
+            assert_eq!(res.unwrap(), 48);
         }
 
         #[test]
         fn async_write_from_at() {
             let file1 = TempFile::new().unwrap().into_file();
             let fd1 = file1.as_raw_fd();
-            let mut file = TempFile::new().unwrap().into_file();
-            let fd = file.as_raw_fd();
+
             let buf = vec![0xdeu8; 64];
+            let dir = TempDir::new().unwrap();
+            let path = dir.as_path().to_path_buf().join("test.txt");
+            std::fs::write(&path, &buf).unwrap();
 
-            file.write_all(&buf).unwrap();
-            file.seek(SeekFrom::Start(0)).unwrap();
+            let mut buf = vec![0x0u8; 48];
+            let mut writer = Writer::<()>::new(fd1, &mut buf).unwrap();
+            let res = tokio_uring::start(async {
+                let file = OpenOptions::new().read(true).open(&path).await.unwrap();
+                writer.async_write_from_at(&file, 40, 16).await
+            });
 
-            let executor = ThreadPool::new().unwrap();
-            let handle = executor
-                .spawn_with_handle(async move {
-                    let drive = DemoDriver::default();
-                    let mut buf = vec![0x0u8; 48];
-                    let mut writer = Writer::<()>::new(fd1, &mut buf).unwrap();
-
-                    writer.async_write_from_at(drive, fd, 40, 16).await
-                })
-                .unwrap();
-
-            assert_eq!(block_on(handle).unwrap(), 40);
+            assert_eq!(res.unwrap(), 40);
         }
 
         #[test]
@@ -1107,16 +1077,8 @@ mod tests {
                 64
             );
 
-            let executor = ThreadPool::new().unwrap();
-            let handle = executor
-                .spawn_with_handle(async move {
-                    let drive = DemoDriver::default();
-
-                    writer.async_commit(drive, Some(&other)).await
-                })
-                .unwrap();
-
-            let _result = block_on(handle).unwrap();
+            let res = tokio_uring::start(async { writer.async_commit(Some(&other)).await });
+            let _ = res.unwrap();
         }
     }
 }

@@ -47,7 +47,7 @@ vm-memory = { version = "0.7", features = ["backend-mmap", "backend-bitmap"] }
 [features]
 default = ["fusedev"]
 #async-io = ["async-trait", "futures", "caps]
-async_io = ["async-trait", "futures", "tokio-uring"]
+async-io = ["async-trait", "futures", "tokio-uring"]
 fusedev = ["vmm-sys-util", "caps", "core-foundation-sys"]
 virtiofs = ["virtio-queue", "caps"]
 vhost-user-fs = ["virtiofs", "vhost", "caps"]
