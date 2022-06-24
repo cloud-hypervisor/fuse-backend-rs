@@ -447,10 +447,10 @@ macro_rules! volatile_impl {
 
 volatile_impl!(File);
 
-#[cfg(feature = "async_io")]
+#[cfg(feature = "async-io")]
 pub use async_io::AsyncFileReadWriteVolatile;
 
-#[cfg(feature = "async_io")]
+#[cfg(feature = "async-io")]
 mod async_io {
     use futures::join;
     use std::sync::Arc;

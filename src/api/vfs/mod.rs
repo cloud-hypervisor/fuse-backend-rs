@@ -33,7 +33,7 @@ use crate::abi::fuse_abi::*;
 use crate::api::filesystem::*;
 use crate::async_util::{AsyncDrive, AsyncDriver};
 
-#[cfg(feature = "async-io")]
+#[cfg(feature = "async_io")]
 mod async_io;
 mod sync_io;
 
@@ -165,7 +165,7 @@ use Either::*;
 /// D refers to the type of asynchronous event driver
 pub type BackFileSystem<D> = Box<dyn BackendFileSystem<D, Inode = u64, Handle = u64> + Sync + Send>;
 
-#[cfg(not(feature = "async-io"))]
+#[cfg(not(feature = "async_io"))]
 /// BackendFileSystem abstracts all backend file systems under vfs
 pub trait BackendFileSystem<D: AsyncDrive = AsyncDriver>: FileSystem {
     /// mount returns the backend file system root inode entry and
@@ -180,7 +180,7 @@ pub trait BackendFileSystem<D: AsyncDrive = AsyncDriver>: FileSystem {
     fn as_any(&self) -> &dyn Any;
 }
 
-#[cfg(feature = "async-io")]
+#[cfg(feature = "async_io")]
 /// BackendFileSystem abstracts all backend file systems under vfs
 pub trait BackendFileSystem<D: AsyncDrive = AsyncDriver>: AsyncFileSystem<D> {
     /// mount returns the backend file system root inode entry and
@@ -639,7 +639,7 @@ mod tests {
         assert!(!is_dot_or_dotdot(name));
     }
 
-    #[cfg(feature = "async-io")]
+    #[cfg(feature = "async_io")]
     mod async_io {
         use super::*;
         use crate::abi::fuse_abi::{OpenOptions, SetattrValid};
@@ -907,7 +907,7 @@ mod tests {
         }
     }
 
-    #[cfg(not(feature = "async-io"))]
+    #[cfg(not(feature = "async_io"))]
     impl BackendFileSystem<AsyncDriver> for FakeFileSystemOne {
         fn mount(&self) -> Result<(Entry, u64)> {
             Ok((
@@ -924,7 +924,7 @@ mod tests {
         }
     }
 
-    #[cfg(not(feature = "async-io"))]
+    #[cfg(not(feature = "async_io"))]
     impl BackendFileSystem<AsyncDriver> for FakeFileSystemTwo {
         fn mount(&self) -> Result<(Entry, u64)> {
             Ok((

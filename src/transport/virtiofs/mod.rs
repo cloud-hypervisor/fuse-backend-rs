@@ -174,7 +174,7 @@ impl<'a, S: BitmapSlice> Writer<'a, S> {
         mut src: F,
         count: usize,
     ) -> io::Result<usize> {
-        self.check_available_space(count)?;
+        self.check_available_space(count, 0, 0)?;
         self.buffers
             .consume_for_write(count, |bufs| src.read_vectored_volatile(bufs))
     }
@@ -188,7 +188,7 @@ impl<'a, S: BitmapSlice> Writer<'a, S> {
         count: usize,
         off: u64,
     ) -> io::Result<usize> {
-        self.check_available_space(count)?;
+        self.check_available_space(count, 0, 0)?;
         self.buffers
             .consume_for_write(count, |bufs| src.read_vectored_at_volatile(bufs, off))
     }
@@ -199,7 +199,7 @@ impl<'a, S: BitmapSlice> Writer<'a, S> {
         mut src: F,
         mut count: usize,
     ) -> io::Result<()> {
-        self.check_available_space(count)?;
+        self.check_available_space(count, 0, 0)?;
         while count > 0 {
             match self.write_from(&mut src, count) {
                 Ok(0) => {
@@ -246,14 +246,20 @@ impl<'a, S: BitmapSlice> Writer<'a, S> {
         Ok(0)
     }
 
-    fn check_available_space(&self, sz: usize) -> io::Result<()> {
-        if sz > self.available_bytes() {
+    fn check_available_space(&self, len1: usize, len2: usize, len3: usize) -> io::Result<()> {
+        let len = len1
+            .checked_add(len2)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "buffer size is too big"))?;
+        let len = len
+            .checked_add(len3)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "buffer size is too big"))?;
+        if len > self.available_bytes() {
             Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!(
                     "data out of range, available {} requested {}",
                     self.available_bytes(),
-                    sz
+                    len
                 ),
             ))
         } else {
@@ -264,7 +270,7 @@ impl<'a, S: BitmapSlice> Writer<'a, S> {
 
 impl<'a, S: BitmapSlice> io::Write for Writer<'a, S> {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        self.check_available_space(buf.len())?;
+        self.check_available_space(buf.len(), 0, 0)?;
 
         self.buffers.consume_for_write(buf.len(), |bufs| {
             let mut rem = buf;
@@ -284,7 +290,7 @@ impl<'a, S: BitmapSlice> io::Write for Writer<'a, S> {
     }
 
     fn write_vectored(&mut self, bufs: &[IoSlice<'_>]) -> io::Result<usize> {
-        self.check_available_space(bufs.iter().fold(0, |acc, x| acc + x.len()))?;
+        self.check_available_space(bufs.iter().fold(0, |acc, x| acc + x.len()), 0, 0)?;
 
         let mut count = 0;
         for buf in bufs.iter().filter(|b| !b.is_empty()) {
@@ -299,58 +305,51 @@ impl<'a, S: BitmapSlice> io::Write for Writer<'a, S> {
     }
 }
 
-// For virtio-fs, the output is written to memory buffer, so need for async io.
+// For Virtio-fs, the output is written to memory buffer, so no need for async io at all.
 // Just relay the operation to corresponding sync io handler.
 #[cfg(feature = "async-io")]
 mod async_io {
-    use std::os::unix::io::RawFd;
-
     use super::*;
-    use crate::async_util::{AsyncDrive, AsyncUtil};
+    use crate::transport::AsyncFileReadWriteVolatile;
 
     impl<'a, S: BitmapSlice> Reader<'a, S> {
         /// Reads data from the descriptor chain buffer into a File at offset `off`.
+        ///
         /// Returns the number of bytes read from the descriptor chain buffer.
         /// The number of bytes read can be less than `count` if there isn't
         /// enough data in the descriptor chain buffer.
-        pub async fn async_read_to_at<D: AsyncDrive>(
+        pub async fn async_read_to_at<F: AsyncFileReadWriteVolatile>(
             &mut self,
-            drive: D,
-            dst: RawFd,
+            dst: &F,
             count: usize,
             off: u64,
         ) -> io::Result<usize> {
-            let bufs = self.buffers.allocate_io_slice(count);
+            // Safe because `bufs` doesn't out-live `self`.
+            let bufs = unsafe { self.buffers.prepare_io_buf(count) };
             if bufs.is_empty() {
                 Ok(0)
             } else {
-                let result = AsyncUtil::write_vectored(drive, dst, &bufs, off).await?;
-                self.buffers.mark_used(result)?;
-                Ok(result)
+                let (res, _) = dst.async_write_vectored_at_volatile(bufs, off).await;
+                match res {
+                    Ok(cnt) => {
+                        self.buffers.mark_used(cnt)?;
+                        Ok(cnt)
+                    }
+                    Err(e) => Err(e),
+                }
             }
         }
     }
 
     impl<'a, S: BitmapSlice> Writer<'a, S> {
         /// Write data from a buffer into this writer in asynchronous mode.
-        pub async fn async_write<D: AsyncDrive>(
-            &mut self,
-            _drive: D,
-            data: &[u8],
-        ) -> io::Result<usize> {
+        pub async fn async_write(&mut self, data: &[u8]) -> io::Result<usize> {
             self.write(data)
         }
 
         /// Write data from two buffers into this writer in asynchronous mode.
-        pub async fn async_write2<D: AsyncDrive>(
-            &mut self,
-            _drive: D,
-            data: &[u8],
-            data2: &[u8],
-        ) -> io::Result<usize> {
-            let len = data.len() + data2.len();
-            self.check_available_space(len)?;
-
+        pub async fn async_write2(&mut self, data: &[u8], data2: &[u8]) -> io::Result<usize> {
+            self.check_available_space(data.len(), data2.len(), 0)?;
             let mut cnt = self.write(data)?;
             cnt += self.write(data2)?;
 
@@ -358,16 +357,13 @@ mod async_io {
         }
 
         /// Write data from two buffers into this writer in asynchronous mode.
-        pub async fn async_write3<D: AsyncDrive>(
+        pub async fn async_write3(
             &mut self,
-            _drive: D,
             data: &[u8],
             data2: &[u8],
             data3: &[u8],
         ) -> io::Result<usize> {
-            let len = data.len() + data2.len() + data3.len();
-            self.check_available_space(len)?;
-
+            self.check_available_space(data.len(), data2.len(), data3.len())?;
             let mut cnt = self.write(data)?;
             cnt += self.write(data2)?;
             cnt += self.write(data3)?;
@@ -376,42 +372,39 @@ mod async_io {
         }
 
         /// Attempts to write an entire buffer into this writer in asynchronous mode.
-        pub async fn async_write_all<D: AsyncDrive>(
-            &mut self,
-            _drive: D,
-            buf: &[u8],
-        ) -> io::Result<()> {
+        pub async fn async_write_all(&mut self, buf: &[u8]) -> io::Result<()> {
             self.write_all(buf)
         }
 
         /// Writes data to the descriptor chain buffer from a File at offset `off`.
         /// Returns the number of bytes written to the descriptor chain buffer.
-        pub async fn async_write_from_at<D: AsyncDrive>(
+        pub async fn async_write_from_at<F: AsyncFileReadWriteVolatile>(
             &mut self,
-            drive: D,
-            src: RawFd,
+            src: &F,
             count: usize,
             off: u64,
         ) -> io::Result<usize> {
-            self.check_available_space(count)?;
-            let mut bufs = self.buffers.allocate_mut_io_slice(count);
+            self.check_available_space(count, 0, 0)?;
+            // Safe because `bufs` doesn't out-live `self`.
+            let bufs = unsafe { self.buffers.prepare_mut_io_buf(count) };
             if bufs.is_empty() {
                 Ok(0)
             } else {
-                let result = AsyncUtil::read_vectored(drive, src, &mut bufs, off).await?;
-                self.buffers.mark_dirty(count);
-                self.buffers.mark_used(count)?;
-                Ok(result)
+                let (res, _) = src.async_read_vectored_at_volatile(bufs, off).await;
+                match res {
+                    Ok(cnt) => {
+                        self.buffers.mark_dirty(cnt);
+                        self.buffers.mark_used(cnt)?;
+                        Ok(cnt)
+                    }
+                    Err(e) => Err(e),
+                }
             }
         }
 
         /// Commit all internal buffers of self and others
         /// We need this because the lifetime of others is usually shorter than self.
-        pub async fn async_commit<D: AsyncDrive>(
-            &mut self,
-            _drive: D,
-            other: Option<&Self>,
-        ) -> io::Result<usize> {
+        pub async fn async_commit(&mut self, other: Option<&Self>) -> io::Result<usize> {
             self.commit(other)
         }
     }

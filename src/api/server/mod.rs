@@ -30,7 +30,7 @@ use crate::async_util::{AsyncDrive, AsyncDriver};
 use crate::transport::{FileReadWriteVolatile, Reader, Writer};
 use crate::{bytes_to_cstr, BitmapSlice, Error, Result};
 
-#[cfg(feature = "async-io")]
+#[cfg(feature = "async_io")]
 mod async_io;
 mod sync_io;
 

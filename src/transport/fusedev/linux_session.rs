@@ -380,6 +380,7 @@ fn fuse_kern_umount(mountpoint: &str, file: File) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs::File;
     use std::os::unix::io::FromRawFd;
     use std::path::Path;
     use vmm_sys_util::tempdir::TempDir;
@@ -396,19 +397,16 @@ mod tests {
 
     #[test]
     fn test_new_channel() {
-        let ch = FuseChannel::new(
-            // Provide a valid FD to allow poll register to work.
-            unsafe { File::from_raw_fd(std::io::stdout().as_raw_fd()) },
-            3,
-        );
-        assert!(ch.is_ok());
+        let fd = nix::unistd::dup(std::io::stdout().as_raw_fd()).unwrap();
+        let file = unsafe { File::from_raw_fd(fd) };
+        let _ = FuseChannel::new(file, 3).unwrap();
     }
 }
 
-#[cfg(feature = "async-io")]
+#[cfg(feature = "async_io")]
 pub use asyncio::FuseDevTask;
 
-#[cfg(feature = "async-io")]
+#[cfg(feature = "async_io")]
 /// Task context to handle fuse request in asynchronous mode.
 mod asyncio {
     use std::os::unix::io::RawFd;
@@ -416,7 +414,6 @@ mod asyncio {
 
     use crate::api::filesystem::AsyncFileSystem;
     use crate::api::server::Server;
-    use crate::async_util::{AsyncDriver, AsyncExecutorState, AsyncUtil};
     use crate::transport::{FuseBuf, Reader, Writer};
 
     /// Task context to handle fuse request in asynchronous mode.

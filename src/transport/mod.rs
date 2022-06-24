@@ -27,8 +27,12 @@ use vm_memory::{ByteValued, VolatileSlice};
 use crate::BitmapSlice;
 
 pub mod file_traits;
+#[cfg(feature = "async-io")]
+pub use file_traits::AsyncFileReadWriteVolatile;
 pub use file_traits::{FileReadWriteVolatile, FileSetLen};
 pub mod file_volatile_slice;
+#[cfg(feature = "async-io")]
+pub use file_volatile_slice::FileVolatileBuf;
 pub use file_volatile_slice::FileVolatileSlice;
 
 mod fs_cache_req_handler;
@@ -158,7 +162,7 @@ impl<S: BitmapSlice> IoBuffers<'_, S> {
     }
 
     #[cfg(feature = "async-io")]
-    fn allocate_io_slice(&self, count: usize) -> Vec<IoSlice> {
+    unsafe fn prepare_io_buf(&self, count: usize) -> Vec<file_volatile_slice::FileVolatileBuf> {
         let mut rem = count;
         let mut bufs = Vec::with_capacity(self.buffers.len());
 
@@ -176,9 +180,11 @@ impl<S: BitmapSlice> IoBuffers<'_, S> {
                 buf.clone()
             };
             // Safe because we just change the interface to access underlying buffers.
-            bufs.push(IoSlice::new(unsafe {
-                std::slice::from_raw_parts(local_buf.as_ptr(), local_buf.len())
-            }));
+            bufs.push(file_volatile_slice::FileVolatileBuf::from_raw(
+                local_buf.as_ptr(),
+                local_buf.len(),
+                local_buf.len(),
+            ));
 
             // Don't need check_sub() as we just made sure rem >= local_buf.len()
             rem -= local_buf.len() as usize;
@@ -188,7 +194,7 @@ impl<S: BitmapSlice> IoBuffers<'_, S> {
     }
 
     #[cfg(all(feature = "async-io", feature = "virtiofs"))]
-    fn allocate_mut_io_slice(&self, count: usize) -> Vec<IoSliceMut> {
+    unsafe fn prepare_mut_io_buf(&self, count: usize) -> Vec<file_volatile_slice::FileVolatileBuf> {
         let mut rem = count;
         let mut bufs = Vec::with_capacity(self.buffers.len());
 
@@ -205,10 +211,11 @@ impl<S: BitmapSlice> IoBuffers<'_, S> {
             } else {
                 buf.clone()
             };
-            // Safe because we just change the interface to access underlying buffers.
-            bufs.push(IoSliceMut::new(unsafe {
-                std::slice::from_raw_parts_mut(local_buf.as_ptr(), local_buf.len())
-            }));
+            bufs.push(file_volatile_slice::FileVolatileBuf::from_raw(
+                local_buf.as_ptr(),
+                0,
+                local_buf.len(),
+            ));
 
             // Don't need check_sub() as we just made sure rem >= local_buf.len()
             rem -= local_buf.len() as usize;

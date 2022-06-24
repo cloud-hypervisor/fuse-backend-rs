@@ -4,6 +4,9 @@ build:
 	cargo build --features="fusedev"
 	cargo build --features="virtiofs"
 	cargo build --features="vhost-user-fs"
+	cargo build --features="fusedev,async-io"
+	cargo build --features="virtiofs,async-io"
+	cargo build --features="vhost-user-fs,async-io"
 
 build-macos:
 	cargo build --features="fusedev"
@@ -18,9 +21,12 @@ check: build
 	cargo clippy --features="fusedev" -- -Dwarnings
 	cargo clippy --features="virtiofs" -- -Dwarnings
 	cargo clippy --features="vhost-user-fs" -- -Dwarnings
-	cargo test --features="virtiofs" -- --nocapture --skip integration
 	cargo test --features="fusedev" -- --nocapture --skip integration
+	cargo test --features="virtiofs" -- --nocapture --skip integration
 	cargo test --features="vhost-user-fs" -- --nocapture --skip integration
+	cargo test --features="fusedev,async-io" -- --nocapture --skip integration
+	cargo test --features="virtiofs,async-io" -- --nocapture --skip integration
+	cargo test --features="vhost-user-fs,async-io" -- --nocapture --skip integration
 
 smoke: check
 	cargo test --features="fusedev" -- --nocapture
