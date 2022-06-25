@@ -11,7 +11,7 @@ use std::thread;
 use fuse_backend_rs::api::{server::Server, Vfs, VfsOptions};
 use fuse_backend_rs::async_util::AsyncDriver;
 use fuse_backend_rs::passthrough::{Config, PassthroughFs};
-use fuse_backend_rs::transport::fusedev::{FuseChannel, FuseSession};
+use fuse_backend_rs::transport::{FuseChannel, FuseSession};
 
 /// A fusedev daemon example
 #[allow(dead_code)]
@@ -106,7 +106,10 @@ impl FuseServer {
                 .get_request()
                 .map_err(|_| std::io::Error::from_raw_os_error(libc::EINVAL))?
             {
-                if let Err(e) = self.server.handle_message(reader, writer, None, None) {
+                if let Err(e) = self
+                    .server
+                    .handle_message(reader, writer.into(), None, None)
+                {
                     match e {
                         fuse_backend_rs::Error::EncodeMessage(_ebadf) => {
                             break;

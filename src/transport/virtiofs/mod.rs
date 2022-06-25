@@ -50,7 +50,7 @@ use vm_memory::{
     Address, ByteValued, GuestMemory, GuestMemoryRegion, MemoryRegionAddress, VolatileSlice,
 };
 
-use super::{Error, FileReadWriteVolatile, FileVolatileSlice, IoBuffers, Reader, Result};
+use super::{Error, FileReadWriteVolatile, FileVolatileSlice, IoBuffers, Reader, Result, Writer};
 
 impl<S: BitmapSlice> IoBuffers<'_, S> {
     /// Consumes for write.
@@ -113,16 +113,16 @@ impl<'a> Reader<'a> {
 /// Writer will start iterating the descriptors from the first writable one and will
 /// assume that all following descriptors are writable.
 #[derive(Clone)]
-pub struct Writer<'a, S = ()> {
+pub struct VirtioFsWriter<'a, S = ()> {
     buffers: IoBuffers<'a, S>,
 }
 
-impl<'a> Writer<'a> {
+impl<'a> VirtioFsWriter<'a> {
     /// Construct a new [Writer] wrapper over `desc_chain`.
     pub fn new<M>(
         mem: &'a M::Target,
         desc_chain: DescriptorChain<M>,
-    ) -> Result<Writer<'a, MS<'a, M::Target>>>
+    ) -> Result<VirtioFsWriter<'a, MS<'a, M::Target>>>
     where
         M: Deref,
         M::Target: GuestMemory + Sized,
@@ -151,7 +151,7 @@ impl<'a> Writer<'a> {
             })
             .collect::<Result<VecDeque<VolatileSlice<'a, MS<M::Target>>>>>()?;
 
-        Ok(Writer {
+        Ok(VirtioFsWriter {
             buffers: IoBuffers {
                 buffers,
                 bytes_consumed: 0,
@@ -160,7 +160,7 @@ impl<'a> Writer<'a> {
     }
 }
 
-impl<'a, S: BitmapSlice> Writer<'a, S> {
+impl<'a, S: BitmapSlice> VirtioFsWriter<'a, S> {
     /// Write an object to the descriptor chain buffer.
     pub fn write_obj<T: ByteValued>(&mut self, val: T) -> io::Result<()> {
         self.write_all(val.as_slice())
@@ -237,12 +237,13 @@ impl<'a, S: BitmapSlice> Writer<'a, S> {
     pub fn split_at(&mut self, offset: usize) -> Result<Self> {
         self.buffers
             .split_at(offset)
-            .map(|buffers| Writer { buffers })
+            .map(|buffers| VirtioFsWriter { buffers })
     }
 
     /// Commit all internal buffers of self and others
+    ///
     /// This is provided just to be compatible with fusedev
-    pub fn commit(&mut self, _other: Option<&Self>) -> io::Result<usize> {
+    pub fn commit(&mut self, _other: Option<&Writer<'a, S>>) -> io::Result<usize> {
         Ok(0)
     }
 
@@ -268,7 +269,7 @@ impl<'a, S: BitmapSlice> Writer<'a, S> {
     }
 }
 
-impl<'a, S: BitmapSlice> io::Write for Writer<'a, S> {
+impl<'a, S: BitmapSlice> io::Write for VirtioFsWriter<'a, S> {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         self.check_available_space(buf.len(), 0, 0)?;
 
@@ -312,36 +313,7 @@ mod async_io {
     use super::*;
     use crate::transport::AsyncFileReadWriteVolatile;
 
-    impl<'a, S: BitmapSlice> Reader<'a, S> {
-        /// Reads data from the descriptor chain buffer into a File at offset `off`.
-        ///
-        /// Returns the number of bytes read from the descriptor chain buffer.
-        /// The number of bytes read can be less than `count` if there isn't
-        /// enough data in the descriptor chain buffer.
-        pub async fn async_read_to_at<F: AsyncFileReadWriteVolatile>(
-            &mut self,
-            dst: &F,
-            count: usize,
-            off: u64,
-        ) -> io::Result<usize> {
-            // Safe because `bufs` doesn't out-live `self`.
-            let bufs = unsafe { self.buffers.prepare_io_buf(count) };
-            if bufs.is_empty() {
-                Ok(0)
-            } else {
-                let (res, _) = dst.async_write_vectored_at_volatile(bufs, off).await;
-                match res {
-                    Ok(cnt) => {
-                        self.buffers.mark_used(cnt)?;
-                        Ok(cnt)
-                    }
-                    Err(e) => Err(e),
-                }
-            }
-        }
-    }
-
-    impl<'a, S: BitmapSlice> Writer<'a, S> {
+    impl<'a, S: BitmapSlice> VirtioFsWriter<'a, S> {
         /// Write data from a buffer into this writer in asynchronous mode.
         pub async fn async_write(&mut self, data: &[u8]) -> io::Result<usize> {
             self.write(data)
@@ -356,7 +328,7 @@ mod async_io {
             Ok(cnt)
         }
 
-        /// Write data from two buffers into this writer in asynchronous mode.
+        /// Write data from three buffers into this writer in asynchronous mode.
         pub async fn async_write3(
             &mut self,
             data: &[u8],
@@ -404,7 +376,7 @@ mod async_io {
 
         /// Commit all internal buffers of self and others
         /// We need this because the lifetime of others is usually shorter than self.
-        pub async fn async_commit(&mut self, other: Option<&Self>) -> io::Result<usize> {
+        pub async fn async_commit(&mut self, other: Option<&Writer<'a, S>>) -> io::Result<usize> {
             self.commit(other)
         }
     }
@@ -544,7 +516,7 @@ mod tests {
             0,
         )
         .expect("create_descriptor_chain failed");
-        let mut writer = Writer::new(&memory, chain).expect("failed to create Writer");
+        let mut writer = VirtioFsWriter::new(&memory, chain).expect("failed to create Writer");
         assert_eq!(writer.available_bytes(), 106);
         assert_eq!(writer.bytes_written(), 0);
 
@@ -606,7 +578,7 @@ mod tests {
             0,
         )
         .expect("create_descriptor_chain failed");
-        let mut writer = Writer::new(&memory, chain).expect("failed to create Writer");
+        let mut writer = VirtioFsWriter::new(&memory, chain).expect("failed to create Writer");
         assert_eq!(writer.available_bytes(), 0);
         assert_eq!(writer.bytes_written(), 0);
 
@@ -639,7 +611,7 @@ mod tests {
         )
         .expect("create_descriptor_chain failed");
         let mut reader = Reader::new(&memory, chain.clone()).expect("failed to create Reader");
-        let mut writer = Writer::new(&memory, chain).expect("failed to create Writer");
+        let mut writer = VirtioFsWriter::new(&memory, chain).expect("failed to create Writer");
 
         assert_eq!(reader.bytes_read(), 0);
         assert_eq!(writer.bytes_written(), 0);
@@ -682,7 +654,8 @@ mod tests {
             123,
         )
         .expect("create_descriptor_chain failed");
-        let mut writer = Writer::new(&memory, chain_writer).expect("failed to create Writer");
+        let mut writer =
+            VirtioFsWriter::new(&memory, chain_writer).expect("failed to create Writer");
         assert!(writer.flush().is_ok());
         if let Err(_) = writer.write_obj(secret) {
             panic!("write_obj should not fail here");
@@ -919,7 +892,7 @@ mod tests {
             0,
         )
         .expect("create_descriptor_chain failed");
-        let mut writer = Writer::new(&memory, chain).expect("failed to create Writer");
+        let mut writer = VirtioFsWriter::new(&memory, chain).expect("failed to create Writer");
 
         let buf = vec![0xdeu8; 40];
         assert_eq!(
@@ -950,7 +923,7 @@ mod tests {
             0,
         )
         .expect("create_descriptor_chain failed");
-        let mut writer = Writer::new(&memory, chain).expect("failed to create Writer");
+        let mut writer = VirtioFsWriter::new(&memory, chain).expect("failed to create Writer");
 
         let buf = vec![0xdeu8; 48];
         let slices = [
@@ -1044,7 +1017,7 @@ mod tests {
             0,
         )
         .expect("create_descriptor_chain failed");
-        let mut writer = Writer::new(&memory, chain).expect("failed to create Writer");
+        let mut writer = VirtioFsWriter::new(&memory, chain).expect("failed to create Writer");
 
         let mut file = TempFile::new().unwrap().into_file();
         let buf = vec![0xdeu8; 64];
@@ -1073,7 +1046,7 @@ mod tests {
             0,
         )
         .expect("create_descriptor_chain failed");
-        let mut writer = Writer::new(&memory, chain).expect("failed to create Writer");
+        let mut writer = VirtioFsWriter::new(&memory, chain).expect("failed to create Writer");
 
         let mut file = TempFile::new().unwrap().into_file();
         let buf = vec![0xdeu8; 64];
@@ -1149,7 +1122,8 @@ mod tests {
                         0,
                     )
                     .expect("create_descriptor_chain failed");
-                    let mut writer = Writer::new(&memory, chain).expect("failed to create Writer");
+                    let mut writer =
+                        VirtioFsWriter::new(&memory, chain).expect("failed to create Writer");
                     let drive = DemoDriver::default();
                     let buf = vec![0xdeu8; 64];
 
@@ -1175,7 +1149,8 @@ mod tests {
                         0,
                     )
                     .expect("create_descriptor_chain failed");
-                    let mut writer = Writer::new(&memory, chain).expect("failed to create Writer");
+                    let mut writer =
+                        VirtioFsWriter::new(&memory, chain).expect("failed to create Writer");
                     let drive = DemoDriver::default();
 
                     let buf = vec![0xdeu8; 48];
@@ -1205,7 +1180,8 @@ mod tests {
                         0,
                     )
                     .expect("create_descriptor_chain failed");
-                    let mut writer = Writer::new(&memory, chain).expect("failed to create Writer");
+                    let mut writer =
+                        VirtioFsWriter::new(&memory, chain).expect("failed to create Writer");
                     let drive = DemoDriver::default();
                     let buf = vec![0xdeu8; 48];
 
@@ -1235,7 +1211,8 @@ mod tests {
                         0,
                     )
                     .expect("create_descriptor_chain failed");
-                    let mut writer = Writer::new(&memory, chain).expect("failed to create Writer");
+                    let mut writer =
+                        VirtioFsWriter::new(&memory, chain).expect("failed to create Writer");
                     let drive = DemoDriver::default();
                     let buf = vec![0xdeu8; 48];
 
@@ -1274,7 +1251,8 @@ mod tests {
                         0,
                     )
                     .expect("create_descriptor_chain failed");
-                    let mut writer = Writer::new(&memory, chain).expect("failed to create Writer");
+                    let mut writer =
+                        VirtioFsWriter::new(&memory, chain).expect("failed to create Writer");
                     let drive = DemoDriver::default();
 
                     writer.async_write_from_at(drive, fd, 40, 16).await

@@ -18,15 +18,18 @@ check-macos: build-macos
 
 check: build
 	cargo fmt -- --check
-	cargo clippy --features="fusedev" -- -Dwarnings
-	cargo clippy --features="virtiofs" -- -Dwarnings
-	cargo clippy --features="vhost-user-fs" -- -Dwarnings
-	cargo test --features="fusedev" -- --nocapture --skip integration
-	cargo test --features="virtiofs" -- --nocapture --skip integration
-	cargo test --features="vhost-user-fs" -- --nocapture --skip integration
-	cargo test --features="fusedev,async-io" -- --nocapture --skip integration
-	cargo test --features="virtiofs,async-io" -- --nocapture --skip integration
-	cargo test --features="vhost-user-fs,async-io" -- --nocapture --skip integration
+	cargo clippy --features="fusedev" --no-default-features -- -Dwarnings
+	cargo clippy --features="virtiofs" --no-default-features -- -Dwarnings
+	cargo clippy --features="vhost-user-fs" --no-default-features -- -Dwarnings
+	cargo clippy --features="fusedev,virtiofs" --no-default-features -- -Dwarnings
+	cargo test --features="fusedev" --no-default-features -- --nocapture --skip integration
+	cargo test --features="virtiofs" --no-default-features  -- --nocapture --skip integration
+	cargo test --features="vhost-user-fs" --no-default-features -- --nocapture --skip integration
+	cargo test --features="fusedev,virtiofs" --no-default-features -- --nocapture --skip integration
+	cargo test --features="fusedev,async-io" --no-default-features -- --nocapture --skip integration
+	cargo test --features="virtiofs,async-io" --no-default-features -- --nocapture --skip integration
+	cargo test --features="vhost-user-fs,async-io" --no-default-features -- --nocapture --skip integration
+	cargo test --features="fusedev,virtiofs,async-io" --no-default-features -- --nocapture --skip integration
 
 smoke: check
 	cargo test --features="fusedev" -- --nocapture

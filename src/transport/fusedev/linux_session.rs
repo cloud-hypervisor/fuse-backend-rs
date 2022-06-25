@@ -23,7 +23,7 @@ use nix::poll::{poll, PollFd, PollFlags};
 use nix::sys::epoll::{epoll_ctl, EpollEvent, EpollFlags, EpollOp};
 use nix::unistd::{getgid, getuid, read};
 
-use super::{super::pagesize, Error::SessionFailure, FuseBuf, Reader, Result, Writer};
+use super::{super::pagesize, Error::SessionFailure, FuseBuf, FuseDevWriter, Reader, Result};
 
 // These follows definition from libfuse.
 const FUSE_KERN_BUF_SIZE: usize = 256;
@@ -223,7 +223,7 @@ impl FuseChannel {
     /// - Ok(None): signal has pending on the exiting event channel
     /// - Ok(Some((reader, writer))): reader to receive request and writer to send reply
     /// - Err(e): error message
-    pub fn get_request(&mut self) -> Result<Option<(Reader, Writer)>> {
+    pub fn get_request(&mut self) -> Result<Option<(Reader, FuseDevWriter)>> {
         let mut events = Events::with_capacity(POLL_EVENTS_CAPACITY);
         let mut need_exit = false;
         loop {
@@ -281,7 +281,7 @@ impl FuseChannel {
                         // Reader::new() and Writer::new() should always return success.
                         let reader =
                             Reader::from_fuse_buffer(FuseBuf::new(&mut self.buf[..len])).unwrap();
-                        let writer = Writer::new(fd, buf).unwrap();
+                        let writer = FuseDevWriter::new(fd, buf).unwrap();
                         return Ok(Some((reader, writer)));
                     }
                     Err(e) => match e {
