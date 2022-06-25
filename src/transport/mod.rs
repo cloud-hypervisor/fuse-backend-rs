@@ -15,7 +15,8 @@
 //! - virtiofs: communicate with the virtiofsd on host side by using virtio descriptors.
 
 use std::collections::VecDeque;
-use std::io::{self, Read};
+use std::io::{self, IoSlice, Read};
+use std::marker::PhantomData;
 use std::mem::{size_of, MaybeUninit};
 use std::ptr::copy_nonoverlapping;
 use std::{cmp, fmt};
@@ -26,28 +27,25 @@ use vm_memory::{ByteValued, VolatileSlice};
 
 use crate::BitmapSlice;
 
-pub mod file_traits;
-#[cfg(feature = "async-io")]
-pub use file_traits::AsyncFileReadWriteVolatile;
-pub use file_traits::{FileReadWriteVolatile, FileSetLen};
-pub mod file_volatile_slice;
-#[cfg(feature = "async-io")]
-pub use file_volatile_slice::FileVolatileBuf;
-pub use file_volatile_slice::FileVolatileSlice;
-
+mod file_traits;
+mod file_volatile_slice;
 mod fs_cache_req_handler;
-pub use fs_cache_req_handler::FsCacheReqHandler;
-
+#[cfg(feature = "fusedev")]
+mod fusedev;
 #[cfg(feature = "virtiofs")]
-pub mod virtiofs;
+mod virtiofs;
+
+#[cfg(feature = "async-io")]
+pub use self::file_traits::AsyncFileReadWriteVolatile;
+pub use self::file_traits::{FileReadWriteVolatile, FileSetLen};
+#[cfg(feature = "async-io")]
+pub use self::file_volatile_slice::FileVolatileBuf;
+pub use self::file_volatile_slice::FileVolatileSlice;
+pub use self::fs_cache_req_handler::FsCacheReqHandler;
+#[cfg(feature = "fusedev")]
+pub use self::fusedev::{FuseBuf, FuseChannel, FuseDevWriter, FuseSession};
 #[cfg(feature = "virtiofs")]
-pub use self::virtiofs::Writer;
-
-#[cfg(all(feature = "fusedev", not(feature = "virtiofs")))]
-pub mod fusedev;
-
-#[cfg(all(feature = "fusedev", not(feature = "virtiofs")))]
-pub use self::fusedev::{FuseBuf, FuseSession, Writer};
+pub use self::virtiofs::VirtioFsWriter;
 
 /// Transport layer specific error codes.
 #[derive(Debug)]
@@ -58,6 +56,8 @@ pub enum Error {
     FindMemoryRegion,
     /// Invalid virtio queue descriptor chain.
     InvalidChain,
+    /// Invalid paramater.
+    InvalidParameter,
     /// Generic IO error.
     IoError(io::Error),
     /// Out of bounds when splitting VolatileSplice.
@@ -86,6 +86,7 @@ impl fmt::Display for Error {
             ),
             FindMemoryRegion => write!(f, "no memory region for this address range"),
             InvalidChain => write!(f, "invalid descriptor chain"),
+            InvalidParameter => write!(f, "invalid parameter"),
             IoError(e) => write!(f, "descriptor I/O error: {}", e),
             SplitOutOfBounds(off) => write!(f, "`DescriptorChain` split is out of bounds: {}", off),
             VolatileMemoryError(e) => write!(f, "volatile memory error: {}", e),
@@ -475,6 +476,249 @@ impl<S: BitmapSlice> io::Read for Reader<'_, S> {
             }
             Ok(total)
         })
+    }
+}
+
+#[cfg(feature = "async-io")]
+mod async_io {
+    use super::*;
+
+    impl<'a, S: BitmapSlice> Reader<'a, S> {
+        /// Read data from the data buffer into a File at offset `off` in asynchronous mode.
+        ///
+        /// Return the number of bytes read from the data buffer. The number of bytes read can
+        /// be less than `count` if there isn't enough data in the buffer.
+        pub async fn async_read_to_at<F: AsyncFileReadWriteVolatile>(
+            &mut self,
+            dst: &F,
+            count: usize,
+            off: u64,
+        ) -> io::Result<usize> {
+            // Safe because `bufs` doesn't out-live `self`.
+            let bufs = unsafe { self.buffers.prepare_io_buf(count) };
+            if bufs.is_empty() {
+                Ok(0)
+            } else {
+                let (res, _) = dst.async_write_vectored_at_volatile(bufs, off).await;
+                match res {
+                    Ok(cnt) => {
+                        self.buffers.mark_used(cnt)?;
+                        Ok(cnt)
+                    }
+                    Err(e) => Err(e),
+                }
+            }
+        }
+    }
+}
+
+/// Writer to send reply message to '/dev/fuse` or virtiofs queue.
+pub enum Writer<'a, S: BitmapSlice = ()> {
+    #[cfg(feature = "fusedev")]
+    /// Writer for FuseDev transport driver.
+    FuseDev(FuseDevWriter<'a, S>),
+    #[cfg(feature = "virtiofs")]
+    /// Writer for virtiofs transport driver.
+    VirtioFs(VirtioFsWriter<'a, S>),
+    /// Writer for Noop transport driver.
+    Noop(PhantomData<&'a S>),
+}
+
+impl<'a, S: BitmapSlice> Writer<'a, S> {
+    /// Write data to the descriptor chain buffer from a File at offset `off`.
+    ///
+    /// Return the number of bytes written to the descriptor chain buffer.
+    pub fn write_from_at<F: FileReadWriteVolatile>(
+        &mut self,
+        src: F,
+        count: usize,
+        off: u64,
+    ) -> io::Result<usize> {
+        match self {
+            #[cfg(feature = "fusedev")]
+            Writer::FuseDev(w) => w.write_from_at(src, count, off),
+            #[cfg(feature = "virtiofs")]
+            Writer::VirtioFs(w) => w.write_from_at(src, count, off),
+            _ => Err(std::io::Error::from_raw_os_error(libc::EINVAL)),
+        }
+    }
+
+    /// Split this `Writer` into two at the given offset in the `DescriptorChain` buffer.
+    ///
+    /// After the split, `self` will be able to write up to `offset` bytes while the returned
+    /// `Writer` can write up to `available_bytes() - offset` bytes.  Return an error if
+    /// `offset > self.available_bytes()`.
+    pub fn split_at(&mut self, offset: usize) -> Result<Self> {
+        match self {
+            #[cfg(feature = "fusedev")]
+            Writer::FuseDev(w) => w.split_at(offset).map(|w| w.into()),
+            #[cfg(feature = "virtiofs")]
+            Writer::VirtioFs(w) => w.split_at(offset).map(|w| w.into()),
+            _ => Err(Error::InvalidParameter),
+        }
+    }
+
+    /// Return number of bytes available for writing.
+    ///
+    /// May return an error if the combined lengths of all the buffers in the DescriptorChain would
+    /// cause an overflow.
+    pub fn available_bytes(&self) -> usize {
+        match self {
+            #[cfg(feature = "fusedev")]
+            Writer::FuseDev(w) => w.available_bytes(),
+            #[cfg(feature = "virtiofs")]
+            Writer::VirtioFs(w) => w.available_bytes(),
+            _ => 0,
+        }
+    }
+
+    /// Return number of bytes already written to the descriptor chain buffer.
+    pub fn bytes_written(&self) -> usize {
+        match self {
+            #[cfg(feature = "fusedev")]
+            Writer::FuseDev(w) => w.bytes_written(),
+            #[cfg(feature = "virtiofs")]
+            Writer::VirtioFs(w) => w.bytes_written(),
+            _ => 0,
+        }
+    }
+
+    /// Commit all internal buffers of self and others
+    pub fn commit(&mut self, other: Option<&Self>) -> io::Result<usize> {
+        match self {
+            #[cfg(feature = "fusedev")]
+            Writer::FuseDev(w) => w.commit(other),
+            #[cfg(feature = "virtiofs")]
+            Writer::VirtioFs(w) => w.commit(other),
+            _ => Ok(0),
+        }
+    }
+}
+
+impl<'a, S: BitmapSlice> io::Write for Writer<'a, S> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        match self {
+            #[cfg(feature = "fusedev")]
+            Writer::FuseDev(w) => w.write(buf),
+            #[cfg(feature = "virtiofs")]
+            Writer::VirtioFs(w) => w.write(buf),
+            _ => Err(std::io::Error::from_raw_os_error(libc::EINVAL)),
+        }
+    }
+
+    fn write_vectored(&mut self, bufs: &[IoSlice<'_>]) -> io::Result<usize> {
+        match self {
+            #[cfg(feature = "fusedev")]
+            Writer::FuseDev(w) => w.write_vectored(bufs),
+            #[cfg(feature = "virtiofs")]
+            Writer::VirtioFs(w) => w.write_vectored(bufs),
+            _ => Err(std::io::Error::from_raw_os_error(libc::EINVAL)),
+        }
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        match self {
+            #[cfg(feature = "fusedev")]
+            Writer::FuseDev(w) => w.flush(),
+            #[cfg(feature = "virtiofs")]
+            Writer::VirtioFs(w) => w.flush(),
+            _ => Ok(()),
+        }
+    }
+}
+
+#[cfg(feature = "async-io")]
+impl<'a, S: BitmapSlice> Writer<'a, S> {
+    /// Write data from a buffer into this writer in asynchronous mode.
+    pub async fn async_write(&mut self, data: &[u8]) -> io::Result<usize> {
+        match self {
+            #[cfg(feature = "fusedev")]
+            Writer::FuseDev(w) => w.async_write(data).await,
+            #[cfg(feature = "virtiofs")]
+            Writer::VirtioFs(w) => w.async_write(data).await,
+            _ => Err(std::io::Error::from_raw_os_error(libc::EINVAL)),
+        }
+    }
+
+    /// Write data from two buffers into this writer in asynchronous mode.
+    pub async fn async_write2(&mut self, data: &[u8], data2: &[u8]) -> io::Result<usize> {
+        match self {
+            #[cfg(feature = "fusedev")]
+            Writer::FuseDev(w) => w.async_write2(data, data2).await,
+            #[cfg(feature = "virtiofs")]
+            Writer::VirtioFs(w) => w.async_write2(data, data2).await,
+            _ => Err(std::io::Error::from_raw_os_error(libc::EINVAL)),
+        }
+    }
+
+    /// Write data from three buffers into this writer in asynchronous mode.
+    pub async fn async_write3(
+        &mut self,
+        data: &[u8],
+        data2: &[u8],
+        data3: &[u8],
+    ) -> io::Result<usize> {
+        match self {
+            #[cfg(feature = "fusedev")]
+            Writer::FuseDev(w) => w.async_write3(data, data2, data3).await,
+            #[cfg(feature = "virtiofs")]
+            Writer::VirtioFs(w) => w.async_write3(data, data2, data3).await,
+            _ => Err(std::io::Error::from_raw_os_error(libc::EINVAL)),
+        }
+    }
+
+    /// Attempt to write an entire buffer into this writer in asynchronous mode.
+    pub async fn async_write_all(&mut self, buf: &[u8]) -> io::Result<()> {
+        match self {
+            #[cfg(feature = "fusedev")]
+            Writer::FuseDev(w) => w.async_write_all(buf).await,
+            #[cfg(feature = "virtiofs")]
+            Writer::VirtioFs(w) => w.async_write_all(buf).await,
+            _ => Err(std::io::Error::from_raw_os_error(libc::EINVAL)),
+        }
+    }
+
+    /// Asynchronously write data to the descriptor chain buffer from a File at offset `off`.
+    ///
+    /// Return the number of bytes written to the descriptor chain buffer.
+    pub async fn async_write_from_at<F: AsyncFileReadWriteVolatile>(
+        &mut self,
+        src: &F,
+        count: usize,
+        off: u64,
+    ) -> io::Result<usize> {
+        match self {
+            #[cfg(feature = "fusedev")]
+            Writer::FuseDev(w) => w.async_write_from_at(src, count, off).await,
+            #[cfg(feature = "virtiofs")]
+            Writer::VirtioFs(w) => w.async_write_from_at(src, count, off).await,
+            _ => Err(std::io::Error::from_raw_os_error(libc::EINVAL)),
+        }
+    }
+
+    /// Commit all internal buffers of self and others
+    pub async fn async_commit(&mut self, other: Option<&Writer<'a, S>>) -> io::Result<usize> {
+        match self {
+            #[cfg(feature = "fusedev")]
+            Writer::FuseDev(w) => w.async_commit(other).await,
+            #[cfg(feature = "virtiofs")]
+            Writer::VirtioFs(w) => w.async_commit(other).await,
+            _ => Err(std::io::Error::from_raw_os_error(libc::EINVAL)),
+        }
+    }
+}
+
+#[cfg(feature = "fusedev")]
+impl<'a, S: BitmapSlice> From<FuseDevWriter<'a, S>> for Writer<'a, S> {
+    fn from(w: FuseDevWriter<'a, S>) -> Self {
+        Writer::FuseDev(w)
+    }
+}
+
+#[cfg(feature = "virtiofs")]
+impl<'a, S: BitmapSlice> From<VirtioFsWriter<'a, S>> for Writer<'a, S> {
+    fn from(w: VirtioFsWriter<'a, S>) -> Self {
+        Writer::VirtioFs(w)
     }
 }
 

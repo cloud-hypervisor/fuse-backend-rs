@@ -8,6 +8,7 @@
 //! buffer and the whole reply message must be written all at once.
 
 use std::collections::VecDeque;
+
 use std::io::{self, IoSlice, Write};
 use std::marker::PhantomData;
 use std::mem::ManuallyDrop;
@@ -17,7 +18,7 @@ use nix::sys::uio::writev;
 use nix::unistd::write;
 use vm_memory::{ByteValued, VolatileMemory, VolatileSlice};
 
-use super::{Error, FileReadWriteVolatile, FileVolatileSlice, IoBuffers, Reader, Result};
+use super::{Error, FileReadWriteVolatile, FileVolatileSlice, IoBuffers, Reader, Result, Writer};
 use crate::BitmapSlice;
 
 #[cfg(target_os = "linux")]
@@ -71,7 +72,7 @@ impl<'a, S: BitmapSlice + Default> Reader<'a, S> {
 ///    device write operation.
 /// 3. Concurrency, caller should not write to the writer concurrently.
 #[derive(Debug, PartialEq, Eq)]
-pub struct Writer<'a, S: BitmapSlice = ()> {
+pub struct FuseDevWriter<'a, S: BitmapSlice = ()> {
     fd: RawFd,
     buffered: bool,
     buf: ManuallyDrop<Vec<u8>>,
@@ -79,11 +80,11 @@ pub struct Writer<'a, S: BitmapSlice = ()> {
     phantom: PhantomData<&'a mut [S]>,
 }
 
-impl<'a, S: BitmapSlice + Default> Writer<'a, S> {
+impl<'a, S: BitmapSlice + Default> FuseDevWriter<'a, S> {
     /// Construct a new [Writer].
-    pub fn new(fd: RawFd, data_buf: &'a mut [u8]) -> Result<Writer<'a, S>> {
+    pub fn new(fd: RawFd, data_buf: &'a mut [u8]) -> Result<FuseDevWriter<'a, S>> {
         let buf = unsafe { Vec::from_raw_parts(data_buf.as_mut_ptr(), 0, data_buf.len()) };
-        Ok(Writer {
+        Ok(FuseDevWriter {
             fd,
             buffered: false,
             buf: ManuallyDrop::new(buf),
@@ -93,13 +94,13 @@ impl<'a, S: BitmapSlice + Default> Writer<'a, S> {
     }
 }
 
-impl<'a, S: BitmapSlice> Writer<'a, S> {
+impl<'a, S: BitmapSlice> FuseDevWriter<'a, S> {
     /// Split the [Writer] at the given offset.
     ///
     /// After the split, `self` will be able to write up to `offset` bytes while the returned
     /// `Writer` can write up to `available_bytes() - offset` bytes.  Returns an error if
     /// `offset > self.available_bytes()`.
-    pub fn split_at(&mut self, offset: usize) -> Result<Writer<'a, S>> {
+    pub fn split_at(&mut self, offset: usize) -> Result<FuseDevWriter<'a, S>> {
         if self.buf.capacity() < offset {
             return Err(Error::SplitOutOfBounds(offset));
         }
@@ -117,7 +118,7 @@ impl<'a, S: BitmapSlice> Writer<'a, S> {
         self.buffered = true;
         let buf = unsafe { ManuallyDrop::new(Vec::from_raw_parts(ptr.add(offset), len2, cap2)) };
 
-        Ok(Writer {
+        Ok(FuseDevWriter {
             fd: self.fd,
             buffered: true,
             buf,
@@ -132,7 +133,10 @@ impl<'a, S: BitmapSlice> Writer<'a, S> {
             return Ok(0);
         }
 
-        let o = other.map(|v| v.buf.as_slice()).unwrap_or(&[]);
+        let o = match other {
+            Some(Writer::FuseDev(w)) => w.buf.as_slice(),
+            _ => &[],
+        };
         let res = match (self.buf.len(), o.len()) {
             (0, 0) => Ok(0),
             (0, _) => write(self.fd, o),
@@ -276,7 +280,7 @@ impl<'a, S: BitmapSlice> Writer<'a, S> {
     }
 }
 
-impl<'a, S: BitmapSlice> io::Write for Writer<'a, S> {
+impl<'a, S: BitmapSlice> io::Write for FuseDevWriter<'a, S> {
     fn write(&mut self, data: &[u8]) -> io::Result<usize> {
         self.check_available_space(data.len())?;
 
@@ -333,39 +337,7 @@ mod async_io {
     use crate::transport::file_volatile_slice::FileVolatileBuf;
     use crate::transport::AsyncFileReadWriteVolatile;
 
-    impl<'a, S: BitmapSlice> Reader<'a, S> {
-        /// Reads data from the data buffer into a File at offset `off` in asynchronous mode.
-        ///
-        /// Returns the number of bytes read from the descriptor chain buffer. The number of bytes
-        /// read can be less than `count` if there isn't enough data in the descriptor chain buffer.
-        pub async fn async_read_to_at<F: AsyncFileReadWriteVolatile>(
-            &mut self,
-            dst: &F,
-            count: usize,
-            off: u64,
-        ) -> io::Result<usize> {
-            // Safe because `bufs` doesn't out-live `self`.
-            let bufs = unsafe { self.buffers.prepare_io_buf(count) };
-            if bufs.is_empty() {
-                Ok(0)
-            } else {
-                if bufs.len() == 1 {
-                    let (res, _) = dst.async_write_at_volatile(bufs[0], off).await;
-                    match res {
-                        Ok(cnt) => {
-                            self.buffers.mark_used(cnt)?;
-                            Ok(cnt)
-                        }
-                        Err(e) => Err(e),
-                    }
-                } else {
-                    panic!("fusedev: only one data buffer is supported");
-                }
-            }
-        }
-    }
-
-    impl<'a, S: BitmapSlice> Writer<'a, S> {
+    impl<'a, S: BitmapSlice> FuseDevWriter<'a, S> {
         /// Write data from a buffer into this writer in asynchronous mode.
         ///
         /// Return the number of bytes written to the writer.
@@ -504,7 +476,10 @@ mod async_io {
         ///
         /// We need this because the lifetime of others is usually shorter than self.
         pub async fn async_commit(&mut self, other: Option<&Writer<'a, S>>) -> io::Result<usize> {
-            let o = other.map(|v| v.buf.as_slice()).unwrap_or(&[]);
+            let o = match other {
+                Some(Writer::FuseDev(w)) => w.buf.as_slice(),
+                _ => &[],
+            };
 
             let res = match (self.buf.len(), o.len()) {
                 (0, 0) => Ok(0),
@@ -572,7 +547,7 @@ mod tests {
     fn writer_test_simple_chain() {
         let file = TempFile::new().unwrap().into_file();
         let mut buf = vec![0x0u8; 106];
-        let mut writer = Writer::<()>::new(file.as_raw_fd(), &mut buf).unwrap();
+        let mut writer = FuseDevWriter::<()>::new(file.as_raw_fd(), &mut buf).unwrap();
 
         writer.buffered = true;
         assert_eq!(writer.available_bytes(), 106);
@@ -600,7 +575,7 @@ mod tests {
     fn writer_test_split_chain() {
         let file = TempFile::new().unwrap().into_file();
         let mut buf = vec![0x0u8; 108];
-        let mut writer = Writer::<()>::new(file.as_raw_fd(), &mut buf).unwrap();
+        let mut writer = FuseDevWriter::<()>::new(file.as_raw_fd(), &mut buf).unwrap();
         let writer2 = writer.split_at(106).unwrap();
 
         assert_eq!(writer.available_bytes(), 106);
@@ -667,7 +642,7 @@ mod tests {
     fn writer_simple_commit_header() {
         let file = TempFile::new().unwrap().into_file();
         let mut buf = vec![0x0u8; 106];
-        let mut writer = Writer::<()>::new(file.as_raw_fd(), &mut buf).unwrap();
+        let mut writer = FuseDevWriter::<()>::new(file.as_raw_fd(), &mut buf).unwrap();
 
         writer.buffered = true;
         assert_eq!(writer.available_bytes(), 106);
@@ -697,7 +672,7 @@ mod tests {
     fn writer_split_commit_header() {
         let file = TempFile::new().unwrap().into_file();
         let mut buf = vec![0x0u8; 106];
-        let mut writer = Writer::<()>::new(file.as_raw_fd(), &mut buf).unwrap();
+        let mut writer = FuseDevWriter::<()>::new(file.as_raw_fd(), &mut buf).unwrap();
         let mut other = writer.split_at(4).expect("failed to split Writer");
 
         assert_eq!(writer.available_bytes(), 4);
@@ -728,7 +703,7 @@ mod tests {
     fn writer_split_commit_all() {
         let file = TempFile::new().unwrap().into_file();
         let mut buf = vec![0x0u8; 106];
-        let mut writer = Writer::<()>::new(file.as_raw_fd(), &mut buf).unwrap();
+        let mut writer = FuseDevWriter::<()>::new(file.as_raw_fd(), &mut buf).unwrap();
         let mut other = writer.split_at(4).expect("failed to split Writer");
 
         assert_eq!(writer.available_bytes(), 4);
@@ -751,7 +726,7 @@ mod tests {
             64
         );
 
-        writer.commit(Some(&other)).unwrap();
+        writer.commit(Some(&other.into())).unwrap();
     }
 
     #[test]
@@ -770,7 +745,7 @@ mod tests {
     fn write_full() {
         let file = TempFile::new().unwrap().into_file();
         let mut buf = vec![0x0u8; 48];
-        let mut writer = Writer::<()>::new(file.as_raw_fd(), &mut buf).unwrap();
+        let mut writer = FuseDevWriter::<()>::new(file.as_raw_fd(), &mut buf).unwrap();
 
         let buf = vec![0xdeu8; 64];
         writer.write(&buf[..]).unwrap_err();
@@ -786,7 +761,7 @@ mod tests {
     fn write_vectored() {
         let file = TempFile::new().unwrap().into_file();
         let mut buf = vec![0x0u8; 48];
-        let mut writer = Writer::<()>::new(file.as_raw_fd(), &mut buf).unwrap();
+        let mut writer = FuseDevWriter::<()>::new(file.as_raw_fd(), &mut buf).unwrap();
 
         let buf = vec![0xdeu8; 48];
         let slices = [
@@ -848,7 +823,7 @@ mod tests {
     fn write_obj() {
         let file1 = TempFile::new().unwrap().into_file();
         let mut buf = vec![0x0u8; 48];
-        let mut writer = Writer::<()>::new(file1.as_raw_fd(), &mut buf).unwrap();
+        let mut writer = FuseDevWriter::<()>::new(file1.as_raw_fd(), &mut buf).unwrap();
         let _writer2 = writer.split_at(40).unwrap();
         let val = 0x1u64;
 
@@ -860,7 +835,7 @@ mod tests {
     fn write_all_from() {
         let file1 = TempFile::new().unwrap().into_file();
         let mut buf = vec![0x0u8; 48];
-        let mut writer = Writer::<()>::new(file1.as_raw_fd(), &mut buf).unwrap();
+        let mut writer = FuseDevWriter::<()>::new(file1.as_raw_fd(), &mut buf).unwrap();
         let mut file = TempFile::new().unwrap().into_file();
         let buf = vec![0xdeu8; 64];
 
@@ -884,7 +859,7 @@ mod tests {
     fn write_all_from_split() {
         let file1 = TempFile::new().unwrap().into_file();
         let mut buf = vec![0x0u8; 58];
-        let mut writer = Writer::<()>::new(file1.as_raw_fd(), &mut buf).unwrap();
+        let mut writer = FuseDevWriter::<()>::new(file1.as_raw_fd(), &mut buf).unwrap();
         let _other = writer.split_at(48).unwrap();
         let mut file = TempFile::new().unwrap().into_file();
         let buf = vec![0xdeu8; 64];
@@ -907,7 +882,7 @@ mod tests {
     fn write_from_at() {
         let file1 = TempFile::new().unwrap().into_file();
         let mut buf = vec![0x0u8; 48];
-        let mut writer = Writer::<()>::new(file1.as_raw_fd(), &mut buf).unwrap();
+        let mut writer = FuseDevWriter::<()>::new(file1.as_raw_fd(), &mut buf).unwrap();
         let mut file = TempFile::new().unwrap().into_file();
         let buf = vec![0xdeu8; 64];
 
@@ -934,7 +909,7 @@ mod tests {
     fn write_from_at_split() {
         let file1 = TempFile::new().unwrap().into_file();
         let mut buf = vec![0x0u8; 58];
-        let mut writer = Writer::<()>::new(file1.as_raw_fd(), &mut buf).unwrap();
+        let mut writer = FuseDevWriter::<()>::new(file1.as_raw_fd(), &mut buf).unwrap();
         let _other = writer.split_at(48).unwrap();
         let mut file = TempFile::new().unwrap().into_file();
         let buf = vec![0xdeu8; 64];
@@ -988,14 +963,14 @@ mod tests {
             let file = TempFile::new().unwrap().into_file();
             let fd = file.as_raw_fd();
             let mut buf = vec![0x0u8; 48];
-            let mut writer = Writer::<()>::new(fd, &mut buf).unwrap();
+            let mut writer = FuseDevWriter::<()>::new(fd, &mut buf).unwrap();
             let buf = vec![0xdeu8; 64];
             let res = tokio_uring::start(async { writer.async_write(&buf[..]).await });
             assert!(res.is_err());
 
             let fd = file.as_raw_fd();
             let mut buf = vec![0x0u8; 48];
-            let mut writer2 = Writer::<()>::new(fd, &mut buf).unwrap();
+            let mut writer2 = FuseDevWriter::<()>::new(fd, &mut buf).unwrap();
             let buf = vec![0xdeu8; 48];
             let res = tokio_uring::start(async { writer2.async_write(&buf[..]).await });
             assert_eq!(res.unwrap(), 48);
@@ -1006,7 +981,7 @@ mod tests {
             let file = TempFile::new().unwrap().into_file();
             let fd = file.as_raw_fd();
             let mut buf = vec![0x0u8; 48];
-            let mut writer = Writer::<()>::new(fd, &mut buf).unwrap();
+            let mut writer = FuseDevWriter::<()>::new(fd, &mut buf).unwrap();
             let buf = vec![0xdeu8; 48];
             let res =
                 tokio_uring::start(async { writer.async_write2(&buf[..32], &buf[32..]).await });
@@ -1018,7 +993,7 @@ mod tests {
             let file = TempFile::new().unwrap().into_file();
             let fd = file.as_raw_fd();
             let mut buf = vec![0x0u8; 48];
-            let mut writer = Writer::<()>::new(fd, &mut buf).unwrap();
+            let mut writer = FuseDevWriter::<()>::new(fd, &mut buf).unwrap();
             let buf = vec![0xdeu8; 48];
             let res = tokio_uring::start(async {
                 writer
@@ -1039,7 +1014,7 @@ mod tests {
             std::fs::write(&path, &buf).unwrap();
 
             let mut buf = vec![0x0u8; 48];
-            let mut writer = Writer::<()>::new(fd1, &mut buf).unwrap();
+            let mut writer = FuseDevWriter::<()>::new(fd1, &mut buf).unwrap();
             let res = tokio_uring::start(async {
                 let file = OpenOptions::new().read(true).open(&path).await.unwrap();
                 writer.async_write_from_at(&file, 40, 16).await
@@ -1054,7 +1029,7 @@ mod tests {
             let fd = file.as_raw_fd();
             let mut buf = vec![0x0u8; 106];
             let buf = unsafe { std::mem::transmute::<&mut [u8], &'static mut [u8]>(&mut buf) };
-            let mut writer = Writer::<()>::new(fd, buf).unwrap();
+            let mut writer = FuseDevWriter::<()>::new(fd, buf).unwrap();
             let mut other = writer.split_at(4).expect("failed to split Writer");
 
             assert_eq!(writer.available_bytes(), 4);
@@ -1077,7 +1052,7 @@ mod tests {
                 64
             );
 
-            let res = tokio_uring::start(async { writer.async_commit(Some(&other)).await });
+            let res = tokio_uring::start(async { writer.async_commit(Some(&other.into())).await });
             let _ = res.unwrap();
         }
     }

@@ -31,7 +31,7 @@ use nix::sys::socket::{
 use nix::unistd::{close, execv, fork, getpid, read, ForkResult};
 use nix::{cmsg_space, NixPath};
 
-use super::{Error::IoError, Error::SessionFailure, FuseBuf, Reader, Result, Writer};
+use super::{Error::IoError, Error::SessionFailure, FuseBuf, FuseDevWriter, Reader, Result};
 use crate::transport::pagesize;
 
 // These follows definition from libfuse.
@@ -225,7 +225,7 @@ impl FuseChannel {
     /// - Ok(None): signal has pending on the exiting event channel
     /// - Ok(Some((reader, writer))): reader to receive request and writer to send reply
     /// - Err(e): error message
-    pub fn get_request(&mut self) -> Result<Option<(Reader, Writer)>> {
+    pub fn get_request(&mut self) -> Result<Option<(Reader, FuseDevWriter)>> {
         let fd = self.file.as_raw_fd();
         loop {
             match read(fd, &mut self.buf) {
@@ -242,7 +242,7 @@ impl FuseChannel {
                     // Reader::new() and Writer::new() should always return success.
                     let reader =
                         Reader::from_fuse_buffer(FuseBuf::new(&mut self.buf[..len])).unwrap();
-                    let writer = Writer::new(fd, buf).unwrap();
+                    let writer = FuseDevWriter::new(fd, buf).unwrap();
                     return Ok(Some((reader, writer)));
                 }
                 Err(e) => match e {

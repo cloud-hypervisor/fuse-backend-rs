@@ -17,7 +17,7 @@ use fuse_backend_rs::abi::fuse_abi::Attr;
 use fuse_backend_rs::api::filesystem::{Context, DirEntry, Entry, FileSystem, ZeroCopyWriter};
 use fuse_backend_rs::api::{server::Server, BackendFileSystem, Vfs, VfsOptions};
 use fuse_backend_rs::async_util::AsyncDriver;
-use fuse_backend_rs::transport::fusedev::{FuseChannel, FuseSession};
+use fuse_backend_rs::transport::{FuseChannel, FuseSession};
 
 pub(crate) struct HelloFileSystem {}
 
