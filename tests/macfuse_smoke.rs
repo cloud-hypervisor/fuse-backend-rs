@@ -3,13 +3,13 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 
-#[cfg(all(feature = "fusedev", not(feature = "virtiofs"), target_os = "macos"))]
+#[cfg(all(feature = "fusedev", target_os = "macos"))]
 #[macro_use]
 extern crate log;
 
 mod example;
 
-#[cfg(all(feature = "fusedev", not(feature = "virtiofs"), target_os = "macos"))]
+#[cfg(all(feature = "fusedev", target_os = "macos"))]
 mod macfuse_tests {
     extern crate stderrlog;
 

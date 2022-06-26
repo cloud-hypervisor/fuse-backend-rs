@@ -1,4 +1,4 @@
-// Copyright (C) 2020 Alibaba Cloud. All rights reserved.
+// Copyright (C) 2020-2022 Alibaba Cloud. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
 //! Fuse passthrough file system, mirroring an existing FS hierarchy.
@@ -37,7 +37,7 @@ use crate::api::{
 };
 use crate::BitmapSlice;
 
-#[cfg(feature = "async_io")]
+#[cfg(feature = "async-io")]
 mod async_io;
 mod file_handle;
 mod multikey;
@@ -45,8 +45,6 @@ mod sync_io;
 
 use file_handle::{FileHandle, MountFds};
 use multikey::MultikeyBTreeMap;
-
-use crate::async_util::{AsyncDrive, AsyncDriver};
 
 type Inode = u64;
 type Handle = u64;
@@ -500,7 +498,7 @@ impl Default for Config {
 /// that wish to serve only a specific directory should set up the environment so that that
 /// directory ends up as the root of the file system process. One way to accomplish this is via a
 /// combination of mount namespaces and the pivot_root system call.
-pub struct PassthroughFs<D: AsyncDrive = AsyncDriver, S: BitmapSlice + Send + Sync = ()> {
+pub struct PassthroughFs<S: BitmapSlice + Send + Sync = ()> {
     // File descriptors for various points in the file system tree. These fds are always opened with
     // the `O_PATH` option so they cannot be used for reading or writing any data. See the
     // documentation of the `O_PATH` flag in `open(2)` for more details on what one can and cannot
@@ -544,13 +542,12 @@ pub struct PassthroughFs<D: AsyncDrive = AsyncDriver, S: BitmapSlice + Send + Sy
 
     cfg: Config,
 
-    phantom: PhantomData<D>,
-    phantom2: PhantomData<S>,
+    phantom: PhantomData<S>,
 }
 
-impl<D: AsyncDrive, S: BitmapSlice + Send + Sync> PassthroughFs<D, S> {
+impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
     /// Create a Passthrough file system instance.
-    pub fn new(cfg: Config) -> io::Result<PassthroughFs<D, S>> {
+    pub fn new(cfg: Config) -> io::Result<PassthroughFs<S>> {
         // Safe because this is a constant value and a valid C string.
         let proc_self_fd_cstr = unsafe { CStr::from_bytes_with_nul_unchecked(PROC_SELF_FD_CSTR) };
         let proc_self_fd = Self::open_file(
@@ -579,7 +576,6 @@ impl<D: AsyncDrive, S: BitmapSlice + Send + Sync> PassthroughFs<D, S> {
             cfg,
 
             phantom: PhantomData,
-            phantom2: PhantomData,
         })
     }
 
@@ -1006,8 +1002,8 @@ impl<D: AsyncDrive, S: BitmapSlice + Send + Sync> PassthroughFs<D, S> {
     }
 }
 
-#[cfg(not(feature = "async_io"))]
-impl<D: AsyncDrive> BackendFileSystem<D> for PassthroughFs<D> {
+#[cfg(not(feature = "async-io"))]
+impl<S: BitmapSlice + Send + Sync + 'static> BackendFileSystem for PassthroughFs<S> {
     fn mount(&self) -> io::Result<(Entry, u64)> {
         let entry = self.do_lookup(fuse::ROOT_ID, &CString::new(".").unwrap())?;
         Ok((entry, VFS_MAX_INO))
@@ -1138,7 +1134,7 @@ mod tests {
                 .to_string(),
             ..Default::default()
         };
-        let fs = PassthroughFs::<AsyncDriver, ()>::new(fs_cfg).unwrap();
+        let fs = PassthroughFs::<()>::new(fs_cfg).unwrap();
         fs.import().unwrap();
 
         fs
@@ -1150,7 +1146,7 @@ mod tests {
             ..Default::default()
         };
 
-        let vfs = &Vfs::<AsyncDriver>::new(opts);
+        let vfs = &Vfs::new(opts);
         // Assume that fuse kernel supports no_open.
         vfs.init(FsOptions::ZERO_MESSAGE_OPEN).unwrap();
 
@@ -1159,7 +1155,7 @@ mod tests {
             no_open: cfg,
             ..Default::default()
         };
-        let fs = PassthroughFs::new(fs_cfg.clone()).unwrap();
+        let fs = PassthroughFs::<()>::new(fs_cfg.clone()).unwrap();
         fs.import().unwrap();
         vfs.mount(Box::new(fs), "/submnt/A").unwrap();
 
@@ -1209,7 +1205,7 @@ mod tests {
                 .to_string(),
             ..Default::default()
         };
-        let fs = PassthroughFs::<AsyncDriver, ()>::new(fs_cfg).unwrap();
+        let fs = PassthroughFs::<()>::new(fs_cfg).unwrap();
         fs.import().unwrap();
 
         let ctx = Context::default();

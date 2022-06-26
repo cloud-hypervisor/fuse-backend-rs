@@ -1,11 +1,10 @@
-// Copyright (C) 2021 Alibaba Cloud. All rights reserved.
+// Copyright (C) 2021-2022 Alibaba Cloud. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
 use std::ffi::CStr;
 use std::future::Future;
 use std::io;
 use std::ops::Deref;
-use std::os::unix::io::RawFd;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
@@ -13,14 +12,13 @@ use std::time::Duration;
 use async_trait::async_trait;
 
 use super::{Context, Entry, FileSystem, ZeroCopyReader, ZeroCopyWriter};
-use crate::abi::fuse_abi::{stat64, OpenOptions, SetattrValid};
-use crate::api::CreateIn;
-use crate::async_util::{AsyncDrive, AsyncDriver};
+use crate::abi::fuse_abi::{stat64, CreateIn, OpenOptions, SetattrValid};
+use crate::transport::AsyncFileReadWriteVolatile;
 
 /// A trait for directly copying data from the fuse transport into a `File` without first storing it
 /// in an intermediate buffer in asynchronous mode.
-#[async_trait]
-pub trait AsyncZeroCopyReader<D: AsyncDrive = AsyncDriver>: ZeroCopyReader {
+#[async_trait(?Send)]
+pub trait AsyncZeroCopyReader: ZeroCopyReader {
     /// Copies at most `count` bytes from `self` directly into `f` at offset `off` without storing
     /// it in any intermediate buffers. If the return value is `Ok(n)` then it must be guaranteed
     /// that `0 <= n <= count`. If `n` is `0`, then it can indicate one of 3 possibilities:
@@ -36,8 +34,7 @@ pub trait AsyncZeroCopyReader<D: AsyncDrive = AsyncDriver>: ZeroCopyReader {
     /// an error of the kind `io::ErrorKind::WriteZero`.
     async fn async_read_to(
         &mut self,
-        drive: D,
-        f: RawFd,
+        f: Arc<dyn AsyncFileReadWriteVolatile>,
         count: usize,
         off: u64,
     ) -> io::Result<usize>;
@@ -45,8 +42,8 @@ pub trait AsyncZeroCopyReader<D: AsyncDrive = AsyncDriver>: ZeroCopyReader {
 
 /// A trait for directly copying data from a `RawFd` into the fuse transport without first storing
 /// it in an intermediate buffer in asynchronous mode.
-#[async_trait]
-pub trait AsyncZeroCopyWriter<D: AsyncDrive = AsyncDriver>: ZeroCopyWriter {
+#[async_trait(?Send)]
+pub trait AsyncZeroCopyWriter: ZeroCopyWriter {
     /// Copies at most `count` bytes from `f` at offset `off` directly into `self` without storing
     /// it in any intermediate buffers. If the return value is `Ok(n)` then it must be guaranteed
     /// that `0 <= n <= count`. If `n` is `0`, then it can indicate one of 3 possibilities:
@@ -62,8 +59,7 @@ pub trait AsyncZeroCopyWriter<D: AsyncDrive = AsyncDriver>: ZeroCopyWriter {
     /// error of the kind `io::ErrorKind::UnexpectedEof`.
     async fn async_write_from(
         &mut self,
-        drive: D,
-        f: RawFd,
+        f: Arc<dyn AsyncFileReadWriteVolatile>,
         count: usize,
         off: u64,
     ) -> io::Result<usize>;
@@ -72,7 +68,7 @@ pub trait AsyncZeroCopyWriter<D: AsyncDrive = AsyncDriver>: ZeroCopyWriter {
 /// The main trait that connects a file system with a transport with asynchronous IO.
 #[allow(unused_variables)]
 #[async_trait]
-pub trait AsyncFileSystem<D: AsyncDrive = AsyncDriver>: FileSystem {
+pub trait AsyncFileSystem: FileSystem {
     /// Look up a directory entry by name and get its attributes.
     ///
     /// If this call is successful then the lookup count of the `Inode` associated with the returned
@@ -362,7 +358,7 @@ pub trait AsyncFileSystem<D: AsyncDrive = AsyncDriver>: FileSystem {
         ctx: &Context,
         inode: Self::Inode,
         handle: Self::Handle,
-        w: &mut (dyn AsyncZeroCopyWriter<D> + Send),
+        w: &mut (dyn AsyncZeroCopyWriter + Send),
         size: u32,
         offset: u64,
         lock_owner: Option<u64>,
@@ -394,7 +390,7 @@ pub trait AsyncFileSystem<D: AsyncDrive = AsyncDriver>: FileSystem {
         ctx: &Context,
         inode: Self::Inode,
         handle: Self::Handle,
-        r: &mut (dyn AsyncZeroCopyReader<D> + Send),
+        r: &mut (dyn AsyncZeroCopyReader + Send),
         size: u32,
         offset: u64,
         lock_owner: Option<u64>,
@@ -845,7 +841,7 @@ type OpenFuture<'async_trait, H> =
 type CreateFuture<'async_trait, H> =
     Box<dyn Future<Output = io::Result<(Entry, Option<H>, OpenOptions)>> + Send + 'async_trait>;
 
-impl<FS: AsyncFileSystem<D>, D: AsyncDrive> AsyncFileSystem<D> for Arc<FS> {
+impl<FS: AsyncFileSystem> AsyncFileSystem for Arc<FS> {
     fn async_lookup<'a, 'b, 'c, 'async_trait>(
         &'a self,
         ctx: &'b Context,
@@ -927,7 +923,7 @@ impl<FS: AsyncFileSystem<D>, D: AsyncDrive> AsyncFileSystem<D> for Arc<FS> {
         ctx: &'b Context,
         inode: Self::Inode,
         handle: Self::Handle,
-        w: &'c mut (dyn AsyncZeroCopyWriter<D> + Send),
+        w: &'c mut (dyn AsyncZeroCopyWriter + Send),
         size: u32,
         offset: u64,
         lock_owner: Option<u64>,
@@ -948,7 +944,7 @@ impl<FS: AsyncFileSystem<D>, D: AsyncDrive> AsyncFileSystem<D> for Arc<FS> {
         ctx: &'b Context,
         inode: Self::Inode,
         handle: Self::Handle,
-        r: &'c mut (dyn AsyncZeroCopyReader<D> + Send),
+        r: &'c mut (dyn AsyncZeroCopyReader + Send),
         size: u32,
         offset: u64,
         lock_owner: Option<u64>,

@@ -1,4 +1,4 @@
-// Copyright (C) 2020 Alibaba Cloud. All rights reserved.
+// Copyright (C) 2020-2022 Alibaba Cloud. All rights reserved.
 // Copyright 2019 The Chromium OS Authors. All rights reserved.
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE-BSD-3-Clause file.
@@ -22,9 +22,9 @@ pub use fuse::ROOT_ID;
 
 use crate::abi::fuse_abi::{ino64_t, stat64};
 
-#[cfg(feature = "async_io")]
+#[cfg(feature = "async-io")]
 mod async_io;
-#[cfg(feature = "async_io")]
+#[cfg(feature = "async-io")]
 pub use async_io::{AsyncFileSystem, AsyncZeroCopyReader, AsyncZeroCopyWriter};
 
 mod sync_io;
@@ -383,10 +383,6 @@ pub struct Context {
 
     /// The thread group ID of the calling process.
     pub pid: libc::pid_t,
-
-    #[cfg(feature = "async_io")]
-    /// Asynchronous event drive
-    pub drive: usize,
 }
 
 impl Context {
@@ -402,38 +398,6 @@ impl From<&fuse::InHeader> for Context {
             uid: source.uid,
             gid: source.gid,
             pid: source.pid as i32,
-            #[cfg(feature = "async_io")]
-            drive: 0,
-        }
-    }
-}
-
-// The design is very ugly, but it helps to avoid adding a generic type parameter "D: AsyncDrive"
-// to the FileSystem trait.
-#[cfg(feature = "async_io")]
-impl Context {
-    /// Set the asynchronous event drive.
-    ///
-    /// ## Safety
-    /// The caller must ensure that the the referenced `drive` has a longer lifetime than the
-    /// `Context` object.
-    pub(crate) unsafe fn set_drive<D: crate::async_util::AsyncDrive>(&mut self, drive: &D) {
-        // The generic type `D` has bound as "Clone + Send". `D` is Send, then `&D` is Sync,
-        // so it's safe to call drive.clone() in get_drive() only if the caller ensures `drive`
-        // has longer lifetime than this `Context` object.
-        self.drive = drive as *const D as *const u8 as usize;
-    }
-
-    /// Get an asynchronous event drive.
-    ///
-    /// If `get_drive()` returns None, it means async io has been disabled for the associated
-    /// fuse request.
-    pub fn get_drive<D: crate::async_util::AsyncDrive>(&self) -> Option<D> {
-        if self.drive == 0 {
-            None
-        } else {
-            let drive = unsafe { &*(self.drive as *const u8 as *const D) };
-            Some(drive.clone())
         }
     }
 }

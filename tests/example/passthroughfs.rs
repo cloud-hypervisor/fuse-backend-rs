@@ -9,7 +9,6 @@ use std::sync::Arc;
 use std::thread;
 
 use fuse_backend_rs::api::{server::Server, Vfs, VfsOptions};
-use fuse_backend_rs::async_util::AsyncDriver;
 use fuse_backend_rs::passthrough::{Config, PassthroughFs};
 use fuse_backend_rs::transport::{FuseChannel, FuseSession};
 
@@ -17,7 +16,7 @@ use fuse_backend_rs::transport::{FuseChannel, FuseSession};
 #[allow(dead_code)]
 pub struct Daemon {
     mountpoint: String,
-    server: Arc<Server<Arc<Vfs<AsyncDriver>>>>,
+    server: Arc<Server<Arc<Vfs>>>,
     thread_cnt: u32,
     session: Option<FuseSession>,
 }
@@ -37,7 +36,7 @@ impl Daemon {
         let mut cfg = Config::default();
         cfg.root_dir = src.to_string();
         cfg.do_import = false;
-        let fs = PassthroughFs::new(cfg).unwrap();
+        let fs = PassthroughFs::<()>::new(cfg).unwrap();
         fs.import().unwrap();
 
         // attach passthrough fs to vfs root
@@ -92,7 +91,7 @@ impl Drop for Daemon {
 }
 
 struct FuseServer {
-    server: Arc<Server<Arc<Vfs<AsyncDriver>>>>,
+    server: Arc<Server<Arc<Vfs>>>,
     ch: FuseChannel,
 }
 

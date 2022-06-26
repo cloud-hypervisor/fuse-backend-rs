@@ -5,11 +5,10 @@ use super::*;
 use crate::abi::fuse_abi::{stat64, statvfs64};
 #[cfg(any(feature = "vhost-user-fs", feature = "virtiofs"))]
 use crate::abi::virtio_fs;
-use crate::async_util::AsyncDrive;
 #[cfg(any(feature = "vhost-user-fs", feature = "virtiofs"))]
 use crate::transport::FsCacheReqHandler;
 
-impl<D: AsyncDrive> FileSystem for Vfs<D> {
+impl FileSystem for Vfs {
     type Inode = VfsInode;
     type Handle = VfsHandle;
 

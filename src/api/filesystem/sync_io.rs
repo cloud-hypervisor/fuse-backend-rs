@@ -1,7 +1,14 @@
-// Copyright (C) 2021 Alibaba Cloud. All rights reserved.
+// Copyright (C) 2021-2022 Alibaba Cloud. All rights reserved.
 // Copyright 2019 The Chromium OS Authors. All rights reserved.
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE-BSD-3-Clause file.
+
+use std::ffi::CStr;
+use std::io;
+use std::mem;
+use std::ops::Deref;
+use std::sync::Arc;
+use std::time::Duration;
 
 use super::{
     Context, DirEntry, Entry, FileLock, GetxattrReply, IoctlData, ListxattrReply, ZeroCopyReader,
@@ -12,12 +19,6 @@ use crate::abi::fuse_abi::{stat64, statvfs64, CreateIn, FsOptions, OpenOptions, 
 pub use crate::abi::virtio_fs::RemovemappingOne;
 #[cfg(feature = "virtiofs")]
 use crate::transport::FsCacheReqHandler;
-use std::ffi::CStr;
-use std::io;
-use std::mem;
-use std::ops::Deref;
-use std::sync::Arc;
-use std::time::Duration;
 
 /// The main trait that connects a file system with a transport.
 #[allow(unused_variables)]
@@ -1336,7 +1337,7 @@ impl<FS: FileSystem> FileSystem for Arc<FS> {
             .poll(ctx, inode, handle, khandle, flags, events)
     }
 
-    /// TODO: support this
+    /// Send notify reply.
     fn notify_reply(&self) -> io::Result<()> {
         self.deref().notify_reply()
     }
