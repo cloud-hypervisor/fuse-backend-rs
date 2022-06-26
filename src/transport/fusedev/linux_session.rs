@@ -177,7 +177,9 @@ impl Drop for FuseSession {
     }
 }
 
-/// A fuse channel abstruction. Each session can hold multiple channels.
+/// A fuse channel abstraction.
+///
+/// Each session can hold multiple channels.
 pub struct FuseChannel {
     file: File,
     poll: Poll,
