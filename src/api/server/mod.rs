@@ -1,4 +1,4 @@
-// Copyright (C) 2020 Alibaba Cloud. All rights reserved.
+// Copyright (C) 2020-2022 Alibaba Cloud. All rights reserved.
 // Copyright 2019 The Chromium OS Authors. All rights reserved.
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE-BSD-3-Clause file.
@@ -24,13 +24,12 @@ use std::sync::Arc;
 
 use arc_swap::ArcSwap;
 
-use super::filesystem::{Context, FileSystem, ZeroCopyReader, ZeroCopyWriter};
 use crate::abi::fuse_abi::*;
-use crate::async_util::{AsyncDrive, AsyncDriver};
+use crate::api::filesystem::{Context, FileSystem, ZeroCopyReader, ZeroCopyWriter};
 use crate::transport::{FileReadWriteVolatile, Reader, Writer};
 use crate::{bytes_to_cstr, BitmapSlice, Error, Result};
 
-#[cfg(feature = "async_io")]
+#[cfg(feature = "async-io")]
 mod async_io;
 mod sync_io;
 
@@ -48,22 +47,20 @@ const DIRENT_PADDING: [u8; 8] = [0; 8];
 pub const MAX_REQ_PAGES: u16 = 256; // 1MB
 
 /// Fuse Server to handle requests from the Fuse client and vhost user master.
-pub struct Server<F: FileSystem + Sync, D: AsyncDrive = AsyncDriver> {
+pub struct Server<F: FileSystem + Sync> {
     fs: F,
     vers: ArcSwap<ServerVersion>,
-    phantom: PhantomData<D>,
 }
 
-impl<F: FileSystem + Sync, D: AsyncDrive> Server<F, D> {
+impl<F: FileSystem + Sync> Server<F> {
     /// Create a Server instance from a filesystem driver object.
-    pub fn new(fs: F) -> Server<F, D> {
+    pub fn new(fs: F) -> Server<F> {
         Server {
             fs,
             vers: ArcSwap::new(Arc::new(ServerVersion {
                 major: KERNEL_VERSION,
                 minor: KERNEL_MINOR_VERSION,
             })),
-            phantom: PhantomData,
         }
     }
 }
@@ -164,9 +161,7 @@ pub trait MetricsHook {
     fn release(&self, oh: Option<&OutHeader>);
 }
 
-struct SrvContext<'a, F, D: AsyncDrive = AsyncDriver, S: BitmapSlice = ()> {
-    #[allow(dead_code)]
-    drive: Option<D>,
+struct SrvContext<'a, F, S: BitmapSlice = ()> {
     in_header: InHeader,
     context: Context,
     r: Reader<'a, S>,
@@ -175,12 +170,11 @@ struct SrvContext<'a, F, D: AsyncDrive = AsyncDriver, S: BitmapSlice = ()> {
     phantom2: PhantomData<S>,
 }
 
-impl<'a, F: FileSystem, D: AsyncDrive, S: BitmapSlice> SrvContext<'a, F, D, S> {
+impl<'a, F: FileSystem, S: BitmapSlice> SrvContext<'a, F, S> {
     fn new(in_header: InHeader, r: Reader<'a, S>, w: Writer<'a, S>) -> Self {
         let context = Context::from(&in_header);
 
         SrvContext {
-            drive: None,
             in_header,
             context,
             r,

@@ -6,11 +6,9 @@ use std::io;
 use async_trait::async_trait;
 
 use super::*;
-use crate::api::CreateIn;
-use crate::async_util::AsyncDrive;
 
 #[async_trait]
-impl<D: AsyncDrive + Sync> AsyncFileSystem<D> for Vfs<D> {
+impl AsyncFileSystem for Vfs {
     async fn async_lookup(
         &self,
         ctx: &Context,
@@ -111,7 +109,7 @@ impl<D: AsyncDrive + Sync> AsyncFileSystem<D> for Vfs<D> {
         ctx: &Context,
         inode: <Self as FileSystem>::Inode,
         handle: <Self as FileSystem>::Handle,
-        w: &mut (dyn AsyncZeroCopyWriter<D> + Send),
+        w: &mut (dyn AsyncZeroCopyWriter + Send),
         size: u32,
         offset: u64,
         lock_owner: Option<u64>,
@@ -132,7 +130,7 @@ impl<D: AsyncDrive + Sync> AsyncFileSystem<D> for Vfs<D> {
         ctx: &Context,
         inode: <Self as FileSystem>::Inode,
         handle: <Self as FileSystem>::Handle,
-        r: &mut (dyn AsyncZeroCopyReader<D> + Send),
+        r: &mut (dyn AsyncZeroCopyReader + Send),
         size: u32,
         offset: u64,
         lock_owner: Option<u64>,
@@ -221,7 +219,6 @@ mod tests {
             uid: 0,
             gid: 0,
             pid: 0,
-            drive: 0,
         };
         let executor = futures::executor::ThreadPool::new().unwrap();
 

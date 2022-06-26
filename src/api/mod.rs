@@ -12,8 +12,6 @@
 //! - [struct Vfs](vfs/struct.Vfs.html), a simple union file system to help organize multiple
 //!   backend file systems.
 
-pub use super::abi::fuse_abi::CreateIn;
-
 mod pseudo_fs;
 
 pub mod vfs;

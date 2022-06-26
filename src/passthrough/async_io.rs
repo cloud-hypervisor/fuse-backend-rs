@@ -1,5 +1,9 @@
-// Copyright (C) 2021 Alibaba Cloud. All rights reserved.
+// Copyright (C) 2021-2022 Alibaba Cloud. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
+
+#![allow(unused_variables)]
+#![allow(dead_code)]
+#![allow(unused_imports)]
 
 use std::io;
 use std::mem::ManuallyDrop;
@@ -7,14 +11,14 @@ use std::mem::ManuallyDrop;
 use async_trait::async_trait;
 
 use super::*;
-use crate::abi::fuse_abi::{OpenOptions, SetattrValid, FOPEN_IN_KILL_SUIDGID, WRITE_KILL_PRIV};
+use crate::abi::fuse_abi::{
+    CreateIn, OpenOptions, SetattrValid, FOPEN_IN_KILL_SUIDGID, WRITE_KILL_PRIV,
+};
 use crate::api::filesystem::{
     AsyncFileSystem, AsyncZeroCopyReader, AsyncZeroCopyWriter, Context, FileSystem,
 };
-use crate::api::CreateIn;
-use crate::async_util::{AsyncDrive, AsyncUtil};
 
-impl<D: AsyncDrive + Sync> BackendFileSystem<D> for PassthroughFs<D> {
+impl<S: BitmapSlice + Send + Sync + 'static> BackendFileSystem for PassthroughFs<S> {
     fn mount(&self) -> io::Result<(Entry, u64)> {
         let entry = self.do_lookup(fuse::ROOT_ID, &CString::new(".").unwrap())?;
         Ok((entry, VFS_MAX_INO))
@@ -32,7 +36,8 @@ impl<'a> InodeData {
     }
 }
 
-impl<D: AsyncDrive> PassthroughFs<D> {
+impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
+    /*
     async fn async_open_file(
         &self,
         ctx: &Context,
@@ -41,172 +46,169 @@ impl<D: AsyncDrive> PassthroughFs<D> {
         flags: i32,
         mode: u32,
     ) -> io::Result<File> {
-        let drive = ctx
-            .get_drive::<D>()
-            .ok_or_else(|| io::Error::from_raw_os_error(libc::EINVAL))?;
-
         AsyncUtil::open_at(drive, dir_fd, pathname, flags, mode)
             .await
             .map(|fd| unsafe { File::from_raw_fd(fd as i32) })
-    }
-
-    async fn async_open_proc_file(
-        &self,
-        ctx: &Context,
-        fd: RawFd,
-        flags: i32,
-        mode: u32,
-    ) -> io::Result<File> {
-        if !is_safe_inode(mode) {
-            return Err(ebadf());
         }
 
-        let pathname = CString::new(format!("{}", fd))
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-
-        // We don't really check `flags` because if the kernel can't handle poorly specified flags
-        // then we have much bigger problems. Also, clear the `O_NOFOLLOW` flag if it is set since
-        // we need to follow the `/proc/self/fd` symlink to get the file.
-        self.async_open_file(
-            ctx,
-            self.proc_self_fd.as_raw_fd(),
-            pathname.as_c_str(),
-            (flags | libc::O_CLOEXEC) & (!libc::O_NOFOLLOW),
-            0,
-        )
-        .await
-    }
-
-    /// Create a File or File Handle for `name` under directory `dir_fd` to support `lookup()`.
-    async fn async_open_file_or_handle<F>(
-        &self,
-        ctx: &Context,
-        dir_fd: RawFd,
-        name: &CStr,
-        reopen_dir: F,
-    ) -> io::Result<(FileOrHandle, InodeStat, InodeAltKey, Option<InodeAltKey>)>
-    where
-        F: FnOnce(RawFd, libc::c_int, u32) -> io::Result<File>,
-    {
-        let handle = if self.cfg.inode_file_handles {
-            FileHandle::from_name_at_with_mount_fds(dir_fd, name, &self.mount_fds, reopen_dir)
-        } else {
-            Err(io::Error::from_raw_os_error(libc::ENOTSUP))
-        };
-
-        // Ignore errors, because having a handle is optional
-        let file_or_handle = if let Ok(h) = handle {
-            FileOrHandle::Handle(h)
-        } else {
-            let f = self
-                .async_open_file(
-                    ctx,
-                    dir_fd,
-                    name,
-                    libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-                    0,
-                )
-                .await?;
-
-            FileOrHandle::File(f)
-        };
-
-        let st = match &file_or_handle {
-            FileOrHandle::File(f) => {
-                // TODO: use statx(2) to query mntid when 5.8 kernel or later are widely used.
-                //
-                // Some filesystems don't support file handle, for example overlayfs mounted
-                // without index feature, if so just use mntid 0 in that case.
-                let mnt_id = match FileHandle::from_name_at(dir_fd, name) {
-                    Ok(h) => h.mnt_id,
-                    Err(_) => 0,
-                };
-                InodeStat {
-                    stat: self.async_stat(ctx, f, None).await?,
-                    mnt_id,
-                }
+        async fn async_open_proc_file(
+            &self,
+            ctx: &Context,
+            fd: RawFd,
+            flags: i32,
+            mode: u32,
+        ) -> io::Result<File> {
+            if !is_safe_inode(mode) {
+                return Err(ebadf());
             }
-            FileOrHandle::Handle(h) => InodeStat {
-                stat: self.async_stat_fd(ctx, dir_fd, Some(name)).await?,
-                mnt_id: h.mnt_id,
-            },
-        };
-        let ids_altkey = InodeAltKey::ids_from_stat(&st);
 
-        // Note that this will always be `None` if `cfg.inode_file_handles` is false, but we only
-        // really need this alt key when we do not have an `O_PATH` fd open for every inode.  So if
-        // `cfg.inode_file_handles` is false, we do not need this key anyway.
-        let handle_altkey = file_or_handle.handle().map(|h| InodeAltKey::Handle(*h));
+            let pathname = CString::new(format!("{}", fd))
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
 
-        Ok((file_or_handle, st, ids_altkey, handle_altkey))
-    }
-
-    async fn async_open_inode(
-        &self,
-        ctx: &Context,
-        inode: Inode,
-        mut flags: i32,
-    ) -> io::Result<File> {
-        // When writeback caching is enabled, the kernel may send read requests even if the
-        // userspace program opened the file write-only. So we need to ensure that we have opened
-        // the file for reading as well as writing.
-        let writeback = self.writeback.load(Ordering::Relaxed);
-        if writeback && flags & libc::O_ACCMODE == libc::O_WRONLY {
-            flags &= !libc::O_ACCMODE;
-            flags |= libc::O_RDWR;
-        }
-
-        // When writeback caching is enabled the kernel is responsible for handling `O_APPEND`.
-        // However, this breaks atomicity as the file may have changed on disk, invalidating the
-        // cached copy of the data in the kernel and the offset that the kernel thinks is the end of
-        // the file. Just allow this for now as it is the user's responsibility to enable writeback
-        // caching only for directories that are not shared. It also means that we need to clear the
-        // `O_APPEND` flag.
-        if writeback && flags & libc::O_APPEND != 0 {
-            flags &= !libc::O_APPEND;
-        }
-
-        let data = self.inode_map.get(inode)?;
-        let file = data.async_get_file(&self.mount_fds).await?;
-
-        self.async_open_proc_file(ctx, file.as_raw_fd(), flags, data.mode)
+            // We don't really check `flags` because if the kernel can't handle poorly specified flags
+            // then we have much bigger problems. Also, clear the `O_NOFOLLOW` flag if it is set since
+            // we need to follow the `/proc/self/fd` symlink to get the file.
+            self.async_open_file(
+                ctx,
+                self.proc_self_fd.as_raw_fd(),
+                pathname.as_c_str(),
+                (flags | libc::O_CLOEXEC) & (!libc::O_NOFOLLOW),
+                0,
+            )
             .await
-    }
+        }
 
-    async fn async_do_open(
-        &self,
-        ctx: &Context,
-        inode: Inode,
-        flags: u32,
-        fuse_flags: u32,
-    ) -> io::Result<(Option<Handle>, OpenOptions)> {
-        let killpriv = if self.killpriv_v2.load(Ordering::Relaxed)
-            && (fuse_flags & FOPEN_IN_KILL_SUIDGID != 0)
+        /// Create a File or File Handle for `name` under directory `dir_fd` to support `lookup()`.
+        async fn async_open_file_or_handle<F>(
+            &self,
+            ctx: &Context,
+            dir_fd: RawFd,
+            name: &CStr,
+            reopen_dir: F,
+        ) -> io::Result<(FileOrHandle, InodeStat, InodeAltKey, Option<InodeAltKey>)>
+        where
+            F: FnOnce(RawFd, libc::c_int, u32) -> io::Result<File>,
         {
-            self::drop_cap_fsetid()?
-        } else {
-            None
-        };
-        let file = self.async_open_inode(ctx, inode, flags as i32).await?;
-        drop(killpriv);
+            let handle = if self.cfg.inode_file_handles {
+                FileHandle::from_name_at_with_mount_fds(dir_fd, name, &self.mount_fds, reopen_dir)
+            } else {
+                Err(io::Error::from_raw_os_error(libc::ENOTSUP))
+            };
 
-        let data = HandleData::new(inode, file);
-        let handle = self.next_handle.fetch_add(1, Ordering::Relaxed);
-        let mut opts = OpenOptions::empty();
+            // Ignore errors, because having a handle is optional
+            let file_or_handle = if let Ok(h) = handle {
+                FileOrHandle::Handle(h)
+            } else {
+                let f = self
+                    .async_open_file(
+                        ctx,
+                        dir_fd,
+                        name,
+                        libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                        0,
+                    )
+                    .await?;
 
-        self.handle_map.insert(handle, data);
-        match self.cfg.cache_policy {
-            // We only set the direct I/O option on files.
-            CachePolicy::Never => opts.set(
-                OpenOptions::DIRECT_IO,
-                flags & (libc::O_DIRECTORY as u32) == 0,
-            ),
-            CachePolicy::Always => opts |= OpenOptions::KEEP_CACHE,
-            _ => {}
-        };
+                FileOrHandle::File(f)
+            };
 
-        Ok((Some(handle), opts))
-    }
+            let st = match &file_or_handle {
+                FileOrHandle::File(f) => {
+                    // TODO: use statx(2) to query mntid when 5.8 kernel or later are widely used.
+                    //
+                    // Some filesystems don't support file handle, for example overlayfs mounted
+                    // without index feature, if so just use mntid 0 in that case.
+                    let mnt_id = match FileHandle::from_name_at(dir_fd, name) {
+                        Ok(h) => h.mnt_id,
+                        Err(_) => 0,
+                    };
+                    InodeStat {
+                        stat: self.async_stat(ctx, f, None).await?,
+                        mnt_id,
+                    }
+                }
+                FileOrHandle::Handle(h) => InodeStat {
+                    stat: self.async_stat_fd(ctx, dir_fd, Some(name)).await?,
+                    mnt_id: h.mnt_id,
+                },
+            };
+            let ids_altkey = InodeAltKey::ids_from_stat(&st);
+
+            // Note that this will always be `None` if `cfg.inode_file_handles` is false, but we only
+            // really need this alt key when we do not have an `O_PATH` fd open for every inode.  So if
+            // `cfg.inode_file_handles` is false, we do not need this key anyway.
+            let handle_altkey = file_or_handle.handle().map(|h| InodeAltKey::Handle(*h));
+
+            Ok((file_or_handle, st, ids_altkey, handle_altkey))
+        }
+
+        async fn async_open_inode(
+            &self,
+            ctx: &Context,
+            inode: Inode,
+            mut flags: i32,
+        ) -> io::Result<File> {
+            // When writeback caching is enabled, the kernel may send read requests even if the
+            // userspace program opened the file write-only. So we need to ensure that we have opened
+            // the file for reading as well as writing.
+            let writeback = self.writeback.load(Ordering::Relaxed);
+            if writeback && flags & libc::O_ACCMODE == libc::O_WRONLY {
+                flags &= !libc::O_ACCMODE;
+                flags |= libc::O_RDWR;
+            }
+
+            // When writeback caching is enabled the kernel is responsible for handling `O_APPEND`.
+            // However, this breaks atomicity as the file may have changed on disk, invalidating the
+            // cached copy of the data in the kernel and the offset that the kernel thinks is the end of
+            // the file. Just allow this for now as it is the user's responsibility to enable writeback
+            // caching only for directories that are not shared. It also means that we need to clear the
+            // `O_APPEND` flag.
+            if writeback && flags & libc::O_APPEND != 0 {
+                flags &= !libc::O_APPEND;
+            }
+
+            let data = self.inode_map.get(inode)?;
+            let file = data.async_get_file(&self.mount_fds).await?;
+
+            self.async_open_proc_file(ctx, file.as_raw_fd(), flags, data.mode)
+                .await
+        }
+
+        async fn async_do_open(
+            &self,
+            ctx: &Context,
+            inode: Inode,
+            flags: u32,
+            fuse_flags: u32,
+        ) -> io::Result<(Option<Handle>, OpenOptions)> {
+            let killpriv = if self.killpriv_v2.load(Ordering::Relaxed)
+                && (fuse_flags & FOPEN_IN_KILL_SUIDGID != 0)
+            {
+                self::drop_cap_fsetid()?
+            } else {
+                None
+            };
+            let file = self.async_open_inode(ctx, inode, flags as i32).await?;
+            drop(killpriv);
+
+            let data = HandleData::new(inode, file);
+            let handle = self.next_handle.fetch_add(1, Ordering::Relaxed);
+            let mut opts = OpenOptions::empty();
+
+            self.handle_map.insert(handle, data);
+            match self.cfg.cache_policy {
+                // We only set the direct I/O option on files.
+                CachePolicy::Never => opts.set(
+                    OpenOptions::DIRECT_IO,
+                    flags & (libc::O_DIRECTORY as u32) == 0,
+                ),
+                CachePolicy::Always => opts |= OpenOptions::KEEP_CACHE,
+                _ => {}
+            };
+
+            Ok((Some(handle), opts))
+        }
+        */
 
     async fn async_do_getattr(
         &self,
@@ -214,6 +216,8 @@ impl<D: AsyncDrive> PassthroughFs<D> {
         inode: Inode,
         handle: Option<<Self as FileSystem>::Handle>,
     ) -> io::Result<(libc::stat64, Duration)> {
+        unimplemented!()
+        /*
         let st;
         let fd;
         let data = self.inode_map.get(inode).map_err(|e| {
@@ -251,8 +255,10 @@ impl<D: AsyncDrive> PassthroughFs<D> {
         })?;
 
         Ok((st, self.cfg.attr_timeout))
+        */
     }
 
+    /*
     async fn async_stat(
         &self,
         ctx: &Context,
@@ -305,16 +311,19 @@ impl<D: AsyncDrive> PassthroughFs<D> {
             Ok(Arc::new(HandleData::new(inode, file)))
         }
     }
+     */
 }
 
 #[async_trait]
-impl<D: AsyncDrive + Sync> AsyncFileSystem<D> for PassthroughFs<D> {
+impl<S: BitmapSlice + Send + Sync> AsyncFileSystem for PassthroughFs<S> {
     async fn async_lookup(
         &self,
         ctx: &Context,
         parent: <Self as FileSystem>::Inode,
         name: &CStr,
     ) -> io::Result<Entry> {
+        unimplemented!()
+        /*
         // Don't use is_safe_path_component(), allow "." and ".." for NFS export support
         if name.to_bytes_with_nul().contains(&SLASH_ASCII) {
             return Err(io::Error::from_raw_os_error(libc::EINVAL));
@@ -423,6 +432,7 @@ impl<D: AsyncDrive + Sync> AsyncFileSystem<D> for PassthroughFs<D> {
             attr_timeout: self.cfg.attr_timeout,
             entry_timeout: self.cfg.entry_timeout,
         })
+        */
     }
 
     async fn async_getattr(
@@ -442,6 +452,8 @@ impl<D: AsyncDrive + Sync> AsyncFileSystem<D> for PassthroughFs<D> {
         handle: Option<<Self as FileSystem>::Handle>,
         valid: SetattrValid,
     ) -> io::Result<(libc::stat64, Duration)> {
+        unimplemented!()
+        /*
         enum Data {
             Handle(Arc<HandleData>, RawFd),
             ProcPath(CString),
@@ -578,6 +590,7 @@ impl<D: AsyncDrive + Sync> AsyncFileSystem<D> for PassthroughFs<D> {
         }
 
         self.async_do_getattr(ctx, inode, handle).await
+         */
     }
 
     async fn async_open(
@@ -587,12 +600,15 @@ impl<D: AsyncDrive + Sync> AsyncFileSystem<D> for PassthroughFs<D> {
         flags: u32,
         fuse_flags: u32,
     ) -> io::Result<(Option<<Self as FileSystem>::Handle>, OpenOptions)> {
+        unimplemented!()
+        /*
         if self.no_open.load(Ordering::Relaxed) {
             info!("fuse: open is not supported.");
             Err(io::Error::from_raw_os_error(libc::ENOSYS))
         } else {
             self.async_do_open(ctx, inode, flags, fuse_flags).await
         }
+         */
     }
 
     async fn async_create(
@@ -602,6 +618,8 @@ impl<D: AsyncDrive + Sync> AsyncFileSystem<D> for PassthroughFs<D> {
         name: &CStr,
         args: CreateIn,
     ) -> io::Result<(Entry, Option<<Self as FileSystem>::Handle>, OpenOptions)> {
+        unimplemented!()
+        /*
         self.validate_path_component(name)?;
 
         let dir = self.inode_map.get(parent)?;
@@ -658,6 +676,7 @@ impl<D: AsyncDrive + Sync> AsyncFileSystem<D> for PassthroughFs<D> {
         };
 
         Ok((entry, ret_handle, opts))
+         */
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -666,12 +685,14 @@ impl<D: AsyncDrive + Sync> AsyncFileSystem<D> for PassthroughFs<D> {
         ctx: &Context,
         inode: <Self as FileSystem>::Inode,
         handle: <Self as FileSystem>::Handle,
-        w: &mut (dyn AsyncZeroCopyWriter<D> + Send),
+        w: &mut (dyn AsyncZeroCopyWriter + Send),
         size: u32,
         offset: u64,
         _lock_owner: Option<u64>,
         _flags: u32,
     ) -> io::Result<usize> {
+        unimplemented!()
+        /*
         let data = self
             .async_get_data(ctx, handle, inode, libc::O_RDONLY)
             .await?;
@@ -681,6 +702,7 @@ impl<D: AsyncDrive + Sync> AsyncFileSystem<D> for PassthroughFs<D> {
 
         w.async_write_from(drive, data.get_handle_raw_fd(), size as usize, offset)
             .await
+         */
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -689,7 +711,7 @@ impl<D: AsyncDrive + Sync> AsyncFileSystem<D> for PassthroughFs<D> {
         ctx: &Context,
         inode: <Self as FileSystem>::Inode,
         handle: <Self as FileSystem>::Handle,
-        r: &mut (dyn AsyncZeroCopyReader<D> + Send),
+        r: &mut (dyn AsyncZeroCopyReader + Send),
         size: u32,
         offset: u64,
         _lock_owner: Option<u64>,
@@ -697,6 +719,8 @@ impl<D: AsyncDrive + Sync> AsyncFileSystem<D> for PassthroughFs<D> {
         _flags: u32,
         fuse_flags: u32,
     ) -> io::Result<usize> {
+        unimplemented!()
+        /*
         let data = self
             .async_get_data(ctx, handle, inode, libc::O_RDWR)
             .await?;
@@ -720,6 +744,7 @@ impl<D: AsyncDrive + Sync> AsyncFileSystem<D> for PassthroughFs<D> {
             r.async_read_to(drive, data.get_handle_raw_fd(), size as usize, offset)
                 .await
         }
+         */
     }
 
     async fn async_fsync(
@@ -729,6 +754,8 @@ impl<D: AsyncDrive + Sync> AsyncFileSystem<D> for PassthroughFs<D> {
         datasync: bool,
         handle: <Self as FileSystem>::Handle,
     ) -> io::Result<()> {
+        unimplemented!()
+        /*
         let data = self
             .async_get_data(ctx, handle, inode, libc::O_RDONLY)
             .await?;
@@ -737,6 +764,7 @@ impl<D: AsyncDrive + Sync> AsyncFileSystem<D> for PassthroughFs<D> {
             .ok_or_else(|| io::Error::from_raw_os_error(libc::EINVAL))?;
 
         AsyncUtil::fsync(drive, data.get_handle_raw_fd(), datasync).await
+         */
     }
 
     async fn async_fallocate(
@@ -748,6 +776,8 @@ impl<D: AsyncDrive + Sync> AsyncFileSystem<D> for PassthroughFs<D> {
         offset: u64,
         length: u64,
     ) -> io::Result<()> {
+        unimplemented!()
+        /*
         // Let the Arc<HandleData> in scope, otherwise fd may get invalid.
         let data = self
             .async_get_data(ctx, handle, inode, libc::O_RDWR)
@@ -757,6 +787,7 @@ impl<D: AsyncDrive + Sync> AsyncFileSystem<D> for PassthroughFs<D> {
             .ok_or_else(|| io::Error::from_raw_os_error(libc::EINVAL))?;
 
         AsyncUtil::fallocate(drive, data.get_handle_raw_fd(), offset, length, mode).await
+         */
     }
 
     async fn async_fsyncdir(

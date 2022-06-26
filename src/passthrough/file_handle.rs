@@ -11,7 +11,6 @@ use std::io;
 use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
 use std::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 
-use crate::async_util::AsyncDriver;
 use crate::passthrough::PassthroughFs;
 
 /// An arbitrary maximum size for CFileHandle::f_handle.
@@ -247,7 +246,7 @@ impl MountFds {
             // goes out of scope.)
             (dir_fd, None)
         } else {
-            let f = PassthroughFs::<AsyncDriver, ()>::open_file(
+            let f = PassthroughFs::<()>::open_file(
                 dir_fd,
                 path,
                 libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC,
@@ -269,7 +268,7 @@ impl MountFds {
         //     return Err(io::Error::from_raw_os_error(libc::EIO));
         // }
 
-        let st = PassthroughFs::<AsyncDriver, ()>::stat_fd(path_fd, None)?;
+        let st = PassthroughFs::<()>::stat_fd(path_fd, None)?;
         // Ensure that we can safely reopen `path_fd` with `O_RDONLY`
         let file_type = st.st_mode & libc::S_IFMT;
         if file_type != libc::S_IFREG && file_type != libc::S_IFDIR {

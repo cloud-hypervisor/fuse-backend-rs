@@ -20,7 +20,6 @@ use std::collections::HashMap;
 use std::ffi::CStr;
 use std::io;
 use std::io::{Error, ErrorKind, Result};
-use std::marker::PhantomData;
 use std::ops::Deref;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
@@ -28,12 +27,11 @@ use std::time::Duration;
 
 use arc_swap::ArcSwap;
 
-use super::pseudo_fs::PseudoFs;
 use crate::abi::fuse_abi::*;
 use crate::api::filesystem::*;
-use crate::async_util::{AsyncDrive, AsyncDriver};
+use crate::api::pseudo_fs::PseudoFs;
 
-#[cfg(feature = "async_io")]
+#[cfg(feature = "async-io")]
 mod async_io;
 mod sync_io;
 
@@ -57,9 +55,9 @@ pub const VFS_MAX_INO: u64 = 0xff_ffff_ffff_ffff;
 const VFS_INDEX_SHIFT: u8 = 56;
 const VFS_PSEUDO_FS_IDX: VfsIndex = 0;
 
-type ArcBackFs<DR> = Arc<BackFileSystem<DR>>;
-type ArcSuperBlock<D> = ArcSwap<Vec<Option<Arc<BackFileSystem<D>>>>>;
-type VfsEitherFs<'a, D> = Either<&'a PseudoFs, ArcBackFs<D>>;
+type ArcBackFs = Arc<BackFileSystem>;
+type ArcSuperBlock = ArcSwap<Vec<Option<Arc<BackFileSystem>>>>;
+type VfsEitherFs<'a> = Either<&'a PseudoFs, ArcBackFs>;
 
 type VfsHandle = u64;
 /// Vfs backend file system index
@@ -162,12 +160,11 @@ enum Either<A, B> {
 use Either::*;
 
 /// Type that implements BackendFileSystem and Sync and Send
-/// D refers to the type of asynchronous event driver
-pub type BackFileSystem<D> = Box<dyn BackendFileSystem<D, Inode = u64, Handle = u64> + Sync + Send>;
+pub type BackFileSystem = Box<dyn BackendFileSystem<Inode = u64, Handle = u64> + Sync + Send>;
 
-#[cfg(not(feature = "async_io"))]
+#[cfg(not(feature = "async-io"))]
 /// BackendFileSystem abstracts all backend file systems under vfs
-pub trait BackendFileSystem<D: AsyncDrive = AsyncDriver>: FileSystem {
+pub trait BackendFileSystem: FileSystem {
     /// mount returns the backend file system root inode entry and
     /// the largest inode number it has.
     fn mount(&self) -> Result<(Entry, u64)> {
@@ -180,9 +177,9 @@ pub trait BackendFileSystem<D: AsyncDrive = AsyncDriver>: FileSystem {
     fn as_any(&self) -> &dyn Any;
 }
 
-#[cfg(feature = "async_io")]
+#[cfg(feature = "async-io")]
 /// BackendFileSystem abstracts all backend file systems under vfs
-pub trait BackendFileSystem<D: AsyncDrive = AsyncDriver>: AsyncFileSystem<D> {
+pub trait BackendFileSystem: AsyncFileSystem {
     /// mount returns the backend file system root inode entry and
     /// the largest inode number it has.
     fn mount(&self) -> Result<(Entry, u64)> {
@@ -263,26 +260,25 @@ impl Default for VfsOptions {
 }
 
 /// A union fs that combines multiple backend file systems.
-pub struct Vfs<D: AsyncDrive = AsyncDriver> {
+pub struct Vfs {
     next_super: AtomicU8,
     root: PseudoFs,
     // mountpoints maps from pseudo fs inode to mounted fs mountpoint data
     mountpoints: ArcSwap<HashMap<u64, Arc<MountPointData>>>,
     // superblocks keeps track of all mounted file systems
-    superblocks: ArcSuperBlock<D>,
+    superblocks: ArcSuperBlock,
     opts: ArcSwap<VfsOptions>,
     initialized: AtomicBool,
     lock: Mutex<()>,
-    phantom: PhantomData<D>,
 }
 
-impl<D: AsyncDrive> Default for Vfs<D> {
+impl Default for Vfs {
     fn default() -> Self {
         Self::new(VfsOptions::new())
     }
 }
 
-impl<D: AsyncDrive> Vfs<D> {
+impl Vfs {
     /// Create a new vfs instance
     pub fn new(opts: VfsOptions) -> Self {
         Vfs {
@@ -293,7 +289,6 @@ impl<D: AsyncDrive> Vfs<D> {
             opts: ArcSwap::new(Arc::new(opts)),
             lock: Mutex::new(()),
             initialized: AtomicBool::new(false),
-            phantom: PhantomData,
         }
     }
 
@@ -310,7 +305,7 @@ impl<D: AsyncDrive> Vfs<D> {
 
     fn insert_mount_locked(
         &self,
-        fs: BackFileSystem<D>,
+        fs: BackFileSystem,
         mut entry: Entry,
         fs_idx: VfsIndex,
         path: &str,
@@ -346,7 +341,7 @@ impl<D: AsyncDrive> Vfs<D> {
     }
 
     /// Mount a backend file system to path
-    pub fn mount(&self, fs: BackFileSystem<D>, path: &str) -> VfsResult<VfsIndex> {
+    pub fn mount(&self, fs: BackFileSystem, path: &str) -> VfsResult<VfsIndex> {
         let (entry, ino) = fs.mount().map_err(VfsError::Mount)?;
         if ino > VFS_MAX_INO {
             fs.destroy();
@@ -411,7 +406,7 @@ impl<D: AsyncDrive> Vfs<D> {
     }
 
     /// Get the mounted backend file system alongside the path if there's one.
-    pub fn get_rootfs(&self, path: &str) -> VfsResult<Option<Arc<BackFileSystem<D>>>> {
+    pub fn get_rootfs(&self, path: &str) -> VfsResult<Option<Arc<BackFileSystem>>> {
         // Serialize mount operations. Do not expect poisoned lock here.
         let _guard = self.lock.lock().unwrap();
         let inode = match self.root.path_walk(path).map_err(VfsError::PathWalk)? {
@@ -493,7 +488,7 @@ impl<D: AsyncDrive> Vfs<D> {
         ))
     }
 
-    fn get_fs_by_idx(&self, fs_idx: VfsIndex) -> Result<Arc<BackFileSystem<D>>> {
+    fn get_fs_by_idx(&self, fs_idx: VfsIndex) -> Result<Arc<BackFileSystem>> {
         let superblocks = self.superblocks.load();
 
         if let Some(fs) = &superblocks[fs_idx as usize] {
@@ -503,7 +498,7 @@ impl<D: AsyncDrive> Vfs<D> {
         Err(Error::from_raw_os_error(libc::ENOENT))
     }
 
-    fn get_real_rootfs(&self, inode: VfsInode) -> Result<(VfsEitherFs<'_, D>, VfsInode)> {
+    fn get_real_rootfs(&self, inode: VfsInode) -> Result<(VfsEitherFs<'_>, VfsInode)> {
         if inode.is_pseudo_fs() {
             // ROOT_ID is special, we need to check if we have a mountpoint on the vfs root
             if inode.ino() == ROOT_ID {
@@ -552,7 +547,6 @@ impl<D: AsyncDrive> Vfs<D> {
 mod tests {
     use super::*;
     use crate::api::Vfs;
-    use crate::async_util::AsyncDriver;
     use std::ffi::CString;
 
     pub(crate) struct FakeFileSystemOne {}
@@ -639,7 +633,7 @@ mod tests {
         assert!(!is_dot_or_dotdot(name));
     }
 
-    #[cfg(feature = "async_io")]
+    #[cfg(feature = "async-io")]
     mod async_io {
         use super::*;
         use crate::abi::fuse_abi::{OpenOptions, SetattrValid};
@@ -907,8 +901,8 @@ mod tests {
         }
     }
 
-    #[cfg(not(feature = "async_io"))]
-    impl BackendFileSystem<AsyncDriver> for FakeFileSystemOne {
+    #[cfg(not(feature = "async-io"))]
+    impl BackendFileSystem for FakeFileSystemOne {
         fn mount(&self) -> Result<(Entry, u64)> {
             Ok((
                 Entry {
@@ -924,8 +918,8 @@ mod tests {
         }
     }
 
-    #[cfg(not(feature = "async_io"))]
-    impl BackendFileSystem<AsyncDriver> for FakeFileSystemTwo {
+    #[cfg(not(feature = "async-io"))]
+    impl BackendFileSystem for FakeFileSystemTwo {
         fn mount(&self) -> Result<(Entry, u64)> {
             Ok((
                 Entry {
@@ -942,7 +936,7 @@ mod tests {
 
     #[test]
     fn test_vfs_init() {
-        let vfs = Vfs::<AsyncDriver>::default();
+        let vfs = Vfs::default();
         assert_eq!(vfs.initialized(), false);
 
         let opts = vfs.opts.load();
@@ -968,7 +962,7 @@ mod tests {
         vfs.destroy();
         assert_eq!(vfs.initialized(), false);
 
-        let vfs = Vfs::<AsyncDriver>::default();
+        let vfs = Vfs::default();
         let in_opts =
             FsOptions::ASYNC_READ | FsOptions::ZERO_MESSAGE_OPEN | FsOptions::ZERO_MESSAGE_OPENDIR;
         vfs.init(in_opts).unwrap();

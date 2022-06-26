@@ -16,7 +16,6 @@ use fuse_backend_rs::abi::fuse_abi::Attr;
 
 use fuse_backend_rs::api::filesystem::{Context, DirEntry, Entry, FileSystem, ZeroCopyWriter};
 use fuse_backend_rs::api::{server::Server, BackendFileSystem, Vfs, VfsOptions};
-use fuse_backend_rs::async_util::AsyncDriver;
 use fuse_backend_rs::transport::{FuseChannel, FuseSession};
 
 pub(crate) struct HelloFileSystem {}
@@ -255,7 +254,7 @@ impl BackendFileSystem for HelloFileSystem {
 #[allow(dead_code)]
 pub struct Daemon {
     mountpoint: String,
-    server: Arc<Server<Arc<Vfs<AsyncDriver>>>>,
+    server: Arc<Server<Arc<Vfs>>>,
     thread_cnt: u32,
     session: Option<FuseSession>,
 }
@@ -322,7 +321,7 @@ impl Drop for Daemon {
 }
 
 struct FuseServer {
-    server: Arc<Server<Arc<Vfs<AsyncDriver>>>>,
+    server: Arc<Server<Arc<Vfs>>>,
     ch: FuseChannel,
 }
 
@@ -336,7 +335,10 @@ impl FuseServer {
                 .get_request()
                 .map_err(|_| std::io::Error::from_raw_os_error(libc::EINVAL))?
             {
-                if let Err(e) = self.server.handle_message(reader, writer, None, None) {
+                if let Err(e) = self
+                    .server
+                    .handle_message(reader, writer.into(), None, None)
+                {
                     match e {
                         fuse_backend_rs::Error::EncodeMessage(_ebadf) => {
                             break;

@@ -15,20 +15,18 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use super::*;
-use crate::abi::fuse_abi::{FOPEN_IN_KILL_SUIDGID, WRITE_KILL_PRIV};
+use crate::abi::fuse_abi::{CreateIn, FOPEN_IN_KILL_SUIDGID, WRITE_KILL_PRIV};
 #[cfg(any(feature = "vhost-user-fs", feature = "virtiofs"))]
 use crate::abi::virtio_fs;
 use crate::api::filesystem::{
     Context, DirEntry, Entry, FileSystem, FsOptions, GetxattrReply, ListxattrReply, OpenOptions,
     SetattrValid, ZeroCopyReader, ZeroCopyWriter,
 };
-use crate::api::CreateIn;
-use crate::async_util::AsyncDrive;
 use crate::bytes_to_cstr;
 #[cfg(any(feature = "vhost-user-fs", feature = "virtiofs"))]
 use crate::transport::FsCacheReqHandler;
 
-impl<D: AsyncDrive> PassthroughFs<D> {
+impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
     fn open_inode(&self, inode: Inode, mut flags: i32) -> io::Result<File> {
         // When writeback caching is enabled, the kernel may send read requests even if the
         // userspace program opened the file write-only. So we need to ensure that we have opened
@@ -297,7 +295,7 @@ impl<D: AsyncDrive> PassthroughFs<D> {
     }
 }
 
-impl<D: AsyncDrive> FileSystem for PassthroughFs<D> {
+impl<S: BitmapSlice + Send + Sync> FileSystem for PassthroughFs<S> {
     type Inode = Inode;
     type Handle = Handle;
 
