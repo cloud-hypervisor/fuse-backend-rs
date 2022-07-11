@@ -21,6 +21,12 @@ use std::mem::{size_of, MaybeUninit};
 use std::ptr::copy_nonoverlapping;
 use std::{cmp, fmt};
 
+#[cfg(feature = "async-io")]
+use dbs_fuse::buf::FileVolatileBuf;
+use dbs_fuse::buf::FileVolatileSlice;
+#[cfg(feature = "async-io")]
+use dbs_fuse::file_traits::AsyncFileReadWriteVolatile;
+use dbs_fuse::file_traits::FileReadWriteVolatile;
 use lazy_static::lazy_static;
 use libc::{sysconf, _SC_PAGESIZE};
 use vm_memory::{ByteValued, VolatileSlice};
@@ -38,11 +44,6 @@ pub use self::fs_cache_req_handler::FsCacheReqHandler;
 pub use self::fusedev::{FuseBuf, FuseChannel, FuseDevWriter, FuseSession};
 #[cfg(feature = "virtiofs")]
 pub use self::virtiofs::VirtioFsWriter;
-pub use dbs_fuse::buf::FileVolatileBuf;
-pub use dbs_fuse::buf::FileVolatileSlice;
-#[cfg(feature = "async-io")]
-pub use dbs_fuse::file_traits::AsyncFileReadWriteVolatile;
-pub use dbs_fuse::file_traits::{FileReadWriteVolatile, FileSetLen};
 
 /// Transport layer specific error codes.
 #[derive(Debug)]

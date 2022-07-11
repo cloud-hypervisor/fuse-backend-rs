@@ -13,7 +13,8 @@ use std::io;
 use std::time::Duration;
 
 use crate::abi::fuse_abi as fuse;
-use crate::transport::FileReadWriteVolatile;
+
+use dbs_fuse::file_traits::FileReadWriteVolatile;
 
 pub use fuse::FsOptions;
 pub use fuse::OpenOptions;

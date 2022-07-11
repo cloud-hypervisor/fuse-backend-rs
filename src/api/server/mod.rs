@@ -23,10 +23,11 @@ use std::mem::size_of;
 use std::sync::Arc;
 
 use arc_swap::ArcSwap;
+use dbs_fuse::file_traits::FileReadWriteVolatile;
 
 use crate::abi::fuse_abi::*;
 use crate::api::filesystem::{Context, FileSystem, ZeroCopyReader, ZeroCopyWriter};
-use crate::transport::{FileReadWriteVolatile, Reader, Writer};
+use crate::transport::{Reader, Writer};
 use crate::{bytes_to_cstr, BitmapSlice, Error, Result};
 
 #[cfg(feature = "async-io")]

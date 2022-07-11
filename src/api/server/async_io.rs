@@ -7,6 +7,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
+use dbs_fuse::file_traits::{AsyncFileReadWriteVolatile, FileReadWriteVolatile};
 use vm_memory::ByteValued;
 
 use crate::abi::fuse_abi::{
@@ -20,9 +21,7 @@ use crate::api::filesystem::{
 use crate::api::server::{
     MetricsHook, Server, ServerUtil, SrvContext, BUFFER_HEADER_SIZE, MAX_BUFFER_SIZE,
 };
-use crate::transport::{
-    AsyncFileReadWriteVolatile, FileReadWriteVolatile, FsCacheReqHandler, Reader, Writer,
-};
+use crate::transport::{FsCacheReqHandler, Reader, Writer};
 use crate::{bytes_to_cstr, encode_io_error_kind, BitmapSlice, Error, Result};
 
 struct AsyncZcReader<'a, S: BitmapSlice = ()>(Reader<'a, S>);

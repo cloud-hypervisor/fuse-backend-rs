@@ -10,10 +10,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
+use dbs_fuse::file_traits::AsyncFileReadWriteVolatile;
 
 use super::{Context, Entry, FileSystem, ZeroCopyReader, ZeroCopyWriter};
 use crate::abi::fuse_abi::{stat64, CreateIn, OpenOptions, SetattrValid};
-use crate::transport::AsyncFileReadWriteVolatile;
 
 /// A trait for directly copying data from the fuse transport into a `File` without first storing it
 /// in an intermediate buffer in asynchronous mode.
