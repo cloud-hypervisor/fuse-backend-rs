@@ -27,25 +27,22 @@ use vm_memory::{ByteValued, VolatileSlice};
 
 use crate::BitmapSlice;
 
-mod file_traits;
-mod file_volatile_slice;
 mod fs_cache_req_handler;
 #[cfg(feature = "fusedev")]
 mod fusedev;
 #[cfg(feature = "virtiofs")]
 mod virtiofs;
 
-#[cfg(feature = "async-io")]
-pub use self::file_traits::AsyncFileReadWriteVolatile;
-pub use self::file_traits::{FileReadWriteVolatile, FileSetLen};
-#[cfg(feature = "async-io")]
-pub use self::file_volatile_slice::FileVolatileBuf;
-pub use self::file_volatile_slice::FileVolatileSlice;
 pub use self::fs_cache_req_handler::FsCacheReqHandler;
 #[cfg(feature = "fusedev")]
 pub use self::fusedev::{FuseBuf, FuseChannel, FuseDevWriter, FuseSession};
 #[cfg(feature = "virtiofs")]
 pub use self::virtiofs::VirtioFsWriter;
+pub use dbs_fuse::buf::FileVolatileBuf;
+pub use dbs_fuse::buf::FileVolatileSlice;
+#[cfg(feature = "async-io")]
+pub use dbs_fuse::file_traits::AsyncFileReadWriteVolatile;
+pub use dbs_fuse::file_traits::{FileReadWriteVolatile, FileSetLen};
 
 /// Transport layer specific error codes.
 #[derive(Debug)]
@@ -149,9 +146,9 @@ impl<S: BitmapSlice> IoBuffers<'_, S> {
             // more data is written out and causes data corruption.
             let local_buf = if buf.len() > rem {
                 // Safe because we just check rem < buf.len()
-                FileVolatileSlice::new_from_volatile_slice(&buf.subslice(0, rem).unwrap())
+                FileVolatileSlice::from_volatile_slice(&buf.subslice(0, rem).unwrap())
             } else {
-                FileVolatileSlice::new_from_volatile_slice(buf)
+                FileVolatileSlice::from_volatile_slice(buf)
             };
             bufs.push(local_buf);
 
@@ -163,7 +160,7 @@ impl<S: BitmapSlice> IoBuffers<'_, S> {
     }
 
     #[cfg(feature = "async-io")]
-    unsafe fn prepare_io_buf(&self, count: usize) -> Vec<file_volatile_slice::FileVolatileBuf> {
+    unsafe fn prepare_io_buf(&self, count: usize) -> Vec<FileVolatileBuf> {
         let mut rem = count;
         let mut bufs = Vec::with_capacity(self.buffers.len());
 
@@ -181,7 +178,7 @@ impl<S: BitmapSlice> IoBuffers<'_, S> {
                 buf.clone()
             };
             // Safe because we just change the interface to access underlying buffers.
-            bufs.push(file_volatile_slice::FileVolatileBuf::from_raw(
+            bufs.push(FileVolatileBuf::from_raw_ptr(
                 local_buf.as_ptr(),
                 local_buf.len(),
                 local_buf.len(),
@@ -195,7 +192,7 @@ impl<S: BitmapSlice> IoBuffers<'_, S> {
     }
 
     #[cfg(all(feature = "async-io", feature = "virtiofs"))]
-    unsafe fn prepare_mut_io_buf(&self, count: usize) -> Vec<file_volatile_slice::FileVolatileBuf> {
+    unsafe fn prepare_mut_io_buf(&self, count: usize) -> Vec<FileVolatileBuf> {
         let mut rem = count;
         let mut bufs = Vec::with_capacity(self.buffers.len());
 
@@ -212,7 +209,7 @@ impl<S: BitmapSlice> IoBuffers<'_, S> {
             } else {
                 buf.clone()
             };
-            bufs.push(file_volatile_slice::FileVolatileBuf::from_raw(
+            bufs.push(FileVolatileBuf::from_raw_ptr(
                 local_buf.as_ptr(),
                 0,
                 local_buf.len(),
