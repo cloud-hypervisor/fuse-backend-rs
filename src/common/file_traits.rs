@@ -458,7 +458,7 @@ mod async_io {
     use tokio_uring::fs::File;
 
     use super::*;
-    use crate::transport::file_volatile_slice::FileVolatileBuf;
+    use crate::file_buf::FileVolatileBuf;
 
     /// Extension of [FileReadWriteVolatile] to support io-uring based asynchronous IO.
     ///
