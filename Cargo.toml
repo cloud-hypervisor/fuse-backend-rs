@@ -52,7 +52,7 @@ tokio-test = "0.4.2"
 
 [features]
 default = ["fusedev"]
-async-io = ["async-trait", "futures", "tokio/fs", "tokio/net", "tokio/sync", "tokio/rt"]
+async-io = ["async-trait", "futures", "tokio/fs", "tokio/net", "tokio/sync", "tokio/rt", "tokio/macros"]
 fusedev = ["vmm-sys-util", "caps", "core-foundation-sys"]
 virtiofs = ["virtio-queue", "caps"]
 vhost-user-fs = ["virtiofs", "vhost", "caps"]

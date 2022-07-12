@@ -605,7 +605,7 @@ mod tests {
             .unwrap()
             .into();
 
-        let result = tokio_uring::start(async {
+        let result = crate::async_runtime::block_on(async {
             unsafe { server.async_handle_message(r, w, None, None).await }
         });
         assert!(result.is_err());
