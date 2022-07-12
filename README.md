@@ -93,3 +93,10 @@ impl FuseServer {
 This project is licensed under
 - [Apache License](http://www.apache.org/licenses/LICENSE-2.0), Version 2.0
 - [BSD-3-Clause License](https://opensource.org/licenses/BSD-3-Clause)
+
+Source code under [src/tokio-uring] is temporarily copied from [tokio-uring](https://github.com/tokio-rs/tokio-uring)
+with modifications, which is licensed under [MIT](https://github.com/tokio-rs/tokio-uring/blob/master/LICENSE).
+
+We will use `crate.io` directly instead of this temporary copy when the pendding PRs is merged.
+https://github.com/tokio-rs/tokio-uring/pull/87
+https://github.com/tokio-rs/tokio-uring/pull/88
