@@ -107,6 +107,9 @@ pub mod api;
 pub mod passthrough;
 pub mod transport;
 
+pub mod common;
+pub use self::common::*;
+
 /// Convert io::ErrorKind to OS error code.
 /// Reference to libstd/sys/unix/mod.rs => decode_error_kind.
 pub fn encode_io_error_kind(kind: ErrorKind) -> i32 {

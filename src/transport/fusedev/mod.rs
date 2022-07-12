@@ -18,7 +18,8 @@ use nix::sys::uio::writev;
 use nix::unistd::write;
 use vm_memory::{ByteValued, VolatileMemory, VolatileSlice};
 
-use super::{Error, FileReadWriteVolatile, FileVolatileSlice, IoBuffers, Reader, Result, Writer};
+use super::{Error, FileReadWriteVolatile, IoBuffers, Reader, Result, Writer};
+use crate::file_buf::FileVolatileSlice;
 use crate::BitmapSlice;
 
 #[cfg(target_os = "linux")]
@@ -334,8 +335,8 @@ impl<'a, S: BitmapSlice> io::Write for FuseDevWriter<'a, S> {
 #[cfg(feature = "async-io")]
 mod async_io {
     use super::*;
-    use crate::transport::file_volatile_slice::FileVolatileBuf;
-    use crate::transport::AsyncFileReadWriteVolatile;
+    use crate::file_buf::FileVolatileBuf;
+    use crate::file_traits::AsyncFileReadWriteVolatile;
 
     impl<'a, S: BitmapSlice> FuseDevWriter<'a, S> {
         /// Write data from a buffer into this writer in asynchronous mode.
