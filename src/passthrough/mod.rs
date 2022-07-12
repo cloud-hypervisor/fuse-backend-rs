@@ -136,7 +136,7 @@ fn is_safe_inode(mode: u32) -> bool {
     matches!(mode & libc::S_IFMT, libc::S_IFREG | libc::S_IFDIR)
 }
 
-impl<'a> InodeData {
+impl InodeData {
     fn new(inode: Inode, f: FileOrHandle, refcount: u64, altkey: InodeAltKey, mode: u32) -> Self {
         InodeData {
             inode,
