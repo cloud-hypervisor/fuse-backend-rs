@@ -26,7 +26,7 @@ log = "0.4.6"
 mio = { version = "0.8", features = ["os-poll", "os-ext"]}
 nix = "0.24"
 lazy_static = "1.4"
-tokio-uring = { version = "0.3.0", optional = true }
+tokio = { version = "1", optional = true }
 vmm-sys-util = { version = "0.9", optional = true }
 vm-memory = { version = "0.8", features = ["backend-mmap"] }
 virtio-queue = { version = "0.4", optional = true }
@@ -37,16 +37,22 @@ core-foundation-sys = { version = ">=0.8", optional = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 caps = { version = "0.3", optional = true }
+tokio-uring = "0.3.0"
+io-uring = { version = "0.5.2", features = ["unstable"] }
+socket2 = { version = "0.4.4", features = ["all"] }
+scoped-tls = "1.0.0"
+slab = "0.4.6"
 
 [dev-dependencies]
 futures = { version = "0.3", features = ["thread-pool"]}
 stderrlog = "0.5"
 vmm-sys-util = "0.9"
 vm-memory = { version = "0.8", features = ["backend-mmap", "backend-bitmap"] }
+tokio-test = "0.4.2"
 
 [features]
 default = ["fusedev"]
-async-io = ["async-trait", "futures", "tokio-uring"]
+async-io = ["async-trait", "futures", "tokio/fs", "tokio/net", "tokio/sync", "tokio/rt"]
 fusedev = ["vmm-sys-util", "caps", "core-foundation-sys"]
 virtiofs = ["virtio-queue", "caps"]
 vhost-user-fs = ["virtiofs", "vhost", "caps"]
