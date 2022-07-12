@@ -147,9 +147,9 @@ impl<S: BitmapSlice> IoBuffers<'_, S> {
             // more data is written out and causes data corruption.
             let local_buf = if buf.len() > rem {
                 // Safe because we just check rem < buf.len()
-                FileVolatileSlice::new_from_volatile_slice(&buf.subslice(0, rem).unwrap())
+                FileVolatileSlice::from_volatile_slice(&buf.subslice(0, rem).unwrap())
             } else {
-                FileVolatileSlice::new_from_volatile_slice(buf)
+                FileVolatileSlice::from_volatile_slice(buf)
             };
             bufs.push(local_buf);
 
@@ -179,7 +179,7 @@ impl<S: BitmapSlice> IoBuffers<'_, S> {
                 buf.clone()
             };
             // Safe because we just change the interface to access underlying buffers.
-            bufs.push(FileVolatileBuf::from_raw(
+            bufs.push(FileVolatileBuf::from_raw_ptr(
                 local_buf.as_ptr(),
                 local_buf.len(),
                 local_buf.len(),
@@ -210,7 +210,7 @@ impl<S: BitmapSlice> IoBuffers<'_, S> {
             } else {
                 buf.clone()
             };
-            bufs.push(FileVolatileBuf::from_raw(
+            bufs.push(FileVolatileBuf::from_raw_ptr(
                 local_buf.as_ptr(),
                 0,
                 local_buf.len(),

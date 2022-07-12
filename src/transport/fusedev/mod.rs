@@ -188,7 +188,7 @@ impl<'a, S: BitmapSlice> FuseDevWriter<'a, S> {
         let cnt = src.read_vectored_volatile(
             // Safe because we have made sure buf has at least count capacity above
             unsafe {
-                &[FileVolatileSlice::new(
+                &[FileVolatileSlice::from_raw_ptr(
                     self.buf.as_mut_ptr().add(self.buf.len()),
                     count,
                 )]
@@ -216,7 +216,7 @@ impl<'a, S: BitmapSlice> FuseDevWriter<'a, S> {
         let cnt = src.read_vectored_at_volatile(
             // Safe because we have made sure buf has at least count capacity above
             unsafe {
-                &[FileVolatileSlice::new(
+                &[FileVolatileSlice::from_raw_ptr(
                     self.buf.as_mut_ptr().add(self.buf.len()),
                     count,
                 )]
@@ -454,7 +454,7 @@ mod async_io {
         ) -> io::Result<usize> {
             self.check_available_space(count)?;
 
-            let buf = unsafe { FileVolatileBuf::from_raw(self.buf.as_mut_ptr(), 0, count) };
+            let buf = unsafe { FileVolatileBuf::from_raw_ptr(self.buf.as_mut_ptr(), 0, count) };
             let (res, _) = src.async_read_at_volatile(buf, off).await;
             match res {
                 Ok(cnt) => {
@@ -934,8 +934,10 @@ mod tests {
 
     #[cfg(feature = "async-io")]
     mod async_io {
-        use tokio_uring::fs::OpenOptions;
         use vmm_sys_util::tempdir::TempDir;
+
+        use crate::async_file::File;
+        use crate::async_runtime;
 
         use super::*;
 
@@ -948,8 +950,8 @@ mod tests {
             let mut buf2 = [0u8; 48];
             let mut reader = Reader::<()>::from_fuse_buffer(FuseBuf::new(&mut buf2)).unwrap();
 
-            tokio_uring::start(async {
-                let file = OpenOptions::new().write(true).open(&path).await.unwrap();
+            async_runtime::block_on(async {
+                let file = File::async_open(&path, true, false).await.unwrap();
                 let res = reader.async_read_to_at(&file, 48, 0).await.unwrap();
                 assert_eq!(res, 48);
             })
@@ -966,14 +968,14 @@ mod tests {
             let mut buf = vec![0x0u8; 48];
             let mut writer = FuseDevWriter::<()>::new(fd, &mut buf).unwrap();
             let buf = vec![0xdeu8; 64];
-            let res = tokio_uring::start(async { writer.async_write(&buf[..]).await });
+            let res = async_runtime::block_on(async { writer.async_write(&buf[..]).await });
             assert!(res.is_err());
 
             let fd = file.as_raw_fd();
             let mut buf = vec![0x0u8; 48];
             let mut writer2 = FuseDevWriter::<()>::new(fd, &mut buf).unwrap();
             let buf = vec![0xdeu8; 48];
-            let res = tokio_uring::start(async { writer2.async_write(&buf[..]).await });
+            let res = async_runtime::block_on(async { writer2.async_write(&buf[..]).await });
             assert_eq!(res.unwrap(), 48);
         }
 
@@ -984,8 +986,9 @@ mod tests {
             let mut buf = vec![0x0u8; 48];
             let mut writer = FuseDevWriter::<()>::new(fd, &mut buf).unwrap();
             let buf = vec![0xdeu8; 48];
-            let res =
-                tokio_uring::start(async { writer.async_write2(&buf[..32], &buf[32..]).await });
+            let res = async_runtime::block_on(async {
+                writer.async_write2(&buf[..32], &buf[32..]).await
+            });
             assert_eq!(res.unwrap(), 48);
         }
 
@@ -996,7 +999,7 @@ mod tests {
             let mut buf = vec![0x0u8; 48];
             let mut writer = FuseDevWriter::<()>::new(fd, &mut buf).unwrap();
             let buf = vec![0xdeu8; 48];
-            let res = tokio_uring::start(async {
+            let res = async_runtime::block_on(async {
                 writer
                     .async_write3(&buf[..32], &buf[32..40], &buf[40..])
                     .await
@@ -1016,8 +1019,8 @@ mod tests {
 
             let mut buf = vec![0x0u8; 48];
             let mut writer = FuseDevWriter::<()>::new(fd1, &mut buf).unwrap();
-            let res = tokio_uring::start(async {
-                let file = OpenOptions::new().read(true).open(&path).await.unwrap();
+            let res = async_runtime::block_on(async {
+                let file = File::async_open(&path, true, false).await.unwrap();
                 writer.async_write_from_at(&file, 40, 16).await
             });
 
@@ -1053,7 +1056,8 @@ mod tests {
                 64
             );
 
-            let res = tokio_uring::start(async { writer.async_commit(Some(&other.into())).await });
+            let res =
+                async_runtime::block_on(async { writer.async_commit(Some(&other.into())).await });
             let _ = res.unwrap();
         }
     }
