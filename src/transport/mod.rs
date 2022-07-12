@@ -25,6 +25,12 @@ use lazy_static::lazy_static;
 use libc::{sysconf, _SC_PAGESIZE};
 use vm_memory::{ByteValued, VolatileSlice};
 
+#[cfg(feature = "async-io")]
+use crate::file_buf::FileVolatileBuf;
+use crate::file_buf::FileVolatileSlice;
+#[cfg(feature = "async-io")]
+use crate::file_traits::AsyncFileReadWriteVolatile;
+use crate::file_traits::FileReadWriteVolatile;
 use crate::BitmapSlice;
 
 mod fs_cache_req_handler;
@@ -38,12 +44,6 @@ pub use self::fs_cache_req_handler::FsCacheReqHandler;
 pub use self::fusedev::{FuseBuf, FuseChannel, FuseDevWriter, FuseSession};
 #[cfg(feature = "virtiofs")]
 pub use self::virtiofs::VirtioFsWriter;
-#[cfg(feature = "async-io")]
-pub use crate::file_buf::FileVolatileBuf;
-pub use crate::file_buf::FileVolatileSlice;
-#[cfg(feature = "async-io")]
-pub use crate::file_traits::AsyncFileReadWriteVolatile;
-pub use crate::file_traits::{FileReadWriteVolatile, FileSetLen};
 
 /// Transport layer specific error codes.
 #[derive(Debug)]
