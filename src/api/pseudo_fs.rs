@@ -107,7 +107,7 @@ impl PseudoFs {
         let mut inode = &self.root_inode;
 
         'outer: for component in path.components() {
-            debug!("pseudo fs mount iterate {:?}", component.as_os_str());
+            trace!("pseudo fs mount iterate {:?}", component.as_os_str());
             match component {
                 Component::RootDir => continue,
                 Component::CurDir => continue,

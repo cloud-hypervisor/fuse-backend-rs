@@ -232,21 +232,15 @@ impl FuseChannel {
             let mut fusereq_available = false;
             match self.poll.poll(&mut events, None) {
                 Ok(_) => {}
-                Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => {
-                    continue;
-                }
+                Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
                 Err(e) => return Err(SessionFailure(format!("epoll wait: {}", e))),
             }
 
             for event in events.iter() {
                 if event.is_readable() {
                     match event.token() {
-                        EXIT_FUSE_EVENT => {
-                            need_exit = true;
-                        }
-                        FUSE_DEV_EVENT => {
-                            fusereq_available = true;
-                        }
+                        EXIT_FUSE_EVENT => need_exit = true,
+                        FUSE_DEV_EVENT => fusereq_available = true,
                         x => {
                             error!("unexpected epoll event");
                             return Err(SessionFailure(format!("unexpected epoll event: {}", x.0)));
@@ -288,9 +282,12 @@ impl FuseChannel {
                     }
                     Err(e) => match e {
                         Errno::ENOENT => {
-                            // ENOENT means the operation was interrupted, it's safe
-                            // to restart
-                            trace!("restart reading");
+                            // ENOENT means the operation was interrupted, it's safe to restart
+                            trace!("restart reading due to ENOENT");
+                            continue;
+                        }
+                        Errno::EAGAIN => {
+                            trace!("restart reading due to EAGAIN");
                             continue;
                         }
                         Errno::EINTR => {
