@@ -210,11 +210,8 @@ impl PseudoFs {
 
     // Caller must hold PseudoFs.lock.
     fn insert_inode(&self, inode: Arc<PseudoInode>) {
-        let mut hashmap = self.inodes.load().deref().deref().clone();
-
+        let mut hashmap = self.inodes.load().deref().deref();
         hashmap.insert(inode.ino, inode);
-
-        self.inodes.store(Arc::new(hashmap));
     }
 
     // Caller must hold PseudoFs.lock.
