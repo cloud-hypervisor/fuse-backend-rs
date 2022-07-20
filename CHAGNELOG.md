@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.9.5]
+
+### Changed
+- Update dependency
+- Fix a bug in fusedev
+- Add toio-uring/tokio based async io framework
+
 ## [0.9.2]
 
 ### Added
