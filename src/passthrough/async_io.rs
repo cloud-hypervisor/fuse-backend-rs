@@ -12,7 +12,7 @@ use async_trait::async_trait;
 
 use super::*;
 use crate::abi::fuse_abi::{
-    CreateIn, OpenOptions, SetattrValid, FOPEN_IN_KILL_SUIDGID, WRITE_KILL_PRIV,
+    CreateIn, Opcode, OpenOptions, SetattrValid, FOPEN_IN_KILL_SUIDGID, WRITE_KILL_PRIV,
 };
 use crate::api::filesystem::{
     AsyncFileSystem, AsyncZeroCopyReader, AsyncZeroCopyWriter, Context, FileSystem,
@@ -478,6 +478,10 @@ impl<S: BitmapSlice + Send + Sync> AsyncFileSystem for PassthroughFs<S> {
             }
         };
 
+        if valid.contains(SetattrValid::SIZE) && self.seal_size.load(Ordering::Relaxed) {
+            return Err(io::Error::from_raw_os_error(libc::EPERM));
+        }
+
         if valid.contains(SetattrValid::MODE) {
             // Safe because this doesn't modify any memory and we check the return value.
             let res = unsafe {
@@ -725,6 +729,13 @@ impl<S: BitmapSlice + Send + Sync> AsyncFileSystem for PassthroughFs<S> {
             .async_get_data(ctx, handle, inode, libc::O_RDWR)
             .await?;
 
+        if self.seal_size.load(Ordering::Relaxed) {
+            let st = self
+                .async_stat_fd(cxt, data.get_handle_raw_fd(), None)
+                .await?;
+            self.seal_size_check(Opcode::Write, st.st_size as u64, offset, size as u64, 0)?;
+        }
+
         // Fallback to sync io if KILLPRIV_V2 is enabled to work around a limitation of io_uring.
         if self.killpriv_v2.load(Ordering::Relaxed) && (fuse_flags & WRITE_KILL_PRIV != 0) {
             // Manually implement File::try_clone() by borrowing fd of data.file instead of dup().
@@ -785,6 +796,19 @@ impl<S: BitmapSlice + Send + Sync> AsyncFileSystem for PassthroughFs<S> {
         let drive = ctx
             .get_drive::<D>()
             .ok_or_else(|| io::Error::from_raw_os_error(libc::EINVAL))?;
+
+        if self.seal_size.load(Ordering::Relaxed) {
+            let st = self
+                .async_stat_fd(cxt, data.get_handle_raw_fd(), None)
+                .await?;
+            self.seal_size_check(
+                Opcode::Fallocate,
+                st.st_size as u64,
+                offset,
+                length,
+                mode as i32,
+            )?;
+        }
 
         AsyncUtil::fallocate(drive, data.get_handle_raw_fd(), offset, length, mode).await
          */

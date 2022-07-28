@@ -217,6 +217,9 @@ pub struct VfsOptions {
     /// to remove security.capability xattr and setuid/setgid bits. See details in
     /// comments for HANDLE_KILLPRIV_V2
     pub killpriv_v2: bool,
+    /// Reject requests which will change the file size, or allocate file
+    /// blocks exceed file size.
+    pub seal_size: bool,
     /// File system options passed in from client
     pub in_opts: FsOptions,
     /// File system options returned to client
@@ -236,6 +239,7 @@ impl Default for VfsOptions {
             no_opendir: true,
             no_writeback: false,
             no_readdir: false,
+            seal_size: false,
             killpriv_v2: false,
             in_opts: FsOptions::empty(),
             out_opts: FsOptions::ASYNC_READ
@@ -946,6 +950,7 @@ mod tests {
         assert_eq!(opts.no_opendir, true);
         assert_eq!(opts.no_writeback, false);
         assert_eq!(opts.no_readdir, false);
+        assert_eq!(opts.seal_size, false);
         assert_eq!(opts.killpriv_v2, false);
         assert_eq!(opts.in_opts.is_empty(), true);
 
@@ -957,6 +962,7 @@ mod tests {
         assert_eq!(opts.no_opendir, false);
         assert_eq!(opts.no_writeback, false);
         assert_eq!(opts.no_readdir, false);
+        assert_eq!(opts.seal_size, false);
         assert_eq!(opts.killpriv_v2, false);
 
         vfs.destroy();
