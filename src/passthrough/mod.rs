@@ -30,6 +30,7 @@ use std::time::Duration;
 use vm_memory::ByteValued;
 
 use crate::abi::fuse_abi as fuse;
+use crate::abi::fuse_abi::Opcode;
 use crate::api::filesystem::Entry;
 use crate::api::{
     validate_path_component, BackendFileSystem, CURRENT_DIR_CSTR, EMPTY_CSTR, PARENT_DIR_CSTR,
@@ -463,6 +464,11 @@ pub struct Config {
     /// directory is empty even if it has children.
     pub no_readdir: bool,
 
+    /// Control whether to refuse operations which modify the size of the file. For a share memory
+    /// file mounted from host, seal_size can prohibit guest to increase the size of
+    /// share memory file to attack the host.
+    pub seal_size: bool,
+
     /// What size file supports dax
     /// * If dax_file_size == None, DAX will disable to all files.
     /// * If dax_file_size == 0, DAX will enable all files.
@@ -486,6 +492,7 @@ impl Default for Config {
             killpriv_v2: false,
             inode_file_handles: false,
             no_readdir: false,
+            seal_size: false,
             dax_file_size: None,
         }
     }
@@ -536,6 +543,9 @@ pub struct PassthroughFs<S: BitmapSlice + Send + Sync = ()> {
     // Whether no_readdir is enabled.
     no_readdir: AtomicBool,
 
+    // Whether seal_size is enabled.
+    seal_size: AtomicBool,
+
     // Whether per-file DAX feature is enabled.
     // Init from guest kernel Init cmd of fuse fs.
     perfile_dax: AtomicBool,
@@ -572,6 +582,7 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
             no_opendir: AtomicBool::new(false),
             killpriv_v2: AtomicBool::new(false),
             no_readdir: AtomicBool::new(cfg.no_readdir),
+            seal_size: AtomicBool::new(cfg.seal_size),
             perfile_dax: AtomicBool::new(false),
             cfg,
 
@@ -999,6 +1010,54 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
             return Ok(());
         }
         validate_path_component(name)
+    }
+
+    // When seal_size is set, we don't allow operations that could change file size nor allocate
+    // space beyond EOF
+    fn seal_size_check(
+        &self,
+        opcode: Opcode,
+        file_size: u64,
+        offset: u64,
+        size: u64,
+        mode: i32,
+    ) -> io::Result<()> {
+        if offset.checked_add(size).is_none() {
+            error!(
+                "fuse: {:?}: invalid `offset` + `size` ({}+{}) overflows u64::MAX",
+                opcode, offset, size
+            );
+            return Err(io::Error::from_raw_os_error(libc::EINVAL));
+        }
+
+        match opcode {
+            // write should not exceed the file size.
+            Opcode::Write if size + offset > file_size => {
+                Err(io::Error::from_raw_os_error(libc::EPERM))
+            }
+
+            // fallocate operation should not allocate blocks exceed the file size.
+            //
+            // FALLOC_FL_COLLAPSE_RANGE or FALLOC_FL_INSERT_RANGE mode will change file size which
+            // is not allowed.
+            //
+            // FALLOC_FL_PUNCH_HOLE mode won't change file size, as it must be ORed with
+            // FALLOC_FL_KEEP_SIZE.
+            Opcode::Fallocate
+                if ((mode == 0
+                    || mode == libc::FALLOC_FL_KEEP_SIZE
+                    || mode & libc::FALLOC_FL_ZERO_RANGE != 0)
+                    && size + offset > file_size)
+                    || (mode & libc::FALLOC_FL_COLLAPSE_RANGE != 0
+                        || mode & libc::FALLOC_FL_INSERT_RANGE != 0) =>
+            {
+                Err(io::Error::from_raw_os_error(libc::EPERM))
+            }
+
+            // setattr operation should be handled in setattr handler, other operations won't
+            // change file size.
+            _ => Ok(()),
+        }
     }
 }
 

@@ -15,7 +15,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use super::*;
-use crate::abi::fuse_abi::{CreateIn, FOPEN_IN_KILL_SUIDGID, WRITE_KILL_PRIV};
+use crate::abi::fuse_abi::{CreateIn, Opcode, FOPEN_IN_KILL_SUIDGID, WRITE_KILL_PRIV};
 #[cfg(any(feature = "vhost-user-fs", feature = "virtiofs"))]
 use crate::abi::virtio_fs;
 use crate::api::filesystem::{
@@ -689,6 +689,12 @@ impl<S: BitmapSlice + Send + Sync> FileSystem for PassthroughFs<S> {
         // It's safe because the `data` variable's lifetime spans the whole function,
         // so data.file won't be closed.
         let f = unsafe { File::from_raw_fd(data.get_handle_raw_fd()) };
+
+        if self.seal_size.load(Ordering::Relaxed) {
+            let st = Self::stat_fd(f.as_raw_fd(), None)?;
+            self.seal_size_check(Opcode::Write, st.st_size as u64, offset, size as u64, 0)?;
+        }
+
         let mut f = ManuallyDrop::new(f);
 
         // Cap restored when _killpriv is dropped
@@ -743,6 +749,10 @@ impl<S: BitmapSlice + Send + Sync> FileSystem for PassthroughFs<S> {
                 Data::ProcPath(pathname)
             }
         };
+
+        if valid.contains(SetattrValid::SIZE) && self.seal_size.load(Ordering::Relaxed) {
+            return Err(io::Error::from_raw_os_error(libc::EPERM));
+        }
 
         if valid.contains(SetattrValid::MODE) {
             // Safe because this doesn't modify any memory and we check the return value.
@@ -1263,6 +1273,17 @@ impl<S: BitmapSlice + Send + Sync> FileSystem for PassthroughFs<S> {
         // Let the Arc<HandleData> in scope, otherwise fd may get invalid.
         let data = self.get_data(handle, inode, libc::O_RDWR)?;
         let fd = data.get_handle_raw_fd();
+
+        if self.seal_size.load(Ordering::Relaxed) {
+            let st = Self::stat_fd(fd, None)?;
+            self.seal_size_check(
+                Opcode::Fallocate,
+                st.st_size as u64,
+                offset,
+                length,
+                mode as i32,
+            )?;
+        }
 
         // Safe because this doesn't modify any memory and we check the return value.
         let res = unsafe {
