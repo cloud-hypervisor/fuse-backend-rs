@@ -429,7 +429,7 @@ fn fuse_kern_umount(file: File, disk: Option<DADiskRef>) -> Result<()> {
 
 fn set_fuse_fd_dead(fd: RawFd) -> std::io::Result<()> {
     unsafe {
-        match ioctl::set_fuse_fd_dead(fd, std::mem::transmute(&fd)) {
+        match ioctl::set_fuse_fd_dead(fd, &fd as *const i32 as *const u32) {
             Ok(_) => Ok(()),
             Err(e) => Err(e.into()),
         }
