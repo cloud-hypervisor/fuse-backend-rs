@@ -11,8 +11,6 @@ mod example;
 
 #[cfg(all(feature = "fusedev", target_os = "macos"))]
 mod macfuse_tests {
-    extern crate stderrlog;
-
     use std::io::Result;
     use std::process::Command;
 
@@ -52,17 +50,6 @@ mod macfuse_tests {
         let stdout = std::str::from_utf8(&output.stdout).unwrap();
 
         return Ok(stdout.to_string());
-    }
-
-    #[test]
-    fn integration_test_init() -> Result<()> {
-        stderrlog::new()
-            .quiet(false)
-            .timestamp(stderrlog::Timestamp::Microsecond)
-            .verbosity(log::LevelFilter::Trace as usize - 1)
-            .init()
-            .unwrap();
-        Ok(())
     }
 
     #[test]

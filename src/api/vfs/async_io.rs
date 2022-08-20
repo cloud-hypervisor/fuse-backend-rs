@@ -211,8 +211,8 @@ mod tests {
 
     use std::ffi::CString;
 
-    #[test]
-    fn test_vfs_async_lookup() {
+    #[tokio::test]
+    async fn test_vfs_async_lookup() {
         let vfs = Vfs::new(VfsOptions::default());
         let fs = FakeFileSystemOne {};
         let ctx = Context {
@@ -220,11 +220,10 @@ mod tests {
             gid: 0,
             pid: 0,
         };
-        let executor = futures::executor::ThreadPool::new().unwrap();
 
         assert!(vfs.mount(Box::new(fs), "/x/y").is_ok());
 
-        executor.spawn_ok(async move {
+        let handle = tokio::spawn(async move {
             // Lookup inode on pseudo file system.
             let name = CString::new("x").unwrap();
             let future = vfs.async_lookup(&ctx, ROOT_ID.into(), name.as_c_str());
@@ -253,5 +252,6 @@ mod tests {
                 .unwrap();
             assert_eq!(entry3.inode, 0);
         });
+        handle.await.unwrap();
     }
 }

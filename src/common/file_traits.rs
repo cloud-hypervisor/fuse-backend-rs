@@ -454,7 +454,7 @@ pub use async_io::AsyncFileReadWriteVolatile;
 mod async_io {
     use std::sync::Arc;
 
-    use futures::join;
+    use tokio::join;
 
     use super::*;
     use crate::async_file::File;
