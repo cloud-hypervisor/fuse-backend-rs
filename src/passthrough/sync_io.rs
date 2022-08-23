@@ -27,15 +27,8 @@ use crate::bytes_to_cstr;
 use crate::transport::FsCacheReqHandler;
 
 impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
-    fn open_inode(&self, inode: Inode, mut flags: i32) -> io::Result<File> {
-        // When writeback caching is enabled, the kernel may send read requests even if the
-        // userspace program opened the file write-only. So we need to ensure that we have opened
-        // the file for reading as well as writing.
-        let writeback = self.writeback.load(Ordering::Relaxed);
-        if writeback && flags & libc::O_ACCMODE == libc::O_WRONLY {
-            flags &= !libc::O_ACCMODE;
-            flags |= libc::O_RDWR;
-        }
+    fn open_inode(&self, inode: Inode, flags: i32) -> io::Result<File> {
+        let mut new_flags = self.get_writeback_open_flags(flags);
 
         // When writeback caching is enabled the kernel is responsible for handling `O_APPEND`.
         // However, this breaks atomicity as the file may have changed on disk, invalidating the
@@ -43,14 +36,14 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
         // the file. Just allow this for now as it is the user's responsibility to enable writeback
         // caching only for directories that are not shared. It also means that we need to clear the
         // `O_APPEND` flag.
-        if writeback && flags & libc::O_APPEND != 0 {
-            flags &= !libc::O_APPEND;
+        if self.writeback.load(Ordering::Relaxed) && flags & libc::O_APPEND != 0 {
+            new_flags &= !libc::O_APPEND;
         }
 
         let data = self.inode_map.get(inode)?;
         let file = data.get_file(&self.mount_fds)?;
 
-        Self::open_proc_file(&self.proc_self_fd, file.as_raw_fd(), flags, data.mode)
+        Self::open_proc_file(&self.proc_self_fd, file.as_raw_fd(), new_flags, data.mode)
     }
 
     fn do_readdir(
@@ -556,10 +549,11 @@ impl<S: BitmapSlice + Send + Sync> FileSystem for PassthroughFs<S> {
         let new_file = {
             let (_uid, _gid) = set_creds(ctx.uid, ctx.gid)?;
 
+            let flags = self.get_writeback_open_flags(args.flags as i32);
             Self::create_file_excl(
                 dir_file.as_raw_fd(),
                 name,
-                args.flags as i32,
+                flags,
                 args.mode & !(args.umask & 0o777),
             )?
         };

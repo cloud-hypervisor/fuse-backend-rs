@@ -1059,6 +1059,19 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
             _ => Ok(()),
         }
     }
+
+    // When writeback caching is enabled, the kernel may send read requests even if the userspace
+    // program opened the file write-only. So we need to ensure that we have opened the file for
+    // reading as well as writing.
+    fn get_writeback_open_flags(&self, flags: i32) -> i32 {
+        let mut new_flags = flags;
+        let writeback = self.writeback.load(Ordering::Relaxed);
+        if writeback && flags & libc::O_ACCMODE == libc::O_WRONLY {
+            new_flags &= !libc::O_ACCMODE;
+            new_flags |= libc::O_RDWR;
+        }
+        new_flags
+    }
 }
 
 #[cfg(not(feature = "async-io"))]
@@ -1167,10 +1180,13 @@ fn ebadf() -> io::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::abi::fuse_abi::CreateIn;
     use crate::api::filesystem::*;
     use crate::api::{Vfs, VfsOptions};
     use caps::{CapSet, Capability};
     use log;
+    use std::fs::File;
+    use std::io::Read;
     use std::ops::Deref;
     use vmm_sys_util::{tempdir::TempDir, tempfile::TempFile};
 
@@ -1335,5 +1351,104 @@ mod tests {
 
         let mode = libc::S_IFSOCK;
         assert!(!is_safe_inode(mode));
+    }
+
+    #[test]
+    fn test_get_writeback_open_flags() {
+        // prepare a fs with writeback cache and open being true, so O_WRONLY should be promoted to
+        // O_RDWR, as writeback may read files even if file being opened with write-only.
+        let mut fs = prepare_passthroughfs();
+        fs.writeback = AtomicBool::new(true);
+        fs.no_open = AtomicBool::new(false);
+
+        assert!(fs.writeback.load(Ordering::Relaxed));
+        assert!(!fs.no_open.load(Ordering::Relaxed));
+
+        let flags = libc::O_RDWR;
+        assert_eq!(fs.get_writeback_open_flags(flags), libc::O_RDWR);
+
+        let flags = libc::O_RDONLY;
+        assert_eq!(fs.get_writeback_open_flags(flags), libc::O_RDONLY);
+
+        let flags = libc::O_WRONLY;
+        assert_eq!(fs.get_writeback_open_flags(flags), libc::O_RDWR);
+
+        // prepare a fs with writeback cache disabled, open flags should not change
+        let mut fs = prepare_passthroughfs();
+        fs.writeback = AtomicBool::new(false);
+        fs.no_open = AtomicBool::new(false);
+
+        assert!(!fs.writeback.load(Ordering::Relaxed));
+        assert!(!fs.no_open.load(Ordering::Relaxed));
+
+        let flags = libc::O_RDWR;
+        assert_eq!(fs.get_writeback_open_flags(flags), libc::O_RDWR);
+
+        let flags = libc::O_RDONLY;
+        assert_eq!(fs.get_writeback_open_flags(flags), libc::O_RDONLY);
+
+        let flags = libc::O_WRONLY;
+        assert_eq!(fs.get_writeback_open_flags(flags), libc::O_WRONLY);
+    }
+
+    #[test]
+    fn test_writeback_open_and_create() {
+        // prepare a fs with writeback cache and open being true, so a write-only opened file
+        // should have read permission as well.
+        let source = TempDir::new().expect("Cannot create temporary directory.");
+        let _ = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(format!("touch {}/existfile", source.as_path().to_str().unwrap()).as_str())
+            .output()
+            .unwrap();
+        let fs_cfg = Config {
+            writeback: true,
+            do_import: true,
+            no_open: false,
+            inode_file_handles: false,
+            root_dir: source
+                .as_path()
+                .to_str()
+                .expect("source path to string")
+                .to_string(),
+            ..Default::default()
+        };
+        let mut fs = PassthroughFs::<()>::new(fs_cfg).unwrap();
+        fs.writeback = AtomicBool::new(true);
+        fs.no_open = AtomicBool::new(false);
+        fs.import().unwrap();
+
+        assert!(fs.writeback.load(Ordering::Relaxed));
+        assert!(!fs.no_open.load(Ordering::Relaxed));
+
+        let ctx = Context::default();
+
+        // Create a new file with O_WRONLY, and make sure we can read it as well.
+        let fname = CString::new("testfile").unwrap();
+        let args = CreateIn {
+            flags: libc::O_WRONLY as u32,
+            mode: 0644,
+            umask: 0,
+            fuse_flags: 0,
+        };
+        let (entry, handle, _) = fs.create(&ctx, ROOT_ID, &fname, args).unwrap();
+        let handle_data = fs.handle_map.get(handle.unwrap(), entry.inode).unwrap();
+        let mut f = unsafe { File::from_raw_fd(handle_data.get_handle_raw_fd()) };
+        let mut buf = [0; 4];
+        // Buggy code return EBADF on read
+        let n = f.read(&mut buf).unwrap();
+        assert_eq!(n, 0);
+
+        // Then Open an existing file with O_WRONLY, we should be able to read it as well.
+        let fname = CString::new("existfile").unwrap();
+        let entry = fs.lookup(&ctx, ROOT_ID, &fname).unwrap();
+        let (handle, _) = fs
+            .open(&ctx, entry.inode, libc::O_WRONLY as u32, 0)
+            .unwrap();
+        let handle_data = fs.handle_map.get(handle.unwrap(), entry.inode).unwrap();
+        let mut f = unsafe { File::from_raw_fd(handle_data.get_handle_raw_fd()) };
+        let mut buf = [0; 4];
+        let n = f.read(&mut buf).unwrap();
+        assert_eq!(n, 0);
     }
 }
