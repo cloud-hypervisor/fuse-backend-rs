@@ -25,7 +25,11 @@ impl FileSystem for Vfs {
         } else {
             n_opts.out_opts.remove(FsOptions::ZERO_MESSAGE_OPEN);
         }
-        n_opts.no_opendir = !(opts & FsOptions::ZERO_MESSAGE_OPENDIR).is_empty();
+        if n_opts.no_opendir {
+            n_opts.no_opendir = !(opts & FsOptions::ZERO_MESSAGE_OPENDIR).is_empty();
+        } else {
+            n_opts.out_opts.remove(FsOptions::ZERO_MESSAGE_OPENDIR);
+        }
         if n_opts.no_writeback {
             n_opts.out_opts.remove(FsOptions::WRITEBACK_CACHE);
         }
