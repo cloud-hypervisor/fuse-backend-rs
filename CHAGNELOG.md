@@ -1,5 +1,8 @@
 # Changelog
 
+## [0.9.6]
+- Fix no_opendir option handling
+
 ## [0.9.5]
 
 ### Changed
