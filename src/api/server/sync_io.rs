@@ -633,6 +633,9 @@ impl<F: FileSystem + Sync> Server<F> {
                     time_gran: 1, // nanoseconds
                     ..Default::default()
                 };
+                if enabled.contains(FsOptions::BIG_WRITES) {
+                    out.max_write = MAX_REQ_PAGES as u32 * pagesize() as u32;
+                }
                 if enabled.contains(FsOptions::MAX_PAGES) {
                     out.max_pages = MAX_REQ_PAGES;
                     out.max_write = MAX_REQ_PAGES as u32 * pagesize() as u32; // 1MB
