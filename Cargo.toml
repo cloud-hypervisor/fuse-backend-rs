@@ -28,8 +28,8 @@ lazy_static = "1.4"
 tokio = { version = "1", optional = true }
 vmm-sys-util = { version = "0.10", optional = true }
 vm-memory = { version = "0.9", features = ["backend-mmap"] }
-virtio-queue = { version = "0.4", optional = true }
-vhost = { version = "0.4", features = ["vhost-user-slave"], optional = true }
+virtio-queue = { version = "0.6", optional = true }
+vhost = { version = "0.5", features = ["vhost-user-slave"], optional = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 core-foundation-sys = { version = ">=0.8", optional = true }
