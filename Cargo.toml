@@ -25,7 +25,7 @@ log = "0.4.6"
 mio = { version = "0.8", features = ["os-poll", "os-ext"]}
 nix = "0.24"
 lazy_static = "1.4"
-tokio = { version = "1", optional = true }
+tokio = { version = "~1.20", optional = true }
 vmm-sys-util = { version = "0.10", optional = true }
 vm-memory = { version = "0.9", features = ["backend-mmap"] }
 virtio-queue = { version = "0.6", optional = true }
