@@ -1060,16 +1060,28 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
         }
     }
 
-    // When writeback caching is enabled, the kernel may send read requests even if the userspace
-    // program opened the file write-only. So we need to ensure that we have opened the file for
-    // reading as well as writing.
     fn get_writeback_open_flags(&self, flags: i32) -> i32 {
         let mut new_flags = flags;
         let writeback = self.writeback.load(Ordering::Relaxed);
+
+        // When writeback caching is enabled, the kernel may send read requests even if the
+        // userspace program opened the file write-only. So we need to ensure that we have opened
+        // the file for reading as well as writing.
         if writeback && flags & libc::O_ACCMODE == libc::O_WRONLY {
             new_flags &= !libc::O_ACCMODE;
             new_flags |= libc::O_RDWR;
         }
+
+        // When writeback caching is enabled the kernel is responsible for handling `O_APPEND`.
+        // However, this breaks atomicity as the file may have changed on disk, invalidating the
+        // cached copy of the data in the kernel and the offset that the kernel thinks is the end of
+        // the file. Just allow this for now as it is the user's responsibility to enable writeback
+        // caching only for directories that are not shared. It also means that we need to clear the
+        // `O_APPEND` flag.
+        if writeback && flags & libc::O_APPEND != 0 {
+            new_flags &= !libc::O_APPEND;
+        }
+
         new_flags
     }
 }
@@ -1356,7 +1368,8 @@ mod tests {
     #[test]
     fn test_get_writeback_open_flags() {
         // prepare a fs with writeback cache and open being true, so O_WRONLY should be promoted to
-        // O_RDWR, as writeback may read files even if file being opened with write-only.
+        // O_RDWR, as writeback may read files even if file being opened with write-only. And
+        // O_APPEND should be cleared as well.
         let mut fs = prepare_passthroughfs();
         fs.writeback = AtomicBool::new(true);
         fs.no_open = AtomicBool::new(false);
@@ -1371,6 +1384,15 @@ mod tests {
         assert_eq!(fs.get_writeback_open_flags(flags), libc::O_RDONLY);
 
         let flags = libc::O_WRONLY;
+        assert_eq!(fs.get_writeback_open_flags(flags), libc::O_RDWR);
+
+        let flags = libc::O_RDWR | libc::O_APPEND;
+        assert_eq!(fs.get_writeback_open_flags(flags), libc::O_RDWR);
+
+        let flags = libc::O_RDONLY | libc::O_APPEND;
+        assert_eq!(fs.get_writeback_open_flags(flags), libc::O_RDONLY);
+
+        let flags = libc::O_WRONLY | libc::O_APPEND;
         assert_eq!(fs.get_writeback_open_flags(flags), libc::O_RDWR);
 
         // prepare a fs with writeback cache disabled, open flags should not change
@@ -1389,6 +1411,24 @@ mod tests {
 
         let flags = libc::O_WRONLY;
         assert_eq!(fs.get_writeback_open_flags(flags), libc::O_WRONLY);
+
+        let flags = libc::O_RDWR | libc::O_APPEND;
+        assert_eq!(
+            fs.get_writeback_open_flags(flags),
+            libc::O_RDWR | libc::O_APPEND
+        );
+
+        let flags = libc::O_RDONLY | libc::O_APPEND;
+        assert_eq!(
+            fs.get_writeback_open_flags(flags),
+            libc::O_RDONLY | libc::O_APPEND
+        );
+
+        let flags = libc::O_WRONLY | libc::O_APPEND;
+        assert_eq!(
+            fs.get_writeback_open_flags(flags),
+            libc::O_WRONLY | libc::O_APPEND
+        );
     }
 
     #[test]

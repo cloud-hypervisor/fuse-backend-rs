@@ -148,17 +148,7 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
             inode: Inode,
             mut flags: i32,
         ) -> io::Result<File> {
-            let mut new_flags = self.get_writeback_open_flags(flags);
-
-            // When writeback caching is enabled the kernel is responsible for handling `O_APPEND`.
-            // However, this breaks atomicity as the file may have changed on disk, invalidating the
-            // cached copy of the data in the kernel and the offset that the kernel thinks is the end of
-            // the file. Just allow this for now as it is the user's responsibility to enable writeback
-            // caching only for directories that are not shared. It also means that we need to clear the
-            // `O_APPEND` flag.
-            if self.writeback.load(Ordering::Relaxed) && flags & libc::O_APPEND != 0 {
-                new_flags &= !libc::O_APPEND;
-            }
+            let new_flags = self.get_writeback_open_flags(flags);
 
             let data = self.inode_map.get(inode)?;
             let file = data.async_get_file(&self.mount_fds).await?;
