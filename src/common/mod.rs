@@ -24,13 +24,6 @@ pub mod async_runtime;
 #[cfg(feature = "async-io")]
 pub mod mpmc;
 
-// Temporarily include all source code tokio-uring.
-// Will switch to upstream once our enhancement have been merged and new version available.
-#[cfg(all(feature = "async-io", target_os = "linux"))]
-pub mod tokio_uring;
-#[cfg(all(feature = "async-io", target_os = "linux"))]
-pub(crate) use self::tokio_uring::{buf, driver, fs, future, BufResult};
-
 #[cfg(target_os = "linux")]
 #[doc(hidden)]
 pub use libc::{off64_t, pread64, preadv64, pwrite64, pwritev64};

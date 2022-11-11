@@ -12,7 +12,7 @@ pub enum Runtime {
     Tokio(tokio::runtime::Runtime),
     #[cfg(target_os = "linux")]
     /// Tokio-uring Runtime.
-    Uring(std::sync::Mutex<crate::tokio_uring::Runtime>),
+    Uring(std::sync::Mutex<tokio_uring::Runtime>),
 }
 
 impl Runtime {
@@ -28,7 +28,7 @@ impl Runtime {
         #[cfg(target_os = "linux")]
         {
             // TODO: use io-uring probe to detect supported operations.
-            if let Ok(rt) = crate::tokio_uring::Runtime::new() {
+            if let Ok(rt) = tokio_uring::Runtime::new(&tokio_uring::builder()) {
                 return Runtime::Uring(std::sync::Mutex::new(rt));
             }
         }
@@ -93,7 +93,7 @@ pub fn spawn<T: std::future::Future + 'static>(task: T) -> tokio::task::JoinHand
     CURRENT_RUNTIME.with(|rt| match rt {
         Runtime::Tokio(_) => tokio::task::spawn_local(task),
         #[cfg(target_os = "linux")]
-        Runtime::Uring(_) => crate::tokio_uring::spawn(task),
+        Runtime::Uring(_) => tokio_uring::spawn(task),
     })
 }
 
