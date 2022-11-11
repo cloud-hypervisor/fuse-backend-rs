@@ -455,11 +455,11 @@ mod async_io {
     use std::sync::Arc;
 
     use tokio::join;
+    use tokio_uring::buf::IoBuf;
 
     use super::*;
     use crate::async_file::File;
     use crate::file_buf::FileVolatileBuf;
-    use crate::tokio_uring::buf::IoBuf;
 
     /// Extension of [FileReadWriteVolatile] to support io-uring based asynchronous IO.
     ///
