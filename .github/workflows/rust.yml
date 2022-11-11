@@ -15,6 +15,8 @@ jobs:
     steps:
     - uses: actions/checkout@v2
     - name: build and check
+      env:
+        RUST_BACKTRACE: 1
       run: make check
     - name: smoke
       run: make docker-smoke
