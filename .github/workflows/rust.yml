@@ -8,30 +8,39 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
 
 jobs:
   CI:
     runs-on: ubuntu-latest
     steps:
-    - uses: actions/checkout@v2
+    - uses: actions/checkout@v3
+
+    - name: Install Rust
+      uses: actions-rs/toolchain@v1
+      with:
+        profile: minimal
+        toolchain: stable
+        override: true
+
     - name: build and check
-      env:
-        RUST_BACKTRACE: 1
       run: make check
     - name: smoke
       run: make docker-smoke
+
   Macos-CI:
     runs-on: macos-latest
     steps:
       - name: Install macfuse
         run: brew install --cask macfuse
-      - uses: actions/checkout@v2
+      - uses: actions/checkout@v3
       - name: build and check
         run: make check-macos
+
   deny:
     name: Cargo Deny
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v2
+      - uses: actions/checkout@v3
       - uses: EmbarkStudios/cargo-deny-action@v1
