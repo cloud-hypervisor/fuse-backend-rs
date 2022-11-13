@@ -20,6 +20,7 @@ build = "build.rs"
 arc-swap = "1.5"
 async-trait = { version = "0.1.42", optional = true }
 bitflags = "1.1"
+io-uring = { version = "0.5.8", optional = true }
 libc = "0.2.68"
 log = "0.4.6"
 mio = { version = "0.8", features = ["os-poll", "os-ext"]}
@@ -46,7 +47,7 @@ vm-memory = { version = "0.9", features = ["backend-mmap", "backend-bitmap"] }
 
 [features]
 default = ["fusedev"]
-async-io = ["async-trait", "tokio-uring", "tokio/fs", "tokio/net", "tokio/sync", "tokio/rt", "tokio/macros"]
+async-io = ["async-trait", "tokio-uring", "tokio/fs", "tokio/net", "tokio/sync", "tokio/rt", "tokio/macros", "io-uring"]
 fusedev = ["vmm-sys-util", "caps", "core-foundation-sys"]
 virtiofs = ["virtio-queue", "caps"]
 vhost-user-fs = ["virtiofs", "vhost", "caps"]
