@@ -292,7 +292,7 @@ impl<S: BitmapSlice> IoBuffers<'_, S> {
         if bufs.is_empty() {
             Ok(0)
         } else {
-            let bytes_consumed = f(&*bufs)?;
+            let bytes_consumed = f(&bufs)?;
             if mark_dirty {
                 self.mark_dirty(bytes_consumed);
             }
