@@ -19,7 +19,7 @@ pub enum File {
     Tokio(tokio::fs::File),
     #[cfg(target_os = "linux")]
     /// Tokio-uring asynchronous `File`.
-    Uring(RawFd),
+    Uring(tokio_uring::fs::File),
 }
 
 impl File {
@@ -44,13 +44,7 @@ impl File {
                 .create(create)
                 .open(path)
                 .await
-                .map(|v| {
-                    // Convert the tokio_uring::fs::File object into RawFd(): v.into_raw_fd().
-                    let file = File::Uring(v.as_raw_fd());
-                    std::mem::forget(v);
-                    file
-                }),
-            _ => panic!("should not happen"),
+                .map(File::Uring),
         }
     }
 
@@ -69,15 +63,7 @@ impl File {
                 (res, bufs[0])
             }
             #[cfg(target_os = "linux")]
-            File::Uring(fd) => {
-                // Safety: we rely on tokio_uring::fs::File internal implementation details.
-                // It should be implemented as self.async_try_clone().await.unwrap().read_at,
-                // but that causes two more syscalls.
-                let file = unsafe { tokio_uring::fs::File::from_raw_fd(*fd) };
-                let res = file.read_at(buf, offset).await;
-                std::mem::forget(file);
-                res
-            }
+            File::Uring(f) => f.read_at(buf, offset).await,
         }
     }
 
@@ -95,15 +81,7 @@ impl File {
                 (res, bufs)
             }
             #[cfg(target_os = "linux")]
-            File::Uring(fd) => {
-                // Safety: we rely on tokio_uring::fs::File internal implementation details.
-                // It should be implemented as self.async_try_clone().await.unwrap().readv_at,
-                // but that causes two more syscalls.
-                let file = unsafe { tokio_uring::fs::File::from_raw_fd(*fd) };
-                let res = file.readv_at(bufs, offset).await;
-                std::mem::forget(file);
-                res
-            }
+            File::Uring(f) => f.readv_at(bufs, offset).await,
         }
     }
 
@@ -122,15 +100,7 @@ impl File {
                 (res, bufs[0])
             }
             #[cfg(target_os = "linux")]
-            File::Uring(fd) => {
-                // Safety: we rely on tokio_uring::fs::File internal implementation details.
-                // It should be implemented as self.async_try_clone().await.unwrap().write_at,
-                // but that causes two more syscalls.
-                let file = unsafe { tokio_uring::fs::File::from_raw_fd(*fd) };
-                let res = file.write_at(buf, offset).await;
-                std::mem::forget(file);
-                res
-            }
+            File::Uring(f) => f.write_at(buf, offset).await,
         }
     }
 
@@ -148,15 +118,7 @@ impl File {
                 (res, bufs)
             }
             #[cfg(target_os = "linux")]
-            File::Uring(fd) => {
-                // Safety: we rely on tokio_uring::fs::File internal implementation details.
-                // It should be implemented as self.async_try_clone().await.unwrap().writev_at,
-                // but that causes two more syscalls.
-                let file = unsafe { tokio_uring::fs::File::from_raw_fd(*fd) };
-                let res = file.writev_at(bufs, offset).await;
-                std::mem::forget(file);
-                res
-            }
+            File::Uring(f) => f.writev_at(bufs, offset).await,
         }
     }
 
@@ -174,13 +136,16 @@ impl File {
         match self {
             File::Tokio(f) => f.try_clone().await.map(File::Tokio),
             #[cfg(target_os = "linux")]
-            File::Uring(fd) => {
+            File::Uring(f) => {
                 // Safe because file.as_raw_fd() is valid RawFd and we have checked the result.
-                let fd = unsafe { libc::dup(*fd) };
+                let fd = unsafe { libc::dup(f.as_raw_fd()) };
                 if fd < 0 {
                     Err(std::io::Error::last_os_error())
                 } else {
-                    Ok(File::Uring(fd))
+                    // Safe because we dup a new raw fd.
+                    Ok(File::Uring(unsafe {
+                        tokio_uring::fs::File::from_raw_fd(fd)
+                    }))
                 }
             }
         }
@@ -192,7 +157,7 @@ impl AsRawFd for File {
         match self {
             File::Tokio(f) => f.as_raw_fd(),
             #[cfg(target_os = "linux")]
-            File::Uring(fd) => *fd,
+            File::Uring(f) => f.as_raw_fd(),
         }
     }
 }
@@ -201,15 +166,6 @@ impl Debug for File {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         let fd = self.as_raw_fd();
         write!(f, "Async File {}", fd)
-    }
-}
-
-impl Drop for File {
-    fn drop(&mut self) {
-        #[cfg(target_os = "linux")]
-        if let File::Uring(fd) = self {
-            let _ = unsafe { tokio_uring::fs::File::from_raw_fd(*fd) };
-        }
     }
 }
 
