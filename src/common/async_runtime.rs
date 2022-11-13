@@ -6,6 +6,66 @@
 
 use std::future::Future;
 
+use lazy_static::lazy_static;
+
+lazy_static! {
+    pub(crate) static ref RUNTIME_TYPE: RuntimeType = RuntimeType::new();
+}
+
+pub(crate) enum RuntimeType {
+    Tokio,
+    #[cfg(target_os = "linux")]
+    Uring,
+}
+
+impl RuntimeType {
+    fn new() -> Self {
+        #[cfg(target_os = "linux")]
+        {
+            if Self::probe_io_uring() {
+                return Self::Uring;
+            }
+        }
+        Self::Tokio
+    }
+
+    #[cfg(target_os = "linux")]
+    fn probe_io_uring() -> bool {
+        use io_uring::{opcode, IoUring, Probe};
+
+        let io_uring = match IoUring::new(1) {
+            Ok(io_uring) => io_uring,
+            Err(_) => {
+                return false;
+            }
+        };
+        let submitter = io_uring.submitter();
+
+        let mut probe = Probe::new();
+
+        // Check we can register a probe to validate supported operations.
+        if let Err(_) = submitter.register_probe(&mut probe) {
+            return false;
+        }
+
+        // Check IORING_OP_FSYNC is supported
+        if !probe.is_supported(opcode::Fsync::CODE) {
+            return false;
+        }
+
+        // Check IORING_OP_READ is supported
+        if !probe.is_supported(opcode::Read::CODE) {
+            return false;
+        }
+
+        // Check IORING_OP_WRITE is supported
+        if !probe.is_supported(opcode::Write::CODE) {
+            return false;
+        }
+        return true;
+    }
+}
+
 /// An adapter enum to support both tokio current-thread Runtime and tokio-uring Runtime.
 pub enum Runtime {
     /// Tokio current thread Runtime.
@@ -26,8 +86,7 @@ impl Runtime {
     pub fn new() -> Self {
         // Check whether io-uring is available.
         #[cfg(target_os = "linux")]
-        {
-            // TODO: use io-uring probe to detect supported operations.
+        if matches!(*RUNTIME_TYPE, RuntimeType::Uring) {
             if let Ok(rt) = tokio_uring::Runtime::new(&tokio_uring::builder()) {
                 return Runtime::Uring(std::sync::Mutex::new(rt));
             }

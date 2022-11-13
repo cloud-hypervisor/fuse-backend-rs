@@ -9,7 +9,7 @@ use std::io::{ErrorKind, IoSlice, IoSliceMut};
 use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
 use std::path::Path;
 
-use crate::async_runtime::{Runtime, CURRENT_RUNTIME};
+use crate::async_runtime::{RuntimeType, RUNTIME_TYPE};
 use crate::file_buf::FileVolatileBuf;
 use crate::{off64_t, preadv64, pwritev64};
 
@@ -29,14 +29,8 @@ impl File {
         write: bool,
         create: bool,
     ) -> std::io::Result<Self> {
-        let ty = CURRENT_RUNTIME.with(|rt| match rt {
-            Runtime::Tokio(_) => 1,
-            #[cfg(target_os = "linux")]
-            Runtime::Uring(_) => 2,
-        });
-
-        match ty {
-            1 => tokio::fs::OpenOptions::new()
+        match *RUNTIME_TYPE {
+            RuntimeType::Tokio => tokio::fs::OpenOptions::new()
                 .read(true)
                 .write(write)
                 .create(create)
@@ -44,7 +38,7 @@ impl File {
                 .await
                 .map(File::Tokio),
             #[cfg(target_os = "linux")]
-            2 => tokio_uring::fs::OpenOptions::new()
+            RuntimeType::Uring => tokio_uring::fs::OpenOptions::new()
                 .read(true)
                 .write(write)
                 .create(create)
