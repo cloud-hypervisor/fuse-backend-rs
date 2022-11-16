@@ -6,6 +6,7 @@
 
 #![allow(missing_docs)]
 
+use std::fmt::{Debug, Formatter};
 use std::mem;
 
 use bitflags::bitflags;
@@ -1169,7 +1170,7 @@ pub struct FallocateIn {
 unsafe impl ByteValued for FallocateIn {}
 
 #[repr(C)]
-#[derive(Debug, Default, Copy, Clone)]
+#[derive(Default, Copy, Clone)]
 pub struct InHeader {
     pub len: u32,
     pub opcode: u32,
@@ -1181,6 +1182,16 @@ pub struct InHeader {
     pub padding: u32,
 }
 unsafe impl ByteValued for InHeader {}
+
+impl Debug for InHeader {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "InHeader {{ len: {}, opcode: {}, unique: {}, nodeid: 0x{:x}, uid: {}, gid: {}, pid: {}, padding: {} }}",
+            self.len, self.opcode, self.unique, self.nodeid, self.uid, self.gid, self.pid, self.padding
+        )
+    }
+}
 
 #[repr(C)]
 #[derive(Debug, Default, Copy, Clone)]

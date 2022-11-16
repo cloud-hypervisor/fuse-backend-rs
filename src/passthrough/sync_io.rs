@@ -607,7 +607,7 @@ impl<S: BitmapSlice + Send + Sync> FileSystem for PassthroughFs<S> {
         vu_req: &mut dyn FsCacheReqHandler,
     ) -> io::Result<()> {
         debug!(
-            "fuse: setupmapping ino {:?} foffset {} len {} flags {} moffset {}",
+            "fuse: setupmapping ino {:?} foffset 0x{:x} len 0x{:x} flags 0x{:x} moffset 0x{:x}",
             inode, foffset, len, flags, moffset
         );
 
