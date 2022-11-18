@@ -105,7 +105,13 @@ impl FileSystem for Vfs {
     ) -> Result<(stat64, Duration)> {
         match self.get_real_rootfs(inode)? {
             (Left(fs), idata) => fs.getattr(ctx, idata.ino(), handle),
-            (Right(fs), idata) => fs.getattr(ctx, idata.ino(), handle),
+            (Right(fs), idata) => {
+                fs.getattr(ctx, idata.ino(), handle)
+                    .map(|(mut attr, duration)| {
+                        attr.st_ino = idata.into();
+                        (attr, duration)
+                    })
+            }
         }
     }
 
@@ -119,7 +125,13 @@ impl FileSystem for Vfs {
     ) -> Result<(stat64, Duration)> {
         match self.get_real_rootfs(inode)? {
             (Left(fs), idata) => fs.setattr(ctx, idata.ino(), attr, handle, valid),
-            (Right(fs), idata) => fs.setattr(ctx, idata.ino(), attr, handle, valid),
+            (Right(fs), idata) => {
+                fs.setattr(ctx, idata.ino(), attr, handle, valid)
+                    .map(|(mut attr, duration)| {
+                        attr.st_ino = idata.into();
+                        (attr, duration)
+                    })
+            }
         }
     }
 
@@ -574,7 +586,7 @@ impl FileSystem for Vfs {
                             entry.inode = dir_entry.ino;
                         }
                     }
-
+                    entry.attr.st_ino = entry.inode;
                     add_entry(dir_entry, entry)
                 },
             ),
@@ -585,8 +597,10 @@ impl FileSystem for Vfs {
                 handle,
                 size,
                 offset,
-                &mut |dir_entry, mut entry| {
-                    entry.inode = self.convert_inode(idata.fs_idx(), entry.inode)?;
+                &mut |mut dir_entry, mut entry| {
+                    dir_entry.ino = self.convert_inode(idata.fs_idx(), entry.inode)?;
+                    entry.inode = dir_entry.ino;
+                    entry.attr.st_ino = entry.inode;
                     add_entry(dir_entry, entry)
                 },
             ),
