@@ -585,8 +585,9 @@ impl FileSystem for Vfs {
                 handle,
                 size,
                 offset,
-                &mut |dir_entry, mut entry| {
+                &mut |mut dir_entry, mut entry| {
                     entry.inode = self.convert_inode(idata.fs_idx(), entry.inode)?;
+                    dir_entry.ino = entry.inode;
                     add_entry(dir_entry, entry)
                 },
             ),
