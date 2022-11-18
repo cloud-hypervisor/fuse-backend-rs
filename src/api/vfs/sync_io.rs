@@ -105,7 +105,10 @@ impl FileSystem for Vfs {
     ) -> Result<(stat64, Duration)> {
         match self.get_real_rootfs(inode)? {
             (Left(fs), idata) => fs.getattr(ctx, idata.ino(), handle),
-            (Right(fs), idata) => fs.getattr(ctx, idata.ino(), handle),
+            (Right(fs), idata) => fs.getattr(ctx, idata.ino(), handle).map(|(mut st, du)| {
+                st.st_ino = idata.ino();
+                (st, du)
+            }),
         }
     }
 
@@ -119,7 +122,11 @@ impl FileSystem for Vfs {
     ) -> Result<(stat64, Duration)> {
         match self.get_real_rootfs(inode)? {
             (Left(fs), idata) => fs.setattr(ctx, idata.ino(), attr, handle, valid),
-            (Right(fs), idata) => fs.setattr(ctx, idata.ino(), attr, handle, valid),
+            (Right(fs), idata) => {
+                let mut attr = attr;
+                attr.st_ino = idata.ino();
+                fs.setattr(ctx, idata.ino(), attr, handle, valid)
+            }
         }
     }
 
