@@ -1,4 +1,29 @@
 # Changelog
+## [Unreleased]
+
+## [0.10.0]
+
+### Added
+- [#96](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/96): async_runtime: add probe of io_uring support
+- [#88](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/88): add ability to disallow operations that could change file size
+
+### Fixed
+- [#98](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/98): vfs: fix incorrect st_ino in entry.attr
+- [#93](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/93): fix BIG_WRITES doesn't work
+
+### Removed
+- [#96](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/96): async_runtime: remove thread_local of Runtime
+- [#96](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/96): remove temporarily tokio-uring module
+
+### Changed
+- [#97](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/97): log: print some variables in hexadecimal
+- [#96](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/96): async_runtime: improved async file implement
+- [#95](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/95): open file with O_APPEND cleared when writeback is enabled
+- [#90](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/90): open file for reading if writeback cache is enabled
+
+### Upgraded
+- virtio-queue from 0.4 to 0.6
+- vhost from 0.4 to 0.5
 
 ## [0.9.6]
 - Fix no_opendir option handling
