@@ -120,6 +120,7 @@ pub mod api;
 #[cfg(all(any(feature = "fusedev", feature = "virtiofs"), target_os = "linux"))]
 pub mod passthrough;
 pub mod transport;
+pub mod overlayfs;
 
 pub mod common;
 pub use self::common::*;
