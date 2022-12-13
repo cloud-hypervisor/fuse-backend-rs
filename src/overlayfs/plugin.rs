@@ -9,13 +9,14 @@ use std::io::{Error, ErrorKind};
 use self::super::layer::Layer;
 use self::super::PLUGIN_PREFIX;
 use self::super::direct::Direct;
+use self::super::BoxedLayer;
 
 /// ! plugin trait
 pub trait Plugin {
 	///! name
 	fn name(&self) -> String;
 	///! load data source
-	fn load(&self, opaque: String) -> Result<LinkedList<Arc<Box<dyn Layer>>>>;
+	fn load(&self, opaque: String, upper: bool) -> Result<LinkedList<Arc<BoxedLayer>>>;
 	///! release plugin
 	fn release(&self) -> Result<()>;
 }
@@ -53,7 +54,7 @@ pub fn find_plugin(manager: &PluginManager, name: String) -> Option<Arc<Box<dyn 
 	manager.get_plugin(name)
 }
 
-pub fn process_onelayer(manager: &PluginManager, opaque: String) -> Result<LinkedList<Arc<Box<dyn Layer>>>> {
+pub fn process_onelayer(manager: &PluginManager, opaque: String, upper: bool) -> Result<LinkedList<Arc<BoxedLayer>>> {
 	if opaque.starts_with(PLUGIN_PREFIX) {
 		// plugin
 		let striped = opaque.strip_prefix(PLUGIN_PREFIX).unwrap();
@@ -74,10 +75,10 @@ pub fn process_onelayer(manager: &PluginManager, opaque: String) -> Result<Linke
 		};
 
 		// load layers from plugin
-		return plugin.load(plugin_params.into());
+		return plugin.load(plugin_params.into(), upper);
 
 	} else {
 		// directory
-		return Direct::new(opaque);
+		return Direct::new(opaque, upper);
 	}
 }
