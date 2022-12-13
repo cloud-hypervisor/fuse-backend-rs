@@ -110,10 +110,10 @@ pub enum CachePolicy {
 pub struct OverlayFs {
 	// should be in daemon structure
 	pub config: Config,
-	pub layers: Mutex<LinkedList<Arc<BoxedLayer>>>,
-	pub upper_layer: Mutex<Option<Arc<BoxedLayer>>>,
+	pub layers: LinkedList<Arc<BoxedLayer>>,
+	pub upper_layer: Option<Arc<BoxedLayer>>,
 	// inode management..
-	pub root: Mutex<Option<Arc<OverlayInode>>>,
+	pub root: Option<Arc<OverlayInode>>,
 	pub inodes: Mutex<HashMap<u64, Arc<OverlayInode>>>, 
 	pub next_inode: AtomicU64,
 
@@ -358,10 +358,10 @@ impl OverlayFs {
 		// load root inode
 		Ok(OverlayFs {
 				config: params,
-				upper_layer: Mutex::new(upper_layer),
-				layers: Mutex::new(layers),
+				upper_layer,
+				layers,
 				inodes: Mutex::new(HashMap::new()),
-				root: Mutex::new(None),
+				root: None,
 				next_inode: AtomicU64::new(FUSE_ROOT_ID + 1),
 				handles: Mutex::new(HashMap::new()),
 				next_handle: AtomicU64::new(1),
@@ -383,7 +383,7 @@ impl OverlayFs {
 		let ctx = Context::default();
 
 		let mut first= true;
-		for layer in self.layers.lock().unwrap().iter() {
+		for layer in self.layers.iter() {
 			let (opaque, _ino) = layer.is_opaque_whiteout(&ctx, FUSE_ROOT_ID)?;
 			let real = RealInode {
 				layer: Some(Arc::clone(layer)),
@@ -418,7 +418,7 @@ impl OverlayFs {
 		let ctx = Context::default();
 		self.load_directory(&ctx, Arc::clone(&root_node))?;
 
-		self.root = Mutex::new(Some(root_node));
+		self.root = Some(root_node);
 
 		Ok(())
 	}
@@ -739,7 +739,7 @@ impl OverlayFs {
 	}
 
 	pub fn get_first_layer(&self) -> Option<Arc<BoxedLayer>> {
-		if let Some(v) = self.layers.lock().unwrap().front() {
+		if let Some(v) = self.layers.front() {
 			Some(Arc::clone(v))
 		} else {
 			None
@@ -747,7 +747,7 @@ impl OverlayFs {
 	}
 
 	pub fn get_upper_layer(&self) -> Option<Arc<BoxedLayer>> {
-		if let Some(ref v) = self.upper_layer.lock().unwrap().as_ref() {
+		if let Some(ref v) = self.upper_layer.as_ref() {
 			Some(Arc::clone(v))
 		} else {
 			None
@@ -755,9 +755,9 @@ impl OverlayFs {
 	}
 
 	pub fn get_first_lower_layer(&self) -> Option<Arc<BoxedLayer>> {
-		if let Some(ref _v) = self.upper_layer.lock().unwrap().as_ref() {
+		if let Some(ref _v) = self.upper_layer.as_ref() {
 			let mut index = 0;
-			for layer in self.layers.lock().unwrap().iter() {
+			for layer in self.layers.iter() {
 				if index == 1 {
 					return Some(Arc::clone(layer));
 				}
@@ -766,7 +766,7 @@ impl OverlayFs {
 
 			None
 		} else {
-			if let Some(v) = self.layers.lock().unwrap().front() {
+			if let Some(v) = self.layers.front() {
 				Some(Arc::clone(v))
 			} else {
 				None
@@ -1165,7 +1165,7 @@ impl OverlayFs {
 	}
 
 	pub fn do_rm(&self, ctx: &Context, parent: u64, name: &CStr, dir: bool) -> Result<()> {
-		let upper = if let Some(ref v) = self.upper_layer.lock().unwrap().as_ref() {
+		let upper = if let Some(ref v) = self.upper_layer.as_ref() {
 			Arc::clone(v)
 		} else {
 			return Err(Error::from_raw_os_error(libc::EROFS));
@@ -1353,7 +1353,7 @@ impl OverlayFs {
 
 impl BackendFileSystem for OverlayFs {
 	fn mount(&self) -> Result<(Entry, u64)> {
-		if let Some(ref root) = self.root.lock().unwrap().as_ref() {
+		if let Some(ref root) = self.root.as_ref() {
 			let ctx = Context::default();
 			Ok((Entry {
 				inode: root.inode,
@@ -1505,7 +1505,7 @@ impl FileSystem for OverlayFs {
 		if let Some(p) = node.parent.lock().unwrap().upgrade() {
 			cs.push(p);	
 		} else {
-			cs.push(Arc::clone(self.root.lock().unwrap().as_ref().unwrap()));
+			cs.push(Arc::clone(self.root.as_ref().unwrap()));
 		};
 
 		for (_, child) in node.childrens.lock().unwrap().iter() {
@@ -1780,7 +1780,7 @@ impl FileSystem for OverlayFs {
 		}
 
 		// create file in upper layer
-		if let Some(ref upper_layer) = self.upper_layer.lock().unwrap().as_ref() {
+		if let Some(ref upper_layer) = self.upper_layer.as_ref() {
 			let (entry, h, o) = upper_layer.create(ctx, real_parent_inode, name, hargs)?;
 
 			// record inode, handle
