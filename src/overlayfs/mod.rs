@@ -441,6 +441,7 @@ impl OverlayFs {
 
 		new.first_inode = Mutex::new(Arc::clone(&real_inode));
 		new.last_inode = Mutex::new(Arc::clone(&real_inode));
+		new.lookups = Mutex::new(1);
 		if layer.is_upper() {
 			new.upper_inode = Mutex::new(Some(Arc::clone(&real_inode)));
 		}
@@ -779,29 +780,35 @@ impl OverlayFs {
 			return;
 		}
 
-		if let Some(v) = self.inodes.lock().unwrap().get(&inode) {
-			// lock up lookups
-			let mut lookups = v.lookups.lock().unwrap();
-
-			if *lookups < count {
-				*lookups = 0;
+		let v =  {
+			if let Some(n) = self.inodes.lock().unwrap().get(&inode) {
+				Arc::clone(n)
 			} else {
-				*lookups -= count;
+				return;
 			}
+		};
+		// lock up lookups
+		let mut lookups = v.lookups.lock().unwrap();
 
-			// remove it from hashmap
-
-			if *lookups == 0 {
-				self.inodes.lock().unwrap().remove(&inode);
-				let parent = v.parent.lock().unwrap();
-
-				if let Some(p) = parent.upgrade() {
-					p.childrens.lock().unwrap().remove(v.name.as_str());
-				}
-			}
-
-			// FIXME: is it possible that the inode still in childrens map?
+		if *lookups < count {
+			*lookups = 0;
+		} else {
+			*lookups -= count;
 		}
+
+		// remove it from hashmap
+
+		if *lookups == 0 {
+			self.inodes.lock().unwrap().remove(&inode);
+			let parent = v.parent.lock().unwrap();
+
+			if let Some(p) = parent.upgrade() {
+				p.childrens.lock().unwrap().remove(v.name.as_str());
+				p.loaded.store(true, Ordering::Relaxed);
+			}
+		}
+
+		// FIXME: is it possible that the inode still in childrens map?
 	}
 	
 	pub fn do_statvfs(&self, ctx: &Context, inode: Inode) -> Result<libc::statvfs64> {
@@ -842,9 +849,15 @@ impl OverlayFs {
 			return Ok(());
 		}
 
+		// FIXME: if offset == 0, need to reconstruct dir for this handle
+		// if offset == 0 {
+		// reconstruct directory
+		// }
+
 		// lookup the directory
 		if let Some(dir) = self.handles.lock().unwrap().get(&handle) {
 			let mut len: usize = 0;
+			print!("dir: {}, off: {}, size: {}", dir.node.path.as_str(), offset, size);
 
 			let childrens = 
 			if let Some(ref cs) = dir.childrens {
@@ -854,7 +867,7 @@ impl OverlayFs {
 			};
 
 			if offset >= childrens.len() as u64 {
-				return Err(Error::new(ErrorKind::InvalidInput, "invalid offset!"));
+				return Ok(());
 			}
 
 			let mut index: u64 = 0;
@@ -870,7 +883,7 @@ impl OverlayFs {
 					let st = child.stat64(ctx)?;
 					let dir_entry = DirEntry {
 						ino: st.st_ino,
-						offset: index,
+						offset: index + 1,
 						type_: entry_type_from_mode(st.st_mode) as u32,
 						name: name.as_bytes(),
 					};
@@ -1423,6 +1436,8 @@ impl FileSystem for OverlayFs {
 	}
 
 	fn lookup(&self, ctx: &Context, parent: Inode, name: &CStr) -> Result<Entry> {
+		let tmp =name.to_string_lossy().into_owned().to_owned();
+		trace!("LOOKUP: parent: {}, name: {}\n", parent, tmp);
 		let node = self.lookup_node(ctx, parent, name)?;
 
 		if node.whiteout.load(Ordering::Relaxed) {
@@ -1530,13 +1545,18 @@ impl FileSystem for OverlayFs {
 	}
 
 	fn releasedir(&self, ctx: &Context, inode: Inode, flags: u32, handle: Handle) -> Result<()> {
-		if let Some(v) = self.handles.lock().unwrap().get(&handle) {
-			for child in v.childrens.as_ref().unwrap() {
-				self.forget_one(child.inode, 1);
-			}
+		trace!("RELEASEDIR: inode: {}, handle: {}\n", inode, handle);
+		{
+			if let Some(v) = self.handles.lock().unwrap().get(&handle) {
+				for child in v.childrens.as_ref().unwrap() {
+					self.forget_one(child.inode, 1);
+				}
 
-			self.forget_one(v.node.inode, 1);
+				self.forget_one(v.node.inode, 1);
+			}
 		}
+
+		trace!("RELEASEDIR: returning");
 
 		self.handles.lock().unwrap().remove(&handle);
 
@@ -1878,6 +1898,7 @@ impl FileSystem for OverlayFs {
 	}
 
 	fn getattr(&self, ctx: &Context, inode: Inode, handle: Option<Handle>) -> Result<(libc::stat64, Duration)> {
+		trace!("GETATTR: inode: {}\n", inode);
 		if let Some(h) = handle {
 			if let Some(hd) = self.handles.lock().unwrap().get(&h) {
 				if let Some(ref v) = hd.real_handle {

@@ -32,10 +32,12 @@ impl Direct {
 		config.do_import = false;
 		let fs = PassthroughFs::new(config)?;
 
-		let layer = Direct{
+		let mut layer = Direct{
 			upper,
 			fs,
 		};
+
+		layer.init_layer()?;
 
 		let mut list = LinkedList::new();
 		list.push_back(Arc::new(Box::new(layer) as BoxedLayer));
@@ -46,7 +48,7 @@ impl Direct {
 
 impl Layer for Direct {
 	fn init_layer(&mut self) -> Result<()> {
-		Ok(())
+		self.fs.import()
 	}
 
 	fn cleanup(&mut self) -> Result<()> {
