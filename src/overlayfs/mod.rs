@@ -413,9 +413,12 @@ impl OverlayFs {
 		let root_node = Arc::new(root);
 
 		// insert root inode into hash
-		self.inodes.lock().unwrap().insert(FUSE_ROOT_ID, Arc::clone(&root_node));
+		{
+			self.inodes.lock().unwrap().insert(FUSE_ROOT_ID, Arc::clone(&root_node));
+		}
 
 		let ctx = Context::default();
+		trace!("loading root directory\n");
 		self.load_directory(&ctx, Arc::clone(&root_node))?;
 
 		self.root = Some(root_node);
@@ -512,11 +515,13 @@ impl OverlayFs {
 		let mut new = OverlayInode::new();
 
 		// lookup until meet whiteout/opaque whiteout/file in lower layer..
-		if let Some(ref ri) = *pnode.upper_inode.lock().unwrap() {
-			// find an entry
-			if let Some(ris) = ri.lookup_node(ctx, name)? {
-				node_inited = true;
-				new = self.make_overlay_inode(&ris, Arc::clone(ri.layer.as_ref().unwrap()))?;
+		{
+			if let Some(ref ri) = *pnode.upper_inode.lock().unwrap() {
+				// find an entry
+				if let Some(ris) = ri.lookup_node(ctx, name)? {
+					node_inited = true;
+					new = self.make_overlay_inode(&ris, Arc::clone(ri.layer.as_ref().unwrap()))?;
+				}
 			}
 		}
 
@@ -676,7 +681,16 @@ impl OverlayFs {
 	}
 
 	pub fn load_directory(&self, ctx: &Context, node: Arc<OverlayInode>) -> Result<()> {
-		if let Some(ref ui) = *node.upper_inode.lock().unwrap() {
+		let tmp_ui = {
+			if let Some(ref v) = *node.upper_inode.lock().unwrap() {
+				Some(Arc::clone(v))
+			} else {
+				None
+			}
+		};
+
+		if let Some(ref ui) = tmp_ui {
+			trace!("load upper for {}", node.path.as_str());
 			// upper layer
 			if ui.whiteout.load(Ordering::Relaxed) || ui.invalid.load(Ordering::Relaxed) {
 				return Ok(());
@@ -702,6 +716,7 @@ impl OverlayFs {
 		// read out directories from each layer
 		'layer_loop:
 		for li in &node.lower_inodes {
+			trace!("loading lower for {}", node.path.as_str());
 			if li.whiteout.load(Ordering::Relaxed) || li.invalid.load(Ordering::Relaxed) {
 				break 'layer_loop;
 			}
@@ -1197,6 +1212,7 @@ impl OverlayFs {
 		if dir {
 			self.reload_directory(ctx, Arc::clone(&node))?;
 			let (count, whiteouts, opaque) = node.count_entries_and_whiteout(ctx)?;
+			trace!("files: {}, whiteouts: {} opaque: {}\n", count, whiteouts, opaque);
 			if count > 0 {
 				return Err(Error::from_raw_os_error(libc::ENOTEMPTY));
 			}
@@ -1207,9 +1223,11 @@ impl OverlayFs {
 					self.empty_node_directory(ctx, Arc::clone(&node))?;
 				}
 			}
+
+			trace!("whiteouts deleted!\n");
 		}
 
-		let mut need_whiteout = false;
+		let mut need_whiteout = true;
 		let pnode = self.copy_node_up(ctx, Arc::clone(&pnode))?;
 
 		if node.upper_layer_only() {
@@ -1233,14 +1251,23 @@ impl OverlayFs {
 			}
 		}
 
+		trace!("toggling children and inodes hash\n");
+
+		{
+			pnode.childrens.lock().unwrap().remove(node.name.as_str());
+			self.inodes.lock().unwrap().remove(&node.inode);
+		}
+
 		let sname = name.to_string_lossy().into_owned().to_owned();
 
 		if need_whiteout {
+			trace!("do_rm: creating whiteout\n");
 			layer.create_whiteout(ctx, real_parent_inode, sname.as_str())?;
+			pnode.loaded.store(false, Ordering::Relaxed);
+			// readd whiteout node
+			self.lookup_node(ctx, parent, name)?;
+			pnode.loaded.store(true, Ordering::Relaxed);
 		}
-
-		pnode.childrens.lock().unwrap().remove(node.name.as_str());
-		self.inodes.lock().unwrap().remove(&node.inode);
 
 		Ok(())
 	}
@@ -1274,7 +1301,16 @@ impl OverlayFs {
 			}
 		}
 
-		for (_, child) in node.childrens.lock().unwrap().iter() {
+		let iter = {
+			let mut all = Vec::new();
+			for (_, v) in node.childrens.lock().unwrap().iter() {
+				all.push(Arc::clone(v));
+			}
+
+			all
+		};
+
+		for child in &iter {
 			if child.in_upper_layer() {
 				if child.whiteout.load(Ordering::Relaxed) {
 					layer.delete_whiteout(ctx, real_inode, child.name.as_str())?
@@ -1293,9 +1329,11 @@ impl OverlayFs {
 					}
 				}
 
-				// delete the child
-				self.inodes.lock().unwrap().remove(&child.inode);
-				node.childrens.lock().unwrap().remove(child.name.as_str());
+				{
+					// delete the child
+					self.inodes.lock().unwrap().remove(&child.inode);
+					node.childrens.lock().unwrap().remove(child.name.as_str());
+				}
 			}
 
 		}
@@ -1457,6 +1495,7 @@ impl FileSystem for OverlayFs {
 		// load this directory here
 		if st.st_mode & libc::S_IFMT == libc::S_IFDIR {
 			self.load_directory(ctx, Arc::clone(&node))?;
+			node.loaded.store(true, Ordering::Relaxed);
 		}
 
 		// FIXME: can forget happen between found and increase reference counter? 
@@ -1613,7 +1652,6 @@ impl FileSystem for OverlayFs {
 
 		if delete_whiteout {
 			upper.delete_whiteout(ctx, real_parent_inode, sname.as_str());
-
 		}
 
 		// create dir in upper layer
@@ -1625,6 +1663,12 @@ impl FileSystem for OverlayFs {
 		}
 
 		pnode.loaded.store(false, Ordering::Relaxed);
+		// remove whiteout node from child and inode hash
+		// FIXME: maybe a reload from start better
+		if has_whiteout {
+			pnode.childrens.lock().unwrap().remove(sname.as_str());
+			self.inodes.lock().unwrap().remove(&node.inode);
+		}
 
 		let node = self.lookup_node(ctx, parent, name)?;
 
@@ -1660,6 +1704,8 @@ impl FileSystem for OverlayFs {
 		// open assume file always exist
 
 		let readonly: bool = flags & (libc::O_APPEND | libc::O_CREAT | libc::O_TRUNC | libc::O_RDWR | libc::O_WRONLY) as u32== 0;
+
+		trace!("OPEN: inode: {}, readonly: {}", inode, readonly);
 
 		// toggle flags
 		let mut flags: i32 = flags as i32;
@@ -1699,7 +1745,7 @@ impl FileSystem for OverlayFs {
 				childrens: None,
 				offset: 0,
 				real_handle: Some(RealHandle {
-					real_inode: Arc::clone(node.upper_inode.lock().unwrap().as_ref().unwrap()),
+					real_inode: Arc::clone(&node.first_inode.lock().unwrap()),
 					handle: AtomicU64::new(handle),
 					invalid: AtomicBool::new(false),
 				}),
@@ -1714,7 +1760,9 @@ impl FileSystem for OverlayFs {
 				_ => {},
 			}
 
-			return Ok((Some(handle), opts));
+			trace!("OPEN: returning handle: {}", hd);
+
+			return Ok((Some(hd), opts));
 		}
 
 		Err(Error::from_raw_os_error(libc::ENOENT))
@@ -1891,6 +1939,7 @@ impl FileSystem for OverlayFs {
 				let (real_inode, layer) = (ri.inode.load(Ordering::Relaxed), Arc::clone(ri.layer.as_ref().unwrap()));
 
 				return layer.write(ctx, real_inode, real_handle, r, size, offset, lock_owner, delayed_write, flags, fuse_flags);
+				// remove whiteout node from child and inode hash
 			}
 		}
 
@@ -2061,10 +2110,11 @@ impl FileSystem for OverlayFs {
 				let layer = Arc::clone(pri.layer.as_ref().unwrap());
 				let real_parent_inode = pri.inode.load(Ordering::Relaxed);
 				layer.delete_whiteout(ctx, real_parent_inode, sname.as_str())?;
-				// delete from hash
-				self.inodes.lock().unwrap().remove(&n.inode);
-				newpnode.childrens.lock().unwrap().remove(sname.as_str());
 			}
+
+			// delete from hash
+			self.inodes.lock().unwrap().remove(&n.inode);
+			newpnode.childrens.lock().unwrap().remove(sname.as_str());
 		}
 
 		// create the link
@@ -2107,6 +2157,10 @@ impl FileSystem for OverlayFs {
 
 			// whiteout, may need to delete it
 			self.delete_whiteout_node(ctx, Arc::clone(&n))?;
+
+			// delete from hash
+			self.inodes.lock().unwrap().remove(&n.inode);
+			pnode.childrens.lock().unwrap().remove(sname.as_str());
 		}
 
 		let pnode = self.copy_node_up(ctx, Arc::clone(&pnode))?;
@@ -2158,11 +2212,13 @@ impl FileSystem for OverlayFs {
 			return Err(Error::from_raw_os_error(libc::ENOENT));
 		}
 
-		if !self.node_in_upper_layer(Arc::clone(&node))? {
+		// readonly file can also be flushed, pass flush request
+		// to lower layer instead of return EROFS here
+		// if !self.node_in_upper_layer(Arc::clone(&node))? {
 			// in lower layer, error out or just success?
 			// FIXME:
-			return Err(Error::from_raw_os_error(libc::EROFS));
-		}
+		//	return Err(Error::from_raw_os_error(libc::EROFS));
+		// }
 
 		let (layer, real_inode, real_handle) = self.find_real_info_from_handle(ctx, handle)?;
 

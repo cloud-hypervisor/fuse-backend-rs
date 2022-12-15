@@ -218,9 +218,11 @@ impl FileSystem for Direct {
 	}
 
 	fn flush(&self, ctx: &Context, inode: Inode, handle: Handle, lock_owner: u64) -> Result<()> {
-		if !self.upper {
-			return Err(Error::from_raw_os_error(libc::EROFS));
-		}
+		// even readonly opened file can be flushed,
+		// so it does't have to be in upper layer
+		// if !self.upper {
+		// 	return Err(Error::from_raw_os_error(libc::EROFS));
+		// }
 
 		self.fs.flush(ctx, inode, handle, lock_owner)
 	}

@@ -182,9 +182,9 @@ pub trait Layer: FileSystem {
 		};
 
 		if let Ok((entry, h, o)) = self.create(ctx, Self::Inode::from(parent), cwh_name.as_c_str(), args) {
-			if let Some(handle) = h {
-				self.release(ctx, Self::Inode::from(entry.inode), 0, handle, true, true, None)?;
-			}
+			// if let Some(handle) = h {
+			// 	self.release(ctx, Self::Inode::from(entry.inode), 0, handle, true, true, None)?;
+			// }
 
 			return Ok(entry);
 		}
