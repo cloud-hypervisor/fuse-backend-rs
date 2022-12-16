@@ -5,11 +5,14 @@ use std::collections::{HashMap, LinkedList};
 use std::io::Result;
 use std::sync::{Arc};
 use std::io::{Error, ErrorKind};
+use libc;
 
 use self::super::layer::Layer;
 use self::super::PLUGIN_PREFIX;
 use self::super::direct::Direct;
 use self::super::BoxedLayer;
+
+pub type BoxedPlugin = Box<dyn Plugin + Send + Sync>;
 
 /// ! plugin trait
 pub trait Plugin {
@@ -24,7 +27,7 @@ pub trait Plugin {
 ///! plugin manager
 pub struct PluginManager {
 	///! inner data
-	pub plugins: HashMap<String, Arc<Box<dyn Plugin>>>,
+	pub plugins: HashMap<String, Arc<Box<dyn Plugin + Send + Sync>>>,
 }
 
 impl PluginManager {
@@ -36,12 +39,17 @@ impl PluginManager {
 	}
 
 	///! register a plugin
-	pub fn register(&mut self, name: String, plugin: Arc<Box<dyn Plugin>>) {
+	pub fn register(&mut self, name: String, plugin: Arc<Box<dyn Plugin + Send + Sync>>) -> Result<()> {
+		if self.plugins.get(name.as_str()).is_some() {
+			return Err(Error::from_raw_os_error(libc::EEXIST));
+		}
 		self.plugins.insert(name, plugin);
+
+		Ok(())
 	}
 
 	///! find a registerd plugin
-	pub fn get_plugin(&self, name: String) -> Option<Arc<Box<dyn Plugin>>> {
+	pub fn get_plugin(&self, name: String) -> Option<Arc<Box<dyn Plugin + Send + Sync>>> {
 		if let Some(ref v) = self.plugins.get(name.as_str()) {
 			Some(Arc::clone(v))
 		} else {
@@ -50,7 +58,7 @@ impl PluginManager {
 	}
 }
 
-pub fn find_plugin(manager: &PluginManager, name: String) -> Option<Arc<Box<dyn Plugin>>> {
+pub fn find_plugin(manager: &PluginManager, name: String) -> Option<Arc<Box<dyn Plugin + Send + Sync>>> {
 	manager.get_plugin(name)
 }
 
