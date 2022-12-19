@@ -67,7 +67,7 @@ impl InodeStat {
     }
 }
 
-#[derive(Clone, Copy, PartialOrd, Ord, PartialEq, Eq, Debug)]
+#[derive(Clone, PartialOrd, Ord, PartialEq, Eq, Debug)]
 enum InodeAltKey {
     Ids {
         ino: libc::ino64_t,
@@ -622,7 +622,7 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
                 fuse::ROOT_ID,
                 file_or_handle,
                 2,
-                ids_altkey,
+                ids_altkey.clone(),
                 st.get_stat().st_mode,
             ),
             ids_altkey,
@@ -834,7 +834,9 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
         // Note that this will always be `None` if `cfg.inode_file_handles` is false, but we only
         // really need this alt key when we do not have an `O_PATH` fd open for every inode.  So if
         // `cfg.inode_file_handles` is false, we do not need this key anyway.
-        let handle_altkey = file_or_handle.handle().map(|h| InodeAltKey::Handle(*h));
+        let handle_altkey = file_or_handle
+            .handle()
+            .map(|h| InodeAltKey::Handle((*h).clone()));
 
         Ok((file_or_handle, inode_stat, ids_altkey, handle_altkey))
     }
@@ -937,7 +939,13 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
                     InodeMap::insert_locked(
                         inodes.deref_mut(),
                         inode,
-                        InodeData::new(inode, file_or_handle, 1, ids_altkey, st.get_stat().st_mode),
+                        InodeData::new(
+                            inode,
+                            file_or_handle,
+                            1,
+                            ids_altkey.clone(),
+                            st.get_stat().st_mode,
+                        ),
                         ids_altkey,
                         handle_altkey,
                     );
