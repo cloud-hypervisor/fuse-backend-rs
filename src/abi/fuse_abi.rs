@@ -600,13 +600,16 @@ impl Attr {
             atimensec: st.st_atime_nsec as u32,
             mtimensec: st.st_mtime_nsec as u32,
             ctimensec: st.st_ctime_nsec as u32,
+            #[cfg(target_os = "linux")]
+            mode: st.st_mode,
+            #[cfg(target_os = "macos")]
             mode: st.st_mode as u32,
             nlink: st.st_nlink as u32,
             uid: st.st_uid,
             gid: st.st_gid,
             rdev: st.st_rdev as u32,
             blksize: st.st_blksize as u32,
-            flags: flags as u32,
+            flags,
             #[cfg(target_os = "macos")]
             crtime: 0,
             #[cfg(target_os = "macos")]
@@ -658,6 +661,22 @@ pub struct Kstatfs {
 unsafe impl ByteValued for Kstatfs {}
 
 impl From<statvfs64> for Kstatfs {
+    #[cfg(target_os = "linux")]
+    fn from(st: statvfs64) -> Self {
+        Kstatfs {
+            blocks: st.f_blocks,
+            bfree: st.f_bfree,
+            bavail: st.f_bavail,
+            files: st.f_files,
+            ffree: st.f_ffree,
+            bsize: st.f_bsize as u32,
+            namelen: st.f_namemax as u32,
+            frsize: st.f_frsize as u32,
+            ..Default::default()
+        }
+    }
+
+    #[cfg(target_os = "macos")]
     fn from(st: statvfs64) -> Self {
         Kstatfs {
             blocks: st.f_blocks as u64,
@@ -745,7 +764,7 @@ impl From<u32> for Opcode {
         if op >= Opcode::MaxOpcode as u32 {
             return Opcode::MaxOpcode;
         }
-        unsafe { mem::transmute(op as u32) }
+        unsafe { mem::transmute(op) }
     }
 }
 

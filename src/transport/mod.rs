@@ -127,7 +127,7 @@ impl<S: BitmapSlice> IoBuffers<'_, S> {
         // `Reader::new()` and `Writer::new()`).
         self.buffers
             .iter()
-            .fold(0usize, |count, buf| count + buf.len() as usize)
+            .fold(0usize, |count, buf| count + buf.len())
     }
 
     fn bytes_consumed(&self) -> usize {
@@ -154,7 +154,7 @@ impl<S: BitmapSlice> IoBuffers<'_, S> {
             bufs.push(local_buf);
 
             // Don't need check_sub() as we just made sure rem >= local_buf.len()
-            rem -= local_buf.len() as usize;
+            rem -= local_buf.len();
         }
 
         bufs
@@ -242,7 +242,7 @@ impl<S: BitmapSlice> IoBuffers<'_, S> {
             local_buf.bitmap().mark_dirty(0, local_buf.len());
 
             // Don't need check_sub() as we just made sure rem >= local_buf.len()
-            rem -= local_buf.len() as usize;
+            rem -= local_buf.len();
         }
     }
 

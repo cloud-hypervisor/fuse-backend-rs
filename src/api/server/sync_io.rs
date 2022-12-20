@@ -284,10 +284,10 @@ impl<F: FileSystem + Sync> Server<F> {
 
         #[cfg(target_os = "linux")]
         let flags =
-            flags & (libc::RENAME_EXCHANGE | libc::RENAME_NOREPLACE | libc::RENAME_WHITEOUT) as u32;
+            flags & (libc::RENAME_EXCHANGE | libc::RENAME_NOREPLACE | libc::RENAME_WHITEOUT);
 
         #[cfg(target_os = "macos")]
-        let flags = flags & (libc::RENAME_EXCL | libc::RENAME_SWAP) as u32;
+        let flags = flags & (libc::RENAME_EXCL | libc::RENAME_SWAP);
 
         self.do_rename(ctx, size_of::<Rename2In>(), newdir, flags)
     }

@@ -257,7 +257,7 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
         if !no_open {
             self.handle_map.get(handle, inode)
         } else {
-            let file = self.open_inode(inode, (flags | libc::O_DIRECTORY) as i32)?;
+            let file = self.open_inode(inode, flags | libc::O_DIRECTORY)?;
             Ok(Arc::new(HandleData::new(inode, file)))
         }
     }
@@ -272,7 +272,7 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
         if !no_open {
             self.handle_map.get(handle, inode)
         } else {
-            let file = self.open_inode(inode, flags as i32)?;
+            let file = self.open_inode(inode, flags)?;
             Ok(Arc::new(HandleData::new(inode, file)))
         }
     }
@@ -617,7 +617,7 @@ impl<S: BitmapSlice + Send + Sync> FileSystem for PassthroughFs<S> {
             libc::O_RDONLY
         };
 
-        let file = self.open_inode(inode, open_flags as i32)?;
+        let file = self.open_inode(inode, open_flags)?;
         (*vu_req).map(foffset, moffset, len, flags, file.as_raw_fd())
     }
 

@@ -286,7 +286,7 @@ impl Vfs {
     /// Create a new vfs instance
     pub fn new(opts: VfsOptions) -> Self {
         Vfs {
-            next_super: AtomicU8::new((VFS_PSEUDO_FS_IDX + 1) as u8),
+            next_super: AtomicU8::new(VFS_PSEUDO_FS_IDX + 1),
             mountpoints: ArcSwap::new(Arc::new(HashMap::new())),
             superblocks: ArcSwap::new(Arc::new(vec![None; MAX_VFS_INDEX])),
             root: PseudoFs::new(),

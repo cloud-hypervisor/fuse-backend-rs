@@ -168,12 +168,10 @@ impl<'a> FileVolatileSlice<'a> {
 
     /// Return a subslice of this [FileVolatileSlice] starting at `offset`.
     pub fn offset(&self, count: usize) -> Result<Self, Error> {
-        let new_addr = (self.addr as usize)
-            .checked_add(count)
-            .ok_or(Error::Overflow {
-                base: self.addr as usize,
-                offset: count,
-            })?;
+        let new_addr = self.addr.checked_add(count).ok_or(Error::Overflow {
+            base: self.addr,
+            offset: count,
+        })?;
         let new_size = self
             .size
             .checked_sub(count)

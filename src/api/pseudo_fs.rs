@@ -258,7 +258,14 @@ impl PseudoFs {
             ..Default::default()
         };
         attr.ino = ino;
-        attr.mode = (libc::S_IFDIR | libc::S_IRWXU | libc::S_IRWXG | libc::S_IRWXO) as u32;
+        #[cfg(target_os = "linux")]
+        {
+            attr.mode = libc::S_IFDIR | libc::S_IRWXU | libc::S_IRWXG | libc::S_IRWXO;
+        }
+        #[cfg(target_os = "macos")]
+        {
+            attr.mode = (libc::S_IFDIR | libc::S_IRWXU | libc::S_IRWXG | libc::S_IRWXO) as u32;
+        }
         let now = SystemTime::now();
         attr.ctime = now
             .duration_since(SystemTime::UNIX_EPOCH)
