@@ -533,11 +533,13 @@ impl Vfs {
                 // cross mountpoint, return mount root entry
                 entry = mnt.root_entry;
                 entry.inode = self.convert_inode(mnt.fs_idx, mnt.ino)?;
+                entry.attr.st_ino = entry.inode;
                 trace!(
-                    "vfs lookup cross mountpoint, return new mount fs_idx {} inode {} fuse inode {}",
+                    "vfs lookup cross mountpoint, return new mount fs_idx {} inode 0x{:x} fuse inode 0x{:x}, attr inode 0x{:x}",
                     mnt.fs_idx,
                     mnt.ino,
-                    entry.inode
+                    entry.inode,
+                    entry.attr.st_ino,
                 );
             }
             None => entry.inode = self.convert_inode(idata.fs_idx(), entry.inode)?,
@@ -559,6 +561,18 @@ mod tests {
         type Handle = u64;
         fn lookup(&self, _: &Context, _: Self::Inode, _: &CStr) -> Result<Entry> {
             Ok(Entry::default())
+        }
+        fn getattr(
+            &self,
+            _ctx: &Context,
+            _inode: Self::Inode,
+            _handle: Option<Self::Handle>,
+        ) -> Result<(stat64, Duration)> {
+            let mut attr = Attr {
+                ..Default::default()
+            };
+            attr.ino = 1;
+            Ok((attr.into(), Duration::from_secs(1)))
         }
     }
 
@@ -1013,6 +1027,11 @@ mod tests {
             )
             .unwrap();
         assert_eq!(entry3.inode, 0);
+
+        let (stat, _) = vfs
+            .getattr(&ctx, VfsInode(0x100_0000_0000_0001), None)
+            .unwrap();
+        assert_eq!(stat.st_ino, 0x100_0000_0000_0001);
     }
 
     #[test]
@@ -1022,6 +1041,18 @@ mod tests {
         let fs2 = FakeFileSystemTwo {};
         assert!(vfs.mount(Box::new(fs1), "/foo").is_ok());
         assert!(vfs.mount(Box::new(fs2), "/bar").is_ok());
+
+        // Lookup inode on pseudo file system.
+        let ctx = Context::new();
+        let entry1 = vfs
+            .lookup(
+                &ctx,
+                ROOT_ID.into(),
+                CString::new("bar").unwrap().as_c_str(),
+            )
+            .unwrap();
+        assert_eq!(entry1.inode, 0x200_0000_0000_0001);
+        assert_eq!(entry1.attr.st_ino, 0x200_0000_0000_0001);
     }
 
     #[test]
