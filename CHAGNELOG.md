@@ -1,6 +1,12 @@
 # Changelog
 ## [Unreleased]
 
+## [0.10.1]
+
+### Fixed
+- [#102](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/102): passthrough: reduce the memory footprint of file handle
+- [#103](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/103): vfs: correctly set attr.st_ino for loopup()
+
 ## [0.10.0]
 
 ### Added
