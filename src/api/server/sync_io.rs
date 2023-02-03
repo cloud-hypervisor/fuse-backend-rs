@@ -606,7 +606,12 @@ impl<F: FileSystem + Sync> Server<F> {
             return ctx.reply_ok(Some(out), None);
         }
 
-        let capable = FsOptions::from_bits_truncate(flags);
+        let mut flags_u64 = flags as u64;
+        if flags_u64 & FsOptions::INIT_EXT.bits() != 0 {
+            let InitIn2 { flags2, unused: _ } = ctx.r.read_obj().map_err(Error::DecodeMessage)?;
+            flags_u64 |= (flags2 as u64) << 32;
+        }
+        let capable = FsOptions::from_bits_truncate(flags_u64);
 
         match self.fs.init(capable) {
             Ok(want) => {
@@ -622,15 +627,17 @@ impl<F: FileSystem + Sync> Server<F> {
                     max_readahead
                 };
 
+                let enabled_flags = enabled.bits();
                 let mut out = InitOut {
                     major: KERNEL_VERSION,
                     minor: KERNEL_MINOR_VERSION,
                     max_readahead: readahead,
-                    flags: enabled.bits(),
+                    flags: enabled_flags as u32,
                     max_background: ::std::u16::MAX,
                     congestion_threshold: (::std::u16::MAX / 4) * 3,
                     max_write: MIN_READ_BUFFER - BUFFER_HEADER_SIZE,
                     time_gran: 1, // nanoseconds
+                    flags2: (enabled_flags >> 32) as u32,
                     ..Default::default()
                 };
                 if enabled.contains(FsOptions::BIG_WRITES) {
