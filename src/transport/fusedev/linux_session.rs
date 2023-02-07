@@ -57,9 +57,9 @@ impl FuseSession {
     ) -> Result<FuseSession> {
         let dest = mountpoint
             .canonicalize()
-            .map_err(|_| SessionFailure(format!("invalid mountpoint {:?}", mountpoint)))?;
+            .map_err(|_| SessionFailure(format!("invalid mountpoint {mountpoint:?}")))?;
         if !dest.is_dir() {
-            return Err(SessionFailure(format!("{:?} is not a directory", dest)));
+            return Err(SessionFailure(format!("{dest:?} is not a directory")));
         }
 
         Ok(FuseSession {
@@ -82,7 +82,7 @@ impl FuseSession {
         let file = fuse_kern_mount(&self.mountpoint, &self.fsname, &self.subtype, flags)?;
 
         fcntl(file.as_raw_fd(), FcntlArg::F_SETFL(OFlag::O_NONBLOCK))
-            .map_err(|e| SessionFailure(format!("set fd nonblocking: {}", e)))?;
+            .map_err(|e| SessionFailure(format!("set fd nonblocking: {e}")))?;
         self.file = Some(file);
 
         Ok(())
@@ -136,7 +136,7 @@ impl FuseSession {
         if let Some(file) = &self.file {
             let file = file
                 .try_clone()
-                .map_err(|e| SessionFailure(format!("dup fd: {}", e)))?;
+                .map_err(|e| SessionFailure(format!("dup fd: {e}")))?;
             let channel = FuseChannel::new(file, self.bufsize)?;
             let waker = channel.get_waker();
             self.add_waker(waker)?;
@@ -151,7 +151,7 @@ impl FuseSession {
         let mut wakers = self
             .wakers
             .lock()
-            .map_err(|e| SessionFailure(format!("lock wakers: {}", e)))?;
+            .map_err(|e| SessionFailure(format!("lock wakers: {e}")))?;
         wakers.push(waker);
         Ok(())
     }
@@ -161,11 +161,11 @@ impl FuseSession {
         let wakers = self
             .wakers
             .lock()
-            .map_err(|e| SessionFailure(format!("lock wakers: {}", e)))?;
+            .map_err(|e| SessionFailure(format!("lock wakers: {e}")))?;
         for waker in wakers.iter() {
             waker
                 .wake()
-                .map_err(|e| SessionFailure(format!("wake channel: {}", e)))?;
+                .map_err(|e| SessionFailure(format!("wake channel: {e}")))?;
         }
         Ok(())
     }
@@ -189,9 +189,9 @@ pub struct FuseChannel {
 
 impl FuseChannel {
     fn new(file: File, bufsize: usize) -> Result<Self> {
-        let poll = Poll::new().map_err(|e| SessionFailure(format!("epoll create: {}", e)))?;
+        let poll = Poll::new().map_err(|e| SessionFailure(format!("epoll create: {e}")))?;
         let waker = Waker::new(poll.registry(), EXIT_FUSE_EVENT)
-            .map_err(|e| SessionFailure(format!("epoll register session fd: {}", e)))?;
+            .map_err(|e| SessionFailure(format!("epoll register session fd: {e}")))?;
         let waker = Arc::new(waker);
 
         // mio default add EPOLLET to event flags, so epoll will use edge-triggered mode.
@@ -205,7 +205,7 @@ impl FuseChannel {
             file.as_raw_fd(),
             Some(&mut event),
         )
-        .map_err(|e| SessionFailure(format!("epoll register channel fd: {}", e)))?;
+        .map_err(|e| SessionFailure(format!("epoll register channel fd: {e}")))?;
 
         Ok(FuseChannel {
             file,
@@ -233,7 +233,7 @@ impl FuseChannel {
             match self.poll.poll(&mut events, None) {
                 Ok(_) => {}
                 Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-                Err(e) => return Err(SessionFailure(format!("epoll wait: {}", e))),
+                Err(e) => return Err(SessionFailure(format!("epoll wait: {e}"))),
             }
 
             for event in events.iter() {
@@ -300,7 +300,7 @@ impl FuseChannel {
                         }
                         e => {
                             warn! {"read fuse dev failed on fd {}: {}", fd, e};
-                            return Err(SessionFailure(format!("read new request: {:?}", e)));
+                            return Err(SessionFailure(format!("read new request: {e:?}")));
                         }
                     },
                 }
@@ -316,10 +316,10 @@ fn fuse_kern_mount(mountpoint: &Path, fsname: &str, subtype: &str, flags: MsFlag
         .read(true)
         .write(true)
         .open(FUSE_DEVICE)
-        .map_err(|e| SessionFailure(format!("open {}: {}", FUSE_DEVICE, e)))?;
+        .map_err(|e| SessionFailure(format!("open {FUSE_DEVICE}: {e}")))?;
     let meta = mountpoint
         .metadata()
-        .map_err(|e| SessionFailure(format!("stat {:?}: {}", mountpoint, e)))?;
+        .map_err(|e| SessionFailure(format!("stat {mountpoint:?}: {e}")))?;
     let opts = format!(
         "default_permissions,allow_other,fd={},rootmode={:o},user_id={},group_id={}",
         file.as_raw_fd(),
@@ -350,7 +350,7 @@ fn fuse_kern_mount(mountpoint: &Path, fsname: &str, subtype: &str, flags: MsFlag
         flags,
         Some(opts.deref()),
     )
-    .map_err(|e| SessionFailure(format!("failed to mount {:?}: {}", mountpoint, e)))?;
+    .map_err(|e| SessionFailure(format!("failed to mount {mountpoint:?}: {e}")))?;
 
     Ok(file)
 }
@@ -373,7 +373,7 @@ fn fuse_kern_umount(mountpoint: &str, file: File) -> Result<()> {
     // cause deadlock.
     drop(file);
     umount2(mountpoint, MntFlags::MNT_DETACH)
-        .map_err(|e| SessionFailure(format!("failed to umount {}: {}", mountpoint, e)))
+        .map_err(|e| SessionFailure(format!("failed to umount {mountpoint}: {e}")))
 }
 
 #[cfg(test)]

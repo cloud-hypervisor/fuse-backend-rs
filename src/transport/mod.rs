@@ -85,17 +85,17 @@ impl fmt::Display for Error {
             FindMemoryRegion => write!(f, "no memory region for this address range"),
             InvalidChain => write!(f, "invalid descriptor chain"),
             InvalidParameter => write!(f, "invalid parameter"),
-            IoError(e) => write!(f, "descriptor I/O error: {}", e),
-            SplitOutOfBounds(off) => write!(f, "`DescriptorChain` split is out of bounds: {}", off),
-            VolatileMemoryError(e) => write!(f, "volatile memory error: {}", e),
+            IoError(e) => write!(f, "descriptor I/O error: {e}"),
+            SplitOutOfBounds(off) => write!(f, "`DescriptorChain` split is out of bounds: {off}"),
+            VolatileMemoryError(e) => write!(f, "volatile memory error: {e}"),
 
             #[cfg(feature = "fusedev")]
-            SessionFailure(e) => write!(f, "fuse session failure: {}", e),
+            SessionFailure(e) => write!(f, "fuse session failure: {e}"),
 
             #[cfg(feature = "virtiofs")]
-            ConvertIndirectDescriptor(e) => write!(f, "invalid indirect descriptor: {}", e),
+            ConvertIndirectDescriptor(e) => write!(f, "invalid indirect descriptor: {e}"),
             #[cfg(feature = "virtiofs")]
-            GuestMemoryError(e) => write!(f, "descriptor guest memory error: {}", e),
+            GuestMemoryError(e) => write!(f, "descriptor guest memory error: {e}"),
         }
     }
 }

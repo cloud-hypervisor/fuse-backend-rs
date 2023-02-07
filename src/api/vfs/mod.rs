@@ -350,8 +350,7 @@ impl Vfs {
         if ino > VFS_MAX_INO {
             fs.destroy();
             return Err(VfsError::InodeIndex(format!(
-                "Unsupported max inode number, requested {} supported {}",
-                ino, VFS_MAX_INO
+                "Unsupported max inode number, requested {ino} supported {VFS_MAX_INO}"
             )));
         }
 
@@ -360,7 +359,7 @@ impl Vfs {
         if self.initialized() {
             let opts = self.opts.load().deref().out_opts;
             fs.init(opts).map_err(|e| {
-                VfsError::Initialize(format!("Can't initialize with opts {:?}, {:?}", opts, e))
+                VfsError::Initialize(format!("Can't initialize with opts {opts:?}, {e:?}"))
             })?;
         }
         let index = self.allocate_fs_idx().map_err(VfsError::FsIndex)?;
@@ -442,10 +441,7 @@ impl Vfs {
         if inode > VFS_MAX_INO {
             return Err(Error::new(
                 ErrorKind::Other,
-                format!(
-                    "Inode number {} too large, max supported {}",
-                    inode, VFS_MAX_INO
-                ),
+                format!("Inode number {inode} too large, max supported {VFS_MAX_INO}"),
             ));
         }
         let ino: u64 = ((fs_idx as u64) << VFS_INDEX_SHIFT) | inode;

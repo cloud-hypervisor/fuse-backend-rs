@@ -600,7 +600,7 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
             &root,
             &self.mount_fds,
             |fd, flags, _mode| {
-                let pathname = CString::new(format!("{}", fd))
+                let pathname = CString::new(format!("{fd}"))
                     .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
                 Self::open_file(self.proc_self_fd.as_raw_fd(), &pathname, flags, 0)
             },
@@ -763,7 +763,7 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
             return Err(ebadf());
         }
 
-        let pathname = CString::new(format!("{}", fd))
+        let pathname = CString::new(format!("{fd}"))
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
 
         // We don't really check `flags` because if the kernel can't handle poorly specified flags
@@ -926,7 +926,7 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
                         error!("fuse: max inode number reached: {}", VFS_MAX_INO);
                         return Err(io::Error::new(
                             io::ErrorKind::Other,
-                            format!("max inode number reached: {}", VFS_MAX_INO),
+                            format!("max inode number reached: {VFS_MAX_INO}"),
                         ));
                     }
                     trace!(
