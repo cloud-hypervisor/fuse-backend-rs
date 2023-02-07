@@ -276,7 +276,7 @@ impl<'a, S: BitmapSlice> FuseDevWriter<'a, S> {
     fn do_write(fd: RawFd, data: &[u8]) -> io::Result<usize> {
         write(fd, data).map_err(|e| {
             error! {"fail to write to fuse device fd {}: {}, {:?}", fd, e, data};
-            io::Error::new(io::ErrorKind::Other, format!("{}", e))
+            io::Error::new(io::ErrorKind::Other, format!("{e}"))
         })
     }
 }
@@ -317,7 +317,7 @@ impl<'a, S: BitmapSlice> io::Write for FuseDevWriter<'a, S> {
                 })
                 .map_err(|e| {
                     error! {"fail to write to fuse device on commit: {}", e};
-                    io::Error::new(io::ErrorKind::Other, format!("{}", e))
+                    io::Error::new(io::ErrorKind::Other, format!("{e}"))
                 })
         }
     }

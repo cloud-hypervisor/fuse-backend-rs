@@ -41,13 +41,12 @@ pub enum Error {
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self {
-            Error::OutOfBounds { addr } => write!(f, "address 0x{:x} is out of bounds", addr),
+            Error::OutOfBounds { addr } => write!(f, "address 0x{addr:x} is out of bounds"),
             Error::Overflow { base, offset } => write!(
                 f,
-                "address 0x{:x} offset by 0x{:x} would overflow",
-                base, offset
+                "address 0x{base:x} offset by 0x{offset:x} would overflow"
             ),
-            Error::VolatileSlice(e) => write!(f, "{}", e),
+            Error::VolatileSlice(e) => write!(f, "{e}"),
         }
     }
 }

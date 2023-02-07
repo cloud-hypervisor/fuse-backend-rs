@@ -82,16 +82,15 @@ impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         use Error::*;
         match self {
-            DecodeMessage(err) => write!(f, "failed to decode fuse message: {}", err),
-            EncodeMessage(err) => write!(f, "failed to encode fuse message: {}", err),
+            DecodeMessage(err) => write!(f, "failed to decode fuse message: {err}"),
+            EncodeMessage(err) => write!(f, "failed to encode fuse message: {err}"),
             MissingParameter => write!(f, "one or more parameters are missing"),
             InvalidHeaderLength => write!(f, "the `len` field of the header is too small"),
-            InvalidCString(err) => write!(f, "a c string parameter is invalid: {}", err),
+            InvalidCString(err) => write!(f, "a c string parameter is invalid: {err}"),
             InvalidXattrSize((size, len)) => write!(
                 f,
                 "The `size` field of the `SetxattrIn` message does not match the length of the \
-                 decoded value: size = {}, value.len() = {}",
-                size, len
+                 decoded value: size = {size}, value.len() = {len}"
             ),
         }
     }
