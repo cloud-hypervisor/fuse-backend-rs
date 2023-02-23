@@ -49,7 +49,7 @@ vm-memory = { version = "0.9", features = ["backend-mmap", "backend-bitmap"] }
 default = ["fusedev"]
 async-io = ["async-trait", "tokio-uring", "tokio/fs", "tokio/net", "tokio/sync", "tokio/rt", "tokio/macros", "io-uring"]
 fusedev = ["vmm-sys-util", "caps", "core-foundation-sys"]
-virtiofs = ["virtio-queue", "caps"]
+virtiofs = ["virtio-queue", "caps", "vmm-sys-util"]
 vhost-user-fs = ["virtiofs", "vhost", "caps"]
 
 [package.metadata.docs.rs]
