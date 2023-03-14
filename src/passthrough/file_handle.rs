@@ -8,6 +8,7 @@ use std::ffi::CStr;
 use std::fmt::{Debug, Formatter};
 use std::fs::File;
 use std::io;
+use std::mem::size_of_val;
 use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
 use std::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 
@@ -197,7 +198,9 @@ impl FileHandle {
             return Err(io::Error::from(io::ErrorKind::InvalidData));
         }
 
-        let needed = c_fh.wrapper.as_fam_struct_ref().handle_bytes as usize;
+        let needed = c_fh.wrapper.as_fam_struct_ref().handle_bytes as usize
+            + size_of_val(c_fh.wrapper.as_fam_struct_ref().handle_type)
+            + size_of_val(c_fh.wrapper.as_fam_struct_ref().handle_bytes);
         let mut c_fh = CFileHandle::new(needed);
 
         let ret = unsafe {
