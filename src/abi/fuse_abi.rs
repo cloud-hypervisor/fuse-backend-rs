@@ -203,6 +203,9 @@ const INIT_EXT: u64 = 0x4000_0000;
 // This flag indicates whether the guest kernel enable per-file dax
 const PERFILE_DAX: u64 = 0x2_0000_0000;
 
+// This flag indicates whether kernel support fd passthrough
+const FD_PASSTHROUGH: u64 = 0x8000_0000_0000_0000;
+
 /**
  *
  * fuse_attr flags
@@ -456,6 +459,9 @@ bitflags! {
         /// If this feature is enabled, filesystem will notify guest kernel whether file
         /// enable DAX by EntryOut.Attr.flags of inode when lookup
         const PERFILE_DAX = PERFILE_DAX;
+
+        /// If kernel support fd passthrough
+        const FD_PASSTHROUGH = FD_PASSTHROUGH;
     }
 }
 
