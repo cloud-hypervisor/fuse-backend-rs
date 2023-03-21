@@ -1567,8 +1567,12 @@ impl FileSystem for OverlayFs {
 			if child.whiteout.load(Ordering::Relaxed) || child.hidden.load(Ordering::Relaxed) {
 				continue;
 			}
-			*child.lookups.lock().unwrap() += 1;
+			// *child.lookups.lock().unwrap() += 1;
 			cs.push(Arc::clone(child));
+		}
+
+		for c in cs.iter() {
+			*c.lookups.lock().unwrap() += 1;
 		}
 
 		*node.lookups.lock().unwrap() += 1;
