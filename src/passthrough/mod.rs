@@ -464,6 +464,15 @@ pub struct Config {
     /// share memory file to attack the host.
     pub seal_size: bool,
 
+    /// Whether count mount ID or not when comparing two inodes. By default we think two inodes
+    /// are same if their inode number and st_dev are the same. When `enable_mntid` is set as
+    /// 'true', inode's mount ID will be taken into account as well. For example, bindmount the
+    /// same file into virtiofs' source dir, the two bindmounted files will be identified as two
+    /// different inodes when this option is true, so the don't share pagecache.
+    ///
+    /// The default value for this option is `false`.
+    pub enable_mntid: bool,
+
     /// What size file supports dax
     /// * If dax_file_size == None, DAX will disable to all files.
     /// * If dax_file_size == 0, DAX will enable all files.
@@ -488,6 +497,7 @@ impl Default for Config {
             inode_file_handles: false,
             no_readdir: false,
             seal_size: false,
+            enable_mntid: false,
             dax_file_size: None,
         }
     }
@@ -591,6 +601,7 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
 
         let (file_or_handle, st, ids_altkey, handle_altkey) = Self::open_file_or_handle(
             self.cfg.inode_file_handles,
+            self.cfg.enable_mntid,
             libc::AT_FDCWD,
             &root,
             &self.mount_fds,
@@ -775,6 +786,7 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
     /// Create a File or File Handle for `name` under directory `dir_fd` to support `lookup()`.
     fn open_file_or_handle<F>(
         use_handle: bool,
+        use_mntid: bool,
         dir_fd: RawFd,
         name: &CStr,
         mount_fds: &MountFds,
@@ -805,13 +817,21 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
 
         let inode_stat = match &file_or_handle {
             FileOrHandle::File(f) => {
-                // TODO: use statx(2) to query mntid when 5.8 kernel or later are widely used.
+                // Count mount ID as part of alt key if use_mntid is true. Note that using
+                // name_to_handle_at() to get mntid is kind of expensive in Lookup intensive
+                // workloads, e.g. when cache is none and accessing lots of files.
                 //
                 // Some filesystems don't support file handle, for example overlayfs mounted
                 // without index feature, if so just use mntid 0 in that case.
-                let mnt_id = match FileHandle::from_name_at(dir_fd, name) {
-                    Ok(h) => h.mnt_id,
-                    Err(_) => 0,
+                //
+                // TODO: use statx(2) to query mntid when 5.8 kernel or later are widely used.
+                let mnt_id = if use_mntid {
+                    match FileHandle::from_name_at(dir_fd, name) {
+                        Ok(h) => h.mnt_id,
+                        Err(_) => 0,
+                    }
+                } else {
+                    0
                 };
                 InodeStat {
                     stat: Self::stat(f, None)?,
@@ -849,6 +869,7 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
         let dir_file = dir.get_file(&self.mount_fds)?;
         let (file_or_handle, st, ids_altkey, handle_altkey) = Self::open_file_or_handle(
             self.cfg.inode_file_handles,
+            self.cfg.enable_mntid,
             dir_file.as_raw_fd(),
             name,
             &self.mount_fds,

@@ -114,13 +114,21 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
 
             let st = match &file_or_handle {
                 FileOrHandle::File(f) => {
-                    // TODO: use statx(2) to query mntid when 5.8 kernel or later are widely used.
+                    // Count mount ID as part of alt key if use_mntid is true. Note that using
+                    // name_to_handle_at() to get mntid is kind of expensive in Lookup intensive
+                    // workloads, e.g. when cache is none and accessing lots of files.
                     //
                     // Some filesystems don't support file handle, for example overlayfs mounted
                     // without index feature, if so just use mntid 0 in that case.
-                    let mnt_id = match FileHandle::from_name_at(dir_fd, name) {
-                        Ok(h) => h.mnt_id,
-                        Err(_) => 0,
+                    //
+                    // TODO: use statx(2) to query mntid when 5.8 kernel or later are widely used.
+                    let mnt_id = if self.cfg.enable_mntid {
+                        match FileHandle::from_name_at(dir_fd, name) {
+                            Ok(h) => h.mnt_id,
+                            Err(_) => 0,
+                        }
+                    } else {
+                        0
                     };
                     InodeStat {
                         stat: self.async_stat(ctx, f, None).await?,
