@@ -19,6 +19,7 @@ use crate::abi::virtio_fs::{RemovemappingIn, RemovemappingOne, SetupmappingIn};
 use crate::api::filesystem::{
     DirEntry, Entry, FileSystem, GetxattrReply, IoctlData, ListxattrReply,
 };
+use crate::api::server::ServerMeta;
 #[cfg(feature = "fusedev")]
 use crate::transport::FuseDevWriter;
 use crate::transport::{pagesize, FsCacheReqHandler, Reader, Writer};
@@ -29,7 +30,7 @@ impl<F: FileSystem + Sync> Server<F> {
     /// Use to send notify msg to kernel fuse
     pub fn notify_inval_entry<S: BitmapSlice>(
         &self,
-        mut w: FuseDevWriter<'_, S>,
+        mut w: FuseDevWriter<'_, '_, S>,
         parent: u64,
         name: &std::ffi::CStr,
     ) -> Result<usize> {
@@ -66,7 +67,7 @@ impl<F: FileSystem + Sync> Server<F> {
     pub fn handle_message<S: BitmapSlice>(
         &self,
         mut r: Reader<'_, S>,
-        w: Writer<'_, S>,
+        w: Writer<'_, '_, S>,
         vu_req: Option<&mut dyn FsCacheReqHandler>,
         hook: Option<&dyn MetricsHook>,
     ) -> Result<usize> {
@@ -171,7 +172,7 @@ impl<F: FileSystem + Sync> Server<F> {
         res
     }
 
-    fn lookup<S: BitmapSlice>(&self, mut ctx: SrvContext<'_, F, S>) -> Result<usize> {
+    fn lookup<S: BitmapSlice>(&self, mut ctx: SrvContext<'_, '_, F, S>) -> Result<usize> {
         let buf = ServerUtil::get_message_body(&mut ctx.r, &ctx.in_header, 0)?;
         let name = bytes_to_cstr(buf.as_ref()).map_err(|e| {
             let _ = ctx.reply_error_explicit(io::Error::from_raw_os_error(libc::EINVAL));
@@ -180,7 +181,7 @@ impl<F: FileSystem + Sync> Server<F> {
         })?;
 
         #[cfg(not(feature = "fuse-t"))]
-        let version = self.vers.load();
+        let version = &self.meta.load().version;
         let result = self.fs.lookup(ctx.context(), ctx.nodeid(), name);
 
         match result {
@@ -205,7 +206,10 @@ impl<F: FileSystem + Sync> Server<F> {
         }
     }
 
-    pub(super) fn forget<S: BitmapSlice>(&self, mut ctx: SrvContext<'_, F, S>) -> Result<usize> {
+    pub(super) fn forget<S: BitmapSlice>(
+        &self,
+        mut ctx: SrvContext<'_, '_, F, S>,
+    ) -> Result<usize> {
         let ForgetIn { nlookup } = ctx.r.read_obj().map_err(Error::DecodeMessage)?;
 
         self.fs.forget(ctx.context(), ctx.nodeid(), nlookup);
@@ -214,7 +218,7 @@ impl<F: FileSystem + Sync> Server<F> {
         Ok(0)
     }
 
-    fn getattr<S: BitmapSlice>(&self, mut ctx: SrvContext<'_, F, S>) -> Result<usize> {
+    fn getattr<S: BitmapSlice>(&self, mut ctx: SrvContext<'_, '_, F, S>) -> Result<usize> {
         let GetattrIn { flags, fh, .. } = ctx.r.read_obj().map_err(Error::DecodeMessage)?;
         let handle = if (flags & GETATTR_FH) != 0 {
             Some(fh.into())
@@ -226,7 +230,7 @@ impl<F: FileSystem + Sync> Server<F> {
         ctx.handle_attr_result(result)
     }
 
-    fn setattr<S: BitmapSlice>(&self, mut ctx: SrvContext<'_, F, S>) -> Result<usize> {
+    fn setattr<S: BitmapSlice>(&self, mut ctx: SrvContext<'_, '_, F, S>) -> Result<usize> {
         let setattr_in: SetattrIn = ctx.r.read_obj().map_err(Error::DecodeMessage)?;
         let handle = if setattr_in.valid & FATTR_FH != 0 {
             Some(setattr_in.fh.into())
@@ -242,7 +246,10 @@ impl<F: FileSystem + Sync> Server<F> {
         ctx.handle_attr_result(result)
     }
 
-    pub(super) fn readlink<S: BitmapSlice>(&self, mut ctx: SrvContext<'_, F, S>) -> Result<usize> {
+    pub(super) fn readlink<S: BitmapSlice>(
+        &self,
+        mut ctx: SrvContext<'_, '_, F, S>,
+    ) -> Result<usize> {
         match self.fs.readlink(ctx.context(), ctx.nodeid()) {
             Ok(linkname) => {
                 // We need to disambiguate the option type here even though it is `None`.
@@ -252,7 +259,10 @@ impl<F: FileSystem + Sync> Server<F> {
         }
     }
 
-    pub(super) fn symlink<S: BitmapSlice>(&self, mut ctx: SrvContext<'_, F, S>) -> Result<usize> {
+    pub(super) fn symlink<S: BitmapSlice>(
+        &self,
+        mut ctx: SrvContext<'_, '_, F, S>,
+    ) -> Result<usize> {
         let buf = ServerUtil::get_message_body(&mut ctx.r, &ctx.in_header, 0)?;
         // The name and linkname are encoded one after another and separated by a nul character.
         let (name, linkname) = ServerUtil::extract_two_cstrs(&buf)?;
@@ -263,7 +273,7 @@ impl<F: FileSystem + Sync> Server<F> {
         }
     }
 
-    pub(super) fn mknod<S: BitmapSlice>(&self, mut ctx: SrvContext<'_, F, S>) -> Result<usize> {
+    pub(super) fn mknod<S: BitmapSlice>(&self, mut ctx: SrvContext<'_, '_, F, S>) -> Result<usize> {
         let MknodIn {
             mode, rdev, umask, ..
         } = ctx.r.read_obj().map_err(Error::DecodeMessage)?;
@@ -283,7 +293,7 @@ impl<F: FileSystem + Sync> Server<F> {
         }
     }
 
-    pub(super) fn mkdir<S: BitmapSlice>(&self, mut ctx: SrvContext<'_, F, S>) -> Result<usize> {
+    pub(super) fn mkdir<S: BitmapSlice>(&self, mut ctx: SrvContext<'_, '_, F, S>) -> Result<usize> {
         let MkdirIn { mode, umask } = ctx.r.read_obj().map_err(Error::DecodeMessage)?;
         let buf = ServerUtil::get_message_body(&mut ctx.r, &ctx.in_header, size_of::<MkdirIn>())?;
         let name = bytes_to_cstr(buf.as_ref()).map_err(|e| {
@@ -301,7 +311,10 @@ impl<F: FileSystem + Sync> Server<F> {
         }
     }
 
-    pub(super) fn unlink<S: BitmapSlice>(&self, mut ctx: SrvContext<'_, F, S>) -> Result<usize> {
+    pub(super) fn unlink<S: BitmapSlice>(
+        &self,
+        mut ctx: SrvContext<'_, '_, F, S>,
+    ) -> Result<usize> {
         let buf = ServerUtil::get_message_body(&mut ctx.r, &ctx.in_header, 0)?;
         let name = bytes_to_cstr(buf.as_ref()).map_err(|e| {
             let _ = ctx.reply_error_explicit(io::Error::from_raw_os_error(libc::EINVAL));
@@ -315,7 +328,7 @@ impl<F: FileSystem + Sync> Server<F> {
         }
     }
 
-    pub(super) fn rmdir<S: BitmapSlice>(&self, mut ctx: SrvContext<'_, F, S>) -> Result<usize> {
+    pub(super) fn rmdir<S: BitmapSlice>(&self, mut ctx: SrvContext<'_, '_, F, S>) -> Result<usize> {
         let buf = ServerUtil::get_message_body(&mut ctx.r, &ctx.in_header, 0)?;
         let name = bytes_to_cstr(buf.as_ref()).map_err(|e| {
             let _ = ctx.reply_error_explicit(io::Error::from_raw_os_error(libc::EINVAL));
@@ -331,7 +344,7 @@ impl<F: FileSystem + Sync> Server<F> {
 
     pub(super) fn do_rename<S: BitmapSlice>(
         &self,
-        mut ctx: SrvContext<'_, F, S>,
+        mut ctx: SrvContext<'_, '_, F, S>,
         msg_size: usize,
         newdir: u64,
         flags: u32,
@@ -352,14 +365,20 @@ impl<F: FileSystem + Sync> Server<F> {
         }
     }
 
-    pub(super) fn rename<S: BitmapSlice>(&self, mut ctx: SrvContext<'_, F, S>) -> Result<usize> {
+    pub(super) fn rename<S: BitmapSlice>(
+        &self,
+        mut ctx: SrvContext<'_, '_, F, S>,
+    ) -> Result<usize> {
         let RenameIn { newdir, .. } = ctx.r.read_obj().map_err(Error::DecodeMessage)?;
 
         self.do_rename(ctx, size_of::<RenameIn>(), newdir, 0)
     }
 
     #[cfg(target_os = "linux")]
-    pub(super) fn rename2<S: BitmapSlice>(&self, mut ctx: SrvContext<'_, F, S>) -> Result<usize> {
+    pub(super) fn rename2<S: BitmapSlice>(
+        &self,
+        mut ctx: SrvContext<'_, '_, F, S>,
+    ) -> Result<usize> {
         let Rename2In { newdir, flags, .. } = ctx.r.read_obj().map_err(Error::DecodeMessage)?;
 
         let flags =
@@ -368,7 +387,7 @@ impl<F: FileSystem + Sync> Server<F> {
         self.do_rename(ctx, size_of::<Rename2In>(), newdir, flags)
     }
 
-    pub(super) fn link<S: BitmapSlice>(&self, mut ctx: SrvContext<'_, F, S>) -> Result<usize> {
+    pub(super) fn link<S: BitmapSlice>(&self, mut ctx: SrvContext<'_, '_, F, S>) -> Result<usize> {
         let LinkIn { oldnodeid } = ctx.r.read_obj().map_err(Error::DecodeMessage)?;
         let buf = ServerUtil::get_message_body(&mut ctx.r, &ctx.in_header, size_of::<LinkIn>())?;
         let name = bytes_to_cstr(buf.as_ref()).map_err(|e| {
@@ -386,7 +405,7 @@ impl<F: FileSystem + Sync> Server<F> {
         }
     }
 
-    fn open<S: BitmapSlice>(&self, mut ctx: SrvContext<'_, F, S>) -> Result<usize> {
+    fn open<S: BitmapSlice>(&self, mut ctx: SrvContext<'_, '_, F, S>) -> Result<usize> {
         let OpenIn { flags, fuse_flags } = ctx.r.read_obj().map_err(Error::DecodeMessage)?;
 
         match self.fs.open(ctx.context(), ctx.nodeid(), flags, fuse_flags) {
@@ -403,7 +422,7 @@ impl<F: FileSystem + Sync> Server<F> {
         }
     }
 
-    fn read<S: BitmapSlice>(&self, mut ctx: SrvContext<'_, F, S>) -> Result<usize> {
+    fn read<S: BitmapSlice>(&self, mut ctx: SrvContext<'_, '_, F, S>) -> Result<usize> {
         let ReadIn {
             fh,
             offset,
@@ -454,7 +473,7 @@ impl<F: FileSystem + Sync> Server<F> {
                     .write_all(out.as_slice())
                     .map_err(Error::EncodeMessage)?;
                 ctx.w
-                    .commit(Some(&data_writer.0))
+                    .commit(Some(&mut data_writer.0))
                     .map_err(Error::EncodeMessage)?;
                 Ok(out.len as usize)
             }
@@ -462,7 +481,7 @@ impl<F: FileSystem + Sync> Server<F> {
         }
     }
 
-    fn write<S: BitmapSlice>(&self, mut ctx: SrvContext<'_, F, S>) -> Result<usize> {
+    fn write<S: BitmapSlice>(&self, mut ctx: SrvContext<'_, '_, F, S>) -> Result<usize> {
         let WriteIn {
             fh,
             offset,
@@ -511,14 +530,20 @@ impl<F: FileSystem + Sync> Server<F> {
         }
     }
 
-    pub(super) fn statfs<S: BitmapSlice>(&self, mut ctx: SrvContext<'_, F, S>) -> Result<usize> {
+    pub(super) fn statfs<S: BitmapSlice>(
+        &self,
+        mut ctx: SrvContext<'_, '_, F, S>,
+    ) -> Result<usize> {
         match self.fs.statfs(ctx.context(), ctx.nodeid()) {
             Ok(st) => ctx.reply_ok(Some(Kstatfs::from(st)), None),
             Err(e) => ctx.reply_error(e),
         }
     }
 
-    pub(super) fn release<S: BitmapSlice>(&self, mut ctx: SrvContext<'_, F, S>) -> Result<usize> {
+    pub(super) fn release<S: BitmapSlice>(
+        &self,
+        mut ctx: SrvContext<'_, '_, F, S>,
+    ) -> Result<usize> {
         let ReleaseIn {
             fh,
             flags,
@@ -548,7 +573,7 @@ impl<F: FileSystem + Sync> Server<F> {
         }
     }
 
-    fn fsync<S: BitmapSlice>(&self, mut ctx: SrvContext<'_, F, S>) -> Result<usize> {
+    fn fsync<S: BitmapSlice>(&self, mut ctx: SrvContext<'_, '_, F, S>) -> Result<usize> {
         let FsyncIn {
             fh, fsync_flags, ..
         } = ctx.r.read_obj().map_err(Error::DecodeMessage)?;
@@ -563,7 +588,10 @@ impl<F: FileSystem + Sync> Server<F> {
         }
     }
 
-    pub(super) fn setxattr<S: BitmapSlice>(&self, mut ctx: SrvContext<'_, F, S>) -> Result<usize> {
+    pub(super) fn setxattr<S: BitmapSlice>(
+        &self,
+        mut ctx: SrvContext<'_, '_, F, S>,
+    ) -> Result<usize> {
         let SetxattrIn { size, flags } = ctx.r.read_obj().map_err(Error::DecodeMessage)?;
         let buf =
             ServerUtil::get_message_body(&mut ctx.r, &ctx.in_header, size_of::<SetxattrIn>())?;
@@ -594,7 +622,10 @@ impl<F: FileSystem + Sync> Server<F> {
         }
     }
 
-    pub(super) fn getxattr<S: BitmapSlice>(&self, mut ctx: SrvContext<'_, F, S>) -> Result<usize> {
+    pub(super) fn getxattr<S: BitmapSlice>(
+        &self,
+        mut ctx: SrvContext<'_, '_, F, S>,
+    ) -> Result<usize> {
         let GetxattrIn { size, .. } = ctx.r.read_obj().map_err(Error::DecodeMessage)?;
         if size > MAX_BUFFER_SIZE {
             return ctx.reply_error_explicit(io::Error::from_raw_os_error(libc::ENOMEM));
@@ -622,7 +653,10 @@ impl<F: FileSystem + Sync> Server<F> {
         }
     }
 
-    pub(super) fn listxattr<S: BitmapSlice>(&self, mut ctx: SrvContext<'_, F, S>) -> Result<usize> {
+    pub(super) fn listxattr<S: BitmapSlice>(
+        &self,
+        mut ctx: SrvContext<'_, '_, F, S>,
+    ) -> Result<usize> {
         let GetxattrIn { size, .. } = ctx.r.read_obj().map_err(Error::DecodeMessage)?;
 
         if size > MAX_BUFFER_SIZE {
@@ -645,7 +679,7 @@ impl<F: FileSystem + Sync> Server<F> {
 
     pub(super) fn removexattr<S: BitmapSlice>(
         &self,
-        mut ctx: SrvContext<'_, F, S>,
+        mut ctx: SrvContext<'_, '_, F, S>,
     ) -> Result<usize> {
         let buf = ServerUtil::get_message_body(&mut ctx.r, &ctx.in_header, 0)?;
         let name = bytes_to_cstr(buf.as_ref()).map_err(|e| {
@@ -660,7 +694,7 @@ impl<F: FileSystem + Sync> Server<F> {
         }
     }
 
-    pub(super) fn flush<S: BitmapSlice>(&self, mut ctx: SrvContext<'_, F, S>) -> Result<usize> {
+    pub(super) fn flush<S: BitmapSlice>(&self, mut ctx: SrvContext<'_, '_, F, S>) -> Result<usize> {
         let FlushIn { fh, lock_owner, .. } = ctx.r.read_obj().map_err(Error::DecodeMessage)?;
 
         match self
@@ -672,7 +706,7 @@ impl<F: FileSystem + Sync> Server<F> {
         }
     }
 
-    pub(super) fn init<S: BitmapSlice>(&self, mut ctx: SrvContext<'_, F, S>) -> Result<usize> {
+    pub(super) fn init<S: BitmapSlice>(&self, mut ctx: SrvContext<'_, '_, F, S>) -> Result<usize> {
         let InitIn {
             major,
             minor,
@@ -742,8 +776,21 @@ impl<F: FileSystem + Sync> Server<F> {
                     out.max_pages = MAX_REQ_PAGES;
                     out.max_write = MAX_REQ_PAGES as u32 * pagesize() as u32; // 1MB
                 }
-                let vers = ServerVersion { major, minor };
-                self.vers.store(Arc::new(vers));
+
+                #[cfg(target_os = "linux")]
+                let meta = ServerMeta {
+                    version: ServerVersion { major, minor },
+                    support_splice_read: capable.contains(FsOptions::SPLICE_READ),
+                    support_splice_write: capable
+                        .contains(FsOptions::SPLICE_WRITE | FsOptions::SPLICE_MOVE),
+                };
+                #[cfg(not(target_os = "linux"))]
+                let meta = ServerMeta {
+                    version: ServerVersion { major, minor },
+                    support_splice_read: false,
+                    support_splice_write: false,
+                };
+                self.meta.store(Arc::new(meta));
                 if minor < KERNEL_MINOR_VERSION_INIT_OUT_SIZE {
                     ctx.reply_ok(
                         Some(
@@ -772,7 +819,10 @@ impl<F: FileSystem + Sync> Server<F> {
         }
     }
 
-    pub(super) fn opendir<S: BitmapSlice>(&self, mut ctx: SrvContext<'_, F, S>) -> Result<usize> {
+    pub(super) fn opendir<S: BitmapSlice>(
+        &self,
+        mut ctx: SrvContext<'_, '_, F, S>,
+    ) -> Result<usize> {
         let OpenIn { flags, .. } = ctx.r.read_obj().map_err(Error::DecodeMessage)?;
 
         match self.fs.opendir(ctx.context(), ctx.nodeid(), flags) {
@@ -791,7 +841,7 @@ impl<F: FileSystem + Sync> Server<F> {
 
     fn do_readdir<S: BitmapSlice>(
         &self,
-        mut ctx: SrvContext<'_, F, S>,
+        mut ctx: SrvContext<'_, '_, F, S>,
         plus: bool,
     ) -> Result<usize> {
         let ReadIn {
@@ -847,23 +897,28 @@ impl<F: FileSystem + Sync> Server<F> {
             ctx.w
                 .write_all(out.as_slice())
                 .map_err(Error::EncodeMessage)?;
-            ctx.w.commit(Some(&cursor)).map_err(Error::EncodeMessage)?;
+            ctx.w
+                .commit(Some(&mut cursor))
+                .map_err(Error::EncodeMessage)?;
             Ok(out.len as usize)
         }
     }
 
-    pub(super) fn readdir<S: BitmapSlice>(&self, ctx: SrvContext<'_, F, S>) -> Result<usize> {
+    pub(super) fn readdir<S: BitmapSlice>(&self, ctx: SrvContext<'_, '_, F, S>) -> Result<usize> {
         self.do_readdir(ctx, false)
     }
 
     #[cfg(target_os = "linux")]
-    pub(super) fn readdirplus<S: BitmapSlice>(&self, ctx: SrvContext<'_, F, S>) -> Result<usize> {
+    pub(super) fn readdirplus<S: BitmapSlice>(
+        &self,
+        ctx: SrvContext<'_, '_, F, S>,
+    ) -> Result<usize> {
         self.do_readdir(ctx, true)
     }
 
     pub(super) fn releasedir<S: BitmapSlice>(
         &self,
-        mut ctx: SrvContext<'_, F, S>,
+        mut ctx: SrvContext<'_, '_, F, S>,
     ) -> Result<usize> {
         let ReleaseIn { fh, flags, .. } = ctx.r.read_obj().map_err(Error::DecodeMessage)?;
 
@@ -876,7 +931,7 @@ impl<F: FileSystem + Sync> Server<F> {
         }
     }
 
-    fn fsyncdir<S: BitmapSlice>(&self, mut ctx: SrvContext<'_, F, S>) -> Result<usize> {
+    fn fsyncdir<S: BitmapSlice>(&self, mut ctx: SrvContext<'_, '_, F, S>) -> Result<usize> {
         let FsyncIn {
             fh, fsync_flags, ..
         } = ctx.r.read_obj().map_err(Error::DecodeMessage)?;
@@ -891,7 +946,7 @@ impl<F: FileSystem + Sync> Server<F> {
         }
     }
 
-    pub(super) fn getlk<S: BitmapSlice>(&self, mut ctx: SrvContext<'_, F, S>) -> Result<usize> {
+    pub(super) fn getlk<S: BitmapSlice>(&self, mut ctx: SrvContext<'_, '_, F, S>) -> Result<usize> {
         let LkIn {
             fh,
             owner,
@@ -912,7 +967,7 @@ impl<F: FileSystem + Sync> Server<F> {
         }
     }
 
-    pub(super) fn setlk<S: BitmapSlice>(&self, mut ctx: SrvContext<'_, F, S>) -> Result<usize> {
+    pub(super) fn setlk<S: BitmapSlice>(&self, mut ctx: SrvContext<'_, '_, F, S>) -> Result<usize> {
         let LkIn {
             fh,
             owner,
@@ -933,7 +988,10 @@ impl<F: FileSystem + Sync> Server<F> {
         }
     }
 
-    pub(super) fn setlkw<S: BitmapSlice>(&self, mut ctx: SrvContext<'_, F, S>) -> Result<usize> {
+    pub(super) fn setlkw<S: BitmapSlice>(
+        &self,
+        mut ctx: SrvContext<'_, '_, F, S>,
+    ) -> Result<usize> {
         let LkIn {
             fh,
             owner,
@@ -954,7 +1012,10 @@ impl<F: FileSystem + Sync> Server<F> {
         }
     }
 
-    pub(super) fn access<S: BitmapSlice>(&self, mut ctx: SrvContext<'_, F, S>) -> Result<usize> {
+    pub(super) fn access<S: BitmapSlice>(
+        &self,
+        mut ctx: SrvContext<'_, '_, F, S>,
+    ) -> Result<usize> {
         let AccessIn { mask, .. } = ctx.r.read_obj().map_err(Error::DecodeMessage)?;
 
         match self.fs.access(ctx.context(), ctx.nodeid(), mask) {
@@ -963,7 +1024,7 @@ impl<F: FileSystem + Sync> Server<F> {
         }
     }
 
-    fn create<S: BitmapSlice>(&self, mut ctx: SrvContext<'_, F, S>) -> Result<usize> {
+    fn create<S: BitmapSlice>(&self, mut ctx: SrvContext<'_, '_, F, S>) -> Result<usize> {
         let args: CreateIn = ctx.r.read_obj().map_err(Error::DecodeMessage)?;
         let buf = ServerUtil::get_message_body(&mut ctx.r, &ctx.in_header, size_of::<CreateIn>())?;
         let name = bytes_to_cstr(buf.as_ref()).map_err(|e| {
@@ -997,9 +1058,9 @@ impl<F: FileSystem + Sync> Server<F> {
         }
     }
 
-    pub(super) fn interrupt<S: BitmapSlice>(&self, _ctx: SrvContext<'_, F, S>) {}
+    pub(super) fn interrupt<S: BitmapSlice>(&self, _ctx: SrvContext<'_, '_, F, S>) {}
 
-    pub(super) fn bmap<S: BitmapSlice>(&self, mut ctx: SrvContext<'_, F, S>) -> Result<usize> {
+    pub(super) fn bmap<S: BitmapSlice>(&self, mut ctx: SrvContext<'_, '_, F, S>) -> Result<usize> {
         let BmapIn {
             block, blocksize, ..
         } = ctx.r.read_obj().map_err(Error::DecodeMessage)?;
@@ -1010,14 +1071,14 @@ impl<F: FileSystem + Sync> Server<F> {
         }
     }
 
-    pub(super) fn destroy<S: BitmapSlice>(&self, mut ctx: SrvContext<'_, F, S>) {
+    pub(super) fn destroy<S: BitmapSlice>(&self, mut ctx: SrvContext<'_, '_, F, S>) {
         self.fs.destroy();
         if let Err(e) = ctx.reply_ok(None::<u8>, None) {
             warn!("fuse channel reply destroy failed {:?}", e);
         }
     }
 
-    pub(super) fn ioctl<S: BitmapSlice>(&self, mut ctx: SrvContext<'_, F, S>) -> Result<usize> {
+    pub(super) fn ioctl<S: BitmapSlice>(&self, mut ctx: SrvContext<'_, '_, F, S>) -> Result<usize> {
         let IoctlIn {
             fh,
             flags,
@@ -1062,7 +1123,7 @@ impl<F: FileSystem + Sync> Server<F> {
         }
     }
 
-    pub(super) fn poll<S: BitmapSlice>(&self, mut ctx: SrvContext<'_, F, S>) -> Result<usize> {
+    pub(super) fn poll<S: BitmapSlice>(&self, mut ctx: SrvContext<'_, '_, F, S>) -> Result<usize> {
         let PollIn {
             fh,
             kh,
@@ -1091,7 +1152,7 @@ impl<F: FileSystem + Sync> Server<F> {
 
     pub(super) fn notify_reply<S: BitmapSlice>(
         &self,
-        mut ctx: SrvContext<'_, F, S>,
+        mut ctx: SrvContext<'_, '_, F, S>,
     ) -> Result<usize> {
         if let Err(e) = self.fs.notify_reply() {
             ctx.reply_error(e)
@@ -1102,7 +1163,7 @@ impl<F: FileSystem + Sync> Server<F> {
 
     pub(super) fn batch_forget<S: BitmapSlice>(
         &self,
-        mut ctx: SrvContext<'_, F, S>,
+        mut ctx: SrvContext<'_, '_, F, S>,
     ) -> Result<usize> {
         let BatchForgetIn { count, .. } = ctx.r.read_obj().map_err(Error::DecodeMessage)?;
 
@@ -1134,7 +1195,7 @@ impl<F: FileSystem + Sync> Server<F> {
         Ok(0)
     }
 
-    fn fallocate<S: BitmapSlice>(&self, mut ctx: SrvContext<'_, F, S>) -> Result<usize> {
+    fn fallocate<S: BitmapSlice>(&self, mut ctx: SrvContext<'_, '_, F, S>) -> Result<usize> {
         let FallocateIn {
             fh,
             offset,
@@ -1153,7 +1214,7 @@ impl<F: FileSystem + Sync> Server<F> {
     }
 
     #[cfg(target_os = "linux")]
-    pub(super) fn lseek<S: BitmapSlice>(&self, mut ctx: SrvContext<'_, F, S>) -> Result<usize> {
+    pub(super) fn lseek<S: BitmapSlice>(&self, mut ctx: SrvContext<'_, '_, F, S>) -> Result<usize> {
         let LseekIn {
             fh, offset, whence, ..
         } = ctx.r.read_obj().map_err(Error::DecodeMessage)?;
@@ -1176,7 +1237,7 @@ impl<F: FileSystem + Sync> Server<F> {
 impl<F: FileSystem + Sync> Server<F> {
     pub(super) fn setupmapping<S: BitmapSlice>(
         &self,
-        mut ctx: SrvContext<'_, F, S>,
+        mut ctx: SrvContext<'_, '_, F, S>,
         vu_req: Option<&mut dyn FsCacheReqHandler>,
     ) -> Result<usize> {
         if let Some(req) = vu_req {
@@ -1208,7 +1269,7 @@ impl<F: FileSystem + Sync> Server<F> {
 
     pub(super) fn removemapping<S: BitmapSlice>(
         &self,
-        mut ctx: SrvContext<'_, F, S>,
+        mut ctx: SrvContext<'_, '_, F, S>,
         vu_req: Option<&mut dyn FsCacheReqHandler>,
     ) -> Result<usize> {
         if let Some(req) = vu_req {
@@ -1244,7 +1305,7 @@ impl<F: FileSystem + Sync> Server<F> {
     }
 }
 
-impl<'a, F: FileSystem, S: BitmapSlice> SrvContext<'a, F, S> {
+impl<'a, 'b, F: FileSystem, S: BitmapSlice> SrvContext<'a, 'b, F, S> {
     fn reply_ok<T: ByteValued>(&mut self, out: Option<T>, data: Option<&[u8]>) -> Result<usize> {
         let data2 = out.as_ref().map(|v| v.as_slice()).unwrap_or(&[]);
         let data3 = data.unwrap_or(&[]);
@@ -1338,7 +1399,7 @@ impl<'a, F: FileSystem, S: BitmapSlice> SrvContext<'a, F, S> {
 }
 
 fn add_dirent<S: BitmapSlice>(
-    cursor: &mut Writer<'_, S>,
+    cursor: &mut Writer<'_, '_, S>,
     max: u32,
     d: DirEntry,
     entry: Option<Entry>,

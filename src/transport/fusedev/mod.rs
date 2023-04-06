@@ -41,6 +41,8 @@ pub use fuse_t_session::*;
 pub const FUSE_KERN_BUF_PAGES: usize = 256;
 /// Maximum size of FUSE message header, 4K.
 pub const FUSE_HEADER_SIZE: usize = 0x1000;
+use crate::transport::fusedev::splice::PipeWriter;
+use crate::transport::ReaderInner;
 
 /// A buffer reference wrapper for fuse requests.
 #[derive(Debug)]
@@ -66,12 +68,11 @@ impl<'a, S: BitmapSlice + Default> Reader<'a, S> {
             VolatileSlice::with_bitmap(buf.mem.as_mut_ptr(), buf.mem.len(), S::default())
         });
 
-        Ok(Reader {
-            buffers: IoBuffers {
-                buffers,
-                bytes_consumed: 0,
-            },
+        Ok(ReaderInner::Buffer(IoBuffers {
+            buffers,
+            bytes_consumed: 0,
         })
+        .into())
     }
 }
 
@@ -82,36 +83,77 @@ impl<'a, S: BitmapSlice + Default> Reader<'a, S> {
 /// 2. If the writer is split, a final commit() MUST be called to issue the
 ///    device write operation.
 /// 3. Concurrency, caller should not write to the writer concurrently.
-#[derive(Debug, PartialEq, Eq)]
-pub struct FuseDevWriter<'a, S: BitmapSlice = ()> {
+#[derive(Debug)]
+pub struct FuseDevWriter<'a, 'b, S: BitmapSlice = ()> {
     fd: RawFd,
     buffered: bool,
     buf: ManuallyDrop<Vec<u8>>,
+    pw: Option<(PipeWriter<'b>, PipeWriter<'b>)>,
     bitmapslice: S,
-    phantom: PhantomData<&'a mut [S]>,
+    phantom: PhantomData<(&'a mut [S], &'b mut [S])>,
 }
 
-impl<'a, S: BitmapSlice + Default> FuseDevWriter<'a, S> {
+impl<'a, 'b, S: BitmapSlice + Default> FuseDevWriter<'a, 'b, S> {
     /// Construct a new [Writer].
-    pub fn new(fd: RawFd, data_buf: &'a mut [u8]) -> Result<FuseDevWriter<'a, S>> {
+    pub fn new(fd: RawFd, data_buf: &'a mut [u8]) -> Result<FuseDevWriter<'a, 'b, S>> {
+        Self::with_pipe(fd, data_buf, None)
+    }
+}
+
+/// macos doesn't support splice read/write
+#[cfg(not(target_os = "linux"))]
+pub(crate) mod splice {
+    #[derive(Debug)]
+    pub struct PipeWriter<'a>(&'a ());
+
+    impl<'a> PipeWriter<'a> {
+        pub fn len(&self) -> usize {
+            0
+        }
+
+        pub fn is_empty(&self) -> bool {
+            self.len() == 0
+        }
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+impl<'a, 'b, S: BitmapSlice> FuseDevWriter<'a, 'b, S> {
+    pub(crate) fn commit_by_splice(
+        &mut self,
+        _other: Option<&mut FuseDevWriter<'a, 'b, S>>,
+    ) -> io::Result<usize> {
+        panic!("can't run here");
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+impl<'a, 'b, S: BitmapSlice + Default> FuseDevWriter<'a, 'b, S> {
+    /// Construct writer with pipe
+    pub fn with_pipe(
+        fd: RawFd,
+        data_buf: &'a mut [u8],
+        _p: Option<(PipeWriter<'b>, PipeWriter<'b>)>,
+    ) -> Result<FuseDevWriter<'a, 'b, S>> {
         let buf = unsafe { Vec::from_raw_parts(data_buf.as_mut_ptr(), 0, data_buf.len()) };
         Ok(FuseDevWriter {
             fd,
             buffered: false,
             buf: ManuallyDrop::new(buf),
+            pw: None,
             bitmapslice: S::default(),
             phantom: PhantomData,
         })
     }
 }
 
-impl<'a, S: BitmapSlice> FuseDevWriter<'a, S> {
+impl<'a, 'b, S: BitmapSlice> FuseDevWriter<'a, 'b, S> {
     /// Split the [Writer] at the given offset.
     ///
     /// After the split, `self` will be able to write up to `offset` bytes while the returned
     /// `Writer` can write up to `available_bytes() - offset` bytes.  Returns an error if
     /// `offset > self.available_bytes()`.
-    pub fn split_at(&mut self, offset: usize) -> Result<FuseDevWriter<'a, S>> {
+    pub fn split_at(&mut self, offset: usize) -> Result<FuseDevWriter<'a, 'b, S>> {
         if self.buf.capacity() < offset {
             return Err(Error::SplitOutOfBounds(offset));
         }
@@ -133,19 +175,18 @@ impl<'a, S: BitmapSlice> FuseDevWriter<'a, S> {
             fd: self.fd,
             buffered: true,
             buf,
+            pw: self.pw.take(),
             bitmapslice: self.bitmapslice.clone(),
             phantom: PhantomData,
         })
     }
 
-    /// Compose the FUSE reply message and send the message to `/dev/fuse`.
-    pub fn commit(&mut self, other: Option<&Writer<'a, S>>) -> io::Result<usize> {
-        if !self.buffered {
-            return Ok(0);
-        }
-
+    fn commit_by_write(
+        &mut self,
+        other: Option<&mut FuseDevWriter<'a, 'b, S>>,
+    ) -> io::Result<usize> {
         let o = match other {
-            Some(Writer::FuseDev(w)) => w.buf.as_slice(),
+            Some(w) => w.buf.as_slice(),
             _ => &[],
         };
         let res = match (self.buf.len(), o.len()) {
@@ -161,14 +202,42 @@ impl<'a, S: BitmapSlice> FuseDevWriter<'a, S> {
         res.map_err(|e| io::Error::from_raw_os_error(e as i32))
     }
 
+    /// Compose the FUSE reply message and send the message to `/dev/fuse`.
+    pub fn commit(&mut self, other: Option<&mut Writer<'a, 'b, S>>) -> io::Result<usize> {
+        if !self.buffered {
+            return Ok(0);
+        }
+        let other_fw = match other {
+            Some(Writer::FuseDev(w)) => Some(w),
+            _ => None,
+        };
+        let use_splice = match other_fw {
+            None => self.pw.is_some() && !self.pw.as_ref().unwrap().1.is_empty(),
+            Some(ref w) => w.pw.is_some() && !w.pw.as_ref().unwrap().1.is_empty(),
+        };
+        if !use_splice {
+            self.commit_by_write(other_fw)
+        } else {
+            self.commit_by_splice(other_fw)
+        }
+    }
+
+    fn fd_bufs_size(&self) -> usize {
+        if let Some((_, pw)) = self.pw.as_ref() {
+            pw.len()
+        } else {
+            0
+        }
+    }
+
     /// Return number of bytes already written to the internal buffer.
     pub fn bytes_written(&self) -> usize {
-        self.buf.len()
+        self.buf.len() + self.fd_bufs_size()
     }
 
     /// Return number of bytes available for writing.
     pub fn available_bytes(&self) -> usize {
-        self.buf.capacity() - self.buf.len()
+        self.buf.capacity() - self.bytes_written()
     }
 
     fn account_written(&mut self, count: usize) {
@@ -288,7 +357,7 @@ impl<'a, S: BitmapSlice> FuseDevWriter<'a, S> {
     }
 }
 
-impl<'a, S: BitmapSlice> Write for FuseDevWriter<'a, S> {
+impl<'a, 'b, S: BitmapSlice> io::Write for FuseDevWriter<'a, 'b, S> {
     fn write(&mut self, data: &[u8]) -> io::Result<usize> {
         self.check_available_space(data.len())?;
 
@@ -345,7 +414,7 @@ mod async_io {
     use crate::file_buf::FileVolatileBuf;
     use crate::file_traits::AsyncFileReadWriteVolatile;
 
-    impl<'a, S: BitmapSlice> FuseDevWriter<'a, S> {
+    impl<'a, 'b, S: BitmapSlice> FuseDevWriter<'a, 'b, S> {
         /// Write data from a buffer into this writer in asynchronous mode.
         ///
         /// Return the number of bytes written to the writer.
@@ -479,7 +548,10 @@ mod async_io {
         /// Commit all internal buffers of the writer and others.
         ///
         /// We need this because the lifetime of others is usually shorter than self.
-        pub async fn async_commit(&mut self, other: Option<&Writer<'a, S>>) -> io::Result<usize> {
+        pub async fn async_commit(
+            &mut self,
+            other: Option<&mut Writer<'a, 'b, S>>,
+        ) -> io::Result<usize> {
             let o = match other {
                 Some(Writer::FuseDev(w)) => w.buf.as_slice(),
                 _ => &[],
@@ -519,6 +591,20 @@ mod tests {
     use std::os::unix::io::AsRawFd;
     use vmm_sys_util::tempfile::TempFile;
 
+    #[cfg(target_os = "linux")]
+    use crate::transport::fusedev::splice::{Pipe, PipeReader};
+    #[cfg(target_os = "linux")]
+    use std::os::unix::fs::FileExt;
+    use tokio_test::assert_err;
+
+    #[cfg(target_os = "linux")]
+    fn prepare_pipe(buf: &[u8], buf_size: usize) -> (Pipe, usize) {
+        let pipe = Pipe::new(buf_size).unwrap();
+        let len = nix::unistd::write(pipe.wfd(), buf).unwrap();
+        println!("prepare pipe ok, fd = ({},{})", pipe.rfd(), pipe.wfd());
+        (pipe, len)
+    }
+
     #[test]
     fn reader_test_simple_chain() {
         let mut buf = [0u8; 106];
@@ -542,6 +628,32 @@ mod tests {
 
         assert_eq!(reader.available_bytes(), 0);
         assert_eq!(reader.bytes_read(), 106);
+
+        #[cfg(target_os = "linux")]
+        {
+            let buf = [0u8; 106];
+            let (mut pipe, len) = prepare_pipe(&buf, 128);
+            let mut reader = Reader::<()>::from_pipe_reader(PipeReader::new(&mut pipe, len));
+
+            assert_eq!(reader.available_bytes(), 106);
+            assert_eq!(reader.bytes_read(), 0);
+
+            let mut buffer = [0 as u8; 64];
+            if let Err(_) = reader.read_exact(&mut buffer) {
+                panic!("read_exact should not fail here");
+            }
+
+            assert_eq!(reader.available_bytes(), 42);
+            assert_eq!(reader.bytes_read(), 64);
+
+            match reader.read(&mut buffer) {
+                Err(_) => panic!("read should not fail here"),
+                Ok(length) => assert_eq!(length, 42),
+            }
+
+            assert_eq!(reader.available_bytes(), 0);
+            assert_eq!(reader.bytes_read(), 106);
+        }
     }
 
     #[test]
@@ -617,6 +729,21 @@ mod tests {
                 .kind(),
             io::ErrorKind::UnexpectedEof
         );
+
+        #[cfg(target_os = "linux")]
+        {
+            let buf = [0u8; 106];
+            let (mut pipe, len) = prepare_pipe(&buf, 128);
+            let mut reader = Reader::<()>::from_pipe_reader(PipeReader::new(&mut pipe, len));
+            let mut buf2 = vec![0_u8; 128];
+            assert_eq!(
+                reader
+                    .read_exact(&mut buf2[..])
+                    .expect_err("read more bytes than available")
+                    .kind(),
+                io::ErrorKind::UnexpectedEof
+            );
+        }
     }
 
     #[test]
@@ -627,6 +754,14 @@ mod tests {
 
         assert_eq!(reader.available_bytes(), 32);
         assert_eq!(other.available_bytes(), 96);
+
+        #[cfg(target_os = "linux")]
+        {
+            let buf = [0u8; 128];
+            let (mut pipe, len) = prepare_pipe(&buf, 128);
+            let mut reader = Reader::<()>::from_pipe_reader(PipeReader::new(&mut pipe, len));
+            assert!(reader.split_at(32).is_err());
+        }
     }
 
     #[test]
@@ -634,9 +769,64 @@ mod tests {
         let mut buf = [0u8; 128];
         let mut reader = Reader::<()>::from_fuse_buffer(FuseBuf::new(&mut buf)).unwrap();
 
-        if let Ok(_) = reader.split_at(256) {
+        if reader.split_at(256).is_ok() {
             panic!("successfully split Reader with out of bounds offset");
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn writer_append_fd_buf() {
+        let mut buf = [1_u8; 64];
+        let mut data_file = TempFile::new().unwrap().into_file();
+        data_file.write(&buf[..32]).unwrap();
+
+        let dst_file = TempFile::new().unwrap().into_file();
+        let mut pipe1 = Pipe::new(4096).unwrap();
+        let pwriter1 = PipeWriter::new(&mut pipe1);
+        let mut pipe2 = Pipe::new(4096).unwrap();
+        let pwriter2 = PipeWriter::new(&mut pipe2);
+        let mut writer = FuseDevWriter::<()>::with_pipe(
+            dst_file.as_raw_fd(),
+            &mut buf,
+            Some((pwriter1, pwriter2)),
+        )
+        .unwrap();
+        writer.buffered = true;
+        let buf2 = [0_u8; 16];
+        assert_eq!(
+            32,
+            writer
+                .append_fd_buf(data_file.as_raw_fd(), 32, Some(0))
+                .unwrap()
+        );
+        assert_eq!(32, writer.bytes_written());
+        assert_eq!(32, writer.available_bytes());
+        assert!(writer.write(&buf2).is_ok());
+        assert_eq!(48, writer.bytes_written());
+        assert_eq!(16, writer.available_bytes());
+        let mut w2 = writer.split_at(8).unwrap();
+        assert!(writer
+            .append_fd_buf(data_file.as_raw_fd(), 32, Some(0))
+            .is_err());
+        assert_eq!(
+            16,
+            w2.append_fd_buf(data_file.as_raw_fd(), 16, Some(16))
+                .unwrap()
+        );
+        assert!(w2.write(&buf2).is_err());
+        let mut w2_final = Writer::FuseDev(w2);
+        let res = writer.commit(Some(&mut w2_final));
+        assert!(res.is_ok());
+        assert_eq!(64, res.unwrap());
+        let mut all_data = vec![0_u8; 64];
+        assert_eq!(64, dst_file.read_at(&mut all_data, 0).unwrap());
+        assert_eq!(&buf2, &all_data[..16]);
+        assert_eq!(&[1_u8; 48], &all_data[16..]);
+        drop(w2_final);
+        drop(writer);
+        assert!(!pipe1.is_invalid());
+        assert!(!pipe2.is_invalid());
     }
 
     #[test]
@@ -727,7 +917,7 @@ mod tests {
             64
         );
 
-        writer.commit(Some(&other.into())).unwrap();
+        writer.commit(Some(&mut other.into())).unwrap();
     }
 
     #[test]
@@ -740,6 +930,19 @@ mod tests {
             reader.read(&mut buf[..]).expect("failed to read to buffer"),
             48
         );
+
+        #[cfg(target_os = "linux")]
+        {
+            let buf2 = [0u8; 48];
+            let (mut pipe, len) = prepare_pipe(&buf2, 128);
+            let mut reader = Reader::<()>::from_pipe_reader(PipeReader::new(&mut pipe, len));
+            let mut buf = vec![0u8; 64];
+
+            assert_eq!(
+                reader.read(&mut buf[..]).expect("failed to read to buffer"),
+                48
+            );
+        }
     }
 
     #[test]
@@ -788,6 +991,21 @@ mod tests {
         assert_eq!(reader.available_bytes(), 1);
         assert_eq!(reader.bytes_read(), 8);
         assert!(reader.read_obj::<u64>().is_err());
+
+        #[cfg(target_os = "linux")]
+        {
+            let mut buf2 = [0u8; 9];
+            buf2[0] = 1;
+            let (mut pipe, len) = prepare_pipe(&buf2, 128);
+            let mut reader = Reader::<()>::from_pipe_reader(PipeReader::new(&mut pipe, len));
+            assert_eq!(
+                1_u64,
+                reader.read_obj::<u64>().expect("failed to read to file")
+            );
+            assert_eq!(reader.available_bytes(), 1);
+            assert_eq!(reader.bytes_read(), 8);
+            assert!(reader.read_obj::<u64>().is_err());
+        }
     }
 
     #[test]
@@ -802,6 +1020,19 @@ mod tests {
 
         assert_eq!(reader.available_bytes(), 1);
         assert_eq!(reader.bytes_read(), 47);
+
+        #[cfg(target_os = "linux")]
+        {
+            let buf2 = [0u8; 48];
+            let (mut pipe, len) = prepare_pipe(&buf2, 128);
+            let mut reader = Reader::<()>::from_pipe_reader(PipeReader::new(&mut pipe, len));
+            reader
+                .read_exact_to(&mut file, 47)
+                .expect("failed to read to file");
+
+            assert_eq!(reader.available_bytes(), 1);
+            assert_eq!(reader.bytes_read(), 47);
+        }
     }
 
     #[test]
@@ -815,6 +1046,55 @@ mod tests {
                 .read_to_at(&mut file, 48, 16)
                 .expect("failed to read to file"),
             48
+        );
+        assert_eq!(reader.available_bytes(), 0);
+        assert_eq!(reader.bytes_read(), 48);
+
+        #[cfg(target_os = "linux")]
+        {
+            let buf2 = [0u8; 48];
+            let (mut pipe, len) = prepare_pipe(&buf2, 128);
+            let mut reader = Reader::<()>::from_pipe_reader(PipeReader::new(&mut pipe, len));
+            let mut file = TempFile::new().unwrap().into_file();
+
+            assert_eq!(
+                reader
+                    .read_to_at(&mut file, 48, 16)
+                    .expect("failed to read to file"),
+                48
+            );
+            assert_eq!(reader.available_bytes(), 0);
+            assert_eq!(reader.bytes_read(), 48);
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn read_to_fd() {
+        let mut buf2 = [0u8; 48];
+        let mut reader = Reader::<()>::from_fuse_buffer(FuseBuf::new(&mut buf2)).unwrap();
+        let mut file = TempFile::new().unwrap().into_file();
+        assert_err!(reader.splice_to(&mut file, 16));
+        assert_err!(reader.splice_to_at(&mut file, 44, 20));
+        drop(reader);
+        drop(file);
+
+        let (mut pipe, len) = prepare_pipe(&buf2, 128);
+        let mut reader = Reader::<()>::from_pipe_reader(PipeReader::new(&mut pipe, len));
+        let mut file = TempFile::new().unwrap().into_file();
+        assert_eq!(
+            reader
+                .splice_to(&mut file, 16)
+                .expect("failed to read to file"),
+            16
+        );
+        assert_eq!(reader.available_bytes(), 32);
+        assert_eq!(reader.bytes_read(), 16);
+        assert_eq!(
+            reader
+                .splice_to_at(&mut file, 44, 20)
+                .expect("failed to read to file"),
+            32
         );
         assert_eq!(reader.available_bytes(), 0);
         assert_eq!(reader.bytes_read(), 48);
@@ -1056,8 +1336,9 @@ mod tests {
                 64
             );
 
-            let res =
-                async_runtime::block_on(async { writer.async_commit(Some(&other.into())).await });
+            let res = async_runtime::block_on(async {
+                writer.async_commit(Some(&mut other.into())).await
+            });
             let _ = res.unwrap();
         }
     }

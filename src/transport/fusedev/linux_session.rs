@@ -9,20 +9,25 @@
 //! A FUSE session can have multiple FUSE channels so that FUSE requests are handled in parallel.
 
 use std::fs::{File, OpenOptions};
+use std::io;
+use std::io::IoSlice;
+use std::marker::PhantomData;
+use std::mem::ManuallyDrop;
 use std::ops::Deref;
 use std::os::unix::fs::PermissionsExt;
-use std::os::unix::io::AsRawFd;
+use std::os::unix::io::{AsRawFd, RawFd};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use mio::{Events, Poll, Token, Waker};
 use nix::errno::Errno;
-use nix::fcntl::{fcntl, FcntlArg, FdFlag, OFlag};
+use nix::fcntl::{fcntl, FcntlArg, FdFlag, OFlag, SpliceFFlags};
 use nix::mount::{mount, umount2, MntFlags, MsFlags};
 use nix::poll::{poll, PollFd, PollFlags};
 use nix::sys::epoll::{epoll_ctl, EpollEvent, EpollFlags, EpollOp};
 use nix::unistd::{getgid, getuid, read};
+use vm_memory::bitmap::BitmapSlice;
 
 use super::{
     super::pagesize,
@@ -32,6 +37,11 @@ use super::{
 
 // These follows definition from libfuse.
 const POLL_EVENTS_CAPACITY: usize = 1024;
+
+// fuse header consumes 1 buf + data(1MB) consumes at least 256 bufs
+const DEFAULT_SPLICE_PIPE_READ_BUF_SIZE: usize = 260;
+// fuse header consumes 1 buf + data(128KB) consumes at least 32 bufs
+const DEFAULT_SPLICE_PIPE_WRITE_BUF_SIZE: usize = 64;
 
 const FUSE_DEVICE: &str = "/dev/fuse";
 const FUSE_FSTYPE: &str = "fuse";
@@ -247,6 +257,10 @@ pub struct FuseChannel {
     poll: Poll,
     waker: Arc<Waker>,
     buf: Vec<u8>,
+    /// pipe for splice read
+    r_p: Option<Pipe>,
+    /// pipe for splice write (memory data, fd data)
+    w_ps: Option<(Pipe, Pipe)>,
 }
 
 impl FuseChannel {
@@ -274,11 +288,141 @@ impl FuseChannel {
             poll,
             waker,
             buf: vec![0x0u8; bufsize],
+            r_p: None,
+            w_ps: None,
         })
     }
 
     fn get_waker(&self) -> Arc<Waker> {
         self.waker.clone()
+    }
+
+    /// Enable using splice syscall to read FUSE requests
+    ///
+    /// Improve performance of write request because of less data copy.
+    /// It's better to check whether FUSE module supports SPLICE_READ before enable this.
+    ///
+    /// let mut session = FuseSession::new("./mnt", "fs", "fs", false)?;
+    /// let mut ch = session.new_channel()?;
+    /// let fs = Server::new(MyFs::new()); // MyFs impl FileSystem trait
+    /// loop {
+    ///     // after handle init request, we know whether kernel support splice read
+    ///     if fs.is_support_splice_read() {
+    ///         ch.enable_splice_read();
+    ///     }
+    ///     let (r, w) = ch.get_request()?.unwrap();
+    ///     fs.handle_message(r, w, None, None)?;
+    /// }
+    ///
+    pub fn enable_splice_read(&mut self) -> Result<()> {
+        if self.r_p.is_some() {
+            return Ok(());
+        }
+        self.r_p = Some(Pipe::new(DEFAULT_SPLICE_PIPE_READ_BUF_SIZE * pagesize())?);
+        Ok(())
+    }
+
+    /// Enable using splice syscall to reply FUSE requests
+    ///
+    /// Improve performance of read request because of less data copy.
+    /// It's better to check whether FUSE module supports SPLICE_WRITE&SPLICE_MOVE before enable this.
+    ///
+    /// let mut session = FuseSession::new("./mnt", "fs", "fs", false)?;
+    /// let mut ch = session.new_channel()?;
+    /// let fs = Server::new(MyFs::new()); // MyFs impl FileSystem trait
+    /// loop {
+    ///     // after handle init request, we know whether kernel support splice write
+    ///     if fs.is_support_splice_write() {
+    ///         ch.enable_splice_write();
+    ///     }
+    ///     let (r, w) = ch.get_request()?.unwrap();
+    ///     fs.handle_message(r, w, None, None)?;
+    /// }
+    ///
+    pub fn enable_splice_write(&mut self) -> Result<()> {
+        if self.w_ps.is_some() {
+            return Ok(());
+        }
+        if self.w_ps.is_none() {
+            self.w_ps = Some((
+                Pipe::new(DEFAULT_SPLICE_PIPE_WRITE_BUF_SIZE * pagesize())?,
+                Pipe::new(DEFAULT_SPLICE_PIPE_WRITE_BUF_SIZE * pagesize())?,
+            ));
+        }
+        Ok(())
+    }
+
+    /// Check whether next FUSE request is available
+    ///
+    /// Returns:
+    /// - Ok((available, need_exit)) whether FUSE request is available and whether fuse server need exit
+    /// - Err(e) error message
+    fn is_readable(&mut self) -> Result<(bool, bool)> {
+        let mut events = Events::with_capacity(POLL_EVENTS_CAPACITY);
+        let mut need_exit = false;
+        let mut fusereq_available = false;
+        match self.poll.poll(&mut events, None) {
+            Ok(_) => {}
+            Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => return Ok((false, false)),
+            Err(e) => return Err(SessionFailure(format!("epoll wait: {}", e))),
+        }
+
+        for event in events.iter() {
+            if event.is_readable() {
+                match event.token() {
+                    EXIT_FUSE_EVENT => need_exit = true,
+                    FUSE_DEV_EVENT => fusereq_available = true,
+                    x => {
+                        error!("unexpected epoll event");
+                        return Err(SessionFailure(format!("unexpected epoll event: {}", x.0)));
+                    }
+                }
+            } else if event.is_error() {
+                info!("FUSE channel already closed!");
+                return Err(SessionFailure("epoll error".to_string()));
+            } else {
+                // We should not step into this branch as other event is not registered.
+                panic!("unknown epoll result events");
+            }
+        }
+        Ok((fusereq_available, need_exit))
+    }
+
+    fn prepare(&mut self) -> Result<()> {
+        if self.r_p.is_some() && self.r_p.as_ref().unwrap().is_invalid() {
+            self.r_p = Some(Pipe::new(DEFAULT_SPLICE_PIPE_READ_BUF_SIZE * pagesize())?);
+        }
+        if let Some((vm_p, fd_p)) = self.w_ps.as_mut() {
+            if vm_p.is_invalid() {
+                *vm_p = Pipe::new(DEFAULT_SPLICE_PIPE_WRITE_BUF_SIZE * pagesize())?;
+            }
+            if fd_p.is_invalid() {
+                *fd_p = Pipe::new(DEFAULT_SPLICE_PIPE_WRITE_BUF_SIZE * pagesize())?;
+            }
+        }
+        Ok(())
+    }
+
+    fn do_splice(&mut self) -> io::Result<usize> {
+        loop {
+            match nix::fcntl::splice(
+                self.file.as_raw_fd(),
+                None,
+                self.r_p.as_ref().unwrap().wfd(),
+                None,
+                self.buf.len(),
+                SpliceFFlags::empty(),
+            ) {
+                Ok(n) => return Ok(n),
+                Err(nix::Error::EIO) => {
+                    // FUSE reply EIO if pipe's available buffers are not enough to fill fuse request
+                    // So we need resize pipe buf size
+                    let pipe = self.r_p.as_mut().unwrap();
+                    pipe.set_size(pipe.size() * 2)?;
+                }
+                Err(e) => return Err(e.into()),
+            }
+        }
     }
 
     /// Get next available FUSE request from the underlying fuse device file.
@@ -288,34 +432,8 @@ impl FuseChannel {
     /// - Ok(Some((reader, writer))): reader to receive request and writer to send reply
     /// - Err(e): error message
     pub fn get_request(&mut self) -> Result<Option<(Reader, FuseDevWriter)>> {
-        let mut events = Events::with_capacity(POLL_EVENTS_CAPACITY);
-        let mut need_exit = false;
         loop {
-            let mut fusereq_available = false;
-            match self.poll.poll(&mut events, None) {
-                Ok(_) => {}
-                Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-                Err(e) => return Err(SessionFailure(format!("epoll wait: {e}"))),
-            }
-
-            for event in events.iter() {
-                if event.is_readable() {
-                    match event.token() {
-                        EXIT_FUSE_EVENT => need_exit = true,
-                        FUSE_DEV_EVENT => fusereq_available = true,
-                        x => {
-                            error!("unexpected epoll event");
-                            return Err(SessionFailure(format!("unexpected epoll event: {}", x.0)));
-                        }
-                    }
-                } else if event.is_error() {
-                    info!("FUSE channel already closed!");
-                    return Err(SessionFailure("epoll error".to_string()));
-                } else {
-                    // We should not step into this branch as other event is not registered.
-                    panic!("unknown epoll result events");
-                }
-            }
+            let (fusereq_available, need_exit) = self.is_readable()?;
 
             // Handle wake up event first. We don't read the event fd so that a LEVEL triggered
             // event can still be delivered to other threads/daemons.
@@ -325,46 +443,88 @@ impl FuseChannel {
             }
             if fusereq_available {
                 let fd = self.file.as_raw_fd();
-                match read(fd, &mut self.buf) {
-                    Ok(len) => {
-                        // ###############################################
-                        // Note: it's a heavy hack to reuse the same underlying data
-                        // buffer for both Reader and Writer, in order to reduce memory
-                        // consumption. Here we assume Reader won't be used anymore once
-                        // we start to write to the Writer. To get rid of this hack,
-                        // just allocate a dedicated data buffer for Writer.
-                        let buf = unsafe {
-                            std::slice::from_raw_parts_mut(self.buf.as_mut_ptr(), self.buf.len())
-                        };
-                        // Reader::new() and Writer::new() should always return success.
-                        let reader =
-                            Reader::from_fuse_buffer(FuseBuf::new(&mut self.buf[..len])).unwrap();
-                        let writer = FuseDevWriter::new(fd, buf).unwrap();
-                        return Ok(Some((reader, writer)));
+                self.prepare().map_err(|e| {
+                    error!("failed to prepare, err = {:?}", e);
+                    e
+                })?;
+                let err = if self.r_p.is_some() {
+                    let res = self.do_splice();
+                    match res {
+                        Ok(n) => {
+                            let buf = unsafe {
+                                std::slice::from_raw_parts_mut(
+                                    self.buf.as_mut_ptr(),
+                                    self.buf.len(),
+                                )
+                            };
+                            return Ok(Some((
+                                Reader::from_pipe_reader(splice::PipeReader::new(
+                                    self.r_p.as_mut().unwrap(),
+                                    n,
+                                )),
+                                FuseDevWriter::with_pipe(
+                                    fd,
+                                    buf,
+                                    self.w_ps.as_mut().map(|(vm_p, fd_p)| {
+                                        (PipeWriter::new(vm_p), PipeWriter::new(fd_p))
+                                    }),
+                                )
+                                .unwrap(),
+                            )));
+                        }
+                        Err(e) => e,
                     }
-                    Err(e) => match e {
-                        Errno::ENOENT => {
-                            // ENOENT means the operation was interrupted, it's safe to restart
-                            trace!("restart reading due to ENOENT");
-                            continue;
+                } else {
+                    match read(fd, &mut self.buf) {
+                        Ok(len) => {
+                            let buf = unsafe {
+                                std::slice::from_raw_parts_mut(
+                                    self.buf.as_mut_ptr(),
+                                    self.buf.len(),
+                                )
+                            };
+                            // Reader::new() and Writer::new() should always return success.
+                            let reader =
+                                Reader::from_fuse_buffer(FuseBuf::new(&mut self.buf[..len]))
+                                    .unwrap();
+                            return Ok(Some((
+                                reader,
+                                FuseDevWriter::with_pipe(
+                                    fd,
+                                    buf,
+                                    self.w_ps.as_mut().map(|(vm_p, fd_p)| {
+                                        (PipeWriter::new(vm_p), PipeWriter::new(fd_p))
+                                    }),
+                                )
+                                .unwrap(),
+                            )));
                         }
-                        Errno::EAGAIN => {
-                            trace!("restart reading due to EAGAIN");
-                            continue;
-                        }
-                        Errno::EINTR => {
-                            trace!("syscall interrupted");
-                            continue;
-                        }
-                        Errno::ENODEV => {
-                            info!("fuse filesystem umounted");
-                            return Ok(None);
-                        }
-                        e => {
-                            warn! {"read fuse dev failed on fd {}: {}", fd, e};
-                            return Err(SessionFailure(format!("read new request: {e:?}")));
-                        }
-                    },
+                        Err(e) => e.into(),
+                    }
+                };
+                match err.raw_os_error().unwrap_or(libc::EIO) {
+                    libc::ENOENT => {
+                        // ENOENT means the operation was interrupted, it's safe to restart
+                        trace!("restart reading due to ENOENT");
+                        continue;
+                    }
+                    libc::EAGAIN => {
+                        trace!("restart reading due to EAGAIN");
+                        continue;
+                    }
+                    libc::EINTR => {
+                        trace!("syscall interrupted");
+                        continue;
+                    }
+                    libc::ENODEV => {
+                        info!("fuse filesystem umounted");
+                        return Ok(None);
+                    }
+                    code => {
+                        let e = nix::Error::from_i32(code);
+                        warn! {"read fuse dev failed on fd {}: {}", fd, e};
+                        return Err(SessionFailure(format!("read new request: {e:?}")));
+                    }
                 }
             }
         }
@@ -607,6 +767,474 @@ fn fuse_fusermount_umount(mountpoint: &str, fusermount: &str) -> Result<()> {
     }
 }
 
+impl<'a, 'b, S: BitmapSlice + Default> FuseDevWriter<'a, 'b, S> {
+    /// Construct writer with pipe
+    pub fn with_pipe(
+        fd: RawFd,
+        data_buf: &'a mut [u8],
+        pw: Option<(PipeWriter<'b>, PipeWriter<'b>)>,
+    ) -> Result<FuseDevWriter<'a, 'b, S>> {
+        let buf = unsafe { Vec::from_raw_parts(data_buf.as_mut_ptr(), 0, data_buf.len()) };
+        Ok(FuseDevWriter {
+            fd,
+            buffered: false,
+            buf: ManuallyDrop::new(buf),
+            pw,
+            bitmapslice: S::default(),
+            phantom: PhantomData,
+        })
+    }
+}
+
+impl<'a, 'b, S: BitmapSlice> FuseDevWriter<'a, 'b, S> {
+    /// Append fd buffer for FUSE reply.
+    /// Often for FUSE read requests:
+    ///     fuse reply header in buf and data in fd buffer
+    pub fn append_fd_buf(&mut self, fd: RawFd, size: u64, off: Option<i64>) -> io::Result<usize> {
+        if self.pw.is_none() || !self.buffered {
+            return Err(io::Error::from_raw_os_error(libc::EINVAL));
+        }
+        self.check_available_space(size as usize)?;
+        let n = self
+            .pw
+            .as_mut()
+            .unwrap()
+            .1
+            .splice_from(fd, size as usize, off)?;
+        Ok(n)
+    }
+
+    pub(crate) fn commit_by_splice(
+        &mut self,
+        other: Option<&mut FuseDevWriter<'a, 'b, S>>,
+    ) -> io::Result<usize> {
+        let (other_bufs, (mut pw, fd_pw)) = match other {
+            Some(w) => (w.buf.as_slice(), w.pw.take().unwrap()),
+            _ => (&[] as &[u8], self.pw.take().unwrap()),
+        };
+        match (self.buf.len(), other_bufs.len()) {
+            (0, 0) => return Ok(0),
+            (0, _) => pw.splice_from_buf(other_bufs),
+            (_, 0) => pw.splice_from_buf(&self.buf),
+            (_, _) => {
+                let bufs = [IoSlice::new(self.buf.as_slice()), IoSlice::new(other_bufs)];
+                pw.splice_from_iovec(&bufs)
+            }
+        }
+        .map_err(|e| {
+            error! {"fail to vmsplice to pipe on commit: {}", e};
+            e
+        })?;
+        pw.splice_from_pipe(fd_pw)?;
+        // final commit to fuse fd
+        pw.splice_to_all(self.fd).map_err(|e| {
+            error! {"fail to splice pipe fd to fuse device on commit: {}", e};
+            e
+        })
+    }
+}
+
+impl<'a, S: BitmapSlice + Default> Reader<'a, S> {
+    /// Construct a new Reader wrapper over PipeReader
+    pub fn from_pipe_reader(reader: splice::PipeReader<'a>) -> Reader<'a, S> {
+        ReaderInner::Pipe(reader).into()
+    }
+}
+
+pub(crate) mod splice {
+    use crate::transport::pagesize;
+    use nix::fcntl::{FcntlArg, OFlag, SpliceFFlags};
+    use std::io::IoSlice;
+    use std::os::unix::io::RawFd;
+
+    fn nr_pages(start: usize, len: usize) -> usize {
+        let start_vfn = start / pagesize();
+        let end_vfn = (start + len - 1) / pagesize();
+        end_vfn - start_vfn + 1
+    }
+
+    #[inline]
+    fn buf_nr_pages(buf: &[u8]) -> usize {
+        let start = (buf.as_ptr() as usize) / pagesize();
+        let end = (unsafe { buf.as_ptr().add(buf.len() - 1) as usize }) / pagesize();
+        end - start + 1
+    }
+
+    #[derive(Debug)]
+    pub struct Pipe {
+        r: RawFd,
+        w: RawFd,
+        size: usize,
+    }
+
+    impl Drop for Pipe {
+        fn drop(&mut self) {
+            if self.is_invalid() {
+                return;
+            }
+            nix::unistd::close(self.r).expect("failed to close pipe");
+            nix::unistd::close(self.w).expect("failed to close pipe");
+        }
+    }
+
+    impl Pipe {
+        pub fn new(buf_size: usize) -> std::io::Result<Self> {
+            let (r, w) = nix::unistd::pipe2(OFlag::O_NONBLOCK | OFlag::O_CLOEXEC)?;
+            nix::fcntl::fcntl(w, FcntlArg::F_SETPIPE_SZ(buf_size as nix::libc::c_int))?;
+            Ok(Self {
+                r,
+                w,
+                size: buf_size,
+            })
+        }
+
+        pub fn rfd(&self) -> RawFd {
+            self.r
+        }
+
+        pub fn wfd(&self) -> RawFd {
+            self.w
+        }
+
+        pub fn clear(&mut self) {
+            let _ = nix::unistd::close(self.r);
+            let _ = nix::unistd::close(self.w);
+            self.r = -1;
+            self.w = -1;
+        }
+
+        pub fn is_invalid(&self) -> bool {
+            self.r == -1
+        }
+
+        pub fn set_size(&mut self, new_size: usize) -> std::io::Result<()> {
+            nix::fcntl::fcntl(self.w, FcntlArg::F_SETPIPE_SZ(new_size as nix::libc::c_int))?;
+            self.size = new_size;
+            Ok(())
+        }
+
+        pub fn size(&self) -> usize {
+            self.size
+        }
+    }
+
+    /// Reader for fuse requests using fuse splice
+    #[derive(Debug)]
+    pub struct PipeReader<'a> {
+        p: &'a mut Pipe,
+        n_bytes: usize,
+        bytes_consumed: usize,
+    }
+
+    impl<'a> Drop for PipeReader<'a> {
+        fn drop(&mut self) {
+            if self.n_bytes != 0 {
+                self.p.clear();
+            }
+        }
+    }
+
+    impl<'a> std::io::Read for PipeReader<'a> {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            if self.n_bytes == 0 {
+                return Ok(0);
+            }
+            let n = nix::unistd::read(self.p.r, buf)?;
+            self.n_bytes -= n;
+            self.bytes_consumed += n;
+            Ok(n)
+        }
+    }
+
+    impl<'a> PipeReader<'a> {
+        pub fn new(p: &'a mut Pipe, n_bytes: usize) -> PipeReader<'a> {
+            Self {
+                p,
+                n_bytes,
+                bytes_consumed: 0,
+            }
+        }
+
+        pub fn available_bytes(&self) -> usize {
+            self.n_bytes
+        }
+
+        pub fn bytes_consumed(&self) -> usize {
+            self.bytes_consumed
+        }
+
+        pub fn splice_to(&mut self, fd: RawFd, len: usize) -> std::io::Result<usize> {
+            let n = nix::fcntl::splice(self.p.r, None, fd, None, len, SpliceFFlags::empty())?;
+            self.n_bytes -= n;
+            self.bytes_consumed += n;
+            Ok(n)
+        }
+
+        pub fn splice_to_at(
+            &mut self,
+            fd: RawFd,
+            len: usize,
+            off: &mut i64,
+        ) -> std::io::Result<usize> {
+            let n = nix::fcntl::splice(self.p.r, None, fd, Some(off), len, SpliceFFlags::empty())?;
+            self.n_bytes -= n;
+            self.bytes_consumed += n;
+            Ok(n)
+        }
+    }
+
+    #[derive(Debug)]
+    pub struct PipeWriter<'a> {
+        p: &'a mut Pipe,
+        n_bufs: usize,
+        n_bytes: usize,
+    }
+
+    impl<'a> PipeWriter<'a> {
+        pub fn new(p: &'a mut Pipe) -> Self {
+            Self {
+                p,
+                n_bufs: 0,
+                n_bytes: 0,
+            }
+        }
+
+        pub fn len(&self) -> usize {
+            self.n_bytes
+        }
+
+        pub fn is_empty(&self) -> bool {
+            self.len() == 0
+        }
+
+        fn splice_to(&mut self, fd: RawFd, len: usize) -> std::io::Result<usize> {
+            let len = nix::fcntl::splice(
+                self.p.rfd(),
+                None,
+                fd,
+                None,
+                len,
+                SpliceFFlags::SPLICE_F_MOVE,
+            )?;
+            self.n_bytes -= len;
+            Ok(len)
+        }
+
+        pub fn splice_to_all(mut self, fd: RawFd) -> std::io::Result<usize> {
+            self.splice_to(fd, self.n_bytes)
+        }
+
+        fn may_grow_pipe(&mut self, more_bufs: usize) -> std::io::Result<()> {
+            let expect_size = (self.n_bufs + more_bufs) * pagesize();
+            if expect_size > self.p.size() {
+                self.p.set_size(expect_size + 2 * pagesize())
+            } else {
+                Ok(())
+            }
+        }
+
+        pub fn splice_from(
+            &mut self,
+            fd: RawFd,
+            len: usize,
+            mut off: Option<i64>,
+        ) -> std::io::Result<usize> {
+            let expect_bufs = len / pagesize() + 1;
+            self.may_grow_pipe(expect_bufs)?;
+            let ori_off = off;
+            let n = nix::fcntl::splice(
+                fd,
+                off.as_mut(),
+                self.p.wfd(),
+                None,
+                len,
+                SpliceFFlags::SPLICE_F_MOVE,
+            )?;
+            if let Some(off) = ori_off {
+                self.n_bufs += nr_pages(off as usize, n);
+            } else {
+                self.n_bufs += n / pagesize() + 1;
+            }
+            self.n_bytes += n;
+            Ok(n)
+        }
+
+        pub fn splice_from_pipe(&mut self, mut other: PipeWriter<'_>) -> std::io::Result<usize> {
+            self.may_grow_pipe(other.n_bufs)?;
+            let n = nix::fcntl::splice(
+                other.p.rfd(),
+                None,
+                self.p.wfd(),
+                None,
+                other.len(),
+                SpliceFFlags::SPLICE_F_MOVE,
+            )?;
+            self.n_bytes += n;
+            other.n_bytes -= n;
+            self.n_bufs += other.n_bufs;
+            Ok(n)
+        }
+
+        pub fn splice_from_buf(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            let expect_bufs = buf_nr_pages(buf);
+            self.may_grow_pipe(expect_bufs)?;
+            let n =
+                nix::fcntl::vmsplice(self.p.wfd(), &[IoSlice::new(buf)], SpliceFFlags::empty())?;
+            self.n_bufs += buf_nr_pages(&buf[..n]);
+            self.n_bytes += n;
+            Ok(n)
+        }
+
+        pub fn splice_from_iovec(&mut self, iovec: &[IoSlice]) -> std::io::Result<usize> {
+            let mut expect_bufs = 0;
+            let mut expect_size = 0;
+            for iv in iovec.iter() {
+                expect_size += iv.len();
+                expect_bufs += buf_nr_pages(iv.as_ref());
+            }
+            self.may_grow_pipe(expect_bufs)?;
+            let n = nix::fcntl::vmsplice(self.p.wfd(), iovec, SpliceFFlags::empty())?;
+            if n != expect_size {
+                let mut scan_len = 0;
+                let mut grow_bufs = 0;
+                for iv in iovec.iter() {
+                    if n - scan_len > iv.len() {
+                        grow_bufs += buf_nr_pages(iv.as_ref());
+                    } else {
+                        grow_bufs += buf_nr_pages(&iv.as_ref()[..n - scan_len]);
+                        break;
+                    }
+                    scan_len += iv.len();
+                }
+                self.n_bufs += grow_bufs;
+            } else {
+                self.n_bufs += expect_bufs;
+            }
+            self.n_bytes += n;
+            Ok(n)
+        }
+    }
+
+    impl<'a> Drop for PipeWriter<'a> {
+        fn drop(&mut self) {
+            if !self.p.is_invalid() && self.n_bytes != 0 {
+                self.p.clear();
+            }
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use crate::transport::fusedev::splice::{Pipe, PipeReader, PipeWriter};
+        use nix::fcntl::SpliceFFlags;
+        use std::io::{IoSlice, Read, Write};
+        use std::os::unix::io::AsRawFd;
+        use std::path::Path;
+        use vmm_sys_util::tempfile::TempFile;
+
+        #[test]
+        fn test_splice_reader() {
+            let p_res = Pipe::new(4096);
+            assert!(p_res.is_ok());
+            let mut p = p_res.unwrap();
+            let content = "hello world!";
+            // prepare test file data
+            std::fs::write(Path::new("splice_testdata"), content).unwrap();
+            let file = std::fs::File::open("splice_testdata").unwrap();
+            let res = nix::fcntl::splice(
+                file.as_raw_fd(),
+                None,
+                p.wfd(),
+                None,
+                content.len(),
+                SpliceFFlags::empty(),
+            );
+            assert!(res.is_ok());
+            assert_eq!(content.len(), res.unwrap());
+            let mut reader = PipeReader::new(&mut p, content.len());
+            let mut buf = vec![0_u8; 1024];
+            let res = reader.read(&mut buf);
+            assert!(res.is_ok());
+            assert_eq!(content.len(), res.unwrap());
+            assert_eq!(content.as_bytes(), &buf[..content.len()]);
+            assert_eq!(0, reader.available_bytes());
+            assert_eq!(content.len(), reader.bytes_consumed());
+            drop(reader);
+
+            let mut new_file = std::fs::OpenOptions::new()
+                .write(true)
+                .truncate(true)
+                .create(true)
+                .open("splice_testdata_2")
+                .unwrap();
+            let mut off = 0;
+            nix::fcntl::splice(
+                file.as_raw_fd(),
+                Some(&mut off),
+                p.wfd(),
+                None,
+                content.len(),
+                SpliceFFlags::empty(),
+            )
+            .unwrap();
+            let mut reader = PipeReader::new(&mut p, content.len());
+            let res = reader.splice_to(new_file.as_raw_fd(), content.len());
+            assert!(res.is_ok());
+            assert_eq!(content.len(), res.unwrap());
+            new_file.flush().unwrap();
+            let data = std::fs::read("splice_testdata_2").unwrap();
+            assert_eq!(content.as_bytes(), &data);
+            drop(reader);
+
+            off = 0;
+            nix::fcntl::splice(
+                file.as_raw_fd(),
+                Some(&mut off),
+                p.wfd(),
+                None,
+                content.len(),
+                SpliceFFlags::empty(),
+            )
+            .unwrap();
+            let mut reader = PipeReader::new(&mut p, content.len());
+            let mut off2 = 1;
+            let res = reader.splice_to_at(new_file.as_raw_fd(), content.len(), &mut off2);
+            assert!(res.is_ok());
+            assert_eq!(content.len(), res.unwrap());
+            new_file.flush().unwrap();
+            let data = std::fs::read("splice_testdata_2").unwrap();
+            assert_eq!("hhello world!".as_bytes(), &data);
+
+            drop(file);
+            drop(new_file);
+            let _ = std::fs::remove_file("splice_testdata");
+            let _ = std::fs::remove_file("splice_testdata_2");
+        }
+
+        #[test]
+        fn test_splice_writer() {
+            let mut from = TempFile::new().unwrap().into_file();
+            let to = TempFile::new().unwrap().into_file();
+            let buf = [0_u8; 64];
+            from.write(&buf).unwrap();
+            let mut pipe = Pipe::new(4096).unwrap();
+            let mut pw = PipeWriter::new(&mut pipe);
+            assert_eq!(64, pw.splice_from_buf(&buf).unwrap());
+            let buf2 = [0_u8; 16];
+            assert_eq!(
+                80,
+                pw.splice_from_iovec(&[IoSlice::new(&buf), IoSlice::new(&buf2)])
+                    .unwrap()
+            );
+            assert_eq!(144, pw.n_bytes);
+            assert_eq!(32, pw.splice_from(from.as_raw_fd(), 32, Some(0)).unwrap());
+            assert_eq!(32, pw.splice_from(from.as_raw_fd(), 48, Some(32)).unwrap());
+            assert_eq!(208, pw.splice_to_all(to.as_raw_fd()).unwrap());
+            assert!(!pipe.is_invalid());
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -645,6 +1273,8 @@ mod tests {
     }
 }
 
+use crate::transport::fusedev::splice::{Pipe, PipeWriter};
+use crate::transport::ReaderInner;
 #[cfg(feature = "async_io")]
 pub use asyncio::FuseDevTask;
 

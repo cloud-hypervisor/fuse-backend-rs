@@ -26,6 +26,8 @@ use crate::abi::fuse_abi::{ino64_t, stat64};
 mod async_io;
 #[cfg(feature = "async-io")]
 pub use async_io::{AsyncFileSystem, AsyncZeroCopyReader, AsyncZeroCopyWriter};
+#[cfg(all(target_os = "linux", feature = "fusedev"))]
+use std::os::unix::io::AsRawFd;
 
 mod sync_io;
 pub use sync_io::FileSystem;
@@ -208,6 +210,18 @@ pub trait ZeroCopyReader: io::Read {
         off: u64,
     ) -> io::Result<usize>;
 
+    /// Copies at most `count` bytes from `self` directly into `f` at offset `off` with less data copy
+    /// `f` could be local file description or tcp socket
+    #[cfg(all(target_os = "linux", feature = "fusedev"))]
+    fn splice_to(
+        &mut self,
+        _f: &dyn AsRawFd,
+        _count: usize,
+        _off: Option<u64>,
+    ) -> io::Result<usize> {
+        Err(io::Error::from_raw_os_error(libc::ENOSYS))
+    }
+
     /// Copies exactly `count` bytes of data from `self` into `f` at offset `off`. `off + count`
     /// must be less than `u64::MAX`.
     ///
@@ -251,6 +265,50 @@ pub trait ZeroCopyReader: io::Read {
         Ok(())
     }
 
+    /// Copies exactly `count` bytes of data from `self` into `f` at offset `off`. `off + count`
+    /// must be less than `u64::MAX`.
+    /// `f` could be local file description or tcp socket
+    #[cfg(all(target_os = "linux", feature = "fusedev"))]
+    fn splice_exact_to(
+        &mut self,
+        f: &mut dyn AsRawFd,
+        mut count: usize,
+        mut off: Option<u64>,
+    ) -> io::Result<()> {
+        let c = count
+            .try_into()
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+        if let Some(v) = off.as_ref() {
+            if v.checked_add(c).is_none() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "`off` + `count` must be less than u64::MAX",
+                ));
+            }
+        }
+
+        while count > 0 {
+            match self.splice_to(f, count, off) {
+                Ok(0) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::WriteZero,
+                        "failed to fill whole buffer",
+                    ))
+                }
+                Ok(n) => {
+                    count -= n;
+                    if let Some(v) = off.as_mut() {
+                        *v += n as u64;
+                    }
+                }
+                Err(ref e) if e.kind() == io::ErrorKind::Interrupted => {}
+                Err(e) => return Err(e),
+            }
+        }
+
+        Ok(())
+    }
+
     /// Copies all remaining bytes from `self` into `f` at offset `off`. Equivalent to repeatedly
     /// calling `read_to` until it returns either `Ok(0)` or a non-`ErrorKind::Interrupted` error.
     ///
@@ -268,6 +326,24 @@ pub trait ZeroCopyReader: io::Read {
                 Ok(0) => return Ok(out),
                 Ok(n) => {
                     off = off.saturating_add(n as u64);
+                    out += n;
+                }
+                Err(ref e) if e.kind() == io::ErrorKind::Interrupted => {}
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
+    /// Copies all remaining bytes from `self` into `f` at offset `off`.
+    /// `f` could be local file description or tcp socket
+    #[cfg(all(target_os = "linux", feature = "fusedev"))]
+    fn splice_to_end(&mut self, f: &mut dyn AsRawFd, mut off: Option<u64>) -> io::Result<usize> {
+        let mut out = 0;
+        loop {
+            match self.splice_to(f, ::std::usize::MAX, off) {
+                Ok(0) => return Ok(out),
+                Ok(n) => {
+                    off.as_mut().map(|v| v.saturating_add(n as u64));
                     out += n;
                 }
                 Err(ref e) if e.kind() == io::ErrorKind::Interrupted => {}
@@ -299,6 +375,25 @@ pub trait ZeroCopyWriter: io::Write {
         count: usize,
         off: u64,
     ) -> io::Result<usize>;
+
+    /// Append `count` bytes data from fd `f` at offset `off`
+    /// `f` should be file description or socket
+    /// This data is always appended at the end of all data, only available for buffered writer.
+    /// For example:
+    ///     We already write "aaa" to writer. Then we append fd buf who contains "bbb".
+    /// Finally we write "ccc" to writer. The final data is "aaacccbbb".
+    ///
+    /// # Errors
+    /// ENOSYS: writer doesn't support this operation, should fallback to use `write_from`.
+    #[cfg(all(target_os = "linux", feature = "fusedev"))]
+    fn append_fd_buf(
+        &mut self,
+        _f: &dyn AsRawFd,
+        _count: usize,
+        _off: Option<u64>,
+    ) -> io::Result<usize> {
+        Err(io::Error::from_raw_os_error(libc::ENOSYS))
+    }
 
     /// Copies exactly `count` bytes of data from `f` at offset `off` into `self`. `off + count`
     /// must be less than `u64::MAX`.
