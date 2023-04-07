@@ -137,6 +137,10 @@ fn is_safe_inode(mode: u32) -> bool {
     matches!(mode & libc::S_IFMT, libc::S_IFREG | libc::S_IFDIR)
 }
 
+fn is_dir(mode: u32) -> bool {
+    (mode & libc::S_IFMT) == libc::S_IFDIR
+}
+
 impl InodeData {
     fn new(inode: Inode, f: FileOrHandle, refcount: u64, altkey: InodeAltKey, mode: u32) -> Self {
         InodeData {
@@ -391,6 +395,15 @@ pub struct Config {
     /// The default value for this option is 5 seconds.
     pub attr_timeout: Duration,
 
+    /// Same as `entry_timeout`, override `entry_timeout` config, but only take effect on
+    /// directories when specified. This is useful to set different timeouts for directories and
+    /// regular files.
+    pub dir_entry_timeout: Option<Duration>,
+
+    /// Same as `attr_timeout`, override `attr_timeout` config, but only take effect on directories
+    /// when specified. This is useful to set different timeouts for directories and regular files.
+    pub dir_attr_timeout: Option<Duration>,
+
     /// The caching policy the file system should use. See the documentation of `CachePolicy` for
     /// more details.
     pub cache_policy: CachePolicy,
@@ -499,6 +512,8 @@ impl Default for Config {
             seal_size: false,
             enable_mntid: false,
             dax_file_size: None,
+            dir_entry_timeout: None,
+            dir_attr_timeout: None,
         }
     }
 }
@@ -555,6 +570,9 @@ pub struct PassthroughFs<S: BitmapSlice + Send + Sync = ()> {
     // Init from guest kernel Init cmd of fuse fs.
     perfile_dax: AtomicBool,
 
+    dir_entry_timeout: Duration,
+    dir_attr_timeout: Duration,
+
     cfg: Config,
 
     phantom: PhantomData<S>,
@@ -572,6 +590,13 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
             0,
         )?;
 
+        let (dir_entry_timeout, dir_attr_timeout) =
+            match (cfg.dir_entry_timeout, cfg.dir_attr_timeout) {
+                (Some(e), Some(a)) => (e, a),
+                (Some(e), None) => (e, cfg.attr_timeout),
+                (None, Some(a)) => (cfg.entry_timeout, a),
+                (None, None) => (cfg.entry_timeout, cfg.attr_timeout),
+            };
         Ok(PassthroughFs {
             inode_map: InodeMap::new(),
             next_inode: AtomicU64::new(fuse::ROOT_ID + 1),
@@ -589,6 +614,8 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
             no_readdir: AtomicBool::new(cfg.no_readdir),
             seal_size: AtomicBool::new(cfg.seal_size),
             perfile_dax: AtomicBool::new(false),
+            dir_entry_timeout,
+            dir_attr_timeout,
             cfg,
 
             phantom: PhantomData,
@@ -970,13 +997,19 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
             }
         };
 
+        let attr = st.get_stat();
+        let (entry_timeout, attr_timeout) = if is_dir(attr.st_mode) {
+            (self.dir_entry_timeout, self.dir_attr_timeout)
+        } else {
+            (self.cfg.entry_timeout, self.cfg.attr_timeout)
+        };
         Ok(Entry {
             inode,
             generation: 0,
-            attr: st.get_stat(),
+            attr,
             attr_flags,
-            attr_timeout: self.cfg.attr_timeout,
-            entry_timeout: self.cfg.entry_timeout,
+            attr_timeout,
+            entry_timeout,
         })
     }
 
@@ -1514,5 +1547,77 @@ mod tests {
         let mut buf = [0; 4];
         let n = f.read(&mut buf).unwrap();
         assert_eq!(n, 0);
+    }
+
+    #[test]
+    fn test_is_dir() {
+        let mode = libc::S_IFREG;
+        assert!(!is_dir(mode));
+
+        let mode = libc::S_IFDIR;
+        assert!(is_dir(mode));
+    }
+
+    #[test]
+    fn test_passthroughfs_dir_timeout() {
+        log::set_max_level(log::LevelFilter::Trace);
+
+        let source = TempDir::new().expect("Cannot create temporary directory.");
+        let parent_path =
+            TempDir::new_in(source.as_path()).expect("Cannot create temporary directory.");
+        let child_path =
+            TempFile::new_in(parent_path.as_path()).expect("Cannot create temporary file.");
+
+        // passthroughfs with cache=none, but non-zero dir entry/attr timeout.
+        let fs_cfg = Config {
+            writeback: false,
+            do_import: true,
+            no_open: false,
+            root_dir: source
+                .as_path()
+                .to_str()
+                .expect("source path to string")
+                .to_string(),
+            cache_policy: CachePolicy::Never,
+            entry_timeout: Duration::from_secs(0),
+            attr_timeout: Duration::from_secs(0),
+            dir_entry_timeout: Some(Duration::from_secs(1)),
+            dir_attr_timeout: Some(Duration::from_secs(2)),
+            ..Default::default()
+        };
+        let fs = PassthroughFs::<()>::new(fs_cfg).unwrap();
+        fs.import().unwrap();
+
+        let ctx = Context::default();
+
+        // parent entry should have non-zero timeouts
+        let parent = CString::new(
+            parent_path
+                .as_path()
+                .file_name()
+                .unwrap()
+                .to_str()
+                .expect("path to string"),
+        )
+        .unwrap();
+        let p_entry = fs.lookup(&ctx, ROOT_ID, &parent).unwrap();
+        assert_eq!(p_entry.entry_timeout, Duration::from_secs(1));
+        assert_eq!(p_entry.attr_timeout, Duration::from_secs(2));
+
+        // regular file has zero timeout value
+        let child = CString::new(
+            child_path
+                .as_path()
+                .file_name()
+                .unwrap()
+                .to_str()
+                .expect("path to string"),
+        )
+        .unwrap();
+        let c_entry = fs.lookup(&ctx, p_entry.inode, &child).unwrap();
+        assert_eq!(c_entry.entry_timeout, Duration::from_secs(0));
+        assert_eq!(c_entry.attr_timeout, Duration::from_secs(0));
+
+        fs.destroy();
     }
 }
