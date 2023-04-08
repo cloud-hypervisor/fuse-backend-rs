@@ -49,7 +49,13 @@ use multikey::MultikeyBTreeMap;
 
 type Inode = u64;
 type Handle = u64;
-type MultiKeyMap = MultikeyBTreeMap<Inode, InodeAltKey, Arc<InodeData>>;
+type MultiKeyMap = MultikeyBTreeMap<Inode, Arc<InodeAltKey>, Arc<InodeData>>;
+struct OpenFileOrHandleResult(
+    FileOrHandle,
+    InodeStat,
+    Arc<InodeAltKey>,
+    Option<Arc<InodeAltKey>>,
+);
 
 #[derive(Clone, Copy)]
 struct InodeStat {
@@ -74,30 +80,30 @@ enum InodeAltKey {
         dev: libc::dev_t,
         mnt: u64,
     },
-    Handle(FileHandle),
+    Handle(Arc<FileHandle>),
 }
 
 impl InodeAltKey {
-    fn ids_from_stat(ist: &InodeStat) -> Self {
+    fn ids_from_stat(ist: &InodeStat) -> Arc<Self> {
         let st = ist.get_stat();
-        InodeAltKey::Ids {
+        Arc::new(InodeAltKey::Ids {
             ino: st.st_ino,
             dev: st.st_dev,
             mnt: ist.get_mnt_id(),
-        }
+        })
     }
 }
 
 enum FileOrHandle {
     File(File),
-    Handle(FileHandle),
+    Handle(Arc<FileHandle>),
 }
 
 impl FileOrHandle {
-    fn handle(&self) -> Option<&FileHandle> {
+    fn handle(&self) -> Option<Arc<FileHandle>> {
         match self {
             FileOrHandle::File(_) => None,
-            FileOrHandle::Handle(h) => Some(h),
+            FileOrHandle::Handle(h) => Some(h.clone()),
         }
     }
 }
@@ -185,8 +191,8 @@ impl InodeMap {
 
     fn get_alt(
         &self,
-        ids_altkey: &InodeAltKey,
-        handle_altkey: Option<&InodeAltKey>,
+        ids_altkey: &Arc<InodeAltKey>,
+        handle_altkey: Option<&Arc<InodeAltKey>>,
     ) -> Option<Arc<InodeData>> {
         // Do not expect poisoned lock here, so safe to unwrap().
         let inodes = self.inodes.read().unwrap();
@@ -196,8 +202,8 @@ impl InodeMap {
 
     fn get_alt_locked(
         inodes: &MultiKeyMap,
-        ids_altkey: &InodeAltKey,
-        handle_altkey: Option<&InodeAltKey>,
+        ids_altkey: &Arc<InodeAltKey>,
+        handle_altkey: Option<&Arc<InodeAltKey>>,
     ) -> Option<Arc<InodeData>> {
         handle_altkey
             .and_then(|altkey| inodes.get_alt(altkey))
@@ -222,24 +228,12 @@ impl InodeMap {
         self.inodes.write().unwrap()
     }
 
-    fn insert(
-        &self,
-        inode: Inode,
-        data: InodeData,
-        ids_altkey: InodeAltKey,
-        handle_altkey: Option<InodeAltKey>,
-    ) {
-        let mut inodes = self.get_map_mut();
-
-        Self::insert_locked(inodes.deref_mut(), inode, data, ids_altkey, handle_altkey)
-    }
-
     fn insert_locked(
         inodes: &mut MultiKeyMap,
         inode: Inode,
         data: InodeData,
-        ids_altkey: InodeAltKey,
-        handle_altkey: Option<InodeAltKey>,
+        ids_altkey: Arc<InodeAltKey>,
+        handle_altkey: Option<Arc<InodeAltKey>>,
     ) {
         inodes.insert(inode, Arc::new(data));
         inodes.insert_alt(ids_altkey, inode);
@@ -586,21 +580,22 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
     pub fn import(&self) -> io::Result<()> {
         let root = CString::new(self.cfg.root_dir.as_str()).expect("CString::new failed");
 
-        let (file_or_handle, st, ids_altkey, handle_altkey) = Self::open_file_or_handle(
-            self.cfg.inode_file_handles,
-            libc::AT_FDCWD,
-            &root,
-            &self.mount_fds,
-            |fd, flags, _mode| {
-                let pathname = CString::new(format!("{fd}"))
-                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-                Self::open_file(self.proc_self_fd.as_raw_fd(), &pathname, flags, 0)
-            },
-        )
-        .map_err(|e| {
-            error!("fuse: import: failed to get file or handle: {:?}", e);
-            e
-        })?;
+        let OpenFileOrHandleResult(file_or_handle, st, ids_altkey, handle_altkey) =
+            Self::open_file_or_handle(
+                self.cfg.inode_file_handles,
+                libc::AT_FDCWD,
+                &root,
+                &self.mount_fds,
+                |fd, flags, _mode| {
+                    let pathname = CString::new(format!("{fd}"))
+                        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+                    Self::open_file(self.proc_self_fd.as_raw_fd(), &pathname, flags, 0)
+                },
+            )
+            .map_err(|e| {
+                error!("fuse: import: failed to get file or handle: {:?}", e);
+                e
+            })?;
 
         // Safe because this doesn't modify any memory and there is no need to check the return
         // value because this system call always succeeds. We need to clear the umask here because
@@ -608,12 +603,10 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
         unsafe { libc::umask(0o000) };
 
         // Not sure why the root inode gets a refcount of 2 but that's what libfuse does.
-        self.inode_map.insert(
-            fuse::ROOT_ID,
-            InodeData::new(fuse::ROOT_ID, file_or_handle, 2, st.get_stat().st_mode),
-            ids_altkey,
-            handle_altkey,
-        );
+        let data = InodeData::new(fuse::ROOT_ID, file_or_handle, 2, st.get_stat().st_mode);
+        let mut inodes = self.inode_map.get_map_mut();
+        let inodes = inodes.deref_mut();
+        InodeMap::insert_locked(inodes, fuse::ROOT_ID, data, ids_altkey, handle_altkey);
 
         Ok(())
     }
@@ -770,7 +763,7 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
         name: &CStr,
         mount_fds: &MountFds,
         reopen_dir: F,
-    ) -> io::Result<(FileOrHandle, InodeStat, InodeAltKey, Option<InodeAltKey>)>
+    ) -> io::Result<OpenFileOrHandleResult>
     where
         F: FnOnce(RawFd, libc::c_int, u32) -> io::Result<File>,
     {
@@ -782,7 +775,7 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
 
         // Ignore errors, because having a handle is optional
         let file_or_handle = if let Ok(h) = handle {
-            FileOrHandle::Handle(h)
+            FileOrHandle::Handle(Arc::new(h))
         } else {
             let f = Self::open_file(
                 dir_fd,
@@ -822,9 +815,14 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
         // `cfg.inode_file_handles` is false, we do not need this key anyway.
         let handle_altkey = file_or_handle
             .handle()
-            .map(|h| InodeAltKey::Handle((*h).clone()));
+            .map(|h| Arc::new(InodeAltKey::Handle(h)));
 
-        Ok((file_or_handle, inode_stat, ids_altkey, handle_altkey))
+        Ok(OpenFileOrHandleResult(
+            file_or_handle,
+            inode_stat,
+            ids_altkey,
+            handle_altkey,
+        ))
     }
 
     fn do_lookup(&self, parent: Inode, name: &CStr) -> io::Result<Entry> {
@@ -838,13 +836,14 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
 
         let dir = self.inode_map.get(parent)?;
         let dir_file = dir.get_file(&self.mount_fds)?;
-        let (file_or_handle, st, ids_altkey, handle_altkey) = Self::open_file_or_handle(
-            self.cfg.inode_file_handles,
-            dir_file.as_raw_fd(),
-            name,
-            &self.mount_fds,
-            |fd, flags, mode| Self::open_proc_file(&self.proc_self_fd, fd, flags, mode),
-        )?;
+        let OpenFileOrHandleResult(file_or_handle, st, ids_altkey, handle_altkey) =
+            Self::open_file_or_handle(
+                self.cfg.inode_file_handles,
+                dir_file.as_raw_fd(),
+                name,
+                &self.mount_fds,
+                |fd, flags, mode| Self::open_proc_file(&self.proc_self_fd, fd, flags, mode),
+            )?;
 
         // Whether to enable file DAX according to the value of dax_file_size
         let mut attr_flags: u32 = 0;
