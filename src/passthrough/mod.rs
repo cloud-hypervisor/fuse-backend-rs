@@ -123,8 +123,6 @@ struct InodeData {
     inode: Inode,
     // Most of these aren't actually files but ¯\_(ツ)_/¯.
     file_or_handle: FileOrHandle,
-    #[allow(dead_code)]
-    altkey: InodeAltKey,
     refcount: AtomicU64,
     // File type and mode, not used for now
     mode: u32,
@@ -138,11 +136,10 @@ fn is_safe_inode(mode: u32) -> bool {
 }
 
 impl InodeData {
-    fn new(inode: Inode, f: FileOrHandle, refcount: u64, altkey: InodeAltKey, mode: u32) -> Self {
+    fn new(inode: Inode, f: FileOrHandle, refcount: u64, mode: u32) -> Self {
         InodeData {
             inode,
             file_or_handle: f,
-            altkey,
             refcount: AtomicU64::new(refcount),
             mode,
         }
@@ -613,13 +610,7 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
         // Not sure why the root inode gets a refcount of 2 but that's what libfuse does.
         self.inode_map.insert(
             fuse::ROOT_ID,
-            InodeData::new(
-                fuse::ROOT_ID,
-                file_or_handle,
-                2,
-                ids_altkey.clone(),
-                st.get_stat().st_mode,
-            ),
+            InodeData::new(fuse::ROOT_ID, file_or_handle, 2, st.get_stat().st_mode),
             ids_altkey,
             handle_altkey,
         );
@@ -934,13 +925,7 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
                     InodeMap::insert_locked(
                         inodes.deref_mut(),
                         inode,
-                        InodeData::new(
-                            inode,
-                            file_or_handle,
-                            1,
-                            ids_altkey.clone(),
-                            st.get_stat().st_mode,
-                        ),
+                        InodeData::new(inode, file_or_handle, 1, st.get_stat().st_mode),
                         ids_altkey,
                         handle_altkey,
                     );
