@@ -45,11 +45,11 @@ mod multikey;
 mod sync_io;
 
 use file_handle::{FileHandle, MountFds};
-use multikey::MultikeyBTreeMap;
+use multikey::{MultiKeyState, MultikeyBTreeMap};
 
 type Inode = u64;
 type Handle = u64;
-type MultiKeyMap = MultikeyBTreeMap<Inode, Arc<InodeAltKey>, Arc<InodeData>>;
+type MultiKeyMap = MultikeyBTreeMap;
 struct OpenFileOrHandleResult(
     FileOrHandle,
     InodeStat,
@@ -73,7 +73,7 @@ impl InodeStat {
     }
 }
 
-#[derive(Clone, PartialOrd, Ord, PartialEq, Eq, Debug)]
+#[derive(Clone, Default, Debug, PartialOrd, Ord, PartialEq, Eq)]
 enum InodeAltKey {
     Ids {
         ino: libc::ino64_t,
@@ -81,6 +81,8 @@ enum InodeAltKey {
         mnt: u64,
     },
     Handle(Arc<FileHandle>),
+    #[default]
+    InvalidKey,
 }
 
 impl InodeAltKey {
@@ -91,6 +93,11 @@ impl InodeAltKey {
             dev: st.st_dev,
             mnt: ist.get_mnt_id(),
         })
+    }
+
+    /// Check whether the altkey is valid or not.
+    pub fn is_valid(&self) -> bool {
+        !matches!(self, InodeAltKey::InvalidKey)
     }
 }
 
@@ -132,6 +139,7 @@ struct InodeData {
     refcount: AtomicU64,
     // File type and mode, not used for now
     mode: u32,
+    multi_key_state: MultiKeyState,
 }
 
 // Returns true if it's safe to open this inode without O_PATH.
@@ -148,6 +156,7 @@ impl InodeData {
             file_or_handle: f,
             refcount: AtomicU64::new(refcount),
             mode,
+            multi_key_state: MultiKeyState::new(),
         }
     }
 
@@ -184,7 +193,7 @@ impl InodeMap {
         self.inodes
             .read()
             .unwrap()
-            .get(&inode)
+            .get(inode)
             .map(Arc::clone)
             .ok_or_else(ebadf)
     }
@@ -949,7 +958,7 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
             return;
         }
 
-        if let Some(data) = inodes.get(&inode) {
+        if let Some(data) = inodes.get(inode) {
             // Acquiring the write lock on the inode map prevents new lookups from incrementing the
             // refcount but there is the possibility that a previous lookup already acquired a
             // reference to the inode data and is in the process of updating the refcount so we need
@@ -977,7 +986,7 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
                 {
                     if new == 0 {
                         // We just removed the last refcount for this inode.
-                        inodes.remove(&inode);
+                        inodes.remove(inode);
                     }
                     break;
                 }

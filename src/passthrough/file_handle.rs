@@ -76,12 +76,12 @@ generate_fam_struct_impl!(
 type CFileHandleWrapper = FamStructWrapper<CFileHandleInner>;
 
 #[derive(Clone)]
-struct CFileHandle {
+pub struct CFileHandle {
     pub wrapper: CFileHandleWrapper,
 }
 
 impl CFileHandle {
-    fn new(size: usize) -> Self {
+    pub(crate) fn new(size: usize) -> Self {
         CFileHandle {
             wrapper: CFileHandleWrapper::new(size).unwrap(),
         }
@@ -145,7 +145,7 @@ impl Debug for CFileHandle {
 #[derive(Clone, PartialOrd, Ord, PartialEq, Eq, Debug)]
 pub struct FileHandle {
     pub(crate) mnt_id: u64,
-    handle: CFileHandle,
+    pub(crate) handle: CFileHandle,
 }
 
 extern "C" {
