@@ -20,10 +20,16 @@ mod fusedev_tests {
     use crate::example::passthroughfs;
 
     fn validate_two_git_directory(src: &str, dest: &str) -> bool {
-        let src_files =
-            exec(format!("cd {}; git ls-files;cd - > /dev/null", src).as_str()).unwrap();
-        let dest_files =
-            exec(format!("cd {}; git ls-files;cd - > /dev/null", dest).as_str()).unwrap();
+        let str = format!(
+            "cd {}; git config --global --add safe.directory {}; git ls-files; cd - > /dev/null",
+            src, src
+        );
+        let src_files = exec(str.as_str()).unwrap();
+        let str = format!(
+            "cd {}; git config --global --add safe.directory {}; git ls-files; cd - > /dev/null",
+            dest, dest
+        );
+        let dest_files = exec(str.as_str()).unwrap();
         if src_files != dest_files {
             error!(
                 "src {}:\n{}\ndest {}:\n{}",
