@@ -36,20 +36,19 @@ use crate::api::{
     validate_path_component, BackendFileSystem, CURRENT_DIR_CSTR, EMPTY_CSTR, PARENT_DIR_CSTR,
     PROC_SELF_FD_CSTR, SLASH_ASCII, VFS_MAX_INO,
 };
+use crate::passthrough::inode_store::InodeStore;
 use crate::BitmapSlice;
 
 #[cfg(feature = "async-io")]
 mod async_io;
 mod file_handle;
-mod multikey;
+mod inode_store;
 mod sync_io;
 
 use file_handle::{FileHandle, MountFds};
-use multikey::MultikeyBTreeMap;
 
 type Inode = u64;
 type Handle = u64;
-type MultiKeyMap = MultikeyBTreeMap<Inode, InodeAltKey, Arc<InodeData>>;
 
 #[derive(Clone, Copy)]
 struct InodeStat {
@@ -58,29 +57,30 @@ struct InodeStat {
 }
 
 impl InodeStat {
+    #[inline]
     fn get_stat(&self) -> libc::stat64 {
         self.stat
     }
 
+    #[inline]
     fn get_mnt_id(&self) -> u64 {
         self.mnt_id
     }
 }
 
-#[derive(Clone, PartialOrd, Ord, PartialEq, Eq, Debug)]
-enum InodeAltKey {
-    Ids {
-        ino: libc::ino64_t,
-        dev: libc::dev_t,
-        mnt: u64,
-    },
-    Handle(FileHandle),
+#[derive(Clone, Copy, Default, PartialOrd, Ord, PartialEq, Eq, Debug)]
+/// Identify an inode in `PassthroughFs` by `InodeAltKey`.
+pub struct InodeAltKey {
+    ino: libc::ino64_t,
+    dev: libc::dev_t,
+    mnt: u64,
 }
 
 impl InodeAltKey {
+    #[inline]
     fn ids_from_stat(ist: &InodeStat) -> Self {
         let st = ist.get_stat();
-        InodeAltKey::Ids {
+        InodeAltKey {
             ino: st.st_ino,
             dev: st.st_dev,
             mnt: ist.get_mnt_id(),
@@ -90,18 +90,25 @@ impl InodeAltKey {
 
 enum FileOrHandle {
     File(File),
-    Handle(FileHandle),
+    Handle(Arc<FileHandle>),
 }
 
 impl FileOrHandle {
     fn handle(&self) -> Option<&FileHandle> {
         match self {
             FileOrHandle::File(_) => None,
-            FileOrHandle::Handle(h) => Some(h),
+            FileOrHandle::Handle(h) => Some(h.deref()),
         }
     }
 }
 
+/**
+ * Represents the file associated with an inode (`InodeData`).
+ *
+ * When obtaining such a file, it may either be a new file (the `Owned` variant), in which case the
+ * object's lifetime is static, or it may reference `InodeData.file` (the `Ref` variant), in which
+ * case the object's lifetime is that of the respective `InodeData` object.
+ */
 #[derive(Debug)]
 enum InodeFile<'a> {
     Owned(File),
@@ -119,11 +126,11 @@ impl AsRawFd for InodeFile<'_> {
     }
 }
 
-struct InodeData {
+/// Represents an inode in `PassthroughFs`.
+pub struct InodeData {
     inode: Inode,
     // Most of these aren't actually files but ¯\_(ツ)_/¯.
     file_or_handle: FileOrHandle,
-    #[allow(dead_code)]
     altkey: InodeAltKey,
     refcount: AtomicU64,
     // File type and mode, not used for now
@@ -165,13 +172,13 @@ impl InodeData {
 
 /// Data structures to manage accessed inodes.
 struct InodeMap {
-    inodes: RwLock<MultiKeyMap>,
+    inodes: RwLock<InodeStore>,
 }
 
 impl InodeMap {
     fn new() -> Self {
         InodeMap {
-            inodes: RwLock::new(MultikeyBTreeMap::new()),
+            inodes: RwLock::new(Default::default()),
         }
     }
 
@@ -193,23 +200,23 @@ impl InodeMap {
     fn get_alt(
         &self,
         ids_altkey: &InodeAltKey,
-        handle_altkey: Option<&InodeAltKey>,
+        handle: Option<&FileHandle>,
     ) -> Option<Arc<InodeData>> {
         // Do not expect poisoned lock here, so safe to unwrap().
         let inodes = self.inodes.read().unwrap();
 
-        Self::get_alt_locked(inodes.deref(), ids_altkey, handle_altkey)
+        Self::get_alt_locked(inodes.deref(), ids_altkey, handle)
     }
 
     fn get_alt_locked(
-        inodes: &MultiKeyMap,
+        inodes: &InodeStore,
         ids_altkey: &InodeAltKey,
-        handle_altkey: Option<&InodeAltKey>,
+        handle: Option<&FileHandle>,
     ) -> Option<Arc<InodeData>> {
-        handle_altkey
-            .and_then(|altkey| inodes.get_alt(altkey))
+        handle
+            .and_then(|h| inodes.get_by_handle(h))
             .or_else(|| {
-                inodes.get_alt(ids_altkey).filter(|data| {
+                inodes.get_by_ids(ids_altkey).filter(|data| {
                     // When we have to fall back to looking up an inode by its IDs, ensure that
                     // we hit an entry that does not have a file handle.  Entries with file
                     // handles must also have a handle alt key, so if we have not found it by
@@ -218,41 +225,25 @@ impl InodeMap {
                     // inode ID.
                     // (This can happen when we look up a new file that has reused the inode ID
                     // of some previously unlinked inode we still have in `.inodes`.)
-                    handle_altkey.is_none() || data.file_or_handle.handle().is_none()
+                    handle.is_none() || data.file_or_handle.handle().is_none()
                 })
             })
             .map(Arc::clone)
     }
 
-    fn get_map_mut(&self) -> RwLockWriteGuard<MultiKeyMap> {
+    fn get_map_mut(&self) -> RwLockWriteGuard<InodeStore> {
         // Do not expect poisoned lock here, so safe to unwrap().
         self.inodes.write().unwrap()
     }
 
-    fn insert(
-        &self,
-        inode: Inode,
-        data: InodeData,
-        ids_altkey: InodeAltKey,
-        handle_altkey: Option<InodeAltKey>,
-    ) {
+    fn insert(&self, data: Arc<InodeData>) {
         let mut inodes = self.get_map_mut();
 
-        Self::insert_locked(inodes.deref_mut(), inode, data, ids_altkey, handle_altkey)
+        Self::insert_locked(inodes.deref_mut(), data)
     }
 
-    fn insert_locked(
-        inodes: &mut MultiKeyMap,
-        inode: Inode,
-        data: InodeData,
-        ids_altkey: InodeAltKey,
-        handle_altkey: Option<InodeAltKey>,
-    ) {
-        inodes.insert(inode, Arc::new(data));
-        inodes.insert_alt(ids_altkey, inode);
-        if let Some(altkey) = handle_altkey {
-            inodes.insert_alt(altkey, inode);
-        }
+    fn insert_locked(inodes: &mut InodeStore, data: Arc<InodeData>) {
+        inodes.insert(data);
     }
 }
 
@@ -626,7 +617,7 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
     pub fn import(&self) -> io::Result<()> {
         let root = CString::new(self.cfg.root_dir.as_str()).expect("CString::new failed");
 
-        let (file_or_handle, st, ids_altkey, handle_altkey) = Self::open_file_or_handle(
+        let (file_or_handle, st, ids_altkey) = Self::open_file_or_handle(
             self.cfg.inode_file_handles,
             self.cfg.enable_mntid,
             libc::AT_FDCWD,
@@ -649,18 +640,13 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
         unsafe { libc::umask(0o000) };
 
         // Not sure why the root inode gets a refcount of 2 but that's what libfuse does.
-        self.inode_map.insert(
+        self.inode_map.insert(Arc::new(InodeData::new(
             fuse::ROOT_ID,
-            InodeData::new(
-                fuse::ROOT_ID,
-                file_or_handle,
-                2,
-                ids_altkey.clone(),
-                st.get_stat().st_mode,
-            ),
+            file_or_handle,
+            2,
             ids_altkey,
-            handle_altkey,
-        );
+            st.get_stat().st_mode,
+        )));
 
         Ok(())
     }
@@ -818,7 +804,7 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
         name: &CStr,
         mount_fds: &MountFds,
         reopen_dir: F,
-    ) -> io::Result<(FileOrHandle, InodeStat, InodeAltKey, Option<InodeAltKey>)>
+    ) -> io::Result<(FileOrHandle, InodeStat, InodeAltKey)>
     where
         F: FnOnce(RawFd, libc::c_int, u32) -> io::Result<File>,
     {
@@ -830,7 +816,7 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
 
         // Ignore errors, because having a handle is optional
         let file_or_handle = if let Ok(h) = handle {
-            FileOrHandle::Handle(h)
+            FileOrHandle::Handle(Arc::new(h))
         } else {
             let f = Self::open_file(
                 dir_fd,
@@ -873,14 +859,7 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
 
         let ids_altkey = InodeAltKey::ids_from_stat(&inode_stat);
 
-        // Note that this will always be `None` if `cfg.inode_file_handles` is false, but we only
-        // really need this alt key when we do not have an `O_PATH` fd open for every inode.  So if
-        // `cfg.inode_file_handles` is false, we do not need this key anyway.
-        let handle_altkey = file_or_handle
-            .handle()
-            .map(|h| InodeAltKey::Handle((*h).clone()));
-
-        Ok((file_or_handle, inode_stat, ids_altkey, handle_altkey))
+        Ok((file_or_handle, inode_stat, ids_altkey))
     }
 
     fn do_lookup(&self, parent: Inode, name: &CStr) -> io::Result<Entry> {
@@ -894,7 +873,7 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
 
         let dir = self.inode_map.get(parent)?;
         let dir_file = dir.get_file(&self.mount_fds)?;
-        let (file_or_handle, st, ids_altkey, handle_altkey) = Self::open_file_or_handle(
+        let (file_or_handle, st, ids_altkey) = Self::open_file_or_handle(
             self.cfg.inode_file_handles,
             self.cfg.enable_mntid,
             dir_file.as_raw_fd(),
@@ -902,6 +881,11 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
             &self.mount_fds,
             |fd, flags, mode| Self::open_proc_file(&self.proc_self_fd, fd, flags, mode),
         )?;
+
+        // Note that this will always be `None` if `cfg.inode_file_handles` is false, but we only
+        // really need this alt key when we do not have an `O_PATH` fd open for every inode.  So if
+        // `cfg.inode_file_handles` is false, we do not need this key anyway.
+        let handle_opt = file_or_handle.handle();
 
         // Whether to enable file DAX according to the value of dax_file_size
         let mut attr_flags: u32 = 0;
@@ -917,7 +901,7 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
 
         let mut found = None;
         'search: loop {
-            match self.inode_map.get_alt(&ids_altkey, handle_altkey.as_ref()) {
+            match self.inode_map.get_alt(&ids_altkey, handle_opt) {
                 // No existing entry found
                 None => break 'search,
                 Some(data) => {
@@ -953,7 +937,7 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
             // racing thread already added an inode with the same altkey while we're not holding
             // the lock. If so just use the newly added inode, otherwise the inode will be replaced
             // and results in EBADF.
-            match InodeMap::get_alt_locked(inodes.deref(), &ids_altkey, handle_altkey.as_ref()) {
+            match InodeMap::get_alt_locked(inodes.deref(), &ids_altkey, handle_opt) {
                 Some(data) => {
                     trace!(
                         "fuse: do_lookup sees existing inode {} ids_altkey {:?}",
@@ -973,24 +957,21 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
                         ));
                     }
                     trace!(
-                        "fuse: do_lookup adds new inode {} ids_altkey {:?} handle_altkey {:?}",
+                        "fuse: do_lookup adds new inode {} ids_altkey {:?} handle {:?}",
                         inode,
                         ids_altkey,
-                        handle_altkey
+                        handle_opt,
                     );
 
                     InodeMap::insert_locked(
                         inodes.deref_mut(),
-                        inode,
-                        InodeData::new(
+                        Arc::new(InodeData::new(
                             inode,
                             file_or_handle,
                             1,
-                            ids_altkey.clone(),
+                            ids_altkey,
                             st.get_stat().st_mode,
-                        ),
-                        ids_altkey,
-                        handle_altkey,
+                        )),
                     );
                     inode
                 }
@@ -1013,7 +994,7 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
         })
     }
 
-    fn forget_one(inodes: &mut MultiKeyMap, inode: Inode, count: u64) {
+    fn forget_one(inodes: &mut InodeStore, inode: Inode, count: u64) {
         // ROOT_ID should not be forgotten, or we're not able to access to files any more.
         if inode == fuse::ROOT_ID {
             return;
