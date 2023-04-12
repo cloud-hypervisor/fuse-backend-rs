@@ -939,11 +939,6 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
             // and results in EBADF.
             match InodeMap::get_alt_locked(inodes.deref(), &ids_altkey, handle_opt) {
                 Some(data) => {
-                    trace!(
-                        "fuse: do_lookup sees existing inode {} ids_altkey {:?}",
-                        data.inode,
-                        ids_altkey
-                    );
                     data.refcount.fetch_add(1, Ordering::Relaxed);
                     data.inode
                 }
@@ -956,12 +951,6 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
                             format!("max inode number reached: {VFS_MAX_INO}"),
                         ));
                     }
-                    trace!(
-                        "fuse: do_lookup adds new inode {} ids_altkey {:?} handle {:?}",
-                        inode,
-                        ids_altkey,
-                        handle_opt,
-                    );
 
                     InodeMap::insert_locked(
                         inodes.deref_mut(),
@@ -1011,14 +1000,6 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
                 // Saturating sub because it doesn't make sense for a refcount to go below zero and
                 // we don't want misbehaving clients to cause integer overflow.
                 let new = curr.saturating_sub(count);
-
-                trace!(
-                    "fuse: forget inode {} refcount {}, count {}, new_count {}",
-                    inode,
-                    curr,
-                    count,
-                    new
-                );
 
                 // Synchronizes with the acquire load in `do_lookup`.
                 if data
