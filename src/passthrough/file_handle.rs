@@ -148,6 +148,15 @@ pub struct FileHandle {
     handle: CFileHandle,
 }
 
+impl Default for FileHandle {
+    fn default() -> Self {
+        Self {
+            mnt_id: 0,
+            handle: CFileHandle::new(0),
+        }
+    }
+}
+
 extern "C" {
     fn name_to_handle_at(
         dirfd: libc::c_int,
