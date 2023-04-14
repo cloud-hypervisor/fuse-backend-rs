@@ -88,6 +88,7 @@ impl InodeAltKey {
     }
 }
 
+#[derive(Debug)]
 enum FileOrHandle {
     File(File),
     Handle(Arc<FileHandle>),
@@ -127,6 +128,7 @@ impl AsRawFd for InodeFile<'_> {
 }
 
 /// Represents an inode in `PassthroughFs`.
+#[derive(Debug)]
 pub struct InodeData {
     inode: Inode,
     // Most of these aren't actually files but ¯\_(ツ)_/¯.
