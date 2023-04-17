@@ -117,7 +117,7 @@ impl FuseSession {
     }
 
     /// Expose the associated FUSE session file.
-    pub fn get_fuse_file(&mut self) -> Option<&File> {
+    pub fn get_fuse_file(&self) -> Option<&File> {
         self.file.as_ref()
     }
 
