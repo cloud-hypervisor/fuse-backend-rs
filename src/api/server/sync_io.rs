@@ -129,7 +129,12 @@ impl<F: FileSystem + Sync> Server<F> {
 
     fn lookup<S: BitmapSlice>(&self, mut ctx: SrvContext<'_, F, S>) -> Result<usize> {
         let buf = ServerUtil::get_message_body(&mut ctx.r, &ctx.in_header, 0)?;
-        let name = bytes_to_cstr(buf.as_ref())?;
+        let name = bytes_to_cstr(buf.as_ref()).map_err(|e| {
+            let _ = ctx.reply_error_explicit(io::Error::from_raw_os_error(libc::EINVAL));
+            error!("fuse: bytes to cstr error: {:?}, {:?}", buf, e);
+            e
+        })?;
+
         let version = self.vers.load();
         let result = self.fs.lookup(ctx.context(), ctx.nodeid(), name);
 
@@ -213,7 +218,11 @@ impl<F: FileSystem + Sync> Server<F> {
             mode, rdev, umask, ..
         } = ctx.r.read_obj().map_err(Error::DecodeMessage)?;
         let buf = ServerUtil::get_message_body(&mut ctx.r, &ctx.in_header, size_of::<MknodIn>())?;
-        let name = bytes_to_cstr(buf.as_ref())?;
+        let name = bytes_to_cstr(buf.as_ref()).map_err(|e| {
+            let _ = ctx.reply_error_explicit(io::Error::from_raw_os_error(libc::EINVAL));
+            error!("fuse: bytes to cstr error: {:?}, {:?}", buf, e);
+            e
+        })?;
 
         match self
             .fs
@@ -227,7 +236,11 @@ impl<F: FileSystem + Sync> Server<F> {
     pub(super) fn mkdir<S: BitmapSlice>(&self, mut ctx: SrvContext<'_, F, S>) -> Result<usize> {
         let MkdirIn { mode, umask } = ctx.r.read_obj().map_err(Error::DecodeMessage)?;
         let buf = ServerUtil::get_message_body(&mut ctx.r, &ctx.in_header, size_of::<MkdirIn>())?;
-        let name = bytes_to_cstr(buf.as_ref())?;
+        let name = bytes_to_cstr(buf.as_ref()).map_err(|e| {
+            let _ = ctx.reply_error_explicit(io::Error::from_raw_os_error(libc::EINVAL));
+            error!("fuse: bytes to cstr error: {:?}, {:?}", buf, e);
+            e
+        })?;
 
         match self
             .fs
@@ -240,7 +253,11 @@ impl<F: FileSystem + Sync> Server<F> {
 
     pub(super) fn unlink<S: BitmapSlice>(&self, mut ctx: SrvContext<'_, F, S>) -> Result<usize> {
         let buf = ServerUtil::get_message_body(&mut ctx.r, &ctx.in_header, 0)?;
-        let name = bytes_to_cstr(buf.as_ref())?;
+        let name = bytes_to_cstr(buf.as_ref()).map_err(|e| {
+            let _ = ctx.reply_error_explicit(io::Error::from_raw_os_error(libc::EINVAL));
+            error!("fuse: bytes to cstr error: {:?}, {:?}", buf, e);
+            e
+        })?;
 
         match self.fs.unlink(ctx.context(), ctx.nodeid(), name) {
             Ok(()) => ctx.reply_ok(None::<u8>, None),
@@ -250,7 +267,11 @@ impl<F: FileSystem + Sync> Server<F> {
 
     pub(super) fn rmdir<S: BitmapSlice>(&self, mut ctx: SrvContext<'_, F, S>) -> Result<usize> {
         let buf = ServerUtil::get_message_body(&mut ctx.r, &ctx.in_header, 0)?;
-        let name = bytes_to_cstr(buf.as_ref())?;
+        let name = bytes_to_cstr(buf.as_ref()).map_err(|e| {
+            let _ = ctx.reply_error_explicit(io::Error::from_raw_os_error(libc::EINVAL));
+            error!("fuse: bytes to cstr error: {:?}, {:?}", buf, e);
+            e
+        })?;
 
         match self.fs.rmdir(ctx.context(), ctx.nodeid(), name) {
             Ok(()) => ctx.reply_ok(None::<u8>, None),
@@ -303,7 +324,11 @@ impl<F: FileSystem + Sync> Server<F> {
     pub(super) fn link<S: BitmapSlice>(&self, mut ctx: SrvContext<'_, F, S>) -> Result<usize> {
         let LinkIn { oldnodeid } = ctx.r.read_obj().map_err(Error::DecodeMessage)?;
         let buf = ServerUtil::get_message_body(&mut ctx.r, &ctx.in_header, size_of::<LinkIn>())?;
-        let name = bytes_to_cstr(buf.as_ref())?;
+        let name = bytes_to_cstr(buf.as_ref()).map_err(|e| {
+            let _ = ctx.reply_error_explicit(io::Error::from_raw_os_error(libc::EINVAL));
+            error!("fuse: bytes to cstr error: {:?}, {:?}", buf, e);
+            e
+        })?;
 
         match self
             .fs
@@ -507,14 +532,16 @@ impl<F: FileSystem + Sync> Server<F> {
         if size != value.len() as u32 {
             return Err(Error::InvalidXattrSize((size, value.len())));
         }
+        let name = bytes_to_cstr(name).map_err(|e| {
+            let _ = ctx.reply_error_explicit(io::Error::from_raw_os_error(libc::EINVAL));
+            error!("fuse: bytes to cstr error: {:?}, {:?}", buf, e);
+            e
+        })?;
 
-        match self.fs.setxattr(
-            ctx.context(),
-            ctx.nodeid(),
-            bytes_to_cstr(name)?,
-            value,
-            flags,
-        ) {
+        match self
+            .fs
+            .setxattr(ctx.context(), ctx.nodeid(), name, value, flags)
+        {
             Ok(()) => ctx.reply_ok(None::<u8>, None),
             Err(e) => ctx.reply_error(e),
         }
@@ -528,7 +555,11 @@ impl<F: FileSystem + Sync> Server<F> {
 
         let buf =
             ServerUtil::get_message_body(&mut ctx.r, &ctx.in_header, size_of::<GetxattrIn>())?;
-        let name = bytes_to_cstr(buf.as_ref())?;
+        let name = bytes_to_cstr(buf.as_ref()).map_err(|e| {
+            let _ = ctx.reply_error_explicit(io::Error::from_raw_os_error(libc::EINVAL));
+            error!("fuse: bytes to cstr error: {:?}, {:?}", buf, e);
+            e
+        })?;
 
         match self.fs.getxattr(ctx.context(), ctx.nodeid(), name, size) {
             Ok(GetxattrReply::Value(val)) => ctx.reply_ok(None::<u8>, Some(&val)),
@@ -570,7 +601,11 @@ impl<F: FileSystem + Sync> Server<F> {
         mut ctx: SrvContext<'_, F, S>,
     ) -> Result<usize> {
         let buf = ServerUtil::get_message_body(&mut ctx.r, &ctx.in_header, 0)?;
-        let name = bytes_to_cstr(&buf)?;
+        let name = bytes_to_cstr(buf.as_ref()).map_err(|e| {
+            let _ = ctx.reply_error_explicit(io::Error::from_raw_os_error(libc::EINVAL));
+            error!("fuse: bytes to cstr error: {:?}, {:?}", buf, e);
+            e
+        })?;
 
         match self.fs.removexattr(ctx.context(), ctx.nodeid(), name) {
             Ok(()) => ctx.reply_ok(None::<u8>, None),
@@ -878,7 +913,11 @@ impl<F: FileSystem + Sync> Server<F> {
     fn create<S: BitmapSlice>(&self, mut ctx: SrvContext<'_, F, S>) -> Result<usize> {
         let args: CreateIn = ctx.r.read_obj().map_err(Error::DecodeMessage)?;
         let buf = ServerUtil::get_message_body(&mut ctx.r, &ctx.in_header, size_of::<CreateIn>())?;
-        let name = bytes_to_cstr(&buf)?;
+        let name = bytes_to_cstr(buf.as_ref()).map_err(|e| {
+            let _ = ctx.reply_error_explicit(io::Error::from_raw_os_error(libc::EINVAL));
+            error!("fuse: bytes to cstr error: {:?}, {:?}", buf, e);
+            e
+        })?;
 
         match self.fs.create(ctx.context(), ctx.nodeid(), name, args) {
             Ok((entry, handle, opts)) => {

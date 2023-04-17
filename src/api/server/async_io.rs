@@ -212,7 +212,17 @@ impl<F: AsyncFileSystem + Sync> Server<F> {
 
     async fn async_lookup<S: BitmapSlice>(&self, mut ctx: SrvContext<'_, F, S>) -> Result<usize> {
         let buf = ServerUtil::get_message_body(&mut ctx.r, &ctx.in_header, 0)?;
-        let name = bytes_to_cstr(buf.as_ref())?;
+        let name = match bytes_to_cstr(buf.as_ref()) {
+            Ok(name) => name,
+            Err(e) => {
+                error!("fuse: bytes to cstr error: {:?}, {:?}", buf, e);
+                let _ = ctx
+                    .async_reply_error(io::Error::from_raw_os_error(libc::EINVAL))
+                    .await;
+                return Err(e);
+            }
+        };
+
         let version = self.vers.load();
         let result = self
             .fs
@@ -443,7 +453,17 @@ impl<F: AsyncFileSystem + Sync> Server<F> {
     async fn async_create<S: BitmapSlice>(&self, mut ctx: SrvContext<'_, F, S>) -> Result<usize> {
         let args: CreateIn = ctx.r.read_obj().map_err(Error::DecodeMessage)?;
         let buf = ServerUtil::get_message_body(&mut ctx.r, &ctx.in_header, size_of::<CreateIn>())?;
-        let name = bytes_to_cstr(&buf)?;
+        let name = match bytes_to_cstr(buf.as_ref()) {
+            Ok(name) => name,
+            Err(e) => {
+                error!("fuse: bytes to cstr error: {:?}, {:?}", buf, e);
+                let _ = ctx
+                    .async_reply_error(io::Error::from_raw_os_error(libc::EINVAL))
+                    .await;
+                return Err(e);
+            }
+        };
+
         let result = self
             .fs
             .async_create(ctx.context(), ctx.nodeid(), name, args)
