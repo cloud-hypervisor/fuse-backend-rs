@@ -39,6 +39,14 @@ impl<F: FileSystem + Sync> Server<F> {
         let in_header: InHeader = r.read_obj().map_err(Error::DecodeMessage)?;
         let mut ctx = SrvContext::<F, S>::new(in_header, r, w);
         if ctx.in_header.len > (MAX_BUFFER_SIZE + BUFFER_HEADER_SIZE) {
+            if in_header.opcode == Opcode::Forget as u32
+                || in_header.opcode == Opcode::BatchForget as u32
+            {
+                // Forget and batch-forget do not require reply.
+                return Err(Error::InvalidMessage(io::Error::from_raw_os_error(
+                    libc::EOVERFLOW,
+                )));
+            }
             return ctx.reply_error_explicit(io::Error::from_raw_os_error(libc::ENOMEM));
         }
 
@@ -1007,10 +1015,14 @@ impl<F: FileSystem + Sync> Server<F> {
 
         if let Some(size) = (count as usize).checked_mul(size_of::<ForgetOne>()) {
             if size > MAX_BUFFER_SIZE as usize {
-                return ctx.reply_error_explicit(io::Error::from_raw_os_error(libc::ENOMEM));
+                return Err(Error::InvalidMessage(io::Error::from_raw_os_error(
+                    libc::EOVERFLOW,
+                )));
             }
         } else {
-            return ctx.reply_error_explicit(io::Error::from_raw_os_error(libc::EOVERFLOW));
+            return Err(Error::InvalidMessage(io::Error::from_raw_os_error(
+                libc::EOVERFLOW,
+            )));
         }
 
         let mut requests = Vec::with_capacity(count as usize);
