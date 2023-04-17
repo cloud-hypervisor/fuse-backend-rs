@@ -411,7 +411,7 @@ impl<F: FileSystem + Sync> Server<F> {
                     .map_err(Error::EncodeMessage)?;
                 Ok(out.len as usize)
             }
-            Err(e) => ctx.reply_error_explicit(e),
+            Err(e) => ctx.reply_error(e),
         }
     }
 
@@ -460,7 +460,7 @@ impl<F: FileSystem + Sync> Server<F> {
 
                 ctx.reply_ok(Some(out), None)
             }
-            Err(e) => ctx.reply_error_explicit(e),
+            Err(e) => ctx.reply_error(e),
         }
     }
 
