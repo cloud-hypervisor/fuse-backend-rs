@@ -26,7 +26,9 @@ jobs:
     - name: build and check
       run: make check
     - name: smoke
-      run: make docker-smoke
+      run: |
+        echo user_allow_other | sudo tee -a /etc/fuse.conf
+        make smoke-all
 
   Macos-CI:
     runs-on: macos-latest
