@@ -71,7 +71,9 @@ impl AsyncFileSystem for Vfs {
             Err(Error::from_raw_os_error(libc::ENOSYS))
         } else {
             match self.get_real_rootfs(inode)? {
-                (Left(fs), idata) => fs.open(ctx, idata.ino(), flags, fuse_flags),
+                (Left(fs), idata) => fs
+                    .open(ctx, idata.ino(), flags, fuse_flags)
+                    .map(|(a, b, _)| (a, b)),
                 (Right(fs), idata) => fs
                     .async_open(ctx, idata.ino(), flags, fuse_flags)
                     .await
@@ -90,7 +92,9 @@ impl AsyncFileSystem for Vfs {
         validate_path_component(name)?;
 
         match self.get_real_rootfs(parent)? {
-            (Left(fs), idata) => fs.create(ctx, idata.ino(), name, args),
+            (Left(fs), idata) => fs
+                .create(ctx, idata.ino(), name, args)
+                .map(|(a, b, c, _)| (a, b, c)),
             (Right(fs), idata) => {
                 fs.async_create(ctx, idata.ino(), name, args)
                     .await
