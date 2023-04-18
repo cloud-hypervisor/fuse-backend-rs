@@ -683,7 +683,7 @@ unsafe impl ByteValued for CreateIn {}
 pub struct OpenOut {
     pub fh: u64,
     pub open_flags: u32,
-    pub padding: u32,
+    pub passthrough: u32,
 }
 unsafe impl ByteValued for OpenOut {}
 

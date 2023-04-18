@@ -390,11 +390,11 @@ impl<F: FileSystem + Sync> Server<F> {
         let OpenIn { flags, fuse_flags } = ctx.r.read_obj().map_err(Error::DecodeMessage)?;
 
         match self.fs.open(ctx.context(), ctx.nodeid(), flags, fuse_flags) {
-            Ok((handle, opts)) => {
+            Ok((handle, opts, passthrough)) => {
                 let out = OpenOut {
                     fh: handle.map(Into::into).unwrap_or(0),
                     open_flags: opts.bits(),
-                    ..Default::default()
+                    passthrough: passthrough.unwrap_or_default(),
                 };
 
                 ctx.reply_ok(Some(out), None)
@@ -973,7 +973,7 @@ impl<F: FileSystem + Sync> Server<F> {
         })?;
 
         match self.fs.create(ctx.context(), ctx.nodeid(), name, args) {
-            Ok((entry, handle, opts)) => {
+            Ok((entry, handle, opts, passthrough)) => {
                 let entry_out = EntryOut {
                     nodeid: entry.inode,
                     generation: entry.generation,
@@ -983,10 +983,11 @@ impl<F: FileSystem + Sync> Server<F> {
                     attr_valid_nsec: entry.attr_timeout.subsec_nanos(),
                     attr: entry.attr.into(),
                 };
+
                 let open_out = OpenOut {
                     fh: handle.map(Into::into).unwrap_or(0),
                     open_flags: opts.bits(),
-                    ..Default::default()
+                    passthrough: passthrough.unwrap_or_default(),
                 };
 
                 // Kind of a hack to write both structs.

@@ -181,7 +181,7 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
         inode: Inode,
         flags: u32,
         fuse_flags: u32,
-    ) -> io::Result<(Option<Handle>, OpenOptions)> {
+    ) -> io::Result<(Option<Handle>, OpenOptions, Option<u32>)> {
         let killpriv = if self.killpriv_v2.load(Ordering::Relaxed)
             && (fuse_flags & FOPEN_IN_KILL_SUIDGID != 0)
         {
@@ -207,7 +207,7 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
             _ => {}
         };
 
-        Ok((Some(handle), opts))
+        Ok((Some(handle), opts, None))
     }
 
     fn do_getattr(
@@ -384,6 +384,7 @@ impl<S: BitmapSlice + Send + Sync> FileSystem for PassthroughFs<S> {
             Err(enosys())
         } else {
             self.do_open(inode, flags | (libc::O_DIRECTORY as u32), 0)
+                .map(|(a, b, _)| (a, b))
         }
     }
 
@@ -504,7 +505,7 @@ impl<S: BitmapSlice + Send + Sync> FileSystem for PassthroughFs<S> {
         inode: Inode,
         flags: u32,
         fuse_flags: u32,
-    ) -> io::Result<(Option<Handle>, OpenOptions)> {
+    ) -> io::Result<(Option<Handle>, OpenOptions, Option<u32>)> {
         if self.no_open.load(Ordering::Relaxed) {
             info!("fuse: open is not supported.");
             Err(enosys())
@@ -536,7 +537,7 @@ impl<S: BitmapSlice + Send + Sync> FileSystem for PassthroughFs<S> {
         parent: Inode,
         name: &CStr,
         args: CreateIn,
-    ) -> io::Result<(Entry, Option<Handle>, OpenOptions)> {
+    ) -> io::Result<(Entry, Option<Handle>, OpenOptions, Option<u32>)> {
         self.validate_path_component(name)?;
 
         let dir = self.inode_map.get(parent)?;
@@ -587,7 +588,7 @@ impl<S: BitmapSlice + Send + Sync> FileSystem for PassthroughFs<S> {
             _ => {}
         };
 
-        Ok((entry, ret_handle, opts))
+        Ok((entry, ret_handle, opts, None))
     }
 
     fn unlink(&self, _ctx: &Context, parent: Inode, name: &CStr) -> io::Result<()> {

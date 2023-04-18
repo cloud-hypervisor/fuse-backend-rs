@@ -1224,7 +1224,7 @@ mod tests {
             umask: 0,
             fuse_flags: 0,
         };
-        let (entry, handle, _) = fs.create(&ctx, ROOT_ID, &fname, args).unwrap();
+        let (entry, handle, _, _) = fs.create(&ctx, ROOT_ID, &fname, args).unwrap();
         let handle_data = fs.handle_map.get(handle.unwrap(), entry.inode).unwrap();
         let mut f = unsafe { File::from_raw_fd(handle_data.get_handle_raw_fd()) };
         let mut buf = [0; 4];
@@ -1235,7 +1235,7 @@ mod tests {
         // Then Open an existing file with O_WRONLY, we should be able to read it as well.
         let fname = CString::new("existfile").unwrap();
         let entry = fs.lookup(&ctx, ROOT_ID, &fname).unwrap();
-        let (handle, _) = fs
+        let (handle, _, _) = fs
             .open(&ctx, entry.inode, libc::O_WRONLY as u32, 0)
             .unwrap();
         let handle_data = fs.handle_map.get(handle.unwrap(), entry.inode).unwrap();

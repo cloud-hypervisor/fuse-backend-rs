@@ -197,6 +197,11 @@ const INIT_EXT: u64 = 0x4000_0000;
 // This flag indicates whether the guest kernel enable per-file dax
 const PERFILE_DAX: u64 = 0x2_0000_0000;
 
+// This flag indicates whether to enable fd-passthrough. It was defined in the
+// Anolis kernel but not in the upstream kernel. To avoid collision, we'll set
+// it to the most significant bit.
+const FD_PASSTHROUGH: u64 = 0x8000_0000_0000_0000;
+
 /**
  *
  * fuse_attr flags
@@ -441,6 +446,9 @@ bitflags! {
         ///  -. create has O_TRUNC and FOPEN_IN_KILL_SUIDGID flag set.
         ///  -. write has WRITE_KILL_PRIV
         const HANDLE_KILLPRIV_V2 = HANDLE_KILLPRIV_V2;
+
+        /// Indicates the kernel support fuse fd passthrough.
+        const FD_PASSTHROUGH = FD_PASSTHROUGH;
 
         /// The fuse_init_in is extended.
         const INIT_EXT = INIT_EXT;
@@ -910,7 +918,7 @@ unsafe impl ByteValued for CreateIn {}
 pub struct OpenOut {
     pub fh: u64,
     pub open_flags: u32,
-    pub padding: u32,
+    pub passthrough: u32,
 }
 unsafe impl ByteValued for OpenOut {}
 

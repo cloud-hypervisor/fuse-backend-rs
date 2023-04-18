@@ -313,9 +313,9 @@ pub trait FileSystem {
         inode: Self::Inode,
         flags: u32,
         fuse_flags: u32,
-    ) -> io::Result<(Option<Self::Handle>, OpenOptions)> {
+    ) -> io::Result<(Option<Self::Handle>, OpenOptions, Option<u32>)> {
         // Matches the behavior of libfuse.
-        Ok((None, OpenOptions::empty()))
+        Ok((None, OpenOptions::empty(), None))
     }
 
     /// Create and open a file.
@@ -332,13 +332,14 @@ pub trait FileSystem {
     /// addition to the optional `Handle` and the `OpenOptions`, the file system must also return an
     /// `Entry` for the file. This increases the lookup count for the `Inode` associated with the
     /// file by 1.
+    #[allow(clippy::type_complexity)]
     fn create(
         &self,
         ctx: &Context,
         parent: Self::Inode,
         name: &CStr,
         args: CreateIn,
-    ) -> io::Result<(Entry, Option<Self::Handle>, OpenOptions)> {
+    ) -> io::Result<(Entry, Option<Self::Handle>, OpenOptions, Option<u32>)> {
         Err(io::Error::from_raw_os_error(libc::ENOSYS))
     }
 
@@ -1021,7 +1022,7 @@ impl<FS: FileSystem> FileSystem for Arc<FS> {
         inode: Self::Inode,
         flags: u32,
         fuse_flags: u32,
-    ) -> io::Result<(Option<Self::Handle>, OpenOptions)> {
+    ) -> io::Result<(Option<Self::Handle>, OpenOptions, Option<u32>)> {
         self.deref().open(ctx, inode, flags, fuse_flags)
     }
 
@@ -1031,7 +1032,7 @@ impl<FS: FileSystem> FileSystem for Arc<FS> {
         parent: Self::Inode,
         name: &CStr,
         args: CreateIn,
-    ) -> io::Result<(Entry, Option<Self::Handle>, OpenOptions)> {
+    ) -> io::Result<(Entry, Option<Self::Handle>, OpenOptions, Option<u32>)> {
         self.deref().create(ctx, parent, name, args)
     }
 
