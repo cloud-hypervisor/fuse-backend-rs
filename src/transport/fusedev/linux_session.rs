@@ -408,10 +408,6 @@ fn msflags_to_string(flags: MsFlags) -> String {
         (MsFlags::MS_NOEXEC, ("exec", "noexec")),
         (MsFlags::MS_SYNCHRONOUS, ("async", "sync")),
         (MsFlags::MS_NOATIME, ("atime", "noatime")),
-        (MsFlags::MS_NODIRATIME, ("diratime", "nodiratime")),
-        (MsFlags::MS_LAZYTIME, ("nolazytime", "lazytime")),
-        (MsFlags::MS_RELATIME, ("norelatime", "relatime")),
-        (MsFlags::MS_STRICTATIME, ("nostrictatime", "strictatime")),
     ]
     .map(
         |(flag, (neg, pos))| {
