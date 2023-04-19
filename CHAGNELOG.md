@@ -1,6 +1,19 @@
 # Changelog
 ## [Unreleased]
 
+## [0.10.3]
+
+### Added
+- [#115](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/115)
+  * transport: pre-allocate VecDeque to avoid expending at runtime
+  * passthroughfs: convert MultiKeyBTreeMap to InodeStore for InodeMap
+  * passthroughfs: add config to specify entry and attr timeout for dir
+  * passthroughfs: add config to control count mntid in altkey or not
+- [#119](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/119): Support non-privileged users
+
+### Fixed
+- [#120](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/120): api: forget and batch forget must not reply
+
 ## [0.10.2]
 
 ### Fixed
