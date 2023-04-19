@@ -1,6 +1,12 @@
 # Changelog
 ## [Unreleased]
 
+## [0.10.2]
+
+### Fixed
+- [#105](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/105): abi: fix the conflict of PERFILE_DAX flag
+- [#106](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/106): bugfix: passthrough: refect CFileHandle struct
+
 ## [0.10.1]
 
 ### Fixed
