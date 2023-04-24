@@ -79,7 +79,9 @@ impl FileSystem for Vfs {
                 // parent is in an underlying rootfs
                 let mut entry = fs.lookup(ctx, idata.ino(), name)?;
                 // lookup success, hash it to a real fuse inode
-                entry.inode = self.convert_inode(idata.fs_idx(), entry.inode)?;
+                let new_ino = self.convert_inode(idata.fs_idx(), entry.inode)?;
+                entry.inode = new_ino;
+                entry.attr.st_ino = new_ino;
                 Ok(entry)
             }
         }
