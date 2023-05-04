@@ -40,7 +40,7 @@ mod fusedev_tests {
 
         let src_md5 = exec(
             format!(
-                "cd {}; git ls-files --recurse-submodules | grep -v rust-vmm-ci | xargs md5sum; cd - > /dev/null",
+                "cd {}; git ls-files --recurse-submodules | grep --invert-match rust-vmm-ci | xargs md5sum; cd - > /dev/null",
                 src
             )
             .as_str(),
@@ -48,7 +48,7 @@ mod fusedev_tests {
         .unwrap();
         let dest_md5 = exec(
             format!(
-                "cd {}; git ls-files --recurse-submodules | grep -v rust-vmm-ci | xargs md5sum; cd - > /dev/null",
+                "cd {}; git ls-files --recurse-submodules | grep --invert-match rust-vmm-ci | xargs md5sum; cd - > /dev/null",
                 dest
             )
             .as_str(),
