@@ -322,7 +322,7 @@ impl Vfs {
         let inode = self.root.mount(path)?;
         let real_root_ino = entry.inode;
 
-        entry.inode = self.convert_inode(fs_idx, entry.inode)?;
+        self.convert_entry(fs_idx, entry.inode, &mut entry)?;
 
         // Over mount would invalidate previous superblock inodes.
         if let Some(mnt) = mountpoints.get(&inode) {
@@ -454,6 +454,14 @@ impl Vfs {
         Ok(ino)
     }
 
+    fn convert_entry(&self, fs_idx: VfsIndex, inode: u64, entry: &mut Entry) -> Result<Entry> {
+        self.convert_inode(fs_idx, inode).map(|ino| {
+            entry.inode = ino;
+            entry.attr.st_ino = ino;
+            *entry
+        })
+    }
+
     fn allocate_fs_idx(&self) -> Result<VfsIndex> {
         let superblocks = self.superblocks.load().deref().deref().clone();
         let start = self.next_super.load(Ordering::SeqCst);
@@ -528,8 +536,7 @@ impl Vfs {
             Some(mnt) => {
                 // cross mountpoint, return mount root entry
                 entry = mnt.root_entry;
-                entry.inode = self.convert_inode(mnt.fs_idx, mnt.ino)?;
-                entry.attr.st_ino = entry.inode;
+                self.convert_entry(mnt.fs_idx, mnt.ino, &mut entry)?;
                 trace!(
                     "vfs lookup cross mountpoint, return new mount fs_idx {} inode 0x{:x} fuse inode 0x{:x}, attr inode 0x{:x}",
                     mnt.fs_idx,
@@ -537,11 +544,10 @@ impl Vfs {
                     entry.inode,
                     entry.attr.st_ino,
                 );
+                Ok(entry)
             }
-            None => entry.inode = self.convert_inode(idata.fs_idx(), entry.inode)?,
+            None => self.convert_entry(idata.fs_idx(), entry.inode, &mut entry),
         }
-
-        Ok(entry)
     }
 }
 

@@ -79,10 +79,7 @@ impl FileSystem for Vfs {
                 // parent is in an underlying rootfs
                 let mut entry = fs.lookup(ctx, idata.ino(), name)?;
                 // lookup success, hash it to a real fuse inode
-                let new_ino = self.convert_inode(idata.fs_idx(), entry.inode)?;
-                entry.inode = new_ino;
-                entry.attr.st_ino = new_ino;
-                Ok(entry)
+                self.convert_entry(idata.fs_idx(), entry.inode, &mut entry)
             }
         }
     }
@@ -155,10 +152,9 @@ impl FileSystem for Vfs {
 
         match self.get_real_rootfs(parent)? {
             (Left(fs), idata) => fs.symlink(ctx, linkname, idata.ino(), name),
-            (Right(fs), idata) => fs.symlink(ctx, linkname, idata.ino(), name).map(|mut e| {
-                e.inode = self.convert_inode(idata.fs_idx(), e.inode)?;
-                Ok(e)
-            })?,
+            (Right(fs), idata) => fs
+                .symlink(ctx, linkname, idata.ino(), name)
+                .map(|mut e| self.convert_entry(idata.fs_idx(), e.inode, &mut e))?,
         }
     }
 
@@ -175,13 +171,9 @@ impl FileSystem for Vfs {
 
         match self.get_real_rootfs(inode)? {
             (Left(fs), idata) => fs.mknod(ctx, idata.ino(), name, mode, rdev, umask),
-            (Right(fs), idata) => {
-                fs.mknod(ctx, idata.ino(), name, mode, rdev, umask)
-                    .map(|mut e| {
-                        e.inode = self.convert_inode(idata.fs_idx(), e.inode)?;
-                        Ok(e)
-                    })?
-            }
+            (Right(fs), idata) => fs
+                .mknod(ctx, idata.ino(), name, mode, rdev, umask)
+                .map(|mut e| self.convert_entry(idata.fs_idx(), e.inode, &mut e))?,
         }
     }
 
@@ -197,10 +189,9 @@ impl FileSystem for Vfs {
 
         match self.get_real_rootfs(parent)? {
             (Left(fs), idata) => fs.mkdir(ctx, idata.ino(), name, mode, umask),
-            (Right(fs), idata) => fs.mkdir(ctx, idata.ino(), name, mode, umask).map(|mut e| {
-                e.inode = self.convert_inode(idata.fs_idx(), e.inode)?;
-                Ok(e)
-            })?,
+            (Right(fs), idata) => fs
+                .mkdir(ctx, idata.ino(), name, mode, umask)
+                .map(|mut e| self.convert_entry(idata.fs_idx(), e.inode, &mut e))?,
         }
     }
 
@@ -281,10 +272,7 @@ impl FileSystem for Vfs {
             Left(fs) => fs.link(ctx, idata_old.ino(), idata_new.ino(), newname),
             Right(fs) => fs
                 .link(ctx, idata_old.ino(), idata_new.ino(), newname)
-                .map(|mut e| {
-                    e.inode = self.convert_inode(idata_new.fs_idx(), e.inode)?;
-                    Ok(e)
-                })?,
+                .map(|mut e| self.convert_entry(idata_new.fs_idx(), e.inode, &mut e))?,
         }
     }
 
@@ -321,7 +309,7 @@ impl FileSystem for Vfs {
             (Right(fs), idata) => {
                 fs.create(ctx, idata.ino(), name, args)
                     .map(|(mut a, b, c)| {
-                        a.inode = self.convert_inode(idata.fs_idx(), a.inode)?;
+                        self.convert_entry(idata.fs_idx(), a.inode, &mut a)?;
                         Ok((a, b, c))
                     })?
             }
