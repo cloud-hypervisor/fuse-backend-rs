@@ -27,7 +27,7 @@ jobs:
       run: make check
     - name: smoke
       run: |
-        echo user_allow_other | sudo tee -a /etc/fuse.conf
+        echo user_allow_other | sudo tee --append /etc/fuse.conf
         make smoke-all
 
   Macos-CI:

@@ -16,8 +16,8 @@ jobs:
         uses: actions/checkout@v2
       - name: Publish
         run: |
-          sudo apt-get update && sudo apt-get install -y sed
-          VERSION=$(sed -E -n 's/^version = \"(.*)"$/\1/p' Cargo.toml)
+          sudo apt-get update && sudo apt-get install --yes sed
+          VERSION=$(sed --regexp-extended --silent 's/^version = \"(.*)"$/\1/p' Cargo.toml)
           [ "$GITHUB_REF_NAME" == "v$VERSION" ]
           cargo publish --token ${{ secrets.CRATES_IO_TOKEN }}
       - name: Release
