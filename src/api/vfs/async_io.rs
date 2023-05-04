@@ -26,8 +26,7 @@ impl AsyncFileSystem for Vfs {
                 // parent is in an underlying rootfs
                 let mut entry = fs.async_lookup(ctx, idata.ino(), name).await?;
                 // lookup success, hash it to a real fuse inode
-                entry.inode = self.convert_inode(idata.fs_idx(), entry.inode)?;
-                Ok(entry)
+                self.convert_entry(idata.fs_idx(), entry.inode, &mut entry)
             }
         }
     }
@@ -96,7 +95,7 @@ impl AsyncFileSystem for Vfs {
                 fs.async_create(ctx, idata.ino(), name, args)
                     .await
                     .map(|(mut a, b, c)| {
-                        a.inode = self.convert_inode(idata.fs_idx(), a.inode)?;
+                        self.convert_entry(idata.fs_idx(), a.inode, &mut a)?;
                         Ok((a, b, c))
                     })?
             }
