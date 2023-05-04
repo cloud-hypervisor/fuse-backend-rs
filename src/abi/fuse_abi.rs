@@ -610,7 +610,12 @@ impl Attr {
             mode: st.st_mode,
             #[cfg(target_os = "macos")]
             mode: st.st_mode as u32,
+            // st.st_nlink is u64 on x86_64 and powerpc64, and u32 on other architectures
+            // ref https://github.com/rust-lang/rust/blob/1.69.0/library/std/src/os/linux/raw.rs#L333
+            #[cfg(any(target_arch = "x86_64", target_arch = "powerpc64"))]
             nlink: st.st_nlink as u32,
+            #[cfg(not(any(target_arch = "x86_64", target_arch = "powerpc64")))]
+            nlink: st.st_nlink,
             uid: st.st_uid,
             gid: st.st_gid,
             rdev: st.st_rdev as u32,
