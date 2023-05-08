@@ -23,8 +23,15 @@ impl InodeStore {
         self.data.insert(data.inode, data);
     }
 
-    pub fn remove(&mut self, inode: &Inode) -> Option<Arc<InodeData>> {
+    pub fn remove(&mut self, inode: &Inode, remove_data_only: bool) -> Option<Arc<InodeData>> {
         let data = self.data.remove(inode);
+        if remove_data_only {
+            // Don't remove by_ids and by_handle, we need use it to store inode
+            // record the mapping of inodes using these two structures to ensure
+            // that the same files always use the same inode
+            return data;
+        }
+
         if let Some(data) = data.as_ref() {
             if let FileOrHandle::Handle(handle) = &data.file_or_handle {
                 self.by_handle.remove(handle);
@@ -45,16 +52,13 @@ impl InodeStore {
     }
 
     pub fn get_by_ids(&self, ids: &InodeAltKey) -> Option<&Arc<InodeData>> {
-        // safe to unwrap, inode must be in data map if found by ids, otherwise unwrap on
-        // corruption.
-        self.inode_by_ids(ids).map(|inode| self.get(inode).unwrap())
+        let inode = self.inode_by_ids(ids)?;
+        self.get(inode)
     }
 
     pub fn get_by_handle(&self, handle: &FileHandle) -> Option<&Arc<InodeData>> {
-        // safe to unwrap, inode must be in data map if found by ids, otherwise unwrap on
-        // corruption.
-        self.inode_by_handle(handle)
-            .map(|inode| self.get(inode).unwrap())
+        let inode = self.inode_by_handle(handle)?;
+        self.get(inode)
     }
 
     pub fn inode_by_ids(&self, ids: &InodeAltKey) -> Option<&Inode> {
@@ -176,10 +180,10 @@ mod test {
         assert_eq!(m.get_by_ids(&ids2).unwrap(), &data2);
 
         // remove non-present key
-        assert!(m.remove(&1).is_none());
+        assert!(m.remove(&1, false).is_none());
 
         // remove present key, return its value
-        assert_eq!(m.remove(&inode1).unwrap(), data1.clone());
+        assert_eq!(m.remove(&inode1, false).unwrap(), data1.clone());
         assert!(m.get(&inode1).is_none());
         assert!(m.get_by_ids(&ids1).is_none());
         assert_eq!(m.get(&inode2).unwrap(), &data2);
