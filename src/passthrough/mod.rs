@@ -23,7 +23,7 @@ use std::os::unix::ffi::OsStringExt;
 use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
 use std::path::PathBuf;
 use std::str::FromStr;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, RwLock, RwLockWriteGuard};
 use std::time::Duration;
 
@@ -49,6 +49,75 @@ use file_handle::{FileHandle, MountFds};
 
 type Inode = u64;
 type Handle = u64;
+
+/// Maximum host inode number supported by passthroughfs
+pub const MAX_HOST_INO: u64 = 0x7fff_ffff_ffff;
+
+/// the 56th bit used to set the inode to 1 indicates virtual inode
+pub const USE_VIRTUAL_INODE_MASK: u64 = 1 << 55;
+
+/// Used to form a pair of dev and mntid as the key of the map
+#[derive(Clone, Copy, Default, PartialOrd, Ord, PartialEq, Eq, Debug)]
+pub struct DevMntIDPair(libc::dev_t, u64);
+
+// Used to generate a unique inode with a maximum of 56 bits. the format is
+// |1bit|8bit|47bit
+// when the highest bit is equal to 0, it means the host inode format, and the lower 47 bits normally store no more than 47-bit inode
+// When the highest bit is equal to 1, it indicates the virtual inode format,
+// which is used to store more than 47 bits of inodes
+// the middle 8bit is used to store the unique ID produced by the combination of dev+mntid
+struct UniqueInodeGenerator {
+    // Mapping (dev, mnt_id) pair to another small unique id
+    dev_mntid_map: Mutex<BTreeMap<DevMntIDPair, u8>>,
+    next_unique_id: AtomicU8,
+    next_virtual_inode: AtomicU64,
+}
+
+impl UniqueInodeGenerator {
+    fn new() -> Self {
+        UniqueInodeGenerator {
+            dev_mntid_map: Mutex::new(Default::default()),
+            next_unique_id: AtomicU8::new(1),
+            next_virtual_inode: AtomicU64::new(fuse::ROOT_ID + 1),
+        }
+    }
+
+    fn get_unique_inode(&self, alt_key: &InodeAltKey) -> io::Result<libc::ino64_t> {
+        let id: DevMntIDPair = DevMntIDPair(alt_key.dev, alt_key.mnt);
+        let mut id_map_guard = self.dev_mntid_map.lock().unwrap();
+
+        let unique_id = {
+            match id_map_guard.entry(id) {
+                btree_map::Entry::Occupied(v) => *v.get(),
+                btree_map::Entry::Vacant(v) => {
+                    if self.next_unique_id.load(Ordering::Relaxed) == u8::MAX {
+                        return Err(io::Error::new(
+                            io::ErrorKind::Other,
+                            "the number of combinations of dev and mntid exceeds 255",
+                        ));
+                    }
+                    let next_id = self.next_unique_id.fetch_add(1, Ordering::Relaxed);
+                    v.insert(next_id);
+                    next_id
+                }
+            }
+        };
+
+        let inode = if alt_key.ino <= MAX_HOST_INO {
+            alt_key.ino
+        } else {
+            if self.next_virtual_inode.load(Ordering::Relaxed) > MAX_HOST_INO {
+                return Err(io::Error::new(
+                    io::ErrorKind::Other,
+                    format!("the virtual inode excess {}", MAX_HOST_INO),
+                ));
+            }
+            self.next_virtual_inode.fetch_add(1, Ordering::Relaxed) | USE_VIRTUAL_INODE_MASK
+        };
+
+        Ok((unique_id as u64) << 47 | inode)
+    }
+}
 
 #[derive(Clone, Copy)]
 struct InodeStat {
@@ -197,6 +266,17 @@ impl InodeMap {
             .get(&inode)
             .map(Arc::clone)
             .ok_or_else(ebadf)
+    }
+
+    fn get_inode_locked(
+        inodes: &InodeStore,
+        ids_altkey: &InodeAltKey,
+        handle: Option<&FileHandle>,
+    ) -> Option<Inode> {
+        match handle {
+            Some(h) => inodes.inode_by_handle(h).copied(),
+            None => inodes.inode_by_ids(ids_altkey).copied(),
+        }
     }
 
     fn get_alt(
@@ -485,6 +565,18 @@ pub struct Config {
     /// * If dax_file_size == N, DAX will enable only when the file size is greater than or equal
     /// to N Bytes.
     pub dax_file_size: Option<u64>,
+
+    /// Reduce memory consumption by directly use host inode when possible.
+    ///
+    /// When set to false, a virtual inode number will be allocated for each file managed by
+    /// the passthroughfs driver. A map is used to maintain the relationship between virtual
+    /// inode numbers and host file objects.
+    /// When set to true, the host inode number will be directly used as virtual inode number
+    /// if it's less than the threshold (1 << 47), so reduce memory consumed by the map.
+    /// A virtual inode number will still be allocated and maintained if the host inode number
+    /// is bigger than the threshold.
+    /// The default value for this option is `false`.
+    pub use_host_ino: bool,
 }
 
 impl Default for Config {
@@ -507,6 +599,7 @@ impl Default for Config {
             dax_file_size: None,
             dir_entry_timeout: None,
             dir_attr_timeout: None,
+            use_host_ino: false,
         }
     }
 }
@@ -525,6 +618,8 @@ pub struct PassthroughFs<S: BitmapSlice + Send + Sync = ()> {
     // do with an fd opened with this flag.
     inode_map: InodeMap,
     next_inode: AtomicU64,
+    // Use to generate unique inode
+    ino_allocator: UniqueInodeGenerator,
 
     // File descriptors for open files and directories. Unlike the fds in `inodes`, these _can_ be
     // used for reading and writing data.
@@ -593,6 +688,7 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
         Ok(PassthroughFs {
             inode_map: InodeMap::new(),
             next_inode: AtomicU64::new(fuse::ROOT_ID + 1),
+            ino_allocator: UniqueInodeGenerator::new(),
 
             handle_map: HandleMap::new(),
             next_handle: AtomicU64::new(1),
@@ -864,6 +960,32 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
         Ok((file_or_handle, inode_stat, ids_altkey))
     }
 
+    fn allocate_inode_locked(
+        &self,
+        inodes: &InodeStore,
+        ids_altkey: &InodeAltKey,
+        handle_opt: Option<&FileHandle>,
+    ) -> io::Result<Inode> {
+        if !self.cfg.use_host_ino {
+            // If the inode has already been assigned before, the new inode is not reassigned,
+            // ensuring that the same file is always the same inode
+            Ok(InodeMap::get_inode_locked(inodes, ids_altkey, handle_opt)
+                .unwrap_or_else(|| self.next_inode.fetch_add(1, Ordering::Relaxed)))
+        } else {
+            let inode = if ids_altkey.ino > MAX_HOST_INO {
+                // Prefer look for previous mappings from memory
+                match InodeMap::get_inode_locked(inodes, ids_altkey, handle_opt) {
+                    Some(ino) => ino,
+                    None => self.ino_allocator.get_unique_inode(ids_altkey)?,
+                }
+            } else {
+                self.ino_allocator.get_unique_inode(ids_altkey)?
+            };
+
+            Ok(inode)
+        }
+    }
+
     fn do_lookup(&self, parent: Inode, name: &CStr) -> io::Result<Entry> {
         let name =
             if parent == fuse::ROOT_ID && name.to_bytes_with_nul().starts_with(PARENT_DIR_CSTR) {
@@ -945,7 +1067,9 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
                     data.inode
                 }
                 None => {
-                    let inode = self.next_inode.fetch_add(1, Ordering::Relaxed);
+                    let inode =
+                        self.allocate_inode_locked(inodes.deref(), &ids_altkey, handle_opt)?;
+
                     if inode > VFS_MAX_INO {
                         error!("fuse: max inode number reached: {}", VFS_MAX_INO);
                         return Err(io::Error::new(
@@ -985,7 +1109,7 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
         })
     }
 
-    fn forget_one(inodes: &mut InodeStore, inode: Inode, count: u64) {
+    fn forget_one(&self, inodes: &mut InodeStore, inode: Inode, count: u64) {
         // ROOT_ID should not be forgotten, or we're not able to access to files any more.
         if inode == fuse::ROOT_ID {
             return;
@@ -1011,7 +1135,10 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
                 {
                     if new == 0 {
                         // We just removed the last refcount for this inode.
-                        inodes.remove(&inode);
+                        // The allocated inode number should be kept in the map when use_host_ino
+                        // is false or inode is bigger than MAX_HOST_INO.
+                        let keep_mapping = !self.cfg.use_host_ino || inode > MAX_HOST_INO;
+                        inodes.remove(&inode, keep_mapping);
                     }
                     break;
                 }
@@ -1221,7 +1348,56 @@ mod tests {
     use std::fs::File;
     use std::io::Read;
     use std::ops::Deref;
+    use std::os::unix::prelude::MetadataExt;
     use vmm_sys_util::{tempdir::TempDir, tempfile::TempFile};
+
+    impl UniqueInodeGenerator {
+        fn decode_unique_inode(&self, inode: libc::ino64_t) -> io::Result<InodeAltKey> {
+            if inode > VFS_MAX_INO {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("the inode {} excess {}", inode, VFS_MAX_INO),
+                ));
+            }
+
+            let dev_mntid = (inode >> 47) as u8;
+            if dev_mntid == u8::MAX {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("invalid dev and mntid {} excess 255", dev_mntid),
+                ));
+            }
+
+            let mut dev: libc::dev_t = 0;
+            let mut mnt: u64 = 0;
+
+            let mut found = false;
+            let id_map_guard = self.dev_mntid_map.lock().unwrap();
+            for (k, v) in id_map_guard.iter() {
+                if *v == dev_mntid {
+                    found = true;
+                    dev = k.0;
+                    mnt = k.1;
+                    break;
+                }
+            }
+
+            if !found {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "invalid dev and mntid {},there is no record in memory ",
+                        dev_mntid
+                    ),
+                ));
+            }
+            Ok(InodeAltKey {
+                ino: inode & MAX_HOST_INO,
+                dev,
+                mnt,
+            })
+        }
+    }
 
     fn prepare_passthroughfs() -> PassthroughFs {
         let source = TempDir::new().expect("Cannot create temporary directory.");
@@ -1583,5 +1759,230 @@ mod tests {
         assert_eq!(c_entry.attr_timeout, Duration::from_secs(0));
 
         fs.destroy();
+    }
+
+    #[test]
+    fn test_stable_inode() {
+        use std::os::unix::fs::MetadataExt;
+        let source = TempDir::new().expect("Cannot create temporary directory.");
+        let child_path = TempFile::new_in(source.as_path()).expect("Cannot create temporary file.");
+        let child = CString::new(
+            child_path
+                .as_path()
+                .file_name()
+                .unwrap()
+                .to_str()
+                .expect("path to string"),
+        )
+        .unwrap();
+        let meta = child_path.as_file().metadata().unwrap();
+        let ctx = Context::default();
+        {
+            let fs_cfg = Config {
+                writeback: true,
+                do_import: true,
+                no_open: true,
+                inode_file_handles: false,
+                root_dir: source
+                    .as_path()
+                    .to_str()
+                    .expect("source path to string")
+                    .to_string(),
+                ..Default::default()
+            };
+            let fs = PassthroughFs::<()>::new(fs_cfg).unwrap();
+            fs.import().unwrap();
+            let entry = fs.lookup(&ctx, ROOT_ID, &child).unwrap();
+            assert_eq!(entry.inode, ROOT_ID + 1);
+            fs.forget(&ctx, entry.inode, 1);
+            let entry = fs.lookup(&ctx, ROOT_ID, &child).unwrap();
+            assert_eq!(entry.inode, ROOT_ID + 1);
+        }
+        {
+            let fs_cfg = Config {
+                writeback: true,
+                do_import: true,
+                no_open: true,
+                inode_file_handles: false,
+                root_dir: source
+                    .as_path()
+                    .to_str()
+                    .expect("source path to string")
+                    .to_string(),
+                use_host_ino: true,
+                ..Default::default()
+            };
+            let fs = PassthroughFs::<()>::new(fs_cfg).unwrap();
+            fs.import().unwrap();
+            let entry = fs.lookup(&ctx, ROOT_ID, &child).unwrap();
+            assert_eq!(entry.inode & MAX_HOST_INO, meta.ino());
+            fs.forget(&ctx, entry.inode, 1);
+            let entry = fs.lookup(&ctx, ROOT_ID, &child).unwrap();
+            assert_eq!(entry.inode & MAX_HOST_INO, meta.ino());
+        }
+    }
+
+    #[test]
+    fn test_allocation_inode_locked() {
+        {
+            let fs = prepare_passthroughfs();
+            let m = InodeStore::default();
+            let ids_altkey = InodeAltKey {
+                ino: MAX_HOST_INO + 1,
+                dev: 1,
+                mnt: 1,
+            };
+
+            // Default
+            let inode = fs.allocate_inode_locked(&m, &ids_altkey, None).unwrap();
+            assert_eq!(inode, 2);
+        }
+
+        {
+            let mut fs = prepare_passthroughfs();
+            fs.cfg.use_host_ino = true;
+            let m = InodeStore::default();
+            let ids_altkey = InodeAltKey {
+                ino: 12345,
+                dev: 1,
+                mnt: 1,
+            };
+            // direct return host inode 12345
+            let inode = fs.allocate_inode_locked(&m, &ids_altkey, None).unwrap();
+            assert_eq!(inode & MAX_HOST_INO, 12345)
+        }
+
+        {
+            let mut fs = prepare_passthroughfs();
+            fs.cfg.use_host_ino = true;
+            let mut m = InodeStore::default();
+            let ids_altkey = InodeAltKey {
+                ino: MAX_HOST_INO + 1,
+                dev: 1,
+                mnt: 1,
+            };
+            // allocate a virtual inode
+            let inode = fs.allocate_inode_locked(&m, &ids_altkey, None).unwrap();
+            assert_eq!(inode & MAX_HOST_INO, 2);
+            let file = TempFile::new().expect("Cannot create temporary file.");
+            let mode = file.as_file().metadata().unwrap().mode();
+            let inode_data = InodeData::new(
+                inode,
+                FileOrHandle::File(file.into_file()),
+                1,
+                ids_altkey,
+                mode,
+            );
+            m.insert(Arc::new(inode_data));
+            let inode = fs.allocate_inode_locked(&m, &ids_altkey, None).unwrap();
+            assert_eq!(inode & MAX_HOST_INO, 2);
+        }
+    }
+    #[test]
+    fn test_generate_unique_inode() {
+        // use normal inode format
+        {
+            let generator = UniqueInodeGenerator::new();
+
+            let inode_alt_key = InodeAltKey {
+                ino: 1,
+                dev: 0,
+                mnt: 0,
+            };
+            let unique_inode = generator.get_unique_inode(&inode_alt_key).unwrap();
+            // 56 bit = 0
+            // 55~48 bit = 0000 0001
+            // 47~1 bit  = 1
+            assert_eq!(unique_inode, 0x00800000000001);
+            let expect_inode_alt_key = generator.decode_unique_inode(unique_inode).unwrap();
+            assert_eq!(expect_inode_alt_key, inode_alt_key);
+
+            let inode_alt_key = InodeAltKey {
+                ino: 1,
+                dev: 0,
+                mnt: 1,
+            };
+            let unique_inode = generator.get_unique_inode(&inode_alt_key).unwrap();
+            // 56 bit = 0
+            // 55~48 bit = 0000 0010
+            // 47~1 bit  = 1
+            assert_eq!(unique_inode, 0x01000000000001);
+            let expect_inode_alt_key = generator.decode_unique_inode(unique_inode).unwrap();
+            assert_eq!(expect_inode_alt_key, inode_alt_key);
+
+            let inode_alt_key = InodeAltKey {
+                ino: 2,
+                dev: 0,
+                mnt: 1,
+            };
+            let unique_inode = generator.get_unique_inode(&inode_alt_key).unwrap();
+            // 56 bit = 0
+            // 55~48 bit = 0000 0010
+            // 47~1 bit  = 2
+            assert_eq!(unique_inode, 0x01000000000002);
+            let expect_inode_alt_key = generator.decode_unique_inode(unique_inode).unwrap();
+            assert_eq!(expect_inode_alt_key, inode_alt_key);
+
+            let inode_alt_key = InodeAltKey {
+                ino: MAX_HOST_INO,
+                dev: 0,
+                mnt: 1,
+            };
+            let unique_inode = generator.get_unique_inode(&inode_alt_key).unwrap();
+            // 56 bit = 0
+            // 55~48 bit = 0000 0010
+            // 47~1 bit  = 0x7fffffffffff
+            assert_eq!(unique_inode, 0x017fffffffffff);
+            let expect_inode_alt_key = generator.decode_unique_inode(unique_inode).unwrap();
+            assert_eq!(expect_inode_alt_key, inode_alt_key);
+        }
+
+        // use virtual inode format
+        {
+            let generator = UniqueInodeGenerator::new();
+            let inode_alt_key = InodeAltKey {
+                ino: MAX_HOST_INO + 1,
+                dev: u64::MAX,
+                mnt: u64::MAX,
+            };
+            let unique_inode = generator.get_unique_inode(&inode_alt_key).unwrap();
+            // 56 bit = 1
+            // 55~48 bit = 0000 0001
+            // 47~1 bit  = 2 virtual inode start from 2~MAX_HOST_INO
+            assert_eq!(unique_inode, 0x80800000000002);
+
+            let inode_alt_key = InodeAltKey {
+                ino: MAX_HOST_INO + 2,
+                dev: u64::MAX,
+                mnt: u64::MAX,
+            };
+            let unique_inode = generator.get_unique_inode(&inode_alt_key).unwrap();
+            // 56 bit = 1
+            // 55~48 bit = 0000 0001
+            // 47~1 bit  = 3
+            assert_eq!(unique_inode, 0x80800000000003);
+
+            let inode_alt_key = InodeAltKey {
+                ino: MAX_HOST_INO + 3,
+                dev: u64::MAX,
+                mnt: 0,
+            };
+            let unique_inode = generator.get_unique_inode(&inode_alt_key).unwrap();
+            // 56 bit = 1
+            // 55~48 bit = 0000 0010
+            // 47~1 bit  = 4
+            assert_eq!(unique_inode, 0x81000000000004);
+
+            let inode_alt_key = InodeAltKey {
+                ino: u64::MAX,
+                dev: u64::MAX,
+                mnt: u64::MAX,
+            };
+            let unique_inode = generator.get_unique_inode(&inode_alt_key).unwrap();
+            // 56 bit = 1
+            // 55~48 bit = 0000 0001
+            // 47~1 bit  = 5
+            assert_eq!(unique_inode, 0x80800000000005);
+        }
     }
 }

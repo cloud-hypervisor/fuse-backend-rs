@@ -358,14 +358,14 @@ impl<S: BitmapSlice + Send + Sync> FileSystem for PassthroughFs<S> {
     fn forget(&self, _ctx: &Context, inode: Inode, count: u64) {
         let mut inodes = self.inode_map.get_map_mut();
 
-        Self::forget_one(&mut inodes, inode, count)
+        self.forget_one(&mut inodes, inode, count)
     }
 
     fn batch_forget(&self, _ctx: &Context, requests: Vec<(Inode, u64)>) {
         let mut inodes = self.inode_map.get_map_mut();
 
         for (inode, count) in requests {
-            Self::forget_one(&mut inodes, inode, count)
+            self.forget_one(&mut inodes, inode, count)
         }
     }
 
@@ -485,7 +485,7 @@ impl<S: BitmapSlice + Send + Sync> FileSystem for PassthroughFs<S> {
                 if r == 0 {
                     // Release the refcount acquired by self.do_lookup().
                     let mut inodes = self.inode_map.get_map_mut();
-                    Self::forget_one(&mut inodes, ino, 1);
+                    self.forget_one(&mut inodes, ino, 1);
                 }
                 r
             })
