@@ -10,9 +10,13 @@
   * passthroughfs: add config to specify entry and attr timeout for dir
   * passthroughfs: add config to control count mntid in altkey or not
 - [#119](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/119): Support non-privileged users
+- [#126 #127](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/126 https://github.com/cloud-hypervisor/fuse-backend-rs/pull/127): vfs: ensure entry attr st_ino consistency
+- [#131](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/131): implement stable unique inode for passthroughfs
 
 ### Fixed
 - [#120](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/120): api: forget and batch forget must not reply
+- [#123](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/123): fix possible IO hang due to string convertion failure
+- [#129](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/129): abi: st_nlink is u32 on aarch64
 
 ## [0.10.2]
 
