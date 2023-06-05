@@ -370,6 +370,11 @@ pub trait ZeroCopyWriter: io::Write {
             }
         }
     }
+
+    /// Return number of bytes available for writing.
+    ///
+    /// Useful for buffer fixed writers, such as FuseDevWriter, VirtioFsWriter
+    fn available_bytes(&self) -> usize;
 }
 
 /// Additional context associated with requests.

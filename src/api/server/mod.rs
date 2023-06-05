@@ -96,6 +96,10 @@ impl<'a, S: BitmapSlice> ZeroCopyWriter for ZcWriter<'a, S> {
     ) -> io::Result<usize> {
         self.0.write_from_at(f, count, off)
     }
+
+    fn available_bytes(&self) -> usize {
+        self.0.available_bytes()
+    }
 }
 
 impl<'a, S: BitmapSlice> io::Write for ZcWriter<'a, S> {
