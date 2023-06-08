@@ -1,6 +1,14 @@
 # Changelog
 ## [Unreleased]
 
+## [0.10.4]
+
+### Added
+- [135](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/135): ZeroCopyWriter pass through available bytes from inner writer
+
+### Fixed
+- [133](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/133): https://github.com/cloud-hypervisor/fuse-backend-rs/pull/133
+
 ## [0.10.3]
 
 ### Added
