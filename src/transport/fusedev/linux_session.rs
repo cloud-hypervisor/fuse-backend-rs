@@ -53,6 +53,7 @@ pub struct FuseSession {
     readonly: bool,
     wakers: Mutex<Vec<Arc<Waker>>>,
     auto_unmount: bool,
+    target_mntns: Option<libc::pid_t>,
 }
 
 impl FuseSession {
@@ -91,7 +92,14 @@ impl FuseSession {
             readonly,
             wakers: Mutex::new(Vec::new()),
             auto_unmount,
+            target_mntns: None,
         })
+    }
+
+    /// Set the target pid of mount namespace of the fuse session mount, the fuse will be mounted
+    /// under the given mnt ns.
+    pub fn set_target_mntns(&mut self, pid: Option<libc::pid_t>) {
+        self.target_mntns = pid;
     }
 
     /// Mount the fuse mountpoint, building connection with the in kernel fuse driver.
@@ -106,6 +114,7 @@ impl FuseSession {
             &self.subtype,
             flags,
             self.auto_unmount,
+            self.target_mntns,
         )?;
 
         fcntl(file.as_raw_fd(), FcntlArg::F_SETFL(OFlag::O_NONBLOCK))
@@ -346,6 +355,7 @@ fn fuse_kern_mount(
     subtype: &str,
     flags: MsFlags,
     auto_unmount: bool,
+    target_mntns: Option<libc::pid_t>,
 ) -> Result<(File, Option<UnixStream>)> {
     let file = OpenOptions::new()
         .create(false)
@@ -379,8 +389,20 @@ fn fuse_kern_mount(
             file.as_raw_fd(),
         );
     }
-    if auto_unmount {
-        fuse_fusermount_mount(mountpoint, fsname, subtype, opts, flags, auto_unmount)
+
+    // mount in another mntns requires mounting with fusermount3, which is a new process, as
+    // multithreaded program is not allowed to join to another mntns, and the process running fuse
+    // session might be multithreaded.
+    if auto_unmount || target_mntns.is_some() {
+        fuse_fusermount_mount(
+            mountpoint,
+            fsname,
+            subtype,
+            opts,
+            flags,
+            auto_unmount,
+            target_mntns,
+        )
     } else {
         match mount(
             Some(fsname),
@@ -390,9 +412,15 @@ fn fuse_kern_mount(
             Some(opts.deref()),
         ) {
             Ok(()) => Ok((file, None)),
-            Err(nix::errno::Errno::EPERM) => {
-                fuse_fusermount_mount(mountpoint, fsname, subtype, opts, flags, auto_unmount)
-            }
+            Err(nix::errno::Errno::EPERM) => fuse_fusermount_mount(
+                mountpoint,
+                fsname,
+                subtype,
+                opts,
+                flags,
+                auto_unmount,
+                target_mntns,
+            ),
             Err(e) => Err(SessionFailure(format!(
                 "failed to mount {mountpoint:?}: {e}"
             ))),
@@ -429,6 +457,7 @@ fn fuse_fusermount_mount(
     opts: String,
     flags: MsFlags,
     auto_unmount: bool,
+    target_mntns: Option<libc::pid_t>,
 ) -> Result<(File, Option<UnixStream>)> {
     let mut opts = vec![format!("fsname={fsname}"), opts, msflags_to_string(flags)];
     if !subtype.is_empty() {
@@ -448,15 +477,27 @@ fn fuse_fusermount_mount(
     nix::fcntl::fcntl(send.as_raw_fd(), FcntlArg::F_SETFD(FdFlag::empty()))
         .map_err(|e| SessionFailure(format!("Failed to remove close-on-exec flag: {e}")))?;
 
-    let mut proc = std::process::Command::new("fusermount3")
+    let mut cmd = match target_mntns {
+        Some(pid) => {
+            let mut c = std::process::Command::new("nsenter");
+            c.arg("-t")
+                .arg(format!("{}", pid))
+                .arg("-m")
+                .arg("fusermount3");
+            c
+        }
+        None => std::process::Command::new("fusermount3"),
+    };
+    // Old version of fusermount doesn't support long --options, yet.
+    let mut proc = cmd
         .env("_FUSE_COMMFD", format!("{}", send.as_raw_fd()))
-        // Old version of fusermount doesn't support long --options, yet.
         .arg("-o")
         .arg(opts)
         .arg("--")
         .arg(mountpoint)
         .spawn()
         .map_err(IoError)?;
+
     if auto_unmount {
         std::thread::spawn(move || {
             let _ = proc.wait();
