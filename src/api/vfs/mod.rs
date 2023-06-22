@@ -18,6 +18,7 @@
 use std::any::Any;
 use std::collections::HashMap;
 use std::ffi::CStr;
+use std::fmt;
 use std::io;
 use std::io::{Error, ErrorKind, Result};
 use std::ops::Deref;
@@ -88,6 +89,23 @@ pub enum VfsError {
     /// File system can't ba initialized
     Initialize(String),
 }
+
+impl fmt::Display for VfsError {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        use self::VfsError::*;
+        match self {
+            Unsupported => write!(f, "Vfs operation not supported"),
+            Mount(e) => write!(f, "Mount backend filesystem: {e}"),
+            InodeIndex(s) => write!(f, "Illegal inode index: {s}"),
+            FsIndex(e) => write!(f, "Filesystem index error: {e}"),
+            PathWalk(e) => write!(f, "Walking path error: {e}"),
+            NotFound(s) => write!(f, "Entry can't be found: {s}"),
+            Initialize(s) => write!(f, "File system can't be initialized: {s}"),
+        }
+    }
+}
+
+impl std::error::Error for VfsError {}
 
 /// Vfs result
 pub type VfsResult<T> = std::result::Result<T, VfsError>;
@@ -556,6 +574,7 @@ mod tests {
     use super::*;
     use crate::api::Vfs;
     use std::ffi::CString;
+    use std::io::{Error, ErrorKind};
 
     pub(crate) struct FakeFileSystemOne {}
     impl FileSystem for FakeFileSystemOne {
@@ -1151,5 +1170,46 @@ mod tests {
         for _ in 0..=256 {
             vfs.allocate_fs_idx().unwrap_err();
         }
+    }
+
+    #[test]
+    fn test_fmt_vfs_error() {
+        assert_eq!(
+            format!("{}", VfsError::Unsupported),
+            "Vfs operation not supported".to_string()
+        );
+        assert_eq!(
+            format!(
+                "{}",
+                VfsError::Mount(Error::new(ErrorKind::Other, "mount".to_string()),)
+            ),
+            "Mount backend filesystem: mount".to_string()
+        );
+        assert_eq!(
+            format!("{}", VfsError::InodeIndex("inode index".to_string())),
+            "Illegal inode index: inode index".to_string()
+        );
+        assert_eq!(
+            format!(
+                "{}",
+                VfsError::FsIndex(Error::new(ErrorKind::Other, "fs index".to_string()),)
+            ),
+            "Filesystem index error: fs index".to_string()
+        );
+        assert_eq!(
+            format!(
+                "{}",
+                VfsError::PathWalk(Error::new(ErrorKind::Other, "path walk".to_string()),)
+            ),
+            "Walking path error: path walk".to_string()
+        );
+        assert_eq!(
+            format!("{}", VfsError::NotFound("not found".to_string())),
+            "Entry can't be found: not found".to_string()
+        );
+        assert_eq!(
+            format!("{}", VfsError::Initialize("initialize".to_string())),
+            "File system can't be initialized: initialize".to_string()
+        );
     }
 }
