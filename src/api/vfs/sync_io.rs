@@ -544,7 +544,18 @@ impl FileSystem for Vfs {
                 )
             }
 
-            (Right(fs), idata) => fs.readdir(ctx, idata.ino(), handle, size, offset, add_entry),
+            (Right(fs), idata) => fs.readdir(
+                ctx,
+                idata.ino(),
+                handle,
+                size,
+                offset,
+                &mut |mut dir_entry| {
+                    let new_ino = self.convert_inode(idata.fs_idx(), dir_entry.ino)?;
+                    dir_entry.ino = new_ino;
+                    add_entry(dir_entry)
+                },
+            ),
         }
     }
 
