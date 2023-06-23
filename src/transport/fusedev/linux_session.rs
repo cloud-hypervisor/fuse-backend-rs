@@ -37,6 +37,7 @@ const POLL_EVENTS_CAPACITY: usize = 1024;
 
 const FUSE_DEVICE: &str = "/dev/fuse";
 const FUSE_FSTYPE: &str = "fuse";
+const FUSERMOUNT_BIN: &str = "fusermount3";
 
 const EXIT_FUSE_EVENT: Token = Token(0);
 const FUSE_DEV_EVENT: Token = Token(1);
@@ -54,6 +55,8 @@ pub struct FuseSession {
     wakers: Mutex<Vec<Arc<Waker>>>,
     auto_unmount: bool,
     target_mntns: Option<libc::pid_t>,
+    // fusermount binary, default to fusermount3
+    fusermount: String,
 }
 
 impl FuseSession {
@@ -93,6 +96,7 @@ impl FuseSession {
             wakers: Mutex::new(Vec::new()),
             auto_unmount,
             target_mntns: None,
+            fusermount: FUSERMOUNT_BIN.to_string(),
         })
     }
 
@@ -100,6 +104,16 @@ impl FuseSession {
     /// under the given mnt ns.
     pub fn set_target_mntns(&mut self, pid: Option<libc::pid_t>) {
         self.target_mntns = pid;
+    }
+
+    /// Set fusermount binary, default to fusermount3.
+    pub fn set_fusermount(&mut self, bin: &str) {
+        self.fusermount = bin.to_string();
+    }
+
+    /// Get current fusermount binary.
+    pub fn get_fusermount(&self) -> &str {
+        self.fusermount.as_str()
     }
 
     /// Mount the fuse mountpoint, building connection with the in kernel fuse driver.
@@ -115,6 +129,7 @@ impl FuseSession {
             flags,
             self.auto_unmount,
             self.target_mntns,
+            &self.fusermount,
         )?;
 
         fcntl(file.as_raw_fd(), FcntlArg::F_SETFL(OFlag::O_NONBLOCK))
@@ -138,10 +153,10 @@ impl FuseSession {
     /// Destroy a fuse session.
     pub fn umount(&mut self) -> Result<()> {
         // If we have a keep_alive socket, just drop it,
-        // and let fusermount3 do the unmount.
+        // and let fusermount do the unmount.
         if let (None, Some(file)) = (self.keep_alive.take(), self.file.take()) {
             if let Some(mountpoint) = self.mountpoint.to_str() {
-                fuse_kern_umount(mountpoint, file)
+                fuse_kern_umount(mountpoint, file, self.fusermount.as_str())
             } else {
                 Err(SessionFailure("invalid mountpoint".to_string()))
             }
@@ -356,6 +371,7 @@ fn fuse_kern_mount(
     flags: MsFlags,
     auto_unmount: bool,
     target_mntns: Option<libc::pid_t>,
+    fusermount: &str,
 ) -> Result<(File, Option<UnixStream>)> {
     let file = OpenOptions::new()
         .create(false)
@@ -390,7 +406,7 @@ fn fuse_kern_mount(
         );
     }
 
-    // mount in another mntns requires mounting with fusermount3, which is a new process, as
+    // mount in another mntns requires mounting with fusermount, which is a new process, as
     // multithreaded program is not allowed to join to another mntns, and the process running fuse
     // session might be multithreaded.
     if auto_unmount || target_mntns.is_some() {
@@ -402,6 +418,7 @@ fn fuse_kern_mount(
             flags,
             auto_unmount,
             target_mntns,
+            fusermount,
         )
     } else {
         match mount(
@@ -420,6 +437,7 @@ fn fuse_kern_mount(
                 flags,
                 auto_unmount,
                 target_mntns,
+                fusermount,
             ),
             Err(e) => Err(SessionFailure(format!(
                 "failed to mount {mountpoint:?}: {e}"
@@ -450,6 +468,7 @@ fn msflags_to_string(flags: MsFlags) -> String {
 }
 
 /// Mount a fuse file system with fusermount
+#[allow(clippy::too_many_arguments)]
 fn fuse_fusermount_mount(
     mountpoint: &Path,
     fsname: &str,
@@ -458,6 +477,7 @@ fn fuse_fusermount_mount(
     flags: MsFlags,
     auto_unmount: bool,
     target_mntns: Option<libc::pid_t>,
+    fusermount: &str,
 ) -> Result<(File, Option<UnixStream>)> {
     let mut opts = vec![format!("fsname={fsname}"), opts, msflags_to_string(flags)];
     if !subtype.is_empty() {
@@ -470,10 +490,10 @@ fn fuse_fusermount_mount(
 
     let (send, recv) = UnixStream::pair().unwrap();
 
-    // Keep the sending socket around after exec to pass to fusermount3.
-    // When its partner recv closes, fusermount3 will unmount.
+    // Keep the sending socket around after exec to pass to fusermount.
+    // When its partner recv closes, fusermount will unmount.
     // Remove the close-on-exec flag from the socket, so we can pass it to
-    // fusermount3.
+    // fusermount.
     nix::fcntl::fcntl(send.as_raw_fd(), FcntlArg::F_SETFD(FdFlag::empty()))
         .map_err(|e| SessionFailure(format!("Failed to remove close-on-exec flag: {e}")))?;
 
@@ -483,10 +503,10 @@ fn fuse_fusermount_mount(
             c.arg("-t")
                 .arg(format!("{}", pid))
                 .arg("-m")
-                .arg("fusermount3");
+                .arg(fusermount);
             c
         }
-        None => std::process::Command::new("fusermount3"),
+        None => std::process::Command::new(fusermount),
     };
     // Old version of fusermount doesn't support long --options, yet.
     let mut proc = cmd
@@ -507,7 +527,7 @@ fn fuse_fusermount_mount(
             Some(0) => {}
             exit_code => {
                 return Err(SessionFailure(format!(
-                    "Unexpected exit code when running fusermount3: {exit_code:?}"
+                    "Unexpected exit code when running fusermount: {exit_code:?}"
                 )))
             }
         }
@@ -517,20 +537,20 @@ fn fuse_fusermount_mount(
     match vmm_sys_util::sock_ctrl_msg::ScmSocket::recv_with_fd(&recv, &mut [0u8; 8]).map_err(
         |e| {
             SessionFailure(format!(
-                "Unexpected error when receiving fuse file descriptor from fusermount3: {}",
+                "Unexpected error when receiving fuse file descriptor from fusermount: {}",
                 e
             ))
         },
     )? {
         (_recv_bytes, Some(file)) => Ok((file, if auto_unmount { Some(recv) } else { None })),
         (recv_bytes, None) => Err(SessionFailure(format!(
-            "fusermount3 did not send a file descriptor.  We received {recv_bytes} bytes."
+            "fusermount did not send a file descriptor.  We received {recv_bytes} bytes."
         ))),
     }
 }
 
 /// Umount a fuse file system
-fn fuse_kern_umount(mountpoint: &str, file: File) -> Result<()> {
+fn fuse_kern_umount(mountpoint: &str, file: File, fusermount: &str) -> Result<()> {
     let mut fds = [PollFd::new(file.as_raw_fd(), PollFlags::empty())];
 
     if poll(&mut fds, 0).is_ok() {
@@ -548,7 +568,7 @@ fn fuse_kern_umount(mountpoint: &str, file: File) -> Result<()> {
     drop(file);
     match umount2(mountpoint, MntFlags::MNT_DETACH) {
         Ok(()) => Ok(()),
-        Err(nix::errno::Errno::EPERM) => fuse_fusermount3_umount(mountpoint),
+        Err(nix::errno::Errno::EPERM) => fuse_fusermount_umount(mountpoint, fusermount),
         Err(e) => Err(SessionFailure(format!(
             "failed to umount {mountpoint}: {e}"
         ))),
@@ -556,8 +576,8 @@ fn fuse_kern_umount(mountpoint: &str, file: File) -> Result<()> {
 }
 
 /// Umount a fuse file system
-fn fuse_fusermount3_umount(mountpoint: &str) -> Result<()> {
-    match std::process::Command::new("fusermount3")
+fn fuse_fusermount_umount(mountpoint: &str, fusermount: &str) -> Result<()> {
+    match std::process::Command::new(fusermount)
         .arg("--unmount")
         .arg("--quiet")
         .arg("--lazy")
@@ -569,7 +589,7 @@ fn fuse_fusermount3_umount(mountpoint: &str) -> Result<()> {
     {
         Some(0) => Ok(()),
         exit_code => Err(SessionFailure(format!(
-            "Unexpected exit code when unmounting via running fusermount3: {exit_code:?}"
+            "Unexpected exit code when unmounting via running fusermount: {exit_code:?}"
         ))),
     }
 }
@@ -597,6 +617,18 @@ mod tests {
         let fd = nix::unistd::dup(std::io::stdout().as_raw_fd()).unwrap();
         let file = unsafe { File::from_raw_fd(fd) };
         let _ = FuseChannel::new(file, 3).unwrap();
+    }
+
+    #[test]
+    fn test_fusermount() {
+        let dir = TempDir::new().unwrap();
+        let se = FuseSession::new(dir.as_path(), "foo", "bar", true);
+        assert!(se.is_ok());
+        let mut se = se.unwrap();
+        assert_eq!(se.get_fusermount(), FUSERMOUNT_BIN);
+
+        se.set_fusermount("fusermount");
+        assert_eq!(se.get_fusermount(), "fusermount");
     }
 }
 
