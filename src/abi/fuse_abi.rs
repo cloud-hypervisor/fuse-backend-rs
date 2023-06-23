@@ -99,10 +99,15 @@ bitflags! {
     /// Options controlling the behavior of files opened by the server in response
     /// to an open or create request.
     pub struct OpenOptions: u32 {
+        /// Bypass page cache for this open file.
         const DIRECT_IO = FOPEN_DIRECT_IO;
+        /// Don't invalidate the data cache on open.
         const KEEP_CACHE = FOPEN_KEEP_CACHE;
+        /// The file is not seekable.
         const NONSEEKABLE = FOPEN_NONSEEKABLE;
+        /// allow caching this directory
         const CACHE_DIR = FOPEN_CACHE_DIR;
+        /// the file is stream-like (no file position at all)
         const STREAM = FOPEN_STREAM;
     }
 }
