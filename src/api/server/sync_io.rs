@@ -135,15 +135,21 @@ impl<F: FileSystem + Sync> Server<F> {
             e
         })?;
 
+        #[cfg(not(feature = "fuse-t"))]
         let version = self.vers.load();
         let result = self.fs.lookup(ctx.context(), ctx.nodeid(), name);
 
         match result {
             // before ABI 7.4 inode == 0 was invalid, only ENOENT means negative dentry
+            #[cfg(not(feature = "fuse-t"))]
             Ok(entry)
                 if version.minor < KERNEL_MINOR_VERSION_LOOKUP_NEGATIVE_ENTRY_ZERO
                     && entry.inode == 0 =>
             {
+                ctx.reply_error(io::Error::from_raw_os_error(libc::ENOENT))
+            }
+            #[cfg(feature = "fuse-t")]
+            Ok(entry) if entry.inode == 0 => {
                 ctx.reply_error(io::Error::from_raw_os_error(libc::ENOENT))
             }
             Ok(entry) => {
@@ -649,7 +655,11 @@ impl<F: FileSystem + Sync> Server<F> {
             return ctx.reply_ok(Some(out), None);
         }
 
+        #[cfg(not(feature = "fuse-t"))]
         let mut flags_u64 = flags as u64;
+        #[cfg(feature = "fuse-t")]
+        let flags_u64 = flags as u64;
+        #[cfg(not(feature = "fuse-t"))]
         if flags_u64 & FsOptions::INIT_EXT.bits() != 0 {
             let InitIn2 { flags2, unused: _ } = ctx.r.read_obj().map_err(Error::DecodeMessage)?;
             flags_u64 |= (flags2 as u64) << 32;

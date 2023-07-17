@@ -301,6 +301,8 @@ impl Daemon {
                 })
                 .unwrap();
         }
+        #[cfg(feature = "fuse-t")]
+        se.wait_mount().unwrap();
         self.session = Some(se);
         Ok(())
     }

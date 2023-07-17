@@ -3,13 +3,13 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 
-#[cfg(all(feature = "fusedev", target_os = "macos"))]
+#[cfg(all(feature = "fusedev", feature = "fuse-t", target_os = "macos"))]
 #[macro_use]
 extern crate log;
 
 mod example;
 
-#[cfg(all(feature = "fusedev", target_os = "macos"))]
+#[cfg(all(feature = "fusedev", feature = "fuse-t", target_os = "macos"))]
 mod macfuse_tests {
     use std::io::Result;
     use std::process::Command;
@@ -53,7 +53,7 @@ mod macfuse_tests {
     }
 
     #[test]
-    #[ignore] // it depends on privileged mode to pass through /dev/fuse
+    #[cfg(feature = "fuse-t")]
     fn integration_test_macfuse_hello() -> Result<()> {
         // test the fuse-rs repository
         let tmp_dir = TempDir::new().unwrap();

@@ -14,6 +14,7 @@
 //! - fusedev: communicate with the FUSE driver through `/dev/fuse`
 //! - virtiofs: communicate with the virtiofsd on host side by using virtio descriptors.
 
+use std::any::Any;
 use std::collections::VecDeque;
 use std::io::{self, IoSlice, Read};
 use std::marker::PhantomData;
@@ -97,6 +98,13 @@ impl fmt::Display for Error {
             #[cfg(feature = "virtiofs")]
             GuestMemoryError(e) => write!(f, "descriptor guest memory error: {e}"),
         }
+    }
+}
+
+impl From<Box<dyn Any + Send>> for Error {
+    fn from(value: Box<dyn Any + Send>) -> Self {
+        let err = value.downcast::<Error>().unwrap();
+        *err
     }
 }
 

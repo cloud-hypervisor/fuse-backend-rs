@@ -27,10 +27,19 @@ mod linux_session;
 #[cfg(target_os = "linux")]
 pub use linux_session::*;
 
-#[cfg(target_os = "macos")]
+#[cfg(all(target_os = "macos", not(feature = "fuse-t")))]
 mod macos_session;
-#[cfg(target_os = "macos")]
+#[cfg(all(target_os = "macos", not(feature = "fuse-t")))]
 pub use macos_session::*;
+
+#[cfg(all(target_os = "macos", feature = "fuse-t"))]
+mod fuse_t_session;
+#[cfg(all(target_os = "macos", feature = "fuse-t"))]
+pub use fuse_t_session::*;
+
+// These follows definition from libfuse.
+pub const FUSE_KERN_BUF_SIZE: usize = 256;
+pub const FUSE_HEADER_SIZE: usize = 0x1000;
 
 /// A buffer reference wrapper for fuse requests.
 #[derive(Debug)]

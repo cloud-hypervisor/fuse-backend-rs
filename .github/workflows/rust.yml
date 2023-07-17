@@ -34,10 +34,13 @@ jobs:
     runs-on: macos-latest
     steps:
       - name: Install macfuse
-        run: brew install --cask macfuse
+        run: |
+          brew install --cask macfuse
+          wget https://github.com/macos-fuse-t/fuse-t/releases/download/1.0.24/fuse-t-macos-installer-1.0.24.pkg
+          sudo installer -pkg fuse-t-macos-installer-1.0.24.pkg -target /
       - uses: actions/checkout@v3
       - name: build and check
-        run: make check-macos
+        run: make smoke-macos
 
   deny:
     name: Cargo Deny

@@ -10,11 +10,14 @@ build:
 
 build-macos:
 	cargo build --features="fusedev"
+	cargo build --features="fusedev,fuse-t"
 
 check-macos: build-macos
 	cargo fmt -- --check
 	cargo clippy --features="fusedev" -- -Dwarnings
 	cargo test --features="fusedev" -- --nocapture --skip integration
+	cargo clippy --features="fusedev,fuse-t" -- -Dwarnings
+	cargo test --features="fusedev,fuse-t" -- --nocapture --skip integration
 
 check: build
 	cargo fmt -- --check
@@ -38,7 +41,7 @@ smoke-all: smoke
 	cargo test --features="fusedev" -- --nocapture --ignored
 
 smoke-macos: check-macos
-	cargo test --features="fusedev" -- --nocapture
+	cargo test --features="fusedev,fuse-t" -- --nocapture
 
 docker-smoke:
 	docker run --env RUST_BACKTRACE=1 --rm --privileged --volume ${current_dir}:/fuse-rs rust:1.68 sh -c "rustup component add clippy rustfmt; cd /fuse-rs; make smoke-all"
