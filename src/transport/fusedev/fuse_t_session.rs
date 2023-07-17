@@ -8,28 +8,22 @@
 //! sequentially. A FUSE session is a connection from a FUSE mountpoint to a FUSE server daemon.
 //! A FUSE session can have multiple FUSE channels so that FUSE requests are handled in parallel.
 
-use core_foundation_sys::base::{CFAllocatorRef, CFIndex, CFRelease};
-use core_foundation_sys::string::{kCFStringEncodingUTF8, CFStringCreateWithBytes};
-use core_foundation_sys::url::{kCFURLPOSIXPathStyle, CFURLCreateWithFileSystemPath, CFURLRef};
-use std::ffi::CString;
 use std::fs::File;
-use std::io::IoSliceMut;
-use std::os::unix::ffi::OsStrExt;
+use std::mem::size_of;
 use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
+use std::os::unix::prelude::CommandExt;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicPtr, Ordering};
+use std::process::Command;
 use std::sync::{Arc, Mutex};
+use std::thread::JoinHandle;
 
-use libc::{c_void, proc_pidpath, PROC_PIDPATHINFO_MAXSIZE};
+use libc::{proc_pidpath, PROC_PIDPATHINFO_MAXSIZE};
 use nix::errno::Errno;
-use nix::fcntl::{fcntl, FdFlag, F_SETFD};
 use nix::sys::signal::{signal, SigHandler, Signal};
-use nix::sys::socket::{
-    recvmsg, socketpair, AddressFamily, ControlMessageOwned, MsgFlags, RecvMsg, SockFlag, SockType,
-    UnixAddr,
-};
-use nix::unistd::{close, execv, fork, getpid, read, ForkResult};
-use nix::{cmsg_space, NixPath};
+use nix::sys::socket::{recv, send, setsockopt, SetSockOpt};
+use nix::sys::socket::{socketpair, AddressFamily, MsgFlags, SockFlag, SockType};
+use nix::unistd::{close, fork, getpid, read, ForkResult};
+use vm_memory::ByteValued;
 
 use super::{
     Error::IoError, Error::SessionFailure, FuseBuf, FuseDevWriter, Reader, Result,
@@ -37,46 +31,49 @@ use super::{
 };
 use crate::transport::pagesize;
 
-const OSXFUSE_MOUNT_PROG: &str = "/Library/Filesystems/macfuse.fs/Contents/Resources/mount_macfuse";
+// These follows definition from libfuse.
+const FS_SND_SIZE: usize = 4 * 1024 * 1024;
 
-static K_DADISK_UNMOUNT_OPTION_FORCE: u64 = 524288;
+const FUSE_NFSSRV_PATH: &str = "/usr/local/bin/go-nfsv4";
 
-#[repr(C)]
-struct __DADisk(c_void);
-type DADiskRef = *const __DADisk;
-#[repr(C)]
-struct __DADissenter(c_void);
-type DADissenterRef = *const __DADissenter;
-#[repr(C)]
-struct __DASession(c_void);
-type DASessionRef = *const __DASession;
+#[derive(Clone, Debug)]
+pub struct RcvBuf;
 
-type DADiskUnmountCallback = ::std::option::Option<
-    unsafe extern "C" fn(disk: DADiskRef, dissenter: DADissenterRef, context: *mut c_void),
->;
+impl SetSockOpt for RcvBuf {
+    type Val = usize;
 
-extern "C" {
-    fn DADiskUnmount(
-        disk: DADiskRef,
-        options: u64,
-        callback: DADiskUnmountCallback,
-        context: *mut c_void,
-    );
-    fn DADiskCreateFromVolumePath(
-        allocator: CFAllocatorRef,
-        session: DASessionRef,
-        path: CFURLRef,
-    ) -> DADiskRef;
-    fn DASessionCreate(allocator: CFAllocatorRef) -> DASessionRef;
+    fn set(&self, fd: RawFd, val: &Self::Val) -> nix::Result<()> {
+        unsafe {
+            let res = libc::setsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                libc::SO_RCVBUF,
+                val.as_slice().as_ptr() as *const _,
+                size_of::<usize>() as libc::socklen_t,
+            );
+            Errno::result(res).map(drop)
+        }
+    }
 }
 
-mod ioctl {
-    use nix::ioctl_write_ptr;
+#[derive(Clone, Debug)]
+pub struct SndBuf;
 
-    // #define FUSEDEVIOCSETDAEMONDEAD _IOW('F', 3,  u_int32_t)
-    const FUSE_FD_DEAD_MAGIC: u8 = b'F';
-    const FUSE_FD_DEAD: u8 = 3;
-    ioctl_write_ptr!(set_fuse_fd_dead, FUSE_FD_DEAD_MAGIC, FUSE_FD_DEAD, u32);
+impl SetSockOpt for SndBuf {
+    type Val = usize;
+
+    fn set(&self, fd: RawFd, val: &Self::Val) -> nix::Result<()> {
+        unsafe {
+            let res = libc::setsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                libc::SO_SNDBUF,
+                val.as_slice().as_ptr() as *const _,
+                size_of::<usize>() as libc::socklen_t,
+            );
+            Errno::result(res).map(drop)
+        }
+    }
 }
 
 /// A fuse session manager to manage the connection with the in kernel fuse driver.
@@ -85,10 +82,11 @@ pub struct FuseSession {
     fsname: String,
     subtype: String,
     file: Option<File>,
+    file_lock: Arc<Mutex<()>>,
     bufsize: usize,
-    disk: Arc<Mutex<Option<DADiskRef>>>,
-    dasession: Arc<AtomicPtr<c_void>>,
     readonly: bool,
+    monitor_file: Option<File>,
+    wait_handle: Option<JoinHandle<Result<()>>>,
 }
 
 unsafe impl Send for FuseSession {}
@@ -113,23 +111,20 @@ impl FuseSession {
             fsname: fsname.to_owned(),
             subtype: subtype.to_owned(),
             file: None,
+            file_lock: Arc::new(Mutex::new(())),
             bufsize: FUSE_KERN_BUF_SIZE * pagesize() + FUSE_HEADER_SIZE,
-            disk: Arc::new(Mutex::new(None)),
-            dasession: Arc::new(AtomicPtr::new(unsafe {
-                DASessionCreate(std::ptr::null()) as *mut c_void
-            })),
+            monitor_file: None,
+            wait_handle: None,
             readonly,
         })
     }
 
     /// Mount the fuse mountpoint, building connection with the in kernel fuse driver.
     pub fn mount(&mut self) -> Result<()> {
-        let mut disk = self.disk.lock().expect("lock disk failed");
-        let file = fuse_kern_mount(&self.mountpoint, &self.fsname, &self.subtype, self.readonly)?;
-        let session = self.dasession.load(Ordering::SeqCst);
-        let mount_disk = create_disk(&self.mountpoint, session as DASessionRef);
-        self.file = Some(file);
-        *disk = Some(mount_disk);
+        let files = fuse_kern_mount(&self.mountpoint, &self.fsname, &self.subtype, self.readonly)?;
+        self.file = Some(files.0);
+        self.monitor_file = Some(files.1);
+        self.wait_handle = Some(self.send_mount_command()?);
 
         Ok(())
     }
@@ -146,10 +141,9 @@ impl FuseSession {
 
     /// Destroy a fuse session.
     pub fn umount(&mut self) -> Result<()> {
-        if let Some(file) = self.file.take() {
+        if let Some(file) = self.monitor_file.take() {
             if self.mountpoint.to_str().is_some() {
-                let mut disk = self.disk.lock().expect("lock disk failed");
-                fuse_kern_umount(file, disk.take())
+                fuse_kern_umount(file)
             } else {
                 Err(SessionFailure("invalid mountpoint".to_string()))
             }
@@ -184,7 +178,8 @@ impl FuseSession {
             let file = file
                 .try_clone()
                 .map_err(|e| SessionFailure(format!("dup fd: {}", e)))?;
-            FuseChannel::new(file, self.bufsize)
+            let file_lock = self.file_lock.clone();
+            FuseChannel::new(file, file_lock, self.bufsize)
         } else {
             Err(SessionFailure("invalid fuse session".to_string()))
         }
@@ -195,6 +190,50 @@ impl FuseSession {
     /// So wakers is no need for macfuse to interrupt channel
     pub fn wake(&self) -> Result<()> {
         Ok(())
+    }
+
+    /// wait for fuse-t handle mount command
+    pub fn wait_mount(&mut self) -> Result<()> {
+        if let Some(wait_handle) = self.wait_handle.take() {
+            let _ = wait_handle.join()?;
+        }
+        Ok(())
+    }
+
+    fn send_mount_command(&self) -> Result<JoinHandle<Result<()>>> {
+        let mon_fd = self
+            .monitor_file
+            .as_ref()
+            .ok_or(SessionFailure("monitor fd is not ready".to_string()))
+            .map(|f| f.as_raw_fd())?;
+
+        let handle = std::thread::spawn(move || {
+            let msg = b"mount";
+            if let Err(e) = send(mon_fd, msg, MsgFlags::empty()) {
+                return Err(SessionFailure(format!("send mount failed {:?}", e)));
+            };
+
+            let mut status = -1;
+            loop {
+                match recv(mon_fd, status.as_mut_slice(), MsgFlags::empty()) {
+                    Ok(_size) => {
+                        return if status == 0 {
+                            Ok(())
+                        } else {
+                            Err(SessionFailure(format!("mount failed status: {:?}", status)))
+                        }
+                    }
+                    Err(Errno::EINTR) => {
+                        trace!("read mount status get eintr");
+                        continue;
+                    }
+                    Err(e) => {
+                        return Err(SessionFailure(format!("get mount status failed {:?}", e)));
+                    }
+                }
+            }
+        });
+        Ok(handle)
     }
 }
 
@@ -207,42 +246,27 @@ impl Drop for FuseSession {
 /// A fuse channel abstruction. Each session can hold multiple channels.
 pub struct FuseChannel {
     file: File,
+    file_lock: Arc<Mutex<()>>,
     buf: Vec<u8>,
 }
 
 impl FuseChannel {
-    fn new(file: File, bufsize: usize) -> Result<Self> {
+    fn new(file: File, file_lock: Arc<Mutex<()>>, bufsize: usize) -> Result<Self> {
         Ok(FuseChannel {
             file,
+            file_lock,
             buf: vec![0x0u8; bufsize],
         })
     }
 
-    /// Get next available FUSE request from the underlying fuse device file.
-    ///
-    /// Returns:
-    /// - Ok(None): signal has pending on the exiting event channel
-    /// - Ok(Some((reader, writer))): reader to receive request and writer to send reply
-    /// - Err(e): error message
-    pub fn get_request(&mut self) -> Result<Option<(Reader, FuseDevWriter)>> {
+    fn read(&mut self, len: usize, offset: usize) -> Result<()> {
+        let read_buf = &mut self.buf[offset..offset + len];
+        let mut total: usize = 0;
         let fd = self.file.as_raw_fd();
-        loop {
-            match read(fd, &mut self.buf) {
-                Ok(len) => {
-                    // ###############################################
-                    // Note: it's a heavy hack to reuse the same underlying data
-                    // buffer for both Reader and Writer, in order to reduce memory
-                    // consumption. Here we assume Reader won't be used anymore once
-                    // we start to write to the Writer. To get rid of this hack,
-                    // just allocate a dedicated data buffer for Writer.
-                    let buf = unsafe {
-                        std::slice::from_raw_parts_mut(self.buf.as_mut_ptr(), self.buf.len())
-                    };
-                    // Reader::new() and Writer::new() should always return success.
-                    let reader =
-                        Reader::from_fuse_buffer(FuseBuf::new(&mut self.buf[..len])).unwrap();
-                    let writer = FuseDevWriter::new(fd, buf).unwrap();
-                    return Ok(Some((reader, writer)));
+        while total < len {
+            match read(fd, read_buf) {
+                Ok(size) => {
+                    total += size;
                 }
                 Err(e) => match e {
                     Errno::ENOENT => {
@@ -252,15 +276,17 @@ impl FuseChannel {
                         continue;
                     }
                     Errno::EINTR => {
+                        trace!("failld read EINTR");
                         continue;
                     }
                     // EAGIN requires the caller to handle it, and the current implementation assumes that FD is blocking.
                     Errno::EAGAIN => {
+                        trace!("failld read EAGAIN");
                         return Err(IoError(e.into()));
                     }
                     Errno::ENODEV => {
                         info!("fuse filesystem umounted");
-                        return Ok(None);
+                        return Ok(());
                     }
                     e => {
                         warn! {"read fuse dev failed on fd {}: {}", fd, e};
@@ -269,33 +295,50 @@ impl FuseChannel {
                 },
             }
         }
+        Ok(())
     }
-}
 
-/// Mount a fuse file system
-fn receive_fd(sock_fd: RawFd) -> Result<RawFd> {
-    let mut buffer = vec![0u8; 4];
-    let mut cmsgspace = cmsg_space!(RawFd);
-    let mut iov = [IoSliceMut::new(&mut buffer)];
-    let r: RecvMsg<UnixAddr> =
-        recvmsg(sock_fd, &mut iov, Some(&mut cmsgspace), MsgFlags::empty()).unwrap();
-    if let Some(msg) = r.cmsgs().next() {
-        match msg {
-            ControlMessageOwned::ScmRights(fds) => {
-                let fd = fds
-                    .first()
-                    .ok_or_else(|| SessionFailure(String::from("control msg has no fd")))?;
-                return Ok(*fd);
-            }
-            _ => {
-                return Err(SessionFailure(String::from("unknown msg from fd")));
-            }
+    /// Get next available FUSE request from the underlying fuse device file.
+    ///
+    /// use-t reuses the same fd for all channels, which means multiple requests
+    /// will exist on this fd. We need to read the buffer corresponding to the
+    /// header size first to obtain the size, and then read the remaining part.
+    /// Due to the two-step reading process, we need to use a mutex lock to ensure
+    /// the correctness of the reading.
+    ///
+    /// Returns:
+    /// - Ok(None): signal has pending on the exiting event channel
+    /// - Ok(Some((reader, writer))): reader to receive request and writer to send reply
+    /// - Err(e): error message
+    pub fn get_request(&mut self) -> Result<Option<(Reader, FuseDevWriter)>> {
+        let file_lock = self.file_lock.clone();
+        let result = file_lock.lock();
+        let fd = self.file.as_raw_fd();
+        let size = size_of::<InHeader>();
+        // read header
+        self.read(size, 0)?;
+        let in_header = InHeader::from_slice(&self.buf[0..size]);
+        let header_len = in_header.unwrap().len as usize;
+        let should_read_size = header_len - size;
+        if should_read_size > 0 {
+            self.read(should_read_size, size)?;
         }
+        drop(result);
+
+        let buf = unsafe { std::slice::from_raw_parts_mut(self.buf.as_mut_ptr(), self.buf.len()) };
+        // Reader::new() and Writer::new() should always return success.
+        let reader = Reader::from_fuse_buffer(FuseBuf::new(&mut self.buf[..header_len])).unwrap();
+        let writer = FuseDevWriter::new(fd, buf).unwrap();
+        Ok(Some((reader, writer)))
     }
-    Err(SessionFailure(String::from("not get fd")))
 }
 
-fn fuse_kern_mount(mountpoint: &Path, fsname: &str, subtype: &str, rd_only: bool) -> Result<File> {
+fn fuse_kern_mount(
+    mountpoint: &Path,
+    fsname: &str,
+    subtype: &str,
+    rd_only: bool,
+) -> Result<(File, File)> {
     unsafe { signal(Signal::SIGCHLD, SigHandler::SigDfl) }
         .map_err(|e| SessionFailure(format!("fail to reset SIGCHLD handler{:?}", e)))?;
 
@@ -306,133 +349,87 @@ fn fuse_kern_mount(mountpoint: &Path, fsname: &str, subtype: &str, rd_only: bool
         SockFlag::empty(),
     )
     .map_err(|e| SessionFailure(format!("create socket failed {:?}", e)))?;
-    let file: File = unsafe {
-        match fork().map_err(|e| SessionFailure(format!("fork mount_macfuse failed {:?}", e)))? {
-            ForkResult::Parent { .. } => {
-                close(fd0)
-                    .map_err(|e| SessionFailure(format!("parent close fd0 failed {:?}", e)))?;
-                let fd = receive_fd(fd1)?;
-                File::from_raw_fd(fd)
-            }
-            ForkResult::Child => {
-                close(fd1)
-                    .map_err(|e| SessionFailure(format!("child close fd1 failed {:?}", e)))?;
-                fcntl(fd0, F_SETFD(FdFlag::empty()))
-                    .map_err(|e| SessionFailure(format!("child fcntl fd0 failed {:?}", e)))?;
-                let mut daemon_path: Vec<u8> =
-                    Vec::with_capacity(PROC_PIDPATHINFO_MAXSIZE as usize);
-                if proc_pidpath(
+
+    setsockopt(fd0, SndBuf, &FS_SND_SIZE)
+        .map_err(|e| SessionFailure(format!("set fd0 socket snd size {:?}", e)))?;
+    setsockopt(fd0, RcvBuf, &FS_SND_SIZE)
+        .map_err(|e| SessionFailure(format!("set fd0 socket rcv size {:?}", e)))?;
+    setsockopt(fd1, SndBuf, &FS_SND_SIZE)
+        .map_err(|e| SessionFailure(format!("set fd1 socket snd size {:?}", e)))?;
+    setsockopt(fd1, RcvBuf, &FS_SND_SIZE)
+        .map_err(|e| SessionFailure(format!("set fd1 socket rcv size {:?}", e)))?;
+
+    let (mon_fd0, mon_fd1) = socketpair(
+        AddressFamily::Unix,
+        SockType::Stream,
+        None,
+        SockFlag::empty(),
+    )
+    .map_err(|e| SessionFailure(format!("create mon socket failed {:?}", e)))?;
+
+    let res;
+    unsafe {
+        res = fork().map_err(|e| SessionFailure(format!("fork mount_macfuse failed {:?}", e)))?;
+    }
+
+    match res {
+        ForkResult::Parent { .. } => {
+            close(fd0).map_err(|e| SessionFailure(format!("parent close fd0 failed {:?}", e)))?;
+            close(mon_fd0)
+                .map_err(|e| SessionFailure(format!("parent close mon fd0 failed {:?}", e)))?;
+            unsafe { Ok((File::from_raw_fd(fd1), File::from_raw_fd(mon_fd1))) }
+        }
+        ForkResult::Child => {
+            close(fd1).map_err(|e| SessionFailure(format!("child close fd1 failed {:?}", e)))?;
+            close(mon_fd1)
+                .map_err(|e| SessionFailure(format!("child close mon fd1 failed {:?}", e)))?;
+
+            let mut daemon_path: Vec<u8> = Vec::with_capacity(PROC_PIDPATHINFO_MAXSIZE as usize);
+            unsafe {
+                let res = proc_pidpath(
                     getpid().as_raw(),
                     daemon_path.as_mut_ptr() as *mut libc::c_void,
                     PROC_PIDPATHINFO_MAXSIZE as u32,
-                ) != 0
-                {
-                    let daemon_path = String::from_utf8(daemon_path)
-                        .map_err(|e| SessionFailure(format!("get pid path failed {:?}", e)))?;
-                    std::env::set_var("_FUSE_DAEMON_PATH", daemon_path);
+                );
+                if res > 0 {
+                    daemon_path.set_len(res as usize);
                 }
-                std::env::set_var("_FUSE_COMMFD", format!("{}", fd0));
-                std::env::set_var("_FUSE_COMMVERS", "2");
-                std::env::set_var("_FUSE_CALL_BY_LIB", "1");
-
-                // TODO impl -o
-                let prog_path = CString::new(OSXFUSE_MOUNT_PROG).map_err(|e| {
-                    SessionFailure(format!("create mount_macfuse cstring failed: {:?}", e))
-                })?;
-                let mountpoint = mountpoint.to_str().ok_or_else(|| {
-                    SessionFailure(format!(
-                        "convert mountpoint {:?} to string failed",
-                        mountpoint
-                    ))
-                })?;
-                let fsname_opt = format!("fsname={}", fsname);
-                let subtype_opt = format!("subtype={}", subtype);
-                let mut args: Vec<&str> = vec![
-                    OSXFUSE_MOUNT_PROG,
-                    "-o",
-                    "nodev",
-                    "-o",
-                    "nosuid",
-                    "-o",
-                    "noatime",
-                    "-o",
-                    &fsname_opt,
-                    "-o",
-                    &subtype_opt,
-                ];
-                if rd_only {
-                    args.push("-o");
-                    args.push("-ro");
-                }
-                args.push(mountpoint);
-                let mut c_args: Vec<CString> = Vec::with_capacity(args.len());
-                for arg in args {
-                    let c_arg = CString::new(String::from(arg)).map_err(|e| {
-                        SessionFailure(format!("parse option {:?} to cstring failed {:?}", arg, e))
-                    })?;
-                    c_args.push(c_arg);
-                }
-                execv(&prog_path, &c_args)
-                    .map_err(|e| SessionFailure(format!("exec mount_macfuse failed {:?}", e)))?;
-                panic!("never arrive here")
+            };
+            if !daemon_path.is_empty() {
+                let daemon_path = String::from_utf8(daemon_path)
+                    .map_err(|e| SessionFailure(format!("get pid path failed {:?}", e)))?;
+                std::env::set_var("_FUSE_DAEMON_PATH", daemon_path);
             }
+
+            std::env::set_var("_FUSE_CALL_BY_LIB", "1");
+            std::env::set_var("_FUSE_COMMFD", format!("{}", fd0));
+            std::env::set_var("_FUSE_MONFD", format!("{}", mon_fd0));
+            std::env::set_var("_FUSE_COMMVERS", "2");
+
+            let mut cmd = Command::new(FUSE_NFSSRV_PATH);
+            cmd.arg("--noatime=true")
+                .arg("--noatime=true")
+                // .arg("-d")
+                // .arg("-c")
+                .args(["--volname", &format!("{}-{}", fsname, subtype)]);
+            if rd_only {
+                cmd.arg("-r");
+            }
+            cmd.arg(mountpoint);
+            cmd.exec();
+            panic!("never arrive here")
         }
-    };
-    Ok(file)
-}
-
-fn create_disk(mountpoint: &Path, dasession: DASessionRef) -> DADiskRef {
-    unsafe {
-        let path_len = mountpoint.len();
-        let mountpoint = mountpoint.as_os_str().as_bytes();
-        let mountpoint = mountpoint.as_ptr();
-        let url_str = CFStringCreateWithBytes(
-            std::ptr::null(),
-            mountpoint,
-            path_len as CFIndex,
-            kCFStringEncodingUTF8,
-            1u8,
-        );
-        let url =
-            CFURLCreateWithFileSystemPath(std::ptr::null(), url_str, kCFURLPOSIXPathStyle, 1u8);
-        let disk = DADiskCreateFromVolumePath(std::ptr::null(), dasession, url);
-        CFRelease(std::mem::transmute(url_str));
-        CFRelease(std::mem::transmute(url));
-        disk
     }
 }
-
 /// Umount a fuse file system
-fn fuse_kern_umount(file: File, disk: Option<DADiskRef>) -> Result<()> {
-    if let Err(e) = set_fuse_fd_dead(file.as_raw_fd()) {
-        return Err(SessionFailure(format!(
-            "ioctl set fuse deamon dead failed: {}",
-            e
-        )));
-    }
+fn fuse_kern_umount(file: File) -> Result<()> {
+    let msg = b"unmount";
+    send(file.as_raw_fd(), msg, MsgFlags::empty())
+        .map_err(|e| SessionFailure(format!("send unmount failed {:?}", e)))?;
+
     drop(file);
 
-    if let Some(disk) = disk {
-        unsafe {
-            DADiskUnmount(
-                disk,
-                K_DADISK_UNMOUNT_OPTION_FORCE,
-                None,
-                std::ptr::null_mut(),
-            );
-            CFRelease(std::mem::transmute(disk));
-        }
-    }
     Ok(())
-}
-
-fn set_fuse_fd_dead(fd: RawFd) -> std::io::Result<()> {
-    unsafe {
-        match ioctl::set_fuse_fd_dead(fd, &fd as *const i32 as *const u32) {
-            Ok(_) => Ok(()),
-            Err(e) => Err(e.into()),
-        }
-    }
 }
 
 #[cfg(test)]
@@ -455,11 +452,12 @@ mod tests {
 
     #[test]
     fn test_new_channel() {
-        let ch = FuseChannel::new(unsafe { File::from_raw_fd(0) }, 3);
+        let ch = FuseChannel::new(unsafe { File::from_raw_fd(0) }, Arc::new(Mutex::new(())), 3);
         assert!(ch.is_ok());
     }
 }
 
+use crate::abi::fuse_abi::InHeader;
 #[cfg(feature = "async-io")]
 pub use asyncio::FuseDevTask;
 

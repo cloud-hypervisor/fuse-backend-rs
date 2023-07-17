@@ -27,12 +27,10 @@ use nix::unistd::{getgid, getuid, read};
 use super::{
     super::pagesize,
     Error::{IoError, SessionFailure},
-    FuseBuf, FuseDevWriter, Reader, Result,
+    FuseBuf, FuseDevWriter, Reader, Result, FUSE_HEADER_SIZE, FUSE_KERN_BUF_SIZE,
 };
 
 // These follows definition from libfuse.
-const FUSE_KERN_BUF_SIZE: usize = 256;
-const FUSE_HEADER_SIZE: usize = 0x1000;
 const POLL_EVENTS_CAPACITY: usize = 1024;
 
 const FUSE_DEVICE: &str = "/dev/fuse";

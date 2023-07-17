@@ -51,6 +51,7 @@ async-io = ["async-trait", "tokio-uring", "tokio/fs", "tokio/net", "tokio/sync",
 fusedev = ["vmm-sys-util", "caps", "core-foundation-sys"]
 virtiofs = ["virtio-queue", "caps", "vmm-sys-util"]
 vhost-user-fs = ["virtiofs", "vhost", "caps"]
+fuse-t=[]
 
 [package.metadata.docs.rs]
 all-features = true
