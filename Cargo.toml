@@ -38,7 +38,7 @@ core-foundation-sys = { version = ">=0.8", optional = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 caps = { version = "0.5", optional = true }
-tokio-uring = "0.4"
+tokio-uring = { version = "0.4.0", optional = true }
 
 [dev-dependencies]
 tokio-test = "0.4.2"
