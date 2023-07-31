@@ -1,6 +1,14 @@
 # Changelog
 ## [Unreleased]
 
+## [0.10.5]
+### Added
+- [138](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/138): linuxsession: support mount in given mount namespace
+- [141](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/141): linux_session: support set fusermount binary
+
+### Fixed
+- [140](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/140): fuse: Ensure readdir returns same ino as lookup
+
 ## [0.10.4]
 
 ### Added
