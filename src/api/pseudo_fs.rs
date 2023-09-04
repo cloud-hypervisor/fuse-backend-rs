@@ -413,6 +413,178 @@ impl FileSystem for PseudoFs {
     }
 }
 
+/// Save and restore PseudoFs state.
+#[cfg(feature = "persist")]
+pub mod persist {
+    use std::collections::HashMap;
+    use std::io::{Error as IoError, ErrorKind, Result};
+    use std::sync::atomic::Ordering;
+    use std::sync::Arc;
+
+    use dbs_snapshot::Snapshot;
+    use versionize::{VersionMap, Versionize, VersionizeResult};
+    use versionize_derive::Versionize;
+
+    use super::{PseudoFs, PseudoInode};
+    use crate::api::filesystem::ROOT_ID;
+
+    #[derive(Versionize, PartialEq, Debug, Default, Clone)]
+    struct PseudoInodeState {
+        ino: u64,
+        parent: u64,
+        name: String,
+    }
+
+    #[derive(Versionize, PartialEq, Debug, Default)]
+    pub struct PseudoFsState {
+        next_inode: u64,
+        inodes: Vec<PseudoInodeState>,
+    }
+
+    impl PseudoFs {
+        fn get_version_map() -> VersionMap {
+            let mut vm = VersionMap::new();
+            vm.set_type_version(PseudoFsState::type_id(), 1);
+
+            // more versions for the future
+
+            vm
+        }
+
+        /// Saves part of the PseudoFs into a byte array.
+        /// The upper layer caller can use this method to save
+        /// and transfer metadata for the reloading in the future.
+        pub fn save_to_bytes(&self) -> Result<Vec<u8>> {
+            let mut inodes = Vec::new();
+            let next_inode = self.next_inode.load(Ordering::Relaxed);
+
+            let _guard = self.lock.lock().unwrap();
+            for inode in self.inodes.load().values() {
+                if inode.ino == ROOT_ID {
+                    // no need to save the root inode
+                    continue;
+                }
+
+                inodes.push(PseudoInodeState {
+                    ino: inode.ino,
+                    parent: inode.parent,
+                    name: inode.name.clone(),
+                });
+            }
+            let state = PseudoFsState { next_inode, inodes };
+
+            let vm = PseudoFs::get_version_map();
+            let target_version = vm.latest_version();
+            let mut s = Snapshot::new(vm, target_version);
+            let mut buf = Vec::new();
+            s.save(&mut buf, &state).map_err(|e| {
+                IoError::new(
+                    ErrorKind::Other,
+                    format!("Failed to save PseudoFs to bytes: {:?}", e),
+                )
+            })?;
+
+            Ok(buf)
+        }
+
+        /// Restores the PseudoFs from a byte array.
+        pub fn restore_from_bytes(&self, buf: &mut Vec<u8>) -> Result<()> {
+            let state: PseudoFsState =
+                Snapshot::load(&mut buf.as_slice(), buf.len(), PseudoFs::get_version_map())
+                    .map_err(|e| {
+                        IoError::new(
+                            ErrorKind::Other,
+                            format!("Failed to load PseudoFs from bytes: {:?}", e),
+                        )
+                    })?
+                    .0;
+            self.restore_from_state(&state)
+        }
+
+        fn restore_from_state(&self, state: &PseudoFsState) -> Result<()> {
+            // first, reconstruct all the inodes
+            let mut inode_map = HashMap::new();
+            let mut state_inodes = state.inodes.clone();
+            for inode in state_inodes.iter() {
+                let inode = Arc::new(PseudoInode::new(
+                    inode.ino,
+                    inode.parent,
+                    inode.name.clone(),
+                ));
+                inode_map.insert(inode.ino, inode);
+            }
+
+            // insert root inode to make sure the others inodes can find their parents
+            inode_map.insert(self.root_inode.ino, self.root_inode.clone());
+
+            // then, connect the inodes
+            state_inodes.sort_by(|a, b| a.ino.cmp(&b.ino));
+            for inode in state_inodes.iter() {
+                let inode = inode_map
+                    .get(&inode.ino)
+                    .ok_or_else(|| {
+                        IoError::new(
+                            ErrorKind::InvalidData,
+                            format!("invalid inode {}", inode.ino),
+                        )
+                    })?
+                    .clone();
+                let parent = inode_map.get_mut(&inode.parent).ok_or_else(|| {
+                    IoError::new(
+                        ErrorKind::InvalidData,
+                        format!(
+                            "invalid parent inode {} for inode {}",
+                            inode.parent, inode.ino
+                        ),
+                    )
+                })?;
+                parent.insert_child(inode);
+            }
+            self.inodes.store(Arc::new(inode_map));
+
+            // last, restore next_inode
+            self.next_inode.store(state.next_inode, Ordering::Relaxed);
+
+            Ok(())
+        }
+    }
+
+    mod test {
+
+        #[test]
+        fn save_restore_test() {
+            use crate::api::pseudo_fs::PseudoFs;
+
+            let fs = &PseudoFs::new();
+            let paths = vec!["/a", "/a/b", "/a/b/c", "/b", "/b/a/c", "/d"];
+
+            for path in paths.iter() {
+                fs.mount(path).unwrap();
+            }
+
+            // save fs
+            let mut buf = fs.save_to_bytes().unwrap();
+
+            // restore fs
+            let restored_fs = &PseudoFs::new();
+            restored_fs.restore_from_bytes(&mut buf).unwrap();
+
+            // check fs and restored_fs
+            let next_inode = fs.next_inode.load(std::sync::atomic::Ordering::Relaxed);
+            let restored_next_inode = restored_fs
+                .next_inode
+                .load(std::sync::atomic::Ordering::Relaxed);
+            assert_eq!(next_inode, restored_next_inode);
+
+            for path in paths.iter() {
+                let inode = fs.path_walk(path).unwrap();
+                let restored_inode = restored_fs.path_walk(path).unwrap();
+                assert_eq!(inode, restored_inode);
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

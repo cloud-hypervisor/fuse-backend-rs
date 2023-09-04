@@ -78,6 +78,8 @@ pub enum VfsError {
     Unsupported,
     /// Mount backend filesystem
     Mount(Error),
+    /// Restore mount backend filesystem
+    RestoreMount(Error),
     /// Illegal inode index is used
     InodeIndex(String),
     /// Filesystem index related. For example, an index can't be allocated.
@@ -88,6 +90,8 @@ pub enum VfsError {
     NotFound(String),
     /// File system can't ba initialized
     Initialize(String),
+    /// Error serializing or deserializing the vfs state
+    Persist(String),
 }
 
 impl fmt::Display for VfsError {
@@ -96,11 +100,13 @@ impl fmt::Display for VfsError {
         match self {
             Unsupported => write!(f, "Vfs operation not supported"),
             Mount(e) => write!(f, "Mount backend filesystem: {e}"),
+            RestoreMount(e) => write!(f, "Restore mount backend filesystem: {e}"),
             InodeIndex(s) => write!(f, "Illegal inode index: {s}"),
             FsIndex(e) => write!(f, "Filesystem index error: {e}"),
             PathWalk(e) => write!(f, "Walking path error: {e}"),
             NotFound(s) => write!(f, "Entry can't be found: {s}"),
             Initialize(s) => write!(f, "File system can't be initialized: {s}"),
+            Persist(e) => write!(f, "Error serializing: {e}"),
         }
     }
 }
@@ -416,6 +422,24 @@ impl Vfs {
         Ok(index)
     }
 
+    /// Restore a backend file system to path
+    #[cfg(feature = "persist")]
+    pub fn restore_mount(&self, fs: BackFileSystem, fs_idx: VfsIndex, path: &str) -> Result<()> {
+        let (entry, ino) = fs.mount()?;
+        if ino > VFS_MAX_INO {
+            return Err(Error::new(
+                ErrorKind::Other,
+                format!(
+                    "Unsupported max inode number, requested {} supported {}",
+                    ino, VFS_MAX_INO
+                ),
+            ));
+        }
+
+        let _guard = self.lock.lock().unwrap();
+        self.insert_mount_locked(fs, entry, fs_idx, path)
+    }
+
     /// Umount a backend file system at path
     pub fn umount(&self, path: &str) -> VfsResult<(u64, u64)> {
         // Serialize mount operations. Do not expect poisoned lock here.
@@ -656,6 +680,334 @@ impl Vfs {
                 Ok(entry)
             }
             None => self.convert_entry(idata.fs_idx(), entry.inode, &mut entry),
+        }
+    }
+}
+
+/// Sava and restore Vfs state.
+#[cfg(feature = "persist")]
+pub mod persist {
+    use std::{
+        ops::Deref,
+        sync::{atomic::Ordering, Arc},
+    };
+
+    use dbs_snapshot::Snapshot;
+    use versionize::{VersionMap, Versionize, VersionizeResult};
+    use versionize_derive::Versionize;
+
+    use crate::api::{
+        filesystem::FsOptions,
+        pseudo_fs::persist::PseudoFsState,
+        vfs::{VfsError, VfsResult},
+        Vfs, VfsOptions,
+    };
+
+    /// VfsState stores the state of the VFS.
+    #[derive(Versionize, Debug)]
+    struct VfsState {
+        /// Vfs options
+        options: VfsOptionsState,
+        /// Vfs root
+        root: Vec<u8>,
+        /// next super block index
+        next_super: u8,
+    }
+
+    #[derive(Versionize, Debug, Default)]
+    struct VfsOptionsState {
+        no_open: bool,
+        no_opendir: bool,
+        no_writeback: bool,
+        in_opts: u64,
+        out_opts: u64,
+        killpriv_v2: bool,
+        no_readdir: bool,
+        seal_size: bool,
+    }
+
+    impl VfsOptions {
+        fn save(&self) -> VfsOptionsState {
+            VfsOptionsState {
+                no_open: self.no_open,
+                no_opendir: self.no_opendir,
+                no_writeback: self.no_writeback,
+                in_opts: self.in_opts.bits(),
+                out_opts: self.out_opts.bits(),
+                killpriv_v2: self.killpriv_v2,
+                no_readdir: self.no_readdir,
+                seal_size: self.seal_size,
+            }
+        }
+
+        fn restore(state: &VfsOptionsState) -> VfsResult<VfsOptions> {
+            Ok(VfsOptions {
+                no_open: state.no_open,
+                no_opendir: state.no_opendir,
+                no_writeback: state.no_writeback,
+                in_opts: FsOptions::from_bits(state.in_opts).ok_or(VfsError::Persist(
+                    "Failed to restore VfsOptions.in_opts".to_owned(),
+                ))?,
+                out_opts: FsOptions::from_bits(state.out_opts).ok_or(VfsError::Persist(
+                    "Failed to restore VfsOptions.out_opts".to_owned(),
+                ))?,
+                killpriv_v2: state.killpriv_v2,
+                no_readdir: state.no_readdir,
+                seal_size: state.seal_size,
+            })
+        }
+    }
+
+    impl Vfs {
+        fn get_version_map() -> versionize::VersionMap {
+            let mut version_map = VersionMap::new();
+            version_map
+                .set_type_version(VfsState::type_id(), 1)
+                .set_type_version(PseudoFsState::type_id(), 1)
+                .set_type_version(VfsOptionsState::type_id(), 1);
+
+            // more versions for the future
+
+            version_map
+        }
+
+        /// Saves part of the Vfs metadata into a byte array.
+        /// The upper layer caller can use this method to save
+        /// and transfer metadata for the reloading in the future.
+        ///
+        /// Note! This function does not save the information
+        /// of the Backend FileSystem mounted by VFS,
+        /// which means that when the caller restores VFS,
+        /// in addition to restoring the information in the byte array
+        /// returned by this function,
+        /// it also needs to manually remount each Backend FileSystem
+        /// according to the Index obtained from the previous mount,
+        /// the method `restore_mount` may be help to do this.
+        ///
+        /// # Example
+        ///
+        /// The following example shows how the function is used in conjunction with
+        /// `restore_from_bytes` to implement the serialization and deserialization of VFS.
+        ///
+        /// ```
+        /// use fuse_backend_rs::api::{Vfs, VfsIndex, VfsOptions};
+        /// use fuse_backend_rs::passthrough::{Config, PassthroughFs};
+        ///
+        /// let new_backend_fs = || {
+        ///     let fs_cfg = Config::default();
+        ///     let fs = PassthroughFs::<()>::new(fs_cfg.clone()).unwrap();
+        ///     fs.import().unwrap();
+        ///     Box::new(fs)
+        /// };
+        ///
+        /// // create new vfs
+        /// let vfs = &Vfs::new(VfsOptions::default());
+        /// let paths = vec!["/a", "/a/b", "/a/b/c", "/b", "/b/a/c", "/d"];
+        /// // record the backend fs and their VfsIndexes
+        /// let backend_fs_list: Vec<(&str, VfsIndex)> = paths
+        ///     .iter()
+        ///     .map(|path| {
+        ///         let fs = new_backend_fs();
+        ///         let idx = vfs.mount(fs, path).unwrap();
+        ///
+        ///         (path.to_owned(), idx)
+        ///     })
+        ///     .collect();
+        ///
+        /// // save the vfs state
+        /// let mut buf = vfs.save_to_bytes().unwrap();
+        ///
+        /// // restore the vfs state
+        /// let restored_vfs = &Vfs::new(VfsOptions::default());
+        /// restored_vfs.restore_from_bytes(&mut buf).unwrap();
+        ///
+        /// // mount the backend fs
+        /// backend_fs_list.into_iter().for_each(|(path, idx)| {
+        ///     let fs = new_backend_fs();
+        ///     vfs.restore_mount(fs, idx, path).unwrap();
+        /// });
+        /// ```
+        pub fn save_to_bytes(&self) -> VfsResult<Vec<u8>> {
+            let root_state = self
+                .root
+                .save_to_bytes()
+                .map_err(|e| VfsError::Persist(format!("Failed to save Vfs root: {:?}", e)))?;
+            let vfs_state = VfsState {
+                options: self.opts.load().deref().deref().save(),
+                root: root_state,
+                next_super: self.next_super.load(Ordering::SeqCst),
+            };
+
+            let vm = Vfs::get_version_map();
+            let target_version = vm.latest_version();
+            let mut s = Snapshot::new(vm, target_version);
+            let mut buf = Vec::new();
+            s.save(&mut buf, &vfs_state).map_err(|e| {
+                VfsError::Persist(format!("Failed to save Vfs using snapshot: {:?}", e))
+            })?;
+
+            Ok(buf)
+        }
+
+        /// Restores part of the Vfs metadata from a byte array.
+        /// For more information, see the example of `save_to_bytes`.
+        pub fn restore_from_bytes(&self, buf: &mut Vec<u8>) -> VfsResult<()> {
+            let mut state: VfsState =
+                Snapshot::load(&mut buf.as_slice(), buf.len(), Vfs::get_version_map())
+                    .map_err(|e| {
+                        VfsError::Persist(format!("Failed to load Vfs using snapshot: {:?}", e))
+                    })?
+                    .0;
+            let opts = VfsOptions::restore(&state.options)?;
+            self.initialized
+                .store(!opts.in_opts.is_empty(), Ordering::Release);
+            self.opts.store(Arc::new(opts));
+
+            self.next_super.store(state.next_super, Ordering::SeqCst);
+            self.root
+                .restore_from_bytes(&mut state.root)
+                .map_err(|e| VfsError::Persist(format!("Failed to restore Vfs root: {:?}", e)))?;
+
+            Ok(())
+        }
+    }
+
+    mod test {
+
+        // This test is to make sure that VfsState can be serialized and deserialized
+        #[test]
+        fn test_vfs_save_restore_simple() {
+            use crate::api::{Vfs, VfsOptions};
+
+            // create new vfs
+            let vfs = &Vfs::new(VfsOptions::default());
+
+            // save the vfs state using Snapshot
+            let mut buf = vfs.save_to_bytes().unwrap();
+
+            // restore the vfs state
+            let vfs = &Vfs::new(VfsOptions::default());
+            vfs.restore_from_bytes(&mut buf).unwrap();
+            assert_eq!(vfs.next_super.load(std::sync::atomic::Ordering::SeqCst), 1);
+        }
+
+        #[test]
+        fn test_vfs_save_restore_with_backend_fs() {
+            use crate::api::{Vfs, VfsIndex, VfsOptions};
+            use crate::passthrough::{Config, PassthroughFs};
+
+            let new_backend_fs = || {
+                let fs_cfg = Config::default();
+                let fs = PassthroughFs::<()>::new(fs_cfg.clone()).unwrap();
+                fs.import().unwrap();
+                Box::new(fs)
+            };
+
+            // create new vfs
+            let vfs = &Vfs::new(VfsOptions::default());
+            let paths = vec!["/a", "/a/b", "/a/b/c", "/b", "/b/a/c", "/d"];
+            let backend_fs_list: Vec<(&str, VfsIndex)> = paths
+                .iter()
+                .map(|path| {
+                    let fs = new_backend_fs();
+                    let idx = vfs.mount(fs, path).unwrap();
+
+                    (path.to_owned(), idx)
+                })
+                .collect();
+
+            // save the vfs state using Snapshot
+            let mut buf = vfs.save_to_bytes().unwrap();
+
+            // restore the vfs state
+            let restored_vfs = &Vfs::new(VfsOptions::default());
+            restored_vfs.restore_from_bytes(&mut buf).unwrap();
+            // restore the backend fs
+            backend_fs_list.into_iter().for_each(|(path, idx)| {
+                let fs = new_backend_fs();
+                vfs.restore_mount(fs, idx, path).unwrap();
+            });
+
+            // check the vfs and restored_vfs
+            assert_eq!(
+                vfs.next_super.load(std::sync::atomic::Ordering::SeqCst),
+                restored_vfs
+                    .next_super
+                    .load(std::sync::atomic::Ordering::SeqCst)
+            );
+            assert_eq!(
+                vfs.initialized.load(std::sync::atomic::Ordering::SeqCst),
+                restored_vfs
+                    .initialized
+                    .load(std::sync::atomic::Ordering::SeqCst)
+            );
+            for path in paths.iter() {
+                let inode = vfs.root.path_walk(path).unwrap();
+                let restored_inode = restored_vfs.root.path_walk(path).unwrap();
+                assert_eq!(inode, restored_inode);
+            }
+        }
+
+        #[test]
+        fn test_vfs_save_restore_with_backend_fs_with_initialized() {
+            use crate::api::filesystem::{FileSystem, FsOptions};
+            use crate::api::{Vfs, VfsIndex, VfsOptions};
+            use crate::passthrough::{Config, PassthroughFs};
+            use std::sync::atomic::Ordering;
+
+            let new_backend_fs = || {
+                let fs_cfg = Config::default();
+                let fs = PassthroughFs::<()>::new(fs_cfg.clone()).unwrap();
+                fs.import().unwrap();
+                Box::new(fs)
+            };
+
+            // create new vfs
+            let vfs = &Vfs::new(VfsOptions::default());
+            let paths = vec!["/a", "/a/b", "/a/b/c", "/b", "/b/a/c", "/d"];
+            let backend_fs_list: Vec<(&str, VfsIndex)> = paths
+                .iter()
+                .map(|path| {
+                    let fs = new_backend_fs();
+                    let idx = vfs.mount(fs, path).unwrap();
+
+                    (path.to_owned(), idx)
+                })
+                .collect();
+            vfs.init(FsOptions::ASYNC_READ).unwrap();
+            assert!(vfs.initialized.load(Ordering::Acquire));
+
+            // save the vfs state using Snapshot
+            let mut buf = vfs.save_to_bytes().unwrap();
+
+            // restore the vfs state
+            let restored_vfs = &Vfs::new(VfsOptions::default());
+            restored_vfs.restore_from_bytes(&mut buf).unwrap();
+
+            // restore the backend fs
+            backend_fs_list.into_iter().for_each(|(path, idx)| {
+                let fs = new_backend_fs();
+                vfs.restore_mount(fs, idx, path).unwrap();
+            });
+
+            // check the vfs and restored_vfs
+            assert_eq!(
+                vfs.next_super.load(std::sync::atomic::Ordering::SeqCst),
+                restored_vfs
+                    .next_super
+                    .load(std::sync::atomic::Ordering::SeqCst)
+            );
+            assert_eq!(
+                vfs.initialized.load(std::sync::atomic::Ordering::Acquire),
+                restored_vfs
+                    .initialized
+                    .load(std::sync::atomic::Ordering::Acquire)
+            );
+            for path in paths.iter() {
+                let inode = vfs.root.path_walk(path).unwrap();
+                let restored_inode = restored_vfs.root.path_walk(path).unwrap();
+                assert_eq!(inode, restored_inode);
+            }
         }
     }
 }

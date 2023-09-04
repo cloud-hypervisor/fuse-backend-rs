@@ -20,10 +20,11 @@ build = "build.rs"
 arc-swap = "1.5"
 async-trait = { version = "0.1.42", optional = true }
 bitflags = "1.1"
+dbs-snapshot = { version = "1.5.0", optional = true }
 io-uring = { version = "0.5.8", optional = true }
 libc = "0.2.68"
 log = "0.4.6"
-mio = { version = "0.8", features = ["os-poll", "os-ext"]}
+mio = { version = "0.8", features = ["os-poll", "os-ext"] }
 nix = "0.24"
 lazy_static = "1.4"
 tokio = { version = "1", optional = true }
@@ -32,6 +33,8 @@ vmm-sys-util = { version = "0.11", optional = true }
 vm-memory = { version = "0.10", features = ["backend-mmap"] }
 virtio-queue = { version = "0.7", optional = true }
 vhost = { version = "0.6", features = ["vhost-user-slave"], optional = true }
+versionize_derive = { version = "0.1.6", optional = true }
+versionize = { version = "0.1.10", optional = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 core-foundation-sys = { version = ">=0.8", optional = true }
@@ -47,12 +50,26 @@ vm-memory = { version = "0.10", features = ["backend-mmap", "backend-bitmap"] }
 
 [features]
 default = ["fusedev"]
-async-io = ["async-trait", "tokio-uring", "tokio/fs", "tokio/net", "tokio/sync", "tokio/rt", "tokio/macros", "io-uring"]
+async-io = [
+    "async-trait",
+    "tokio-uring",
+    "tokio/fs",
+    "tokio/net",
+    "tokio/sync",
+    "tokio/rt",
+    "tokio/macros",
+    "io-uring",
+]
 fusedev = ["vmm-sys-util", "caps", "core-foundation-sys"]
 virtiofs = ["virtio-queue", "caps", "vmm-sys-util"]
 vhost-user-fs = ["virtiofs", "vhost", "caps"]
-fuse-t=[]
+persist = ["dbs-snapshot", "versionize", "versionize_derive"]
+fuse-t = []
 
 [package.metadata.docs.rs]
 all-features = true
-targets = ["x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu", "aarch64-apple-darwin"]
+targets = [
+    "x86_64-unknown-linux-gnu",
+    "aarch64-unknown-linux-gnu",
+    "aarch64-apple-darwin",
+]
