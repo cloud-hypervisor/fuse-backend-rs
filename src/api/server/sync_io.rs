@@ -19,10 +19,44 @@ use crate::abi::virtio_fs::{RemovemappingIn, RemovemappingOne, SetupmappingIn};
 use crate::api::filesystem::{
     DirEntry, Entry, FileSystem, GetxattrReply, IoctlData, ListxattrReply,
 };
+#[cfg(feature = "fusedev")]
+use crate::transport::FuseDevWriter;
 use crate::transport::{pagesize, FsCacheReqHandler, Reader, Writer};
 use crate::{bytes_to_cstr, encode_io_error_kind, BitmapSlice, Error, Result};
 
 impl<F: FileSystem + Sync> Server<F> {
+    #[cfg(feature = "fusedev")]
+    /// Use to send notify msg to kernel fuse
+    pub fn notify_inval_entry<S: BitmapSlice>(
+        &self,
+        mut w: FuseDevWriter<'_, S>,
+        parent: u64,
+        name: &std::ffi::CStr,
+    ) -> Result<usize> {
+        let mut buffer_writer = w.split_at(0).map_err(Error::FailedToSplitWriter)?;
+        let mut entry = NotifyInvalEntryOut::default();
+        let mut header = OutHeader::default();
+        let name_with_null = name.to_bytes_with_nul();
+        header.unique = 0;
+        header.error = NotifyOpcode::InvalEntry as i32;
+        header.len = std::mem::size_of::<OutHeader>() as u32
+            + std::mem::size_of::<NotifyInvalEntryOut>() as u32
+            + name_with_null.len() as u32;
+        // the namelne don't contains the nul
+        entry.namelen = (name_with_null.len() - 1) as u32;
+        entry.parent = parent;
+
+        buffer_writer
+            .write_obj(header)
+            .map_err(Error::FailedToWrite)?;
+        buffer_writer
+            .write_obj(entry)
+            .map_err(Error::FailedToWrite)?;
+        buffer_writer
+            .write(name_with_null)
+            .map_err(Error::FailedToWrite)?;
+        buffer_writer.commit(None).map_err(Error::InvalidMessage)
+    }
     /// Main entrance to handle requests from the transport layer.
     ///
     /// It receives Fuse requests from transport layers, parses the request according to Fuse ABI,

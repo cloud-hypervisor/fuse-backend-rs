@@ -76,6 +76,10 @@ pub enum Error {
     InvalidXattrSize((u32, usize)),
     /// Invalid message that the server cannot handle properly.
     InvalidMessage(io::Error),
+    /// Failed to write buffer to writer.
+    FailedToWrite(io::Error),
+    /// Failed to split a writer.
+    FailedToSplitWriter(transport::Error),
 }
 
 impl error::Error for Error {}
@@ -95,6 +99,8 @@ impl fmt::Display for Error {
                  decoded value: size = {size}, value.len() = {len}"
             ),
             InvalidMessage(err) => write!(f, "cannot process fuse message: {err}"),
+            FailedToWrite(err) => write!(f, "cannot write to buffer: {err}"),
+            FailedToSplitWriter(err) => write!(f, "cannot split a writer: {err}"),
         }
     }
 }
