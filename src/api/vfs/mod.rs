@@ -395,7 +395,7 @@ impl Vfs {
     }
 
     /// Umount a backend file system at path
-    pub fn umount(&self, path: &str) -> VfsResult<()> {
+    pub fn umount(&self, path: &str) -> VfsResult<(u64, u64)> {
         // Serialize mount operations. Do not expect poisoned lock here.
         let _guard = self.lock.lock().unwrap();
         let inode = self
@@ -403,7 +403,13 @@ impl Vfs {
             .path_walk(path)
             .map_err(VfsError::PathWalk)?
             .ok_or_else(|| VfsError::NotFound(path.to_string()))?;
-
+        let parent = self
+            .root
+            .get_parent_inode(inode)
+            .ok_or(VfsError::NotFound(format!(
+                "{}'s parent inode does not exist",
+                inode
+            )))?;
         let mut mountpoints = self.mountpoints.load().deref().deref().clone();
         let fs_idx = mountpoints
             .get(&inode)
@@ -437,7 +443,7 @@ impl Vfs {
         }
         self.superblocks.store(Arc::new(superblocks));
 
-        Ok(())
+        Ok((inode, parent))
     }
 
     /// Get the mounted backend file system alongside the path if there's one.
