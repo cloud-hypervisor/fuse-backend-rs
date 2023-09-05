@@ -235,6 +235,12 @@ impl PseudoFs {
         self.inodes.store(Arc::new(hashmap));
     }
 
+    pub fn get_parent_inode(&self, ino: u64) -> Option<u64> {
+        let _guard = self.lock.lock();
+        let inodes = self.inodes.load();
+        inodes.get(&ino).map(|o| o.parent)
+    }
+
     #[allow(dead_code)]
     pub fn evict_inode(&self, ino: u64) {
         let _guard = self.lock.lock();
