@@ -292,6 +292,7 @@ pub struct Vfs {
     opts: ArcSwap<VfsOptions>,
     initialized: AtomicBool,
     lock: Mutex<()>,
+    remove_pseudo_root: bool,
 }
 
 impl Default for Vfs {
@@ -311,7 +312,13 @@ impl Vfs {
             opts: ArcSwap::new(Arc::new(opts)),
             lock: Mutex::new(()),
             initialized: AtomicBool::new(false),
+            remove_pseudo_root: false,
         }
+    }
+
+    /// mark remove pseudo root inode when umount
+    pub fn set_remove_pseudo_root(&mut self) {
+        self.remove_pseudo_root = true;
     }
 
     /// For sake of live-upgrade, only after negotiation is done, it's safe to persist
@@ -406,7 +413,14 @@ impl Vfs {
                 // 1. they can be reused later on
                 // 2. during live upgrade, it is easier reconstruct pseudofs inodes since
                 //    we do not have to track pseudofs deletions
-                //self.root.evict_inode(inode);
+                // In order to make the hot upgrade of virtiofs easy, VFS will save pseudo
+                // inodes when umount for easy recovery. However, in the fuse scenario, if
+                // umount does not remove the pseudo inode, it will cause an invalid
+                // directory to be seen on the host, which is not friendly to users. So add
+                // this option to control this behavior.
+                if self.remove_pseudo_root {
+                    self.root.evict_inode(inode);
+                }
                 mountpoints.remove(&inode);
                 self.mountpoints.store(Arc::new(mountpoints));
                 x.fs_idx
