@@ -668,7 +668,18 @@ pub struct PassthroughFs<S: BitmapSlice + Send + Sync = ()> {
 
 impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
     /// Create a Passthrough file system instance.
-    pub fn new(cfg: Config) -> io::Result<PassthroughFs<S>> {
+    pub fn new(mut cfg: Config) -> io::Result<PassthroughFs<S>> {
+        if cfg.no_open && cfg.cache_policy != CachePolicy::Always {
+            warn!("passthroughfs: no_open only work with cache=always, reset to open mode");
+            cfg.no_open = false;
+        }
+        if cfg.writeback && cfg.cache_policy == CachePolicy::Never {
+            warn!(
+                "passthroughfs: writeback cache conflicts with cache=none, reset to no_writeback"
+            );
+            cfg.writeback = false;
+        }
+
         // Safe because this is a constant value and a valid C string.
         let proc_self_fd_cstr = unsafe { CStr::from_bytes_with_nul_unchecked(PROC_SELF_FD_CSTR) };
         let proc_self_fd = Self::open_file(
@@ -1984,5 +1995,55 @@ mod tests {
             // 47~1 bit  = 5
             assert_eq!(unique_inode, 0x80800000000005);
         }
+    }
+
+    #[test]
+    fn test_validate_virtiofs_config() {
+        // cache=none + writeback, writeback should be disabled
+        let fs_cfg = Config {
+            writeback: true,
+            cache_policy: CachePolicy::Never,
+            ..Default::default()
+        };
+        let fs = PassthroughFs::<()>::new(fs_cfg).unwrap();
+        assert!(!fs.cfg.writeback);
+
+        // cache=none + no_open, no_open should be disabled
+        let fs_cfg = Config {
+            no_open: true,
+            cache_policy: CachePolicy::Never,
+            ..Default::default()
+        };
+        let fs = PassthroughFs::<()>::new(fs_cfg).unwrap();
+        assert!(!fs.cfg.no_open);
+
+        // cache=auto + no_open, no_open should be disabled
+        let fs_cfg = Config {
+            no_open: true,
+            cache_policy: CachePolicy::Auto,
+            ..Default::default()
+        };
+        let fs = PassthroughFs::<()>::new(fs_cfg).unwrap();
+        assert!(!fs.cfg.no_open);
+
+        // cache=always + no_open, no_open should be set
+        let fs_cfg = Config {
+            no_open: true,
+            cache_policy: CachePolicy::Always,
+            ..Default::default()
+        };
+        let fs = PassthroughFs::<()>::new(fs_cfg).unwrap();
+        assert!(fs.cfg.no_open);
+
+        // cache=none + no_open + writeback, no_open and writeback should be disabled
+        let fs_cfg = Config {
+            no_open: true,
+            writeback: true,
+            cache_policy: CachePolicy::Never,
+            ..Default::default()
+        };
+        let fs = PassthroughFs::<()>::new(fs_cfg).unwrap();
+        assert!(!fs.cfg.no_open);
+        assert!(!fs.cfg.writeback);
     }
 }
