@@ -52,6 +52,7 @@ pub struct FuseSession {
     readonly: bool,
     wakers: Mutex<Vec<Arc<Waker>>>,
     auto_unmount: bool,
+    allow_other: bool,
     target_mntns: Option<libc::pid_t>,
     // fusermount binary, default to fusermount3
     fusermount: String,
@@ -95,6 +96,7 @@ impl FuseSession {
             auto_unmount,
             target_mntns: None,
             fusermount: FUSERMOUNT_BIN.to_string(),
+            allow_other: true,
         })
     }
 
@@ -107,6 +109,13 @@ impl FuseSession {
     /// Set fusermount binary, default to fusermount3.
     pub fn set_fusermount(&mut self, bin: &str) {
         self.fusermount = bin.to_string();
+    }
+
+    /// Set the allow_other mount option. This allows other users than the one mounting the
+    /// filesystem to access the filesystem. However, this option is usually restricted to the root
+    /// user unless configured otherwise.
+    pub fn set_allow_other(&mut self, allow_other: bool) {
+        self.allow_other = allow_other;
     }
 
     /// Get current fusermount binary.
@@ -126,6 +135,7 @@ impl FuseSession {
             &self.subtype,
             flags,
             self.auto_unmount,
+            self.allow_other,
             self.target_mntns,
             &self.fusermount,
         )?;
@@ -362,12 +372,14 @@ impl FuseChannel {
 }
 
 /// Mount a fuse file system
+#[allow(clippy::too_many_arguments)]
 fn fuse_kern_mount(
     mountpoint: &Path,
     fsname: &str,
     subtype: &str,
     flags: MsFlags,
     auto_unmount: bool,
+    allow_other: bool,
     target_mntns: Option<libc::pid_t>,
     fusermount: &str,
 ) -> Result<(File, Option<UnixStream>)> {
@@ -380,13 +392,16 @@ fn fuse_kern_mount(
     let meta = mountpoint
         .metadata()
         .map_err(|e| SessionFailure(format!("stat {mountpoint:?}: {e}")))?;
-    let opts = format!(
-        "default_permissions,allow_other,fd={},rootmode={:o},user_id={},group_id={}",
+    let mut opts = format!(
+        "default_permissions,fd={},rootmode={:o},user_id={},group_id={}",
         file.as_raw_fd(),
         meta.permissions().mode() & libc::S_IFMT,
         getuid(),
         getgid(),
     );
+    if allow_other {
+        opts.push_str(",allow_other");
+    }
     let mut fstype = String::from(FUSE_FSTYPE);
     if !subtype.is_empty() {
         fstype.push('.');
