@@ -157,10 +157,7 @@ impl<'a, S: BitmapSlice> FuseDevWriter<'a, S> {
             }
         };
 
-        res.map_err(|e| {
-            error! {"fail to write to fuse device on commit: {}", e};
-            io::Error::from_raw_os_error(e as i32)
-        })
+        res.map_err(|e| io::Error::from_raw_os_error(e as i32))
     }
 
     /// Return number of bytes already written to the internal buffer.
