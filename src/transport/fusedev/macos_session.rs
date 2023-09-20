@@ -86,7 +86,7 @@ pub struct FuseSession {
     subtype: String,
     file: Option<File>,
     bufsize: usize,
-    disk: Arc<Mutex<Option<DADiskRef>>>,
+    disk: Mutex<Option<DADiskRef>>,
     dasession: Arc<AtomicPtr<c_void>>,
     readonly: bool,
 }
@@ -114,7 +114,7 @@ impl FuseSession {
             subtype: subtype.to_owned(),
             file: None,
             bufsize: FUSE_KERN_BUF_SIZE * pagesize() + FUSE_HEADER_SIZE,
-            disk: Arc::new(Mutex::new(None)),
+            disk: Mutex::new(None),
             dasession: Arc::new(AtomicPtr::new(unsafe {
                 DASessionCreate(std::ptr::null()) as *mut c_void
             })),
