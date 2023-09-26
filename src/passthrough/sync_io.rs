@@ -407,7 +407,12 @@ impl<S: BitmapSlice + Send + Sync> FileSystem for PassthroughFs<S> {
         _flags: u32,
         handle: Handle,
     ) -> io::Result<()> {
-        self.do_release(inode, handle)
+        if self.no_opendir.load(Ordering::Relaxed) {
+            info!("fuse: releasedir is not supported.");
+            Err(io::Error::from_raw_os_error(libc::ENOSYS))
+        } else {
+            self.do_release(inode, handle)
+        }
     }
 
     fn mkdir(
