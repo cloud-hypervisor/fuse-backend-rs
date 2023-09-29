@@ -265,7 +265,9 @@ impl Daemon {
     pub fn new(mountpoint: &str, thread_cnt: u32) -> Result<Self> {
         // create vfs
         let vfs = Vfs::new(VfsOptions {
+            #[cfg(not(target_os = "macos"))]
             no_open: false,
+            #[cfg(not(target_os = "macos"))]
             no_opendir: false,
             ..Default::default()
         });

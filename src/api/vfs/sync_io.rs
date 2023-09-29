@@ -20,23 +20,26 @@ impl FileSystem for Vfs {
             return Err(Error::from_raw_os_error(libc::EINVAL));
         }
         let mut n_opts = *self.opts.load().deref().deref();
-        if n_opts.no_open {
-            n_opts.no_open = !(opts & FsOptions::ZERO_MESSAGE_OPEN).is_empty();
-            // We can't support FUSE_ATOMIC_O_TRUNC with no_open
-            n_opts.out_opts.remove(FsOptions::ATOMIC_O_TRUNC);
-        } else {
-            n_opts.out_opts.remove(FsOptions::ZERO_MESSAGE_OPEN);
-        }
-        if n_opts.no_opendir {
-            n_opts.no_opendir = !(opts & FsOptions::ZERO_MESSAGE_OPENDIR).is_empty();
-        } else {
-            n_opts.out_opts.remove(FsOptions::ZERO_MESSAGE_OPENDIR);
-        }
-        if n_opts.no_writeback {
-            n_opts.out_opts.remove(FsOptions::WRITEBACK_CACHE);
-        }
-        if !n_opts.killpriv_v2 {
-            n_opts.out_opts.remove(FsOptions::HANDLE_KILLPRIV_V2);
+        #[cfg(not(target_os = "macos"))]
+        {
+            if n_opts.no_open {
+                n_opts.no_open = !(opts & FsOptions::ZERO_MESSAGE_OPEN).is_empty();
+                // We can't support FUSE_ATOMIC_O_TRUNC with no_open
+                n_opts.out_opts.remove(FsOptions::ATOMIC_O_TRUNC);
+            } else {
+                n_opts.out_opts.remove(FsOptions::ZERO_MESSAGE_OPEN);
+            }
+            if n_opts.no_opendir {
+                n_opts.no_opendir = !(opts & FsOptions::ZERO_MESSAGE_OPENDIR).is_empty();
+            } else {
+                n_opts.out_opts.remove(FsOptions::ZERO_MESSAGE_OPENDIR);
+            }
+            if n_opts.no_writeback {
+                n_opts.out_opts.remove(FsOptions::WRITEBACK_CACHE);
+            }
+            if !n_opts.killpriv_v2 {
+                n_opts.out_opts.remove(FsOptions::HANDLE_KILLPRIV_V2);
+            }
         }
         n_opts.in_opts = opts;
 
@@ -297,15 +300,15 @@ impl FileSystem for Vfs {
         flags: u32,
         fuse_flags: u32,
     ) -> Result<(Option<u64>, OpenOptions)> {
+        #[cfg(not(target_os = "macos"))]
         if self.opts.load().no_open {
-            Err(Error::from_raw_os_error(libc::ENOSYS))
-        } else {
-            match self.get_real_rootfs(inode)? {
-                (Left(fs), idata) => fs.open(ctx, idata.ino(), flags, fuse_flags),
-                (Right(fs), idata) => fs
-                    .open(ctx, idata.ino(), flags, fuse_flags)
-                    .map(|(h, opt)| (h.map(Into::into), opt)),
-            }
+            return Err(Error::from_raw_os_error(libc::ENOSYS));
+        }
+        match self.get_real_rootfs(inode)? {
+            (Left(fs), idata) => fs.open(ctx, idata.ino(), flags, fuse_flags),
+            (Right(fs), idata) => fs
+                .open(ctx, idata.ino(), flags, fuse_flags)
+                .map(|(h, opt)| (h.map(Into::into), opt)),
         }
     }
 
@@ -513,15 +516,15 @@ impl FileSystem for Vfs {
         inode: VfsInode,
         flags: u32,
     ) -> Result<(Option<VfsHandle>, OpenOptions)> {
+        #[cfg(not(target_os = "macos"))]
         if self.opts.load().no_opendir {
-            Err(Error::from_raw_os_error(libc::ENOSYS))
-        } else {
-            match self.get_real_rootfs(inode)? {
-                (Left(fs), idata) => fs.opendir(ctx, idata.ino(), flags),
-                (Right(fs), idata) => fs
-                    .opendir(ctx, idata.ino(), flags)
-                    .map(|(h, opt)| (h.map(Into::into), opt)),
-            }
+            return Err(Error::from_raw_os_error(libc::ENOSYS));
+        }
+        match self.get_real_rootfs(inode)? {
+            (Left(fs), idata) => fs.opendir(ctx, idata.ino(), flags),
+            (Right(fs), idata) => fs
+                .opendir(ctx, idata.ino(), flags)
+                .map(|(h, opt)| (h.map(Into::into), opt)),
         }
     }
 

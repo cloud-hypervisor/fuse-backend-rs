@@ -3,8 +3,14 @@
 
 //! Fuse Application Binary Interfaces(ABI).
 
-/// Linux/Macos Fuse Application Binary Interfaces.
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+/// Linux Fuse Application Binary Interfaces.
+#[cfg(target_os = "linux")]
+#[path = "fuse_abi_linux.rs"]
+pub mod fuse_abi;
+
+/// MacOS Fuse Application Binary Interfaces.
+#[cfg(target_os = "macos")]
+#[path = "fuse_abi_macos.rs"]
 pub mod fuse_abi;
 
 #[cfg(feature = "virtiofs")]

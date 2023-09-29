@@ -222,18 +222,22 @@ struct MountPointData {
 pub struct VfsOptions {
     /// Disable fuse open request handling. When enabled, fuse open
     /// requests are always replied with ENOSYS.
+    #[cfg(not(target_os = "macos"))]
     pub no_open: bool,
     /// Disable fuse opendir request handling. When enabled, fuse opendir
     /// requests are always replied with ENOSYS.
+    #[cfg(not(target_os = "macos"))]
     pub no_opendir: bool,
     /// Disable fuse WRITEBACK_CACHE option so that kernel will not cache
     /// buffer writes.
+    #[cfg(not(target_os = "macos"))]
     pub no_writeback: bool,
     /// Make readdir/readdirplus request return zero dirent even if dir has children.
     pub no_readdir: bool,
     /// Enable fuse killpriv_v2 support. When enabled, fuse file system makes sure
     /// to remove security.capability xattr and setuid/setgid bits. See details in
     /// comments for HANDLE_KILLPRIV_V2
+    #[cfg(not(target_os = "macos"))]
     pub killpriv_v2: bool,
     /// Reject requests which will change the file size, or allocate file
     /// blocks exceed file size.
@@ -256,31 +260,39 @@ impl VfsOptions {
 
 impl Default for VfsOptions {
     fn default() -> Self {
+        #[cfg(not(target_os = "macos"))]
+        let out_opts = FsOptions::ASYNC_READ
+            | FsOptions::PARALLEL_DIROPS
+            | FsOptions::BIG_WRITES
+            | FsOptions::ASYNC_DIO
+            | FsOptions::AUTO_INVAL_DATA
+            | FsOptions::HAS_IOCTL_DIR
+            | FsOptions::WRITEBACK_CACHE
+            | FsOptions::ZERO_MESSAGE_OPEN
+            | FsOptions::MAX_PAGES
+            | FsOptions::ATOMIC_O_TRUNC
+            | FsOptions::CACHE_SYMLINKS
+            | FsOptions::DO_READDIRPLUS
+            | FsOptions::READDIRPLUS_AUTO
+            | FsOptions::EXPLICIT_INVAL_DATA
+            | FsOptions::ZERO_MESSAGE_OPENDIR
+            | FsOptions::HANDLE_KILLPRIV_V2
+            | FsOptions::PERFILE_DAX;
+        #[cfg(target_os = "macos")]
+        let out_opts = FsOptions::ASYNC_READ | FsOptions::BIG_WRITES | FsOptions::ATOMIC_O_TRUNC;
         VfsOptions {
+            #[cfg(not(target_os = "macos"))]
             no_open: true,
+            #[cfg(not(target_os = "macos"))]
             no_opendir: true,
+            #[cfg(not(target_os = "macos"))]
             no_writeback: false,
             no_readdir: false,
             seal_size: false,
+            #[cfg(not(target_os = "macos"))]
             killpriv_v2: false,
             in_opts: FsOptions::empty(),
-            out_opts: FsOptions::ASYNC_READ
-                | FsOptions::PARALLEL_DIROPS
-                | FsOptions::BIG_WRITES
-                | FsOptions::ASYNC_DIO
-                | FsOptions::AUTO_INVAL_DATA
-                | FsOptions::HAS_IOCTL_DIR
-                | FsOptions::WRITEBACK_CACHE
-                | FsOptions::ZERO_MESSAGE_OPEN
-                | FsOptions::MAX_PAGES
-                | FsOptions::ATOMIC_O_TRUNC
-                | FsOptions::CACHE_SYMLINKS
-                | FsOptions::DO_READDIRPLUS
-                | FsOptions::READDIRPLUS_AUTO
-                | FsOptions::EXPLICIT_INVAL_DATA
-                | FsOptions::ZERO_MESSAGE_OPENDIR
-                | FsOptions::HANDLE_KILLPRIV_V2
-                | FsOptions::PERFILE_DAX,
+            out_opts,
             id_mapping: (0, 0, 0),
         }
     }
@@ -1060,37 +1072,49 @@ mod tests {
         let opts = vfs.opts.load();
         let out_opts = opts.out_opts;
 
-        assert_eq!(opts.no_open, true);
-        assert_eq!(opts.no_opendir, true);
-        assert_eq!(opts.no_writeback, false);
+        #[cfg(not(target_os = "macos"))]
+        {
+            assert_eq!(opts.no_open, true);
+            assert_eq!(opts.no_opendir, true);
+            assert_eq!(opts.no_writeback, false);
+            assert_eq!(opts.killpriv_v2, false);
+        }
         assert_eq!(opts.no_readdir, false);
         assert_eq!(opts.seal_size, false);
-        assert_eq!(opts.killpriv_v2, false);
         assert_eq!(opts.in_opts.is_empty(), true);
 
         vfs.init(FsOptions::ASYNC_READ).unwrap();
         assert_eq!(vfs.initialized(), true);
 
         let opts = vfs.opts.load();
-        assert_eq!(opts.no_open, false);
-        assert_eq!(opts.no_opendir, false);
-        assert_eq!(opts.no_writeback, false);
+        #[cfg(not(target_os = "macos"))]
+        {
+            assert_eq!(opts.no_open, false);
+            assert_eq!(opts.no_opendir, false);
+            assert_eq!(opts.no_writeback, false);
+            assert_eq!(opts.killpriv_v2, false);
+        }
         assert_eq!(opts.no_readdir, false);
         assert_eq!(opts.seal_size, false);
-        assert_eq!(opts.killpriv_v2, false);
 
         vfs.destroy();
         assert_eq!(vfs.initialized(), false);
 
         let vfs = Vfs::default();
+        #[cfg(not(target_os = "macos"))]
         let in_opts =
             FsOptions::ASYNC_READ | FsOptions::ZERO_MESSAGE_OPEN | FsOptions::ZERO_MESSAGE_OPENDIR;
+        #[cfg(target_os = "macos")]
+        let in_opts = FsOptions::ASYNC_READ;
         vfs.init(in_opts).unwrap();
         let opts = vfs.opts.load();
-        assert_eq!(opts.no_open, true);
-        assert_eq!(opts.no_opendir, true);
-        assert_eq!(opts.no_writeback, false);
-        assert_eq!(opts.killpriv_v2, false);
+        #[cfg(not(target_os = "macos"))]
+        {
+            assert_eq!(opts.no_open, true);
+            assert_eq!(opts.no_opendir, true);
+            assert_eq!(opts.no_writeback, false);
+            assert_eq!(opts.killpriv_v2, false);
+        }
         assert_eq!(opts.out_opts, out_opts & in_opts);
     }
 
