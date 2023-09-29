@@ -185,8 +185,11 @@ impl<F: AsyncFileSystem + Sync> Server<F> {
             x if x == Opcode::NotifyReply as u32 => self.notify_reply(ctx),
             x if x == Opcode::BatchForget as u32 => self.batch_forget(ctx),
             x if x == Opcode::Fallocate as u32 => self.async_fallocate(ctx).await,
+            #[cfg(not(target_os = "macos"))]
             x if x == Opcode::Readdirplus as u32 => self.readdirplus(ctx),
+            #[cfg(not(target_os = "macos"))]
             x if x == Opcode::Rename2 as u32 => self.rename2(ctx),
+            #[cfg(not(target_os = "macos"))]
             x if x == Opcode::Lseek as u32 => self.lseek(ctx),
             #[cfg(feature = "virtiofs")]
             x if x == Opcode::SetupMapping as u32 => self.setupmapping(ctx, vu_req),
