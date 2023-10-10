@@ -8,7 +8,6 @@
 //! buffer and the whole reply message must be written all at once.
 
 use std::collections::VecDeque;
-
 use std::io::{self, IoSlice, Write};
 use std::marker::PhantomData;
 use std::mem::ManuallyDrop;
@@ -37,8 +36,10 @@ mod fuse_t_session;
 #[cfg(all(target_os = "macos", feature = "fuse-t"))]
 pub use fuse_t_session::*;
 
-// These follows definition from libfuse.
-pub const FUSE_KERN_BUF_SIZE: usize = 256;
+// These follow the definition from libfuse.
+/// Maximum size of FUSE message data, 1M with 4K page.
+pub const FUSE_KERN_BUF_PAGES: usize = 256;
+/// Maximum size of FUSE message header, 4K.
 pub const FUSE_HEADER_SIZE: usize = 0x1000;
 
 /// A buffer reference wrapper for fuse requests.
@@ -287,7 +288,7 @@ impl<'a, S: BitmapSlice> FuseDevWriter<'a, S> {
     }
 }
 
-impl<'a, S: BitmapSlice> io::Write for FuseDevWriter<'a, S> {
+impl<'a, S: BitmapSlice> Write for FuseDevWriter<'a, S> {
     fn write(&mut self, data: &[u8]) -> io::Result<usize> {
         self.check_available_space(data.len())?;
 
@@ -381,7 +382,7 @@ mod async_io {
                 self.buf.extend_from_slice(data2);
                 Ok(len)
             } else {
-                let bufs = [std::io::IoSlice::new(data), std::io::IoSlice::new(data2)];
+                let bufs = [IoSlice::new(data), IoSlice::new(data2)];
                 writev(self.fd, &bufs)
                     .map(|x| {
                         self.account_written(x);
@@ -413,11 +414,7 @@ mod async_io {
                 self.buf.extend_from_slice(data3);
                 Ok(len)
             } else {
-                let bufs = [
-                    std::io::IoSlice::new(data),
-                    std::io::IoSlice::new(data2),
-                    std::io::IoSlice::new(data3),
-                ];
+                let bufs = [IoSlice::new(data), IoSlice::new(data2), IoSlice::new(data3)];
                 writev(self.fd, &bufs)
                     .map(|x| {
                         self.account_written(x);
@@ -499,10 +496,7 @@ mod async_io {
                     io::Error::new(io::ErrorKind::Other, format!("{}", e))
                 }),
                 (_, _) => {
-                    let bufs = [
-                        std::io::IoSlice::new(self.buf.as_slice()),
-                        std::io::IoSlice::new(o),
-                    ];
+                    let bufs = [IoSlice::new(self.buf.as_slice()), IoSlice::new(o)];
                     writev(self.fd, &bufs).map_err(|e| {
                         error! {"fail to write to fuse device fd {}: {}", self.fd, e};
                         io::Error::new(io::ErrorKind::Other, format!("{}", e))

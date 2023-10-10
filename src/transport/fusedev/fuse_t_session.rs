@@ -27,7 +27,7 @@ use vm_memory::ByteValued;
 
 use super::{
     Error::IoError, Error::SessionFailure, FuseBuf, FuseDevWriter, Reader, Result,
-    FUSE_HEADER_SIZE, FUSE_KERN_BUF_SIZE,
+    FUSE_HEADER_SIZE, FUSE_KERN_BUF_PAGES,
 };
 use crate::transport::pagesize;
 
@@ -112,21 +112,11 @@ impl FuseSession {
             subtype: subtype.to_owned(),
             file: None,
             file_lock: Arc::new(Mutex::new(())),
-            bufsize: FUSE_KERN_BUF_SIZE * pagesize() + FUSE_HEADER_SIZE,
+            bufsize: FUSE_KERN_BUF_PAGES * pagesize() + FUSE_HEADER_SIZE,
             monitor_file: None,
             wait_handle: None,
             readonly,
         })
-    }
-
-    /// Mount the fuse mountpoint, building connection with the in kernel fuse driver.
-    pub fn mount(&mut self) -> Result<()> {
-        let files = fuse_kern_mount(&self.mountpoint, &self.fsname, &self.subtype, self.readonly)?;
-        self.file = Some(files.0);
-        self.monitor_file = Some(files.1);
-        self.wait_handle = Some(self.send_mount_command()?);
-
-        Ok(())
     }
 
     /// Expose the associated FUSE session file.
@@ -137,19 +127,6 @@ impl FuseSession {
     /// Force setting the associated FUSE session file.
     pub fn set_fuse_file(&mut self, file: File) {
         self.file = Some(file);
-    }
-
-    /// Destroy a fuse session.
-    pub fn umount(&mut self) -> Result<()> {
-        if let Some(file) = self.monitor_file.take() {
-            if self.mountpoint.to_str().is_some() {
-                fuse_kern_umount(file)
-            } else {
-                Err(SessionFailure("invalid mountpoint".to_string()))
-            }
-        } else {
-            Ok(())
-        }
     }
 
     /// Get the mountpoint of the session.
@@ -170,6 +147,29 @@ impl FuseSession {
     /// Get the default buffer size of the session.
     pub fn bufsize(&self) -> usize {
         self.bufsize
+    }
+
+    /// Mount the fuse mountpoint, building connection with the in kernel fuse driver.
+    pub fn mount(&mut self) -> Result<()> {
+        let files = fuse_kern_mount(&self.mountpoint, &self.fsname, &self.subtype, self.readonly)?;
+        self.file = Some(files.0);
+        self.monitor_file = Some(files.1);
+        self.wait_handle = Some(self.send_mount_command()?);
+
+        Ok(())
+    }
+
+    /// Destroy a fuse session.
+    pub fn umount(&mut self) -> Result<()> {
+        if let Some(file) = self.monitor_file.take() {
+            if self.mountpoint.to_str().is_some() {
+                fuse_kern_umount(file)
+            } else {
+                Err(SessionFailure("invalid mountpoint".to_string()))
+            }
+        } else {
+            Ok(())
+        }
     }
 
     /// Create a new fuse message channel.

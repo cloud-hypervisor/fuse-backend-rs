@@ -8,7 +8,6 @@
 //! sequentially. A FUSE session is a connection from a FUSE mountpoint to a FUSE server daemon.
 //! A FUSE session can have multiple FUSE channels so that FUSE requests are handled in parallel.
 
-use mio::{Events, Poll, Token, Waker};
 use std::fs::{File, OpenOptions};
 use std::ops::Deref;
 use std::os::unix::fs::PermissionsExt;
@@ -17,6 +16,7 @@ use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
+use mio::{Events, Poll, Token, Waker};
 use nix::errno::Errno;
 use nix::fcntl::{fcntl, FcntlArg, FdFlag, OFlag};
 use nix::mount::{mount, umount2, MntFlags, MsFlags};
@@ -27,7 +27,7 @@ use nix::unistd::{getgid, getuid, read};
 use super::{
     super::pagesize,
     Error::{IoError, SessionFailure},
-    FuseBuf, FuseDevWriter, Reader, Result, FUSE_HEADER_SIZE, FUSE_KERN_BUF_SIZE,
+    FuseBuf, FuseDevWriter, Reader, Result, FUSE_HEADER_SIZE, FUSE_KERN_BUF_PAGES,
 };
 
 // These follows definition from libfuse.
@@ -90,7 +90,7 @@ impl FuseSession {
             subtype: subtype.to_owned(),
             file: None,
             keep_alive: None,
-            bufsize: FUSE_KERN_BUF_SIZE * pagesize() + FUSE_HEADER_SIZE,
+            bufsize: FUSE_KERN_BUF_PAGES * pagesize() + FUSE_HEADER_SIZE,
             readonly,
             wakers: Mutex::new(Vec::new()),
             auto_unmount,
@@ -123,6 +123,36 @@ impl FuseSession {
         self.fusermount.as_str()
     }
 
+    /// Expose the associated FUSE session file.
+    pub fn get_fuse_file(&self) -> Option<&File> {
+        self.file.as_ref()
+    }
+
+    /// Force setting the associated FUSE session file.
+    pub fn set_fuse_file(&mut self, file: File) {
+        self.file = Some(file);
+    }
+
+    /// Get the mountpoint of the session.
+    pub fn mountpoint(&self) -> &Path {
+        &self.mountpoint
+    }
+
+    /// Get the file system name of the session.
+    pub fn fsname(&self) -> &str {
+        &self.fsname
+    }
+
+    /// Get the subtype of the session.
+    pub fn subtype(&self) -> &str {
+        &self.subtype
+    }
+
+    /// Get the default buffer size of the session.
+    pub fn bufsize(&self) -> usize {
+        self.bufsize
+    }
+
     /// Mount the fuse mountpoint, building connection with the in kernel fuse driver.
     pub fn mount(&mut self) -> Result<()> {
         let mut flags = MsFlags::MS_NOSUID | MsFlags::MS_NODEV | MsFlags::MS_NOATIME;
@@ -148,16 +178,6 @@ impl FuseSession {
         Ok(())
     }
 
-    /// Expose the associated FUSE session file.
-    pub fn get_fuse_file(&self) -> Option<&File> {
-        self.file.as_ref()
-    }
-
-    /// Force setting the associated FUSE session file.
-    pub fn set_fuse_file(&mut self, file: File) {
-        self.file = Some(file);
-    }
-
     /// Destroy a fuse session.
     pub fn umount(&mut self) -> Result<()> {
         // If we have a keep_alive socket, just drop it,
@@ -171,26 +191,6 @@ impl FuseSession {
         } else {
             Ok(())
         }
-    }
-
-    /// Get the mountpoint of the session.
-    pub fn mountpoint(&self) -> &Path {
-        &self.mountpoint
-    }
-
-    /// Get the file system name of the session.
-    pub fn fsname(&self) -> &str {
-        &self.fsname
-    }
-
-    /// Get the subtype of the session.
-    pub fn subtype(&self) -> &str {
-        &self.subtype
-    }
-
-    /// Get the default buffer size of the session.
-    pub fn bufsize(&self) -> usize {
-        self.bufsize
     }
 
     /// Create a new fuse message channel.
@@ -209,15 +209,6 @@ impl FuseSession {
         }
     }
 
-    fn add_waker(&self, waker: Arc<Waker>) -> Result<()> {
-        let mut wakers = self
-            .wakers
-            .lock()
-            .map_err(|e| SessionFailure(format!("lock wakers: {e}")))?;
-        wakers.push(waker);
-        Ok(())
-    }
-
     /// Wake channel loop and exit
     pub fn wake(&self) -> Result<()> {
         let wakers = self
@@ -229,6 +220,15 @@ impl FuseSession {
                 .wake()
                 .map_err(|e| SessionFailure(format!("wake channel: {e}")))?;
         }
+        Ok(())
+    }
+
+    fn add_waker(&self, waker: Arc<Waker>) -> Result<()> {
+        let mut wakers = self
+            .wakers
+            .lock()
+            .map_err(|e| SessionFailure(format!("lock wakers: {e}")))?;
+        wakers.push(waker);
         Ok(())
     }
 }
@@ -442,7 +442,7 @@ fn fuse_kern_mount(
             Some(opts.deref()),
         ) {
             Ok(()) => Ok((file, None)),
-            Err(nix::errno::Errno::EPERM) => fuse_fusermount_mount(
+            Err(Errno::EPERM) => fuse_fusermount_mount(
                 mountpoint,
                 fsname,
                 subtype,
@@ -507,7 +507,7 @@ fn fuse_fusermount_mount(
     // When its partner recv closes, fusermount will unmount.
     // Remove the close-on-exec flag from the socket, so we can pass it to
     // fusermount.
-    nix::fcntl::fcntl(send.as_raw_fd(), FcntlArg::F_SETFD(FdFlag::empty()))
+    fcntl(send.as_raw_fd(), FcntlArg::F_SETFD(FdFlag::empty()))
         .map_err(|e| SessionFailure(format!("Failed to remove close-on-exec flag: {e}")))?;
 
     let mut cmd = match target_mntns {
@@ -581,14 +581,14 @@ fn fuse_kern_umount(mountpoint: &str, file: File, fusermount: &str) -> Result<()
     drop(file);
     match umount2(mountpoint, MntFlags::MNT_DETACH) {
         Ok(()) => Ok(()),
-        Err(nix::errno::Errno::EPERM) => fuse_fusermount_umount(mountpoint, fusermount),
+        Err(Errno::EPERM) => fuse_fusermount_umount(mountpoint, fusermount),
         Err(e) => Err(SessionFailure(format!(
             "failed to umount {mountpoint}: {e}"
         ))),
     }
 }
 
-/// Umount a fuse file system
+/// Umount a fuse file system by fusermount helper
 fn fuse_fusermount_umount(mountpoint: &str, fusermount: &str) -> Result<()> {
     match std::process::Command::new(fusermount)
         .arg("--unmount")
