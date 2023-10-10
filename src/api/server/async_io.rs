@@ -140,7 +140,10 @@ impl<F: AsyncFileSystem + Sync> Server<F> {
             Opcode::from(in_header.opcode),
             in_header
         );
-        hook.map_or((), |h| h.collect(in_header));
+
+        if let Some(h) = hook {
+            h.collect(&in_header);
+        }
 
         let res = match in_header.opcode {
             x if x == Opcode::Lookup as u32 => self.async_lookup(ctx).await,
@@ -209,7 +212,9 @@ impl<F: AsyncFileSystem + Sync> Server<F> {
         // Pass `None` because current API handler's design does not allow us to catch
         // the `out_header`. Hopefully, we can reach to `out_header` after some
         // refactoring work someday.
-        hook.map_or((), |h| h.release(None));
+        if let Some(h) = hook {
+            h.release(None);
+        }
 
         res
     }
