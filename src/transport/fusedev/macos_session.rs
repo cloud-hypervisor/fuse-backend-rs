@@ -8,9 +8,6 @@
 //! sequentially. A FUSE session is a connection from a FUSE mountpoint to a FUSE server daemon.
 //! A FUSE session can have multiple FUSE channels so that FUSE requests are handled in parallel.
 
-use core_foundation_sys::base::{CFAllocatorRef, CFIndex, CFRelease};
-use core_foundation_sys::string::{kCFStringEncodingUTF8, CFStringCreateWithBytes};
-use core_foundation_sys::url::{kCFURLPOSIXPathStyle, CFURLCreateWithFileSystemPath, CFURLRef};
 use std::ffi::CString;
 use std::fs::File;
 use std::io::IoSliceMut;
@@ -20,6 +17,9 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicPtr, Ordering};
 use std::sync::{Arc, Mutex};
 
+use core_foundation_sys::base::{CFAllocatorRef, CFIndex, CFRelease};
+use core_foundation_sys::string::{kCFStringEncodingUTF8, CFStringCreateWithBytes};
+use core_foundation_sys::url::{kCFURLPOSIXPathStyle, CFURLCreateWithFileSystemPath, CFURLRef};
 use libc::{c_void, proc_pidpath, PROC_PIDPATHINFO_MAXSIZE};
 use nix::errno::Errno;
 use nix::fcntl::{fcntl, FdFlag, F_SETFD};
@@ -33,7 +33,7 @@ use nix::{cmsg_space, NixPath};
 
 use super::{
     Error::IoError, Error::SessionFailure, FuseBuf, FuseDevWriter, Reader, Result,
-    FUSE_HEADER_SIZE, FUSE_KERN_BUF_SIZE,
+    FUSE_HEADER_SIZE, FUSE_KERN_BUF_PAGES,
 };
 use crate::transport::pagesize;
 
@@ -51,9 +51,8 @@ type DADissenterRef = *const __DADissenter;
 struct __DASession(c_void);
 type DASessionRef = *const __DASession;
 
-type DADiskUnmountCallback = ::std::option::Option<
-    unsafe extern "C" fn(disk: DADiskRef, dissenter: DADissenterRef, context: *mut c_void),
->;
+type DADiskUnmountCallback =
+    Option<unsafe extern "C" fn(disk: DADiskRef, dissenter: DADissenterRef, context: *mut c_void)>;
 
 extern "C" {
     fn DADiskUnmount(
@@ -113,25 +112,13 @@ impl FuseSession {
             fsname: fsname.to_owned(),
             subtype: subtype.to_owned(),
             file: None,
-            bufsize: FUSE_KERN_BUF_SIZE * pagesize() + FUSE_HEADER_SIZE,
+            bufsize: FUSE_KERN_BUF_PAGES * pagesize() + FUSE_HEADER_SIZE,
             disk: Mutex::new(None),
             dasession: Arc::new(AtomicPtr::new(unsafe {
                 DASessionCreate(std::ptr::null()) as *mut c_void
             })),
             readonly,
         })
-    }
-
-    /// Mount the fuse mountpoint, building connection with the in kernel fuse driver.
-    pub fn mount(&mut self) -> Result<()> {
-        let mut disk = self.disk.lock().expect("lock disk failed");
-        let file = fuse_kern_mount(&self.mountpoint, &self.fsname, &self.subtype, self.readonly)?;
-        let session = self.dasession.load(Ordering::SeqCst);
-        let mount_disk = create_disk(&self.mountpoint, session as DASessionRef);
-        self.file = Some(file);
-        *disk = Some(mount_disk);
-
-        Ok(())
     }
 
     /// Expose the associated FUSE session file.
@@ -142,20 +129,6 @@ impl FuseSession {
     /// Force setting the associated FUSE session file.
     pub fn set_fuse_file(&mut self, file: File) {
         self.file = Some(file);
-    }
-
-    /// Destroy a fuse session.
-    pub fn umount(&mut self) -> Result<()> {
-        if let Some(file) = self.file.take() {
-            if self.mountpoint.to_str().is_some() {
-                let mut disk = self.disk.lock().expect("lock disk failed");
-                fuse_kern_umount(file, disk.take())
-            } else {
-                Err(SessionFailure("invalid mountpoint".to_string()))
-            }
-        } else {
-            Ok(())
-        }
     }
 
     /// Get the mountpoint of the session.
@@ -176,6 +149,32 @@ impl FuseSession {
     /// Get the default buffer size of the session.
     pub fn bufsize(&self) -> usize {
         self.bufsize
+    }
+
+    /// Mount the fuse mountpoint, building connection with the in kernel fuse driver.
+    pub fn mount(&mut self) -> Result<()> {
+        let mut disk = self.disk.lock().expect("lock disk failed");
+        let file = fuse_kern_mount(&self.mountpoint, &self.fsname, &self.subtype, self.readonly)?;
+        let session = self.dasession.load(Ordering::SeqCst);
+        let mount_disk = create_disk(&self.mountpoint, session as DASessionRef);
+        self.file = Some(file);
+        *disk = Some(mount_disk);
+
+        Ok(())
+    }
+
+    /// Destroy a fuse session.
+    pub fn umount(&mut self) -> Result<()> {
+        if let Some(file) = self.file.take() {
+            if self.mountpoint.to_str().is_some() {
+                let mut disk = self.disk.lock().expect("lock disk failed");
+                fuse_kern_umount(file, disk.take())
+            } else {
+                Err(SessionFailure("invalid mountpoint".to_string()))
+            }
+        } else {
+            Ok(())
+        }
     }
 
     /// Create a new fuse message channel.
