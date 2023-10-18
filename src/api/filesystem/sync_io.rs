@@ -896,6 +896,11 @@ pub trait FileSystem {
     fn notify_reply(&self) -> io::Result<()> {
         Err(io::Error::from_raw_os_error(libc::ENOSYS))
     }
+
+    /// Remap the external IDs in context to internal IDs.
+    fn id_remap(&self, ctx: &mut Context) -> io::Result<()> {
+        Ok(())
+    }
 }
 
 impl<FS: FileSystem> FileSystem for Arc<FS> {
@@ -1340,5 +1345,10 @@ impl<FS: FileSystem> FileSystem for Arc<FS> {
     /// Send notify reply.
     fn notify_reply(&self) -> io::Result<()> {
         self.deref().notify_reply()
+    }
+
+    #[inline]
+    fn id_remap(&self, ctx: &mut Context) -> io::Result<()> {
+        self.deref().id_remap(ctx)
     }
 }
