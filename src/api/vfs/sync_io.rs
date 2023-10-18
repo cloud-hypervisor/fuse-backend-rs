@@ -1,6 +1,8 @@
 // Copyright 2020 Ant Financial. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+use std::sync::Arc;
+
 use super::*;
 use crate::abi::fuse_abi::{stat64, statvfs64};
 #[cfg(any(feature = "vhost-user-fs", feature = "virtiofs"))]
@@ -116,6 +118,7 @@ impl FileSystem for Vfs {
                 fs.getattr(ctx, idata.ino(), handle)
                     .map(|(mut attr, duration)| {
                         attr.st_ino = idata.into();
+                        self.remap_attr_id(true, &mut attr);
                         (attr, duration)
                     })
             }
@@ -133,9 +136,12 @@ impl FileSystem for Vfs {
         match self.get_real_rootfs(inode)? {
             (Left(fs), idata) => fs.setattr(ctx, idata.ino(), attr, handle, valid),
             (Right(fs), idata) => {
+                let mut attr = attr;
+                self.remap_attr_id(false, &mut attr);
                 fs.setattr(ctx, idata.ino(), attr, handle, valid)
                     .map(|(mut attr, duration)| {
                         attr.st_ino = idata.into();
+                        self.remap_attr_id(true, &mut attr);
                         (attr, duration)
                     })
             }
@@ -610,6 +616,7 @@ impl FileSystem for Vfs {
                     dir_entry.ino = self.convert_inode(idata.fs_idx(), entry.inode)?;
                     entry.inode = dir_entry.ino;
                     entry.attr.st_ino = entry.inode;
+                    self.remap_attr_id(true, &mut entry.attr);
                     add_entry(dir_entry, entry)
                 },
             ),
@@ -635,6 +642,21 @@ impl FileSystem for Vfs {
             (Left(fs), idata) => fs.access(ctx, idata.ino(), mask),
             (Right(fs), idata) => fs.access(ctx, idata.ino(), mask),
         }
+    }
+
+    #[inline]
+    fn id_remap(&self, ctx: &mut Context) -> Result<()> {
+        // If id_mapping is enabled, map the external ID to the internal ID.
+        if let Some((internal_id, external_id, range)) = self.id_mapping {
+            if ctx.uid >= external_id && ctx.uid < external_id + range {
+                ctx.uid += internal_id - external_id;
+            }
+            if ctx.gid >= external_id && ctx.gid < external_id + range {
+                ctx.gid += internal_id - external_id;
+            }
+        }
+
+        Ok(())
     }
 
     #[cfg(any(feature = "vhost-user-fs", feature = "virtiofs"))]

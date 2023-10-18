@@ -242,6 +242,10 @@ pub struct VfsOptions {
     pub in_opts: FsOptions,
     /// File system options returned to client
     pub out_opts: FsOptions,
+    /// Declaration of ID mapping, in the format (internal ID, external ID, range).
+    /// For example, (0, 1, 65536) represents mapping the external UID/GID range of `1~65536`
+    /// to the range of `0~65535` within the filesystem.
+    pub id_mapping: (u32, u32, u32),
 }
 
 impl VfsOptions {
@@ -277,6 +281,7 @@ impl Default for VfsOptions {
                 | FsOptions::ZERO_MESSAGE_OPENDIR
                 | FsOptions::HANDLE_KILLPRIV_V2
                 | FsOptions::PERFILE_DAX,
+            id_mapping: (0, 0, 0),
         }
     }
 }
@@ -293,6 +298,7 @@ pub struct Vfs {
     initialized: AtomicBool,
     lock: Mutex<()>,
     remove_pseudo_root: bool,
+    id_mapping: Option<(u32, u32, u32)>,
 }
 
 impl Default for Vfs {
@@ -313,6 +319,10 @@ impl Vfs {
             lock: Mutex::new(()),
             initialized: AtomicBool::new(false),
             remove_pseudo_root: false,
+            id_mapping: match opts.id_mapping.2 {
+                0 => None,
+                _ => Some(opts.id_mapping),
+            },
         }
     }
 
@@ -501,8 +511,52 @@ impl Vfs {
         self.convert_inode(fs_idx, inode).map(|ino| {
             entry.inode = ino;
             entry.attr.st_ino = ino;
+            // If id_mapping is enabled, map the internal ID to the external ID.
+            if let Some((internal_id, external_id, range)) = self.id_mapping {
+                if entry.attr.st_uid >= internal_id && entry.attr.st_uid < internal_id + range {
+                    entry.attr.st_uid += external_id - internal_id;
+                }
+                if entry.attr.st_gid >= internal_id && entry.attr.st_gid < internal_id + range {
+                    entry.attr.st_gid += external_id - internal_id;
+                }
+            }
             *entry
         })
+    }
+
+    /// If id_mapping is enabled, remap the uid/gid in attributes.
+    ///
+    /// If `map_internal_to_external` is true, the IDs inside VFS will be mapped
+    /// to external IDs.
+    /// If `map_internal_to_external` is false, the external IDs will be mapped
+    /// to VFS internal IDs.
+    fn remap_attr_id(&self, map_internal_to_external: bool, attr: &mut stat64) {
+        if let Some((internal_id, external_id, range)) = self.id_mapping {
+            if map_internal_to_external
+                && attr.st_uid >= internal_id
+                && attr.st_uid < internal_id + range
+            {
+                attr.st_uid += external_id - internal_id;
+            }
+            if map_internal_to_external
+                && attr.st_gid >= internal_id
+                && attr.st_gid < internal_id + range
+            {
+                attr.st_gid += external_id - internal_id;
+            }
+            if !map_internal_to_external
+                && attr.st_uid >= external_id
+                && attr.st_uid < external_id + range
+            {
+                attr.st_uid += internal_id - external_id;
+            }
+            if !map_internal_to_external
+                && attr.st_gid >= external_id
+                && attr.st_gid < external_id + range
+            {
+                attr.st_gid += internal_id - external_id;
+            }
+        }
     }
 
     fn allocate_fs_idx(&self) -> Result<VfsIndex> {
