@@ -466,6 +466,11 @@ impl Vfs {
         }
     }
 
+    /// Get the root pseudo fs's reference in vfs
+    pub fn get_root_pseudofs(&self) -> &PseudoFs {
+        &self.root
+    }
+
     // Inode converting rules:
     // 1. Pseudo fs inode is not hashed
     // 2. Index is always larger than 0 so that pseudo fs inodes are never affected
