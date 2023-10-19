@@ -329,6 +329,12 @@ impl PseudoFs {
     }
 }
 
+impl Default for PseudoFs {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl FileSystem for PseudoFs {
     type Inode = Inode;
     type Handle = Handle;
