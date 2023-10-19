@@ -23,7 +23,7 @@ use std::os::unix::ffi::OsStringExt;
 use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
 use std::path::PathBuf;
 use std::str::FromStr;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, RwLock, RwLockWriteGuard};
 use std::time::Duration;
 
@@ -333,14 +333,16 @@ struct HandleData {
     inode: Inode,
     file: File,
     lock: Mutex<()>,
+    open_flags: AtomicU32,
 }
 
 impl HandleData {
-    fn new(inode: Inode, file: File) -> Self {
+    fn new(inode: Inode, file: File, flags: u32) -> Self {
         HandleData {
             inode,
             file,
             lock: Mutex::new(()),
+            open_flags: AtomicU32::new(flags),
         }
     }
 
@@ -354,6 +356,14 @@ impl HandleData {
     // underlying RawFd.
     fn get_handle_raw_fd(&self) -> RawFd {
         self.file.as_raw_fd()
+    }
+
+    fn get_flags(&self) -> u32 {
+        self.open_flags.load(Ordering::Relaxed)
+    }
+
+    fn set_flags(&self, flags: u32) {
+        self.open_flags.store(flags, Ordering::Relaxed);
     }
 }
 

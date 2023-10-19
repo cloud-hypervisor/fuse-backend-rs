@@ -36,6 +36,22 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
         Self::open_proc_file(&self.proc_self_fd, file.as_raw_fd(), new_flags, data.mode)
     }
 
+    /// Check the HandleData flags against the flags from the current request
+    /// if these do not match update the file descriptor flags and store the new
+    /// result in the HandleData entry
+    #[inline(always)]
+    fn check_fd_flags(&self, data: Arc<HandleData>, fd: RawFd, flags: u32) -> io::Result<()> {
+        let open_flags = data.get_flags();
+        if open_flags != flags {
+            let ret = unsafe { libc::fcntl(fd, libc::F_SETFL, flags) };
+            if ret != 0 {
+                return Err(io::Error::last_os_error());
+            }
+            data.set_flags(flags);
+        }
+        Ok(())
+    }
+
     fn do_readdir(
         &self,
         inode: Inode,
@@ -173,7 +189,7 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
         let file = self.open_inode(inode, flags as i32)?;
         drop(killpriv);
 
-        let data = HandleData::new(inode, file);
+        let data = HandleData::new(inode, file, flags);
         let handle = self.next_handle.fetch_add(1, Ordering::Relaxed);
         self.handle_map.insert(handle, data);
 
@@ -258,7 +274,7 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
             self.handle_map.get(handle, inode)
         } else {
             let file = self.open_inode(inode, flags | libc::O_DIRECTORY)?;
-            Ok(Arc::new(HandleData::new(inode, file)))
+            Ok(Arc::new(HandleData::new(inode, file, flags as u32)))
         }
     }
 
@@ -273,7 +289,7 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
             self.handle_map.get(handle, inode)
         } else {
             let file = self.open_inode(inode, flags)?;
-            Ok(Arc::new(HandleData::new(inode, file)))
+            Ok(Arc::new(HandleData::new(inode, file, flags as u32)))
         }
     }
 }
@@ -573,7 +589,7 @@ impl<S: BitmapSlice + Send + Sync> FileSystem for PassthroughFs<S> {
 
         let ret_handle = if !self.no_open.load(Ordering::Relaxed) {
             let handle = self.next_handle.fetch_add(1, Ordering::Relaxed);
-            let data = HandleData::new(entry.inode, file);
+            let data = HandleData::new(entry.inode, file, args.flags);
 
             self.handle_map.insert(handle, data);
             Some(handle)
@@ -643,7 +659,7 @@ impl<S: BitmapSlice + Send + Sync> FileSystem for PassthroughFs<S> {
         size: u32,
         offset: u64,
         _lock_owner: Option<u64>,
-        _flags: u32,
+        flags: u32,
     ) -> io::Result<usize> {
         let data = self.get_data(handle, inode, libc::O_RDONLY)?;
 
@@ -651,6 +667,9 @@ impl<S: BitmapSlice + Send + Sync> FileSystem for PassthroughFs<S> {
         // It's safe because the `data` variable's lifetime spans the whole function,
         // so data.file won't be closed.
         let f = unsafe { File::from_raw_fd(data.get_handle_raw_fd()) };
+
+        self.check_fd_flags(data, f.as_raw_fd(), flags)?;
+
         let mut f = ManuallyDrop::new(f);
 
         w.write_from(&mut *f, size as usize, offset)
@@ -666,7 +685,7 @@ impl<S: BitmapSlice + Send + Sync> FileSystem for PassthroughFs<S> {
         offset: u64,
         _lock_owner: Option<u64>,
         _delayed_write: bool,
-        _flags: u32,
+        flags: u32,
         fuse_flags: u32,
     ) -> io::Result<usize> {
         let data = self.get_data(handle, inode, libc::O_RDWR)?;
@@ -675,6 +694,8 @@ impl<S: BitmapSlice + Send + Sync> FileSystem for PassthroughFs<S> {
         // It's safe because the `data` variable's lifetime spans the whole function,
         // so data.file won't be closed.
         let f = unsafe { File::from_raw_fd(data.get_handle_raw_fd()) };
+
+        self.check_fd_flags(data, f.as_raw_fd(), flags)?;
 
         if self.seal_size.load(Ordering::Relaxed) {
             let st = Self::stat_fd(f.as_raw_fd(), None)?;
