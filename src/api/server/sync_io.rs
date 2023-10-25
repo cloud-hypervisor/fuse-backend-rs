@@ -696,10 +696,10 @@ impl<F: FileSystem + Sync> Server<F> {
             return ctx.reply_ok(Some(out), None);
         }
 
-        #[cfg(not(target_os = "macos"))]
-        let mut flags_u64 = flags as u64;
         #[cfg(target_os = "macos")]
         let flags_u64 = flags as u64;
+        #[cfg(not(target_os = "macos"))]
+        let mut flags_u64 = flags as u64;
         #[cfg(not(target_os = "macos"))]
         if flags_u64 & FsOptions::INIT_EXT.bits() != 0 {
             let InitIn2 { flags2, unused: _ } = ctx.r.read_obj().map_err(Error::DecodeMessage)?;

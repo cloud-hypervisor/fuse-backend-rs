@@ -226,6 +226,20 @@ struct MountPointData {
 #[derive(Debug, Copy, Clone)]
 /// vfs init options
 pub struct VfsOptions {
+    /// Make readdir/readdirplus request return zero dirent even if dir has children.
+    pub no_readdir: bool,
+    /// Reject requests which will change the file size, or allocate file
+    /// blocks exceed file size.
+    pub seal_size: bool,
+    /// File system options passed in from client
+    pub in_opts: FsOptions,
+    /// File system options returned to client
+    pub out_opts: FsOptions,
+    /// Declaration of ID mapping, in the format (internal ID, external ID, range).
+    /// For example, (0, 1, 65536) represents mapping the external UID/GID range of `1~65536`
+    /// to the range of `0~65535` within the filesystem.
+    pub id_mapping: (u32, u32, u32),
+
     /// Disable fuse open request handling. When enabled, fuse open
     /// requests are always replied with ENOSYS.
     #[cfg(not(target_os = "macos"))]
@@ -238,24 +252,11 @@ pub struct VfsOptions {
     /// buffer writes.
     #[cfg(not(target_os = "macos"))]
     pub no_writeback: bool,
-    /// Make readdir/readdirplus request return zero dirent even if dir has children.
-    pub no_readdir: bool,
     /// Enable fuse killpriv_v2 support. When enabled, fuse file system makes sure
     /// to remove security.capability xattr and setuid/setgid bits. See details in
     /// comments for HANDLE_KILLPRIV_V2
     #[cfg(not(target_os = "macos"))]
     pub killpriv_v2: bool,
-    /// Reject requests which will change the file size, or allocate file
-    /// blocks exceed file size.
-    pub seal_size: bool,
-    /// File system options passed in from client
-    pub in_opts: FsOptions,
-    /// File system options returned to client
-    pub out_opts: FsOptions,
-    /// Declaration of ID mapping, in the format (internal ID, external ID, range).
-    /// For example, (0, 1, 65536) represents mapping the external UID/GID range of `1~65536`
-    /// to the range of `0~65535` within the filesystem.
-    pub id_mapping: (u32, u32, u32),
 }
 
 impl VfsOptions {
@@ -265,8 +266,8 @@ impl VfsOptions {
 }
 
 impl Default for VfsOptions {
+    #[cfg(not(target_os = "macos"))]
     fn default() -> Self {
-        #[cfg(not(target_os = "macos"))]
         let out_opts = FsOptions::ASYNC_READ
             | FsOptions::PARALLEL_DIROPS
             | FsOptions::BIG_WRITES
@@ -284,19 +285,25 @@ impl Default for VfsOptions {
             | FsOptions::ZERO_MESSAGE_OPENDIR
             | FsOptions::HANDLE_KILLPRIV_V2
             | FsOptions::PERFILE_DAX;
-        #[cfg(target_os = "macos")]
-        let out_opts = FsOptions::ASYNC_READ | FsOptions::BIG_WRITES | FsOptions::ATOMIC_O_TRUNC;
         VfsOptions {
-            #[cfg(not(target_os = "macos"))]
             no_open: true,
-            #[cfg(not(target_os = "macos"))]
             no_opendir: true,
-            #[cfg(not(target_os = "macos"))]
             no_writeback: false,
             no_readdir: false,
             seal_size: false,
-            #[cfg(not(target_os = "macos"))]
             killpriv_v2: false,
+            in_opts: FsOptions::empty(),
+            out_opts,
+            id_mapping: (0, 0, 0),
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn default() -> Self {
+        let out_opts = FsOptions::ASYNC_READ | FsOptions::BIG_WRITES | FsOptions::ATOMIC_O_TRUNC;
+        VfsOptions {
+            no_readdir: false,
+            seal_size: false,
             in_opts: FsOptions::empty(),
             out_opts,
             id_mapping: (0, 0, 0),
