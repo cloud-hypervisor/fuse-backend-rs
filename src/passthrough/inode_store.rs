@@ -42,7 +42,8 @@ impl InodeStore {
     pub fn insert(&mut self, data: Arc<InodeData>) {
         self.by_id.insert(data.id, data.inode);
         if let FileOrHandle::Handle(handle) = &data.file_or_handle {
-            self.by_handle.insert(handle.clone(), data.inode);
+            self.by_handle
+                .insert(handle.file_handle().clone(), data.inode);
         }
         self.data.insert(data.inode, data);
     }
@@ -59,7 +60,7 @@ impl InodeStore {
 
         if let Some(data) = data.as_ref() {
             if let FileOrHandle::Handle(handle) = &data.file_or_handle {
-                self.by_handle.remove(handle);
+                self.by_handle.remove(handle.file_handle());
             }
             self.by_id.remove(&data.id);
         }
@@ -119,7 +120,9 @@ mod test {
                 (FileOrHandle::File(f1), FileOrHandle::File(f2)) => {
                     f1.as_raw_fd() == f2.as_raw_fd()
                 }
-                (FileOrHandle::Handle(h1), FileOrHandle::Handle(h2)) => h1 == h2,
+                (FileOrHandle::Handle(h1), FileOrHandle::Handle(h2)) => {
+                    h1.file_handle() == h2.file_handle()
+                }
                 _ => false,
             }
         }

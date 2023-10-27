@@ -29,8 +29,9 @@ use std::time::Duration;
 
 use vm_memory::{bitmap::BitmapSlice, ByteValued};
 
-use self::file_handle::{FileHandle, MountFds};
+use self::file_handle::{FileHandle, OpenableFileHandle};
 use self::inode_store::{InodeId, InodeStore};
+use self::mount_fd::MountFds;
 use crate::abi::fuse_abi as fuse;
 use crate::abi::fuse_abi::Opcode;
 use crate::api::filesystem::Entry;
@@ -43,6 +44,7 @@ use crate::api::{
 mod async_io;
 mod file_handle;
 mod inode_store;
+mod mount_fd;
 mod sync_io;
 
 type Inode = u64;
@@ -137,14 +139,14 @@ impl InodeStat {
 #[derive(Debug)]
 enum FileOrHandle {
     File(File),
-    Handle(Arc<FileHandle>),
+    Handle(Arc<OpenableFileHandle>),
 }
 
 impl FileOrHandle {
     fn handle(&self) -> Option<&FileHandle> {
         match self {
             FileOrHandle::File(_) => None,
-            FileOrHandle::Handle(h) => Some(h.deref()),
+            FileOrHandle::Handle(h) => Some(h.file_handle().deref()),
         }
     }
 }
@@ -207,11 +209,11 @@ impl InodeData {
         }
     }
 
-    fn get_file(&self, mount_fds: &MountFds) -> io::Result<InodeFile<'_>> {
+    fn get_file(&self) -> io::Result<InodeFile<'_>> {
         match &self.file_or_handle {
             FileOrHandle::File(f) => Ok(InodeFile::Ref(f)),
             FileOrHandle::Handle(h) => {
-                let f = h.open_with_mount_fds(mount_fds, libc::O_PATH)?;
+                let f = h.open(libc::O_PATH)?;
                 Ok(InodeFile::Owned(f))
             }
         }
@@ -679,6 +681,9 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
                 (None, Some(a)) => (cfg.entry_timeout, a),
                 (None, None) => (cfg.entry_timeout, cfg.attr_timeout),
             };
+
+        let mount_fds = MountFds::new(None)?;
+
         Ok(PassthroughFs {
             inode_map: InodeMap::new(),
             next_inode: AtomicU64::new(fuse::ROOT_ID + 1),
@@ -686,8 +691,8 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
 
             handle_map: HandleMap::new(),
             next_handle: AtomicU64::new(1),
-            mount_fds: MountFds::new(),
 
+            mount_fds,
             proc_self_fd,
 
             writeback: AtomicBool::new(false),
@@ -779,7 +784,7 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
     /// This function is used by Nydus blobfs
     pub fn readlinkat_proc_file(&self, inode: Inode) -> io::Result<PathBuf> {
         let data = self.inode_map.get(inode)?;
-        let file = data.get_file(&self.mount_fds)?;
+        let file = data.get_file()?;
         let pathname = CString::new(format!("{}", file.as_raw_fd()))
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
 
@@ -892,7 +897,7 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
         F: FnOnce(RawFd, libc::c_int, u32) -> io::Result<File>,
     {
         let handle = if use_handle {
-            FileHandle::from_name_at_with_mount_fds(dir_fd, name, mount_fds, reopen_dir)
+            OpenableFileHandle::from_name_at(dir_fd, name, mount_fds, reopen_dir)
         } else {
             Err(io::Error::from_raw_os_error(libc::ENOTSUP))
         };
@@ -936,7 +941,7 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
             }
             FileOrHandle::Handle(h) => InodeStat {
                 stat: Self::stat_fd(dir_fd, Some(name))?,
-                mnt_id: h.mnt_id,
+                mnt_id: h.mount_id(),
             },
         };
 
@@ -981,7 +986,7 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
             };
 
         let dir = self.inode_map.get(parent)?;
-        let dir_file = dir.get_file(&self.mount_fds)?;
+        let dir_file = dir.get_file()?;
         let (file_or_handle, st, id) = Self::open_file_or_handle(
             self.cfg.inode_file_handles,
             self.cfg.enable_mntid,
