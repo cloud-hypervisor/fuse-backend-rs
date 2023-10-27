@@ -15,6 +15,10 @@ pub struct InodeStore {
 }
 
 impl InodeStore {
+    /// Insert an inode into the manager
+    ///
+    /// The caller needs to ensure that no inode with the same key exists, otherwise the old inode
+    /// will get lost.
     pub fn insert(&mut self, data: Arc<InodeData>) {
         self.by_ids.insert(data.altkey, data.inode);
         if let FileOrHandle::Handle(handle) = &data.file_or_handle {
@@ -23,6 +27,7 @@ impl InodeStore {
         self.data.insert(data.inode, data);
     }
 
+    /// Remove an inode from the manager, keeping the (key, ino) mapping if `remove_data_only` is true.
     pub fn remove(&mut self, inode: &Inode, remove_data_only: bool) -> Option<Arc<InodeData>> {
         let data = self.data.remove(inode);
         if remove_data_only {
