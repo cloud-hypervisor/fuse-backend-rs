@@ -30,7 +30,7 @@ use std::time::Duration;
 use vm_memory::{bitmap::BitmapSlice, ByteValued};
 
 use self::file_handle::{FileHandle, MountFds};
-use self::inode_store::InodeStore;
+use self::inode_store::{InodeId, InodeStore};
 use crate::abi::fuse_abi as fuse;
 use crate::abi::fuse_abi::Opcode;
 use crate::api::filesystem::Entry;
@@ -80,7 +80,7 @@ impl UniqueInodeGenerator {
         }
     }
 
-    fn get_unique_inode(&self, alt_key: &InodeAltKey) -> io::Result<libc::ino64_t> {
+    fn get_unique_inode(&self, alt_key: &InodeId) -> io::Result<libc::ino64_t> {
         let unique_id = {
             let id: DevMntIDPair = DevMntIDPair(alt_key.dev, alt_key.mnt);
             let mut id_map_guard = self.dev_mntid_map.lock().unwrap();
@@ -124,33 +124,13 @@ struct InodeStat {
 
 impl InodeStat {
     #[inline]
-    fn get_stat(&self) -> libc::stat64 {
+    pub fn get_stat(&self) -> libc::stat64 {
         self.stat
     }
 
     #[inline]
     fn get_mnt_id(&self) -> u64 {
         self.mnt_id
-    }
-}
-
-#[derive(Clone, Copy, Default, PartialOrd, Ord, PartialEq, Eq, Debug)]
-/// Identify an inode in `PassthroughFs` by `InodeAltKey`.
-pub struct InodeAltKey {
-    ino: libc::ino64_t,
-    dev: libc::dev_t,
-    mnt: u64,
-}
-
-impl InodeAltKey {
-    #[inline]
-    fn ids_from_stat(ist: &InodeStat) -> Self {
-        let st = ist.get_stat();
-        InodeAltKey {
-            ino: st.st_ino,
-            dev: st.st_dev,
-            mnt: ist.get_mnt_id(),
-        }
     }
 }
 
@@ -199,7 +179,7 @@ pub struct InodeData {
     inode: Inode,
     // Most of these aren't actually files but ¯\_(ツ)_/¯.
     file_or_handle: FileOrHandle,
-    altkey: InodeAltKey,
+    id: InodeId,
     refcount: AtomicU64,
     // File type and mode, not used for now
     mode: u32,
@@ -217,11 +197,11 @@ fn is_dir(mode: u32) -> bool {
 }
 
 impl InodeData {
-    fn new(inode: Inode, f: FileOrHandle, refcount: u64, altkey: InodeAltKey, mode: u32) -> Self {
+    fn new(inode: Inode, f: FileOrHandle, refcount: u64, id: InodeId, mode: u32) -> Self {
         InodeData {
             inode,
             file_or_handle: f,
-            altkey,
+            id,
             refcount: AtomicU64::new(refcount),
             mode,
         }
@@ -267,35 +247,31 @@ impl InodeMap {
 
     fn get_inode_locked(
         inodes: &InodeStore,
-        ids_altkey: &InodeAltKey,
+        id: &InodeId,
         handle: Option<&FileHandle>,
     ) -> Option<Inode> {
         match handle {
             Some(h) => inodes.inode_by_handle(h).copied(),
-            None => inodes.inode_by_ids(ids_altkey).copied(),
+            None => inodes.inode_by_id(id).copied(),
         }
     }
 
-    fn get_alt(
-        &self,
-        ids_altkey: &InodeAltKey,
-        handle: Option<&FileHandle>,
-    ) -> Option<Arc<InodeData>> {
+    fn get_alt(&self, id: &InodeId, handle: Option<&FileHandle>) -> Option<Arc<InodeData>> {
         // Do not expect poisoned lock here, so safe to unwrap().
         let inodes = self.inodes.read().unwrap();
 
-        Self::get_alt_locked(inodes.deref(), ids_altkey, handle)
+        Self::get_alt_locked(inodes.deref(), id, handle)
     }
 
     fn get_alt_locked(
         inodes: &InodeStore,
-        ids_altkey: &InodeAltKey,
+        id: &InodeId,
         handle: Option<&FileHandle>,
     ) -> Option<Arc<InodeData>> {
         handle
             .and_then(|h| inodes.get_by_handle(h))
             .or_else(|| {
-                inodes.get_by_ids(ids_altkey).filter(|data| {
+                inodes.get_by_id(id).filter(|data| {
                     // When we have to fall back to looking up an inode by its IDs, ensure that
                     // we hit an entry that does not have a file handle.  Entries with file
                     // handles must also have a handle alt key, so if we have not found it by
@@ -733,7 +709,7 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
     pub fn import(&self) -> io::Result<()> {
         let root = CString::new(self.cfg.root_dir.as_str()).expect("CString::new failed");
 
-        let (file_or_handle, st, ids_altkey) = Self::open_file_or_handle(
+        let (file_or_handle, st, id) = Self::open_file_or_handle(
             self.cfg.inode_file_handles,
             self.cfg.enable_mntid,
             libc::AT_FDCWD,
@@ -760,7 +736,7 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
             fuse::ROOT_ID,
             file_or_handle,
             2,
-            ids_altkey,
+            id,
             st.get_stat().st_mode,
         )));
 
@@ -911,7 +887,7 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
         name: &CStr,
         mount_fds: &MountFds,
         reopen_dir: F,
-    ) -> io::Result<(FileOrHandle, InodeStat, InodeAltKey)>
+    ) -> io::Result<(FileOrHandle, InodeStat, InodeId)>
     where
         F: FnOnce(RawFd, libc::c_int, u32) -> io::Result<File>,
     {
@@ -964,31 +940,31 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
             },
         };
 
-        let ids_altkey = InodeAltKey::ids_from_stat(&inode_stat);
+        let id = InodeId::from_stat(&inode_stat);
 
-        Ok((file_or_handle, inode_stat, ids_altkey))
+        Ok((file_or_handle, inode_stat, id))
     }
 
     fn allocate_inode_locked(
         &self,
         inodes: &InodeStore,
-        ids_altkey: &InodeAltKey,
+        id: &InodeId,
         handle_opt: Option<&FileHandle>,
     ) -> io::Result<Inode> {
         if !self.cfg.use_host_ino {
             // If the inode has already been assigned before, the new inode is not reassigned,
             // ensuring that the same file is always the same inode
-            Ok(InodeMap::get_inode_locked(inodes, ids_altkey, handle_opt)
+            Ok(InodeMap::get_inode_locked(inodes, id, handle_opt)
                 .unwrap_or_else(|| self.next_inode.fetch_add(1, Ordering::Relaxed)))
         } else {
-            let inode = if ids_altkey.ino > MAX_HOST_INO {
+            let inode = if id.ino > MAX_HOST_INO {
                 // Prefer look for previous mappings from memory
-                match InodeMap::get_inode_locked(inodes, ids_altkey, handle_opt) {
+                match InodeMap::get_inode_locked(inodes, id, handle_opt) {
                     Some(ino) => ino,
-                    None => self.ino_allocator.get_unique_inode(ids_altkey)?,
+                    None => self.ino_allocator.get_unique_inode(id)?,
                 }
             } else {
-                self.ino_allocator.get_unique_inode(ids_altkey)?
+                self.ino_allocator.get_unique_inode(id)?
             };
 
             Ok(inode)
@@ -1006,7 +982,7 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
 
         let dir = self.inode_map.get(parent)?;
         let dir_file = dir.get_file(&self.mount_fds)?;
-        let (file_or_handle, st, ids_altkey) = Self::open_file_or_handle(
+        let (file_or_handle, st, id) = Self::open_file_or_handle(
             self.cfg.inode_file_handles,
             self.cfg.enable_mntid,
             dir_file.as_raw_fd(),
@@ -1034,7 +1010,7 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
 
         let mut found = None;
         'search: loop {
-            match self.inode_map.get_alt(&ids_altkey, handle_opt) {
+            match self.inode_map.get_alt(&id, handle_opt) {
                 // No existing entry found
                 None => break 'search,
                 Some(data) => {
@@ -1067,17 +1043,16 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
             let mut inodes = self.inode_map.get_map_mut();
 
             // Lookup inode_map again after acquiring the inode_map lock, as there might be another
-            // racing thread already added an inode with the same altkey while we're not holding
+            // racing thread already added an inode with the same id while we're not holding
             // the lock. If so just use the newly added inode, otherwise the inode will be replaced
             // and results in EBADF.
-            match InodeMap::get_alt_locked(inodes.deref(), &ids_altkey, handle_opt) {
+            match InodeMap::get_alt_locked(inodes.deref(), &id, handle_opt) {
                 Some(data) => {
                     data.refcount.fetch_add(1, Ordering::Relaxed);
                     data.inode
                 }
                 None => {
-                    let inode =
-                        self.allocate_inode_locked(inodes.deref(), &ids_altkey, handle_opt)?;
+                    let inode = self.allocate_inode_locked(inodes.deref(), &id, handle_opt)?;
 
                     if inode > VFS_MAX_INO {
                         error!("fuse: max inode number reached: {}", VFS_MAX_INO);
@@ -1093,7 +1068,7 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
                             inode,
                             file_or_handle,
                             1,
-                            ids_altkey,
+                            id,
                             st.get_stat().st_mode,
                         )),
                     );
@@ -1361,7 +1336,7 @@ mod tests {
     use vmm_sys_util::{tempdir::TempDir, tempfile::TempFile};
 
     impl UniqueInodeGenerator {
-        fn decode_unique_inode(&self, inode: libc::ino64_t) -> io::Result<InodeAltKey> {
+        fn decode_unique_inode(&self, inode: libc::ino64_t) -> io::Result<InodeId> {
             if inode > VFS_MAX_INO {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
@@ -1400,7 +1375,7 @@ mod tests {
                     ),
                 ));
             }
-            Ok(InodeAltKey {
+            Ok(InodeId {
                 ino: inode & MAX_HOST_INO,
                 dev,
                 mnt,
@@ -1836,14 +1811,14 @@ mod tests {
         {
             let fs = prepare_passthroughfs();
             let m = InodeStore::default();
-            let ids_altkey = InodeAltKey {
+            let id = InodeId {
                 ino: MAX_HOST_INO + 1,
                 dev: 1,
                 mnt: 1,
             };
 
             // Default
-            let inode = fs.allocate_inode_locked(&m, &ids_altkey, None).unwrap();
+            let inode = fs.allocate_inode_locked(&m, &id, None).unwrap();
             assert_eq!(inode, 2);
         }
 
@@ -1851,13 +1826,13 @@ mod tests {
             let mut fs = prepare_passthroughfs();
             fs.cfg.use_host_ino = true;
             let m = InodeStore::default();
-            let ids_altkey = InodeAltKey {
+            let id = InodeId {
                 ino: 12345,
                 dev: 1,
                 mnt: 1,
             };
             // direct return host inode 12345
-            let inode = fs.allocate_inode_locked(&m, &ids_altkey, None).unwrap();
+            let inode = fs.allocate_inode_locked(&m, &id, None).unwrap();
             assert_eq!(inode & MAX_HOST_INO, 12345)
         }
 
@@ -1865,25 +1840,20 @@ mod tests {
             let mut fs = prepare_passthroughfs();
             fs.cfg.use_host_ino = true;
             let mut m = InodeStore::default();
-            let ids_altkey = InodeAltKey {
+            let id = InodeId {
                 ino: MAX_HOST_INO + 1,
                 dev: 1,
                 mnt: 1,
             };
             // allocate a virtual inode
-            let inode = fs.allocate_inode_locked(&m, &ids_altkey, None).unwrap();
+            let inode = fs.allocate_inode_locked(&m, &id, None).unwrap();
             assert_eq!(inode & MAX_HOST_INO, 2);
             let file = TempFile::new().expect("Cannot create temporary file.");
             let mode = file.as_file().metadata().unwrap().mode();
-            let inode_data = InodeData::new(
-                inode,
-                FileOrHandle::File(file.into_file()),
-                1,
-                ids_altkey,
-                mode,
-            );
+            let inode_data =
+                InodeData::new(inode, FileOrHandle::File(file.into_file()), 1, id, mode);
             m.insert(Arc::new(inode_data));
-            let inode = fs.allocate_inode_locked(&m, &ids_altkey, None).unwrap();
+            let inode = fs.allocate_inode_locked(&m, &id, None).unwrap();
             assert_eq!(inode & MAX_HOST_INO, 2);
         }
     }
@@ -1893,7 +1863,7 @@ mod tests {
         {
             let generator = UniqueInodeGenerator::new();
 
-            let inode_alt_key = InodeAltKey {
+            let inode_alt_key = InodeId {
                 ino: 1,
                 dev: 0,
                 mnt: 0,
@@ -1906,7 +1876,7 @@ mod tests {
             let expect_inode_alt_key = generator.decode_unique_inode(unique_inode).unwrap();
             assert_eq!(expect_inode_alt_key, inode_alt_key);
 
-            let inode_alt_key = InodeAltKey {
+            let inode_alt_key = InodeId {
                 ino: 1,
                 dev: 0,
                 mnt: 1,
@@ -1919,7 +1889,7 @@ mod tests {
             let expect_inode_alt_key = generator.decode_unique_inode(unique_inode).unwrap();
             assert_eq!(expect_inode_alt_key, inode_alt_key);
 
-            let inode_alt_key = InodeAltKey {
+            let inode_alt_key = InodeId {
                 ino: 2,
                 dev: 0,
                 mnt: 1,
@@ -1932,7 +1902,7 @@ mod tests {
             let expect_inode_alt_key = generator.decode_unique_inode(unique_inode).unwrap();
             assert_eq!(expect_inode_alt_key, inode_alt_key);
 
-            let inode_alt_key = InodeAltKey {
+            let inode_alt_key = InodeId {
                 ino: MAX_HOST_INO,
                 dev: 0,
                 mnt: 1,
@@ -1949,7 +1919,7 @@ mod tests {
         // use virtual inode format
         {
             let generator = UniqueInodeGenerator::new();
-            let inode_alt_key = InodeAltKey {
+            let inode_alt_key = InodeId {
                 ino: MAX_HOST_INO + 1,
                 dev: u64::MAX,
                 mnt: u64::MAX,
@@ -1960,7 +1930,7 @@ mod tests {
             // 47~1 bit  = 2 virtual inode start from 2~MAX_HOST_INO
             assert_eq!(unique_inode, 0x80800000000002);
 
-            let inode_alt_key = InodeAltKey {
+            let inode_alt_key = InodeId {
                 ino: MAX_HOST_INO + 2,
                 dev: u64::MAX,
                 mnt: u64::MAX,
@@ -1971,7 +1941,7 @@ mod tests {
             // 47~1 bit  = 3
             assert_eq!(unique_inode, 0x80800000000003);
 
-            let inode_alt_key = InodeAltKey {
+            let inode_alt_key = InodeId {
                 ino: MAX_HOST_INO + 3,
                 dev: u64::MAX,
                 mnt: 0,
@@ -1982,7 +1952,7 @@ mod tests {
             // 47~1 bit  = 4
             assert_eq!(unique_inode, 0x81000000000004);
 
-            let inode_alt_key = InodeAltKey {
+            let inode_alt_key = InodeId {
                 ino: u64::MAX,
                 dev: u64::MAX,
                 mnt: u64::MAX,
