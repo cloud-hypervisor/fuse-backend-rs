@@ -30,9 +30,9 @@ impl<S: BitmapSlice + Send + Sync + 'static> BackendFileSystem for PassthroughFs
 }
 
 impl<'a> InodeData {
-    async fn async_get_file(&self, mount_fds: &MountFds) -> io::Result<InodeFile<'_>> {
+    async fn async_get_file(&self) -> io::Result<InodeFile<'_>> {
         // The io_uring doesn't support open_by_handle_at yet, so use sync io.
-        self.get_file(mount_fds)
+        self.get_file()
     }
 }
 

@@ -31,7 +31,7 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
         let new_flags = self.get_writeback_open_flags(flags);
 
         let data = self.inode_map.get(inode)?;
-        let file = data.get_file(&self.mount_fds)?;
+        let file = data.get_file()?;
 
         Self::open_proc_file(&self.proc_self_fd, file.as_raw_fd(), new_flags, data.mode)
     }
@@ -233,7 +233,7 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
                     st = Self::stat_fd(fd, None);
                 }
                 FileOrHandle::Handle(_h) => {
-                    let file = data.get_file(&self.mount_fds)?;
+                    let file = data.get_file()?;
                     fd = file.as_raw_fd();
                     st = Self::stat_fd(fd, None);
                 }
@@ -253,7 +253,7 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
 
     fn do_unlink(&self, parent: Inode, name: &CStr, flags: libc::c_int) -> io::Result<()> {
         let data = self.inode_map.get(parent)?;
-        let file = data.get_file(&self.mount_fds)?;
+        let file = data.get_file()?;
         // Safe because this doesn't modify any memory and we check the return value.
         let res = unsafe { libc::unlinkat(file.as_raw_fd(), name.as_ptr(), flags) };
         if res == 0 {
@@ -353,7 +353,7 @@ impl<S: BitmapSlice + Send + Sync> FileSystem for PassthroughFs<S> {
     fn statfs(&self, _ctx: &Context, inode: Inode) -> io::Result<libc::statvfs64> {
         let data = self.inode_map.get(inode)?;
         let mut out = MaybeUninit::<libc::statvfs64>::zeroed();
-        let file = data.get_file(&self.mount_fds)?;
+        let file = data.get_file()?;
 
         // Safe because this will only modify `out` and we check the return value.
         match unsafe { libc::fstatvfs64(file.as_raw_fd(), out.as_mut_ptr()) } {
@@ -424,7 +424,7 @@ impl<S: BitmapSlice + Send + Sync> FileSystem for PassthroughFs<S> {
         let res = {
             let (_uid, _gid) = set_creds(ctx.uid, ctx.gid)?;
 
-            let file = data.get_file(&self.mount_fds)?;
+            let file = data.get_file()?;
             // Safe because this doesn't modify any memory and we check the return value.
             unsafe { libc::mkdirat(file.as_raw_fd(), name.as_ptr(), mode & !umask) }
         };
@@ -552,7 +552,7 @@ impl<S: BitmapSlice + Send + Sync> FileSystem for PassthroughFs<S> {
         self.validate_path_component(name)?;
 
         let dir = self.inode_map.get(parent)?;
-        let dir_file = dir.get_file(&self.mount_fds)?;
+        let dir_file = dir.get_file()?;
 
         let new_file = {
             let (_uid, _gid) = set_creds(ctx.uid, ctx.gid)?;
@@ -739,7 +739,7 @@ impl<S: BitmapSlice + Send + Sync> FileSystem for PassthroughFs<S> {
             ProcPath(CString),
         }
 
-        let file = inode_data.get_file(&self.mount_fds)?;
+        let file = inode_data.get_file()?;
         let data = if self.no_open.load(Ordering::Relaxed) {
             let pathname = CString::new(format!("{}", file.as_raw_fd()))
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
@@ -887,8 +887,8 @@ impl<S: BitmapSlice + Send + Sync> FileSystem for PassthroughFs<S> {
 
         let old_inode = self.inode_map.get(olddir)?;
         let new_inode = self.inode_map.get(newdir)?;
-        let old_file = old_inode.get_file(&self.mount_fds)?;
-        let new_file = new_inode.get_file(&self.mount_fds)?;
+        let old_file = old_inode.get_file()?;
+        let new_file = new_inode.get_file()?;
 
         // Safe because this doesn't modify any memory and we check the return value.
         // TODO: Switch to libc::renameat2 once https://github.com/rust-lang/libc/pull/1508 lands
@@ -922,7 +922,7 @@ impl<S: BitmapSlice + Send + Sync> FileSystem for PassthroughFs<S> {
         self.validate_path_component(name)?;
 
         let data = self.inode_map.get(parent)?;
-        let file = data.get_file(&self.mount_fds)?;
+        let file = data.get_file()?;
 
         let res = {
             let (_uid, _gid) = set_creds(ctx.uid, ctx.gid)?;
@@ -955,8 +955,8 @@ impl<S: BitmapSlice + Send + Sync> FileSystem for PassthroughFs<S> {
 
         let data = self.inode_map.get(inode)?;
         let new_inode = self.inode_map.get(newparent)?;
-        let file = data.get_file(&self.mount_fds)?;
-        let new_file = new_inode.get_file(&self.mount_fds)?;
+        let file = data.get_file()?;
+        let new_file = new_inode.get_file()?;
 
         // Safe because this is a constant value and a valid C string.
         let empty = unsafe { CStr::from_bytes_with_nul_unchecked(EMPTY_CSTR) };
@@ -992,7 +992,7 @@ impl<S: BitmapSlice + Send + Sync> FileSystem for PassthroughFs<S> {
         let res = {
             let (_uid, _gid) = set_creds(ctx.uid, ctx.gid)?;
 
-            let file = data.get_file(&self.mount_fds)?;
+            let file = data.get_file()?;
             // Safe because this doesn't modify any memory and we check the return value.
             unsafe { libc::symlinkat(linkname.as_ptr(), file.as_raw_fd(), name.as_ptr()) }
         };
@@ -1008,7 +1008,7 @@ impl<S: BitmapSlice + Send + Sync> FileSystem for PassthroughFs<S> {
         let empty = unsafe { CStr::from_bytes_with_nul_unchecked(EMPTY_CSTR) };
         let mut buf = Vec::<u8>::with_capacity(libc::PATH_MAX as usize);
         let data = self.inode_map.get(inode)?;
-        let file = data.get_file(&self.mount_fds)?;
+        let file = data.get_file()?;
 
         // Safe because this will only modify the contents of `buf` and we check the return value.
         let res = unsafe {
@@ -1096,7 +1096,7 @@ impl<S: BitmapSlice + Send + Sync> FileSystem for PassthroughFs<S> {
 
     fn access(&self, ctx: &Context, inode: Inode, mask: u32) -> io::Result<()> {
         let data = self.inode_map.get(inode)?;
-        let st = Self::stat(&data.get_file(&self.mount_fds)?, None)?;
+        let st = Self::stat(&data.get_file()?, None)?;
         let mode = mask as i32 & (libc::R_OK | libc::W_OK | libc::X_OK);
 
         if mode == libc::F_OK {
@@ -1149,7 +1149,7 @@ impl<S: BitmapSlice + Send + Sync> FileSystem for PassthroughFs<S> {
         }
 
         let data = self.inode_map.get(inode)?;
-        let file = data.get_file(&self.mount_fds)?;
+        let file = data.get_file()?;
         let pathname = CString::new(format!("/proc/self/fd/{}", file.as_raw_fd()))
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
 
@@ -1184,7 +1184,7 @@ impl<S: BitmapSlice + Send + Sync> FileSystem for PassthroughFs<S> {
         }
 
         let data = self.inode_map.get(inode)?;
-        let file = data.get_file(&self.mount_fds)?;
+        let file = data.get_file()?;
         let mut buf = Vec::<u8>::with_capacity(size as usize);
         let pathname = CString::new(format!("/proc/self/fd/{}", file.as_raw_fd(),))
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
@@ -1219,7 +1219,7 @@ impl<S: BitmapSlice + Send + Sync> FileSystem for PassthroughFs<S> {
         }
 
         let data = self.inode_map.get(inode)?;
-        let file = data.get_file(&self.mount_fds)?;
+        let file = data.get_file()?;
         let mut buf = Vec::<u8>::with_capacity(size as usize);
         let pathname = CString::new(format!("/proc/self/fd/{}", file.as_raw_fd()))
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
@@ -1253,7 +1253,7 @@ impl<S: BitmapSlice + Send + Sync> FileSystem for PassthroughFs<S> {
         }
 
         let data = self.inode_map.get(inode)?;
-        let file = data.get_file(&self.mount_fds)?;
+        let file = data.get_file()?;
         let pathname = CString::new(format!("/proc/self/fd/{}", file.as_raw_fd()))
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
 
