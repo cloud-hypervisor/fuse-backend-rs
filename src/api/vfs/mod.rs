@@ -242,20 +242,20 @@ pub struct VfsOptions {
 
     /// Disable fuse open request handling. When enabled, fuse open
     /// requests are always replied with ENOSYS.
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "linux")]
     pub no_open: bool,
     /// Disable fuse opendir request handling. When enabled, fuse opendir
     /// requests are always replied with ENOSYS.
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "linux")]
     pub no_opendir: bool,
     /// Disable fuse WRITEBACK_CACHE option so that kernel will not cache
     /// buffer writes.
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "linux")]
     pub no_writeback: bool,
     /// Enable fuse killpriv_v2 support. When enabled, fuse file system makes sure
     /// to remove security.capability xattr and setuid/setgid bits. See details in
     /// comments for HANDLE_KILLPRIV_V2
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "linux")]
     pub killpriv_v2: bool,
 }
 
@@ -266,7 +266,7 @@ impl VfsOptions {
 }
 
 impl Default for VfsOptions {
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "linux")]
     fn default() -> Self {
         let out_opts = FsOptions::ASYNC_READ
             | FsOptions::PARALLEL_DIROPS
@@ -723,44 +723,70 @@ pub mod persist {
 
     #[derive(Versionize, Debug, Default)]
     struct VfsOptionsState {
-        no_open: bool,
-        no_opendir: bool,
-        no_writeback: bool,
         in_opts: u64,
         out_opts: u64,
-        killpriv_v2: bool,
         no_readdir: bool,
         seal_size: bool,
+        id_mapping_internal: u32,
+        id_mapping_external: u32,
+        id_mapping_range: u32,
+
+        #[cfg(target_os = "linux")]
+        no_open: bool,
+        #[cfg(target_os = "linux")]
+        no_opendir: bool,
+        #[cfg(target_os = "linux")]
+        no_writeback: bool,
+        #[cfg(target_os = "linux")]
+        killpriv_v2: bool,
     }
 
     impl VfsOptions {
         fn save(&self) -> VfsOptionsState {
             VfsOptionsState {
-                no_open: self.no_open,
-                no_opendir: self.no_opendir,
-                no_writeback: self.no_writeback,
                 in_opts: self.in_opts.bits(),
                 out_opts: self.out_opts.bits(),
-                killpriv_v2: self.killpriv_v2,
                 no_readdir: self.no_readdir,
                 seal_size: self.seal_size,
+                id_mapping_internal: self.id_mapping.0,
+                id_mapping_external: self.id_mapping.1,
+                id_mapping_range: self.id_mapping.2,
+
+                #[cfg(target_os = "linux")]
+                no_open: self.no_open,
+                #[cfg(target_os = "linux")]
+                no_opendir: self.no_opendir,
+                #[cfg(target_os = "linux")]
+                no_writeback: self.no_writeback,
+                #[cfg(target_os = "linux")]
+                killpriv_v2: self.killpriv_v2,
             }
         }
 
         fn restore(state: &VfsOptionsState) -> VfsResult<VfsOptions> {
             Ok(VfsOptions {
-                no_open: state.no_open,
-                no_opendir: state.no_opendir,
-                no_writeback: state.no_writeback,
                 in_opts: FsOptions::from_bits(state.in_opts).ok_or(VfsError::Persist(
                     "Failed to restore VfsOptions.in_opts".to_owned(),
                 ))?,
                 out_opts: FsOptions::from_bits(state.out_opts).ok_or(VfsError::Persist(
                     "Failed to restore VfsOptions.out_opts".to_owned(),
                 ))?,
-                killpriv_v2: state.killpriv_v2,
                 no_readdir: state.no_readdir,
                 seal_size: state.seal_size,
+                id_mapping: (
+                    state.id_mapping_internal,
+                    state.id_mapping_external,
+                    state.id_mapping_range,
+                ),
+
+                #[cfg(target_os = "linux")]
+                no_open: state.no_open,
+                #[cfg(target_os = "linux")]
+                no_opendir: state.no_opendir,
+                #[cfg(target_os = "linux")]
+                no_writeback: state.no_writeback,
+                #[cfg(target_os = "linux")]
+                killpriv_v2: state.killpriv_v2,
             })
         }
     }
@@ -1431,7 +1457,7 @@ mod tests {
         let opts = vfs.opts.load();
         let out_opts = opts.out_opts;
 
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(target_os = "linux")]
         {
             assert_eq!(opts.no_open, true);
             assert_eq!(opts.no_opendir, true);
@@ -1446,7 +1472,7 @@ mod tests {
         assert_eq!(vfs.initialized(), true);
 
         let opts = vfs.opts.load();
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(target_os = "linux")]
         {
             assert_eq!(opts.no_open, false);
             assert_eq!(opts.no_opendir, false);
@@ -1460,14 +1486,14 @@ mod tests {
         assert_eq!(vfs.initialized(), false);
 
         let vfs = Vfs::default();
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(target_os = "linux")]
         let in_opts =
             FsOptions::ASYNC_READ | FsOptions::ZERO_MESSAGE_OPEN | FsOptions::ZERO_MESSAGE_OPENDIR;
         #[cfg(target_os = "macos")]
         let in_opts = FsOptions::ASYNC_READ;
         vfs.init(in_opts).unwrap();
         let opts = vfs.opts.load();
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(target_os = "linux")]
         {
             assert_eq!(opts.no_open, true);
             assert_eq!(opts.no_opendir, true);
