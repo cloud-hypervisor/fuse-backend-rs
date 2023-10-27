@@ -5,12 +5,32 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use super::file_handle::FileHandle;
-use super::{FileOrHandle, Inode, InodeAltKey, InodeData};
+use super::{FileOrHandle, Inode, InodeData, InodeStat};
+
+#[derive(Clone, Copy, Default, PartialOrd, Ord, PartialEq, Eq, Debug)]
+/// Identify an inode in `PassthroughFs` by `InodeId`.
+pub struct InodeId {
+    pub ino: libc::ino64_t,
+    pub dev: libc::dev_t,
+    pub mnt: u64,
+}
+
+impl InodeId {
+    #[inline]
+    pub(super) fn from_stat(ist: &InodeStat) -> Self {
+        let st = ist.get_stat();
+        InodeId {
+            ino: st.st_ino,
+            dev: st.st_dev,
+            mnt: ist.get_mnt_id(),
+        }
+    }
+}
 
 #[derive(Default)]
 pub struct InodeStore {
     data: BTreeMap<Inode, Arc<InodeData>>,
-    by_ids: BTreeMap<InodeAltKey, Inode>,
+    by_id: BTreeMap<InodeId, Inode>,
     by_handle: BTreeMap<Arc<FileHandle>, Inode>,
 }
 
@@ -20,7 +40,7 @@ impl InodeStore {
     /// The caller needs to ensure that no inode with the same key exists, otherwise the old inode
     /// will get lost.
     pub fn insert(&mut self, data: Arc<InodeData>) {
-        self.by_ids.insert(data.altkey, data.inode);
+        self.by_id.insert(data.id, data.inode);
         if let FileOrHandle::Handle(handle) = &data.file_or_handle {
             self.by_handle.insert(handle.clone(), data.inode);
         }
@@ -31,7 +51,7 @@ impl InodeStore {
     pub fn remove(&mut self, inode: &Inode, remove_data_only: bool) -> Option<Arc<InodeData>> {
         let data = self.data.remove(inode);
         if remove_data_only {
-            // Don't remove by_ids and by_handle, we need use it to store inode
+            // Don't remove by_id and by_handle, we need use it to store inode
             // record the mapping of inodes using these two structures to ensure
             // that the same files always use the same inode
             return data;
@@ -41,7 +61,7 @@ impl InodeStore {
             if let FileOrHandle::Handle(handle) = &data.file_or_handle {
                 self.by_handle.remove(handle);
             }
-            self.by_ids.remove(&data.altkey);
+            self.by_id.remove(&data.id);
         }
         data
     }
@@ -49,15 +69,15 @@ impl InodeStore {
     pub fn clear(&mut self) {
         self.data.clear();
         self.by_handle.clear();
-        self.by_ids.clear();
+        self.by_id.clear();
     }
 
     pub fn get(&self, inode: &Inode) -> Option<&Arc<InodeData>> {
         self.data.get(inode)
     }
 
-    pub fn get_by_ids(&self, ids: &InodeAltKey) -> Option<&Arc<InodeData>> {
-        let inode = self.inode_by_ids(ids)?;
+    pub fn get_by_id(&self, id: &InodeId) -> Option<&Arc<InodeData>> {
+        let inode = self.inode_by_id(id)?;
         self.get(inode)
     }
 
@@ -66,8 +86,8 @@ impl InodeStore {
         self.get(inode)
     }
 
-    pub fn inode_by_ids(&self, ids: &InodeAltKey) -> Option<&Inode> {
-        self.by_ids.get(ids)
+    pub fn inode_by_id(&self, id: &InodeId) -> Option<&Inode> {
+        self.by_id.get(id)
     }
 
     pub fn inode_by_handle(&self, handle: &FileHandle) -> Option<&Inode> {
@@ -88,7 +108,7 @@ mod test {
     impl PartialEq for InodeData {
         fn eq(&self, other: &Self) -> bool {
             if self.inode != other.inode
-                || self.altkey != other.altkey
+                || self.id != other.id
                 || self.mode != other.mode
                 || self.refcount.load(Ordering::Relaxed) != other.refcount.load(Ordering::Relaxed)
             {
@@ -142,22 +162,22 @@ mod test {
             stat: stat_fd(tmpfile2.as_file().as_raw_fd()).unwrap(),
             mnt_id: 0,
         };
-        let ids1 = InodeAltKey::ids_from_stat(&inode_stat1);
-        let ids2 = InodeAltKey::ids_from_stat(&inode_stat2);
+        let id1 = InodeId::from_stat(&inode_stat1);
+        let id2 = InodeId::from_stat(&inode_stat2);
         let file_or_handle1 = FileOrHandle::File(tmpfile1.into_file());
         let file_or_handle2 = FileOrHandle::File(tmpfile2.into_file());
         let data1 = InodeData::new(
             inode1,
             file_or_handle1,
             2,
-            ids1,
+            id1,
             inode_stat1.get_stat().st_mode,
         );
         let data2 = InodeData::new(
             inode2,
             file_or_handle2,
             2,
-            ids2,
+            id2,
             inode_stat2.get_stat().st_mode,
         );
         let data1 = Arc::new(data1);
@@ -169,20 +189,20 @@ mod test {
         assert!(m.get(&1).is_none());
 
         // get just inserted value by key, by id, by handle
-        assert!(m.get_by_ids(&InodeAltKey::default()).is_none());
+        assert!(m.get_by_id(&InodeId::default()).is_none());
         assert!(m.get_by_handle(&FileHandle::default()).is_none());
         assert_eq!(m.get(&inode1).unwrap(), &data1);
-        assert_eq!(m.get_by_ids(&ids1).unwrap(), &data1);
+        assert_eq!(m.get_by_id(&id1).unwrap(), &data1);
 
         // insert another value, and check again
         m.insert(data2.clone());
         assert!(m.get(&1).is_none());
-        assert!(m.get_by_ids(&InodeAltKey::default()).is_none());
+        assert!(m.get_by_id(&InodeId::default()).is_none());
         assert!(m.get_by_handle(&FileHandle::default()).is_none());
         assert_eq!(m.get(&inode1).unwrap(), &data1);
-        assert_eq!(m.get_by_ids(&ids1).unwrap(), &data1);
+        assert_eq!(m.get_by_id(&id1).unwrap(), &data1);
         assert_eq!(m.get(&inode2).unwrap(), &data2);
-        assert_eq!(m.get_by_ids(&ids2).unwrap(), &data2);
+        assert_eq!(m.get_by_id(&id2).unwrap(), &data2);
 
         // remove non-present key
         assert!(m.remove(&1, false).is_none());
@@ -190,18 +210,18 @@ mod test {
         // remove present key, return its value
         assert_eq!(m.remove(&inode1, false).unwrap(), data1.clone());
         assert!(m.get(&inode1).is_none());
-        assert!(m.get_by_ids(&ids1).is_none());
+        assert!(m.get_by_id(&id1).is_none());
         assert_eq!(m.get(&inode2).unwrap(), &data2);
-        assert_eq!(m.get_by_ids(&ids2).unwrap(), &data2);
+        assert_eq!(m.get_by_id(&id2).unwrap(), &data2);
 
         // clear the map
         m.clear();
         assert!(m.get(&1).is_none());
-        assert!(m.get_by_ids(&InodeAltKey::default()).is_none());
+        assert!(m.get_by_id(&InodeId::default()).is_none());
         assert!(m.get_by_handle(&FileHandle::default()).is_none());
         assert!(m.get(&inode1).is_none());
-        assert!(m.get_by_ids(&ids1).is_none());
+        assert!(m.get_by_id(&id1).is_none());
         assert!(m.get(&inode2).is_none());
-        assert!(m.get_by_ids(&ids2).is_none());
+        assert!(m.get_by_id(&id2).is_none());
     }
 }
