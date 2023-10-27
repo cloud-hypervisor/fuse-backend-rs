@@ -33,12 +33,14 @@ check: build
 	cargo test --features="virtiofs,async-io" --no-default-features -- --nocapture --skip integration
 	cargo test --features="vhost-user-fs,async-io" --no-default-features -- --nocapture --skip integration
 	cargo test --features="fusedev,virtiofs,async-io" --no-default-features -- --nocapture --skip integration
+	cargo test --features="fusedev,persist" --no-default-features -- --nocapture --skip integration
+	cargo test --all-features -- --nocapture --skip integration
 
 smoke: check
-	cargo test --features="fusedev" -- --nocapture
+	cargo test --features="fusedev,persist" -- --nocapture
 
 smoke-all: smoke
-	cargo test --features="fusedev" -- --nocapture --ignored
+	cargo test --features="fusedev,persist" -- --nocapture --ignored
 
 smoke-macos: check-macos
 	cargo test --features="fusedev,fuse-t" -- --nocapture
