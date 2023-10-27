@@ -27,8 +27,10 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, RwLock, RwLockWriteGuard};
 use std::time::Duration;
 
-use vm_memory::ByteValued;
+use vm_memory::{bitmap::BitmapSlice, ByteValued};
 
+use self::file_handle::{FileHandle, MountFds};
+use self::inode_store::InodeStore;
 use crate::abi::fuse_abi as fuse;
 use crate::abi::fuse_abi::Opcode;
 use crate::api::filesystem::Entry;
@@ -36,8 +38,6 @@ use crate::api::{
     validate_path_component, BackendFileSystem, CURRENT_DIR_CSTR, EMPTY_CSTR, PARENT_DIR_CSTR,
     PROC_SELF_FD_CSTR, SLASH_ASCII, VFS_MAX_INO,
 };
-use crate::passthrough::inode_store::InodeStore;
-use crate::BitmapSlice;
 
 #[cfg(feature = "async-io")]
 mod async_io;
@@ -45,16 +45,14 @@ mod file_handle;
 mod inode_store;
 mod sync_io;
 
-use file_handle::{FileHandle, MountFds};
-
 type Inode = u64;
 type Handle = u64;
 
 /// Maximum host inode number supported by passthroughfs
-pub const MAX_HOST_INO: u64 = 0x7fff_ffff_ffff;
+const MAX_HOST_INO: u64 = 0x7fff_ffff_ffff;
 
 /// the 56th bit used to set the inode to 1 indicates virtual inode
-pub const USE_VIRTUAL_INODE_MASK: u64 = 1 << 55;
+const VIRTUAL_INODE_FLAG: u64 = 1 << 55;
 
 /// Used to form a pair of dev and mntid as the key of the map
 #[derive(Clone, Copy, Default, PartialOrd, Ord, PartialEq, Eq, Debug)]
@@ -83,10 +81,9 @@ impl UniqueInodeGenerator {
     }
 
     fn get_unique_inode(&self, alt_key: &InodeAltKey) -> io::Result<libc::ino64_t> {
-        let id: DevMntIDPair = DevMntIDPair(alt_key.dev, alt_key.mnt);
-        let mut id_map_guard = self.dev_mntid_map.lock().unwrap();
-
         let unique_id = {
+            let id: DevMntIDPair = DevMntIDPair(alt_key.dev, alt_key.mnt);
+            let mut id_map_guard = self.dev_mntid_map.lock().unwrap();
             match id_map_guard.entry(id) {
                 btree_map::Entry::Occupied(v) => *v.get(),
                 btree_map::Entry::Vacant(v) => {
@@ -112,7 +109,7 @@ impl UniqueInodeGenerator {
                     format!("the virtual inode excess {}", MAX_HOST_INO),
                 ));
             }
-            self.next_virtual_inode.fetch_add(1, Ordering::Relaxed) | USE_VIRTUAL_INODE_MASK
+            self.next_virtual_inode.fetch_add(1, Ordering::Relaxed) | VIRTUAL_INODE_FLAG
         };
 
         Ok((unique_id as u64) << 47 | inode)
@@ -464,13 +461,6 @@ impl FromStr for CachePolicy {
 /// Options that configure the behavior of the passthrough fuse file system.
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct Config {
-    /// How long the FUSE client should consider directory entries to be valid. If the contents of a
-    /// directory can only be modified by the FUSE client (i.e., the file system has exclusive
-    /// access), then this should be a large value.
-    ///
-    /// The default value for this option is 5 seconds.
-    pub entry_timeout: Duration,
-
     /// How long the FUSE client should consider file and directory attributes to be valid. If the
     /// attributes of a file or directory can only be modified by the FUSE client (i.e., the file
     /// system has exclusive access), then this should be set to a large value.
@@ -478,20 +468,27 @@ pub struct Config {
     /// The default value for this option is 5 seconds.
     pub attr_timeout: Duration,
 
-    /// Same as `entry_timeout`, override `entry_timeout` config, but only take effect on
-    /// directories when specified. This is useful to set different timeouts for directories and
-    /// regular files.
-    pub dir_entry_timeout: Option<Duration>,
+    /// How long the FUSE client should consider directory entries to be valid. If the contents of a
+    /// directory can only be modified by the FUSE client (i.e., the file system has exclusive
+    /// access), then this should be a large value.
+    ///
+    /// The default value for this option is 5 seconds.
+    pub entry_timeout: Duration,
 
     /// Same as `attr_timeout`, override `attr_timeout` config, but only take effect on directories
     /// when specified. This is useful to set different timeouts for directories and regular files.
     pub dir_attr_timeout: Option<Duration>,
 
+    /// Same as `entry_timeout`, override `entry_timeout` config, but only take effect on
+    /// directories when specified. This is useful to set different timeouts for directories and
+    /// regular files.
+    pub dir_entry_timeout: Option<Duration>,
+
     /// The caching policy the file system should use. See the documentation of `CachePolicy` for
     /// more details.
     pub cache_policy: CachePolicy,
 
-    /// Whether the file system should enabled writeback caching. This can improve performance as it
+    /// Whether the file system should enable writeback caching. This can improve performance as it
     /// allows the FUSE client to cache and coalesce multiple writes before sending them to the file
     /// system. However, enabling this option can increase the risk of data corruption if the file
     /// contents can change without the knowledge of the FUSE client (i.e., the server does **NOT**
@@ -792,23 +789,14 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
             return Err(io::Error::last_os_error());
         }
 
-        // Safe because we know buf len
-        unsafe {
-            buf.set_len(buf_read as usize);
-        }
+        // Safe because we trust the value returned by kernel.
+        unsafe { buf.set_len(buf_read as usize) };
+        buf.shrink_to_fit();
 
-        if (buf_read as usize) < buf.capacity() {
-            buf.shrink_to_fit();
-
-            return Ok(PathBuf::from(OsString::from_vec(buf)));
-        }
-
-        error!(
-            "fuse: readlinkat return value {} is greater than libc::PATH_MAX({})",
-            buf_read,
-            libc::PATH_MAX
-        );
-        Err(io::Error::from_raw_os_error(libc::EOVERFLOW))
+        // Be careful:
+        // - readlink() does not append a terminating null byte to buf
+        // - OsString instances are not NUL terminated
+        return Ok(PathBuf::from(OsString::from_vec(buf)));
     }
 
     /// Get the file pathname corresponding to the Inode
@@ -1320,6 +1308,15 @@ macro_rules! scoped_cred {
 scoped_cred!(ScopedUid, libc::uid_t, libc::SYS_setresuid);
 scoped_cred!(ScopedGid, libc::gid_t, libc::SYS_setresgid);
 
+fn set_creds(
+    uid: libc::uid_t,
+    gid: libc::gid_t,
+) -> io::Result<(Option<ScopedUid>, Option<ScopedGid>)> {
+    // We have to change the gid before we change the uid because if we change the uid first then we
+    // lose the capability to change the gid.  However changing back can happen in any order.
+    ScopedGid::new(gid).and_then(|gid| Ok((ScopedUid::new(uid)?, gid)))
+}
+
 struct CapFsetid {}
 
 impl Drop for CapFsetid {
@@ -1343,15 +1340,6 @@ fn drop_cap_fsetid() -> io::Result<Option<CapFsetid>> {
         )
     })?;
     Ok(Some(CapFsetid {}))
-}
-
-fn set_creds(
-    uid: libc::uid_t,
-    gid: libc::gid_t,
-) -> io::Result<(Option<ScopedUid>, Option<ScopedGid>)> {
-    // We have to change the gid before we change the uid because if we change the uid first then we
-    // lose the capability to change the gid.  However changing back can happen in any order.
-    ScopedGid::new(gid).and_then(|gid| Ok((ScopedUid::new(uid)?, gid)))
 }
 
 fn ebadf() -> io::Error {

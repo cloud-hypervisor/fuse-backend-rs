@@ -20,8 +20,8 @@ use crate::passthrough::PassthroughFs;
 
 /// An arbitrary maximum size for CFileHandle::f_handle.
 ///
-/// According to Linux ABI, struct file_handle has a flexible array member 'f_handle', but it's
-/// hard-coded here for simplicity.
+/// According to Linux ABI, struct file_handle has a flexible array member 'f_handle', with
+/// maximum value of 128 bytes defined in file include/linux/exportfs.h
 pub const MAX_HANDLE_SIZE: usize = 128;
 
 /// Dynamically allocated array.
@@ -209,6 +209,12 @@ impl FileHandle {
         let needed = c_fh.wrapper.as_fam_struct_ref().handle_bytes as usize;
         let mut c_fh = CFileHandle::new(needed);
 
+        // name_to_handle_at() does not trigger a mount when the final component of the pathname is
+        // an automount point. When a filesystem supports both file handles and automount points,
+        // a name_to_handle_at() call on an automount point will return with error EOVERFLOW
+        // without having increased handle_bytes.  This can happen since Linux 4.13 with NFS
+        // when accessing a directory which is on a separate filesystem on the server. In this case,
+        // the automount can be triggered by adding a "/" to the end of the pathname.
         let ret = unsafe {
             name_to_handle_at(
                 dir_fd,
@@ -286,7 +292,7 @@ impl FileHandle {
         mount_fds: &MountFds,
         flags: libc::c_int,
     ) -> io::Result<File> {
-        let mount_fds_locked = mount_fds.map.read().unwrap();
+        let mount_fds_locked = mount_fds.get_map();
         let mount_file = mount_fds_locked.get(&self.mnt_id).ok_or_else(|| {
             error!(
                 "open_with_mount_fds: mnt_id {:?} is not found.",
@@ -314,12 +320,10 @@ impl MountFds {
         MountFds::default()
     }
 
-    #[allow(dead_code)]
     pub fn get_map(&self) -> RwLockReadGuard<'_, HashMap<u64, std::fs::File>> {
         self.map.read().unwrap()
     }
 
-    #[allow(dead_code)]
     pub fn get_map_mut(&self) -> RwLockWriteGuard<'_, HashMap<u64, std::fs::File>> {
         self.map.write().unwrap()
     }
@@ -334,7 +338,7 @@ impl MountFds {
     where
         F: FnOnce(RawFd, libc::c_int, u32) -> io::Result<File>,
     {
-        if self.map.read().unwrap().contains_key(&mnt_id) {
+        if self.get_map().contains_key(&mnt_id) {
             return Ok(());
         }
 
@@ -386,7 +390,7 @@ impl MountFds {
             libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
             st.st_mode,
         )?;
-        self.map.write().unwrap().insert(mnt_id, file);
+        self.get_map_mut().insert(mnt_id, file);
 
         Ok(())
     }
