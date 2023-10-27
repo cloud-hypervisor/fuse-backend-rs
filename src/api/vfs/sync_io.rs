@@ -20,7 +20,7 @@ impl FileSystem for Vfs {
             return Err(Error::from_raw_os_error(libc::EINVAL));
         }
         let mut n_opts = *self.opts.load().deref().deref();
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(target_os = "linux")]
         {
             if n_opts.no_open {
                 n_opts.no_open = !(opts & FsOptions::ZERO_MESSAGE_OPEN).is_empty();
@@ -300,7 +300,7 @@ impl FileSystem for Vfs {
         flags: u32,
         fuse_flags: u32,
     ) -> Result<(Option<u64>, OpenOptions)> {
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(target_os = "linux")]
         if self.opts.load().no_open {
             return Err(Error::from_raw_os_error(libc::ENOSYS));
         }
@@ -516,7 +516,7 @@ impl FileSystem for Vfs {
         inode: VfsInode,
         flags: u32,
     ) -> Result<(Option<VfsHandle>, OpenOptions)> {
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(target_os = "linux")]
         if self.opts.load().no_opendir {
             return Err(Error::from_raw_os_error(libc::ENOSYS));
         }

@@ -137,11 +137,11 @@ impl<F: FileSystem + Sync> Server<F> {
             x if x == Opcode::NotifyReply as u32 => self.notify_reply(ctx),
             x if x == Opcode::BatchForget as u32 => self.batch_forget(ctx),
             x if x == Opcode::Fallocate as u32 => self.fallocate(ctx),
-            #[cfg(not(target_os = "macos"))]
+            #[cfg(target_os = "linux")]
             x if x == Opcode::Readdirplus as u32 => self.readdirplus(ctx),
-            #[cfg(not(target_os = "macos"))]
+            #[cfg(target_os = "linux")]
             x if x == Opcode::Rename2 as u32 => self.rename2(ctx),
-            #[cfg(not(target_os = "macos"))]
+            #[cfg(target_os = "linux")]
             x if x == Opcode::Lseek as u32 => self.lseek(ctx),
             #[cfg(feature = "virtiofs")]
             x if x == Opcode::SetupMapping as u32 => self.setupmapping(ctx, vu_req),
@@ -358,7 +358,7 @@ impl<F: FileSystem + Sync> Server<F> {
         self.do_rename(ctx, size_of::<RenameIn>(), newdir, 0)
     }
 
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "linux")]
     pub(super) fn rename2<S: BitmapSlice>(&self, mut ctx: SrvContext<'_, F, S>) -> Result<usize> {
         let Rename2In { newdir, flags, .. } = ctx.r.read_obj().map_err(Error::DecodeMessage)?;
 
@@ -698,9 +698,9 @@ impl<F: FileSystem + Sync> Server<F> {
 
         #[cfg(target_os = "macos")]
         let flags_u64 = flags as u64;
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(target_os = "linux")]
         let mut flags_u64 = flags as u64;
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(target_os = "linux")]
         if flags_u64 & FsOptions::INIT_EXT.bits() != 0 {
             let InitIn2 { flags2, unused: _ } = ctx.r.read_obj().map_err(Error::DecodeMessage)?;
             flags_u64 |= (flags2 as u64) << 32;
@@ -737,7 +737,7 @@ impl<F: FileSystem + Sync> Server<F> {
                 if enabled.contains(FsOptions::BIG_WRITES) {
                     out.max_write = MAX_REQ_PAGES as u32 * pagesize() as u32;
                 }
-                #[cfg(not(target_os = "macos"))]
+                #[cfg(target_os = "linux")]
                 if enabled.contains(FsOptions::MAX_PAGES) {
                     out.max_pages = MAX_REQ_PAGES;
                     out.max_write = MAX_REQ_PAGES as u32 * pagesize() as u32; // 1MB
@@ -856,7 +856,7 @@ impl<F: FileSystem + Sync> Server<F> {
         self.do_readdir(ctx, false)
     }
 
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "linux")]
     pub(super) fn readdirplus<S: BitmapSlice>(&self, ctx: SrvContext<'_, F, S>) -> Result<usize> {
         self.do_readdir(ctx, true)
     }
@@ -1151,7 +1151,7 @@ impl<F: FileSystem + Sync> Server<F> {
         }
     }
 
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "linux")]
     pub(super) fn lseek<S: BitmapSlice>(&self, mut ctx: SrvContext<'_, F, S>) -> Result<usize> {
         let LseekIn {
             fh, offset, whence, ..
