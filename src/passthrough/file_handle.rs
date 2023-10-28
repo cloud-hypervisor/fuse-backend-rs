@@ -1,3 +1,4 @@
+// Copyright (C) 2023 Alibaba Cloud. All rights reserved.
 // Copyright 2021 Red Hat, Inc. All rights reserved.
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE-BSD-3-Clause file.
@@ -281,10 +282,7 @@ impl OpenableFileHandle {
         })
     }
 
-    /// Open a file handle (low-level wrapper).
-    ///
-    /// `mount_fd` must be an open non-`O_PATH` file descriptor for an inode on the same mount as
-    /// the file to be opened, i.e. the mount given by `self.mnt_id`.
+    /// Open a file from an openable file handle.
     pub fn open(&self, flags: libc::c_int) -> io::Result<File> {
         let ret = unsafe {
             open_by_handle_at(
@@ -316,6 +314,8 @@ impl OpenableFileHandle {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::ffi::CString;
+    use std::io::Read;
 
     fn generate_c_file_handle(
         handle_bytes: usize,
@@ -367,12 +367,12 @@ mod tests {
         };
 
         assert!(fh1 > fh2);
-        assert!(fh1 != fh2);
+        assert_ne!(fh1, fh2);
         assert!(fh1 < fh3);
-        assert!(fh1 != fh3);
+        assert_ne!(fh1, fh3);
         assert!(fh1 < fh4);
-        assert!(fh1 != fh4);
-        assert!(fh1 == fh5);
+        assert_ne!(fh1, fh4);
+        assert_eq!(fh1, fh5);
 
         unsafe {
             fh1.handle
@@ -389,7 +389,7 @@ mod tests {
                 .f_handle
                 .as_mut_slice(128)[0] = 1;
         }
-        assert!(fh1 == fh5);
+        assert_eq!(fh1, fh5);
     }
 
     #[test]
@@ -404,5 +404,48 @@ mod tests {
             unsafe { fh.f_handle.as_slice(MAX_HANDLE_SIZE) },
             buf.as_slice(),
         );
+    }
+
+    #[test]
+    fn test_file_handle_from_name_at() {
+        let topdir = env!("CARGO_MANIFEST_DIR");
+        let dir = File::open(topdir).unwrap();
+        let filename = CString::new("build.rs").unwrap();
+
+        let dir_handle =
+            FileHandle::from_name_at(dir.as_raw_fd(), &CString::new("").unwrap()).unwrap();
+        let file_handle = FileHandle::from_name_at(dir.as_raw_fd(), &filename).unwrap();
+
+        assert_eq!(dir_handle.mnt_id, file_handle.mnt_id);
+        assert_ne!(
+            dir_handle.handle.wrapper.as_fam_struct_ref().handle_bytes,
+            0
+        );
+        assert_ne!(
+            file_handle.handle.wrapper.as_fam_struct_ref().handle_bytes,
+            0
+        );
+    }
+
+    #[test]
+    fn test_openable_file_handle() {
+        let topdir = env!("CARGO_MANIFEST_DIR");
+        let dir = File::open(topdir).unwrap();
+        let filename = CString::new("build.rs").unwrap();
+        let mount_fds = MountFds::new(None).unwrap();
+
+        let file_handle = OpenableFileHandle::from_name_at(
+            dir.as_raw_fd(),
+            &filename,
+            &mount_fds,
+            |_fd, _flags, _mode| File::open(topdir),
+        )
+        .unwrap();
+        assert_eq!(file_handle.handle.mnt_id, file_handle.mount_id());
+
+        let mut file = file_handle.open(libc::O_RDONLY).unwrap();
+        let mut buffer = [0u8; 1024];
+        let res = file.read(&mut buffer).unwrap();
+        assert!(res > 0);
     }
 }
