@@ -193,3 +193,24 @@ pub fn statx(dir: &impl AsRawFd, path: Option<&CStr>) -> io::Result<StatExt> {
         Err(io::Error::last_os_error())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::ffi::CString;
+    use std::fs::File;
+
+    #[test]
+    fn test_statx() {
+        let topdir = env!("CARGO_MANIFEST_DIR");
+        let dir = File::open(topdir).unwrap();
+        let filename = CString::new("build.rs").unwrap();
+
+        let st1 = statx(&dir, None).unwrap();
+        let st2 = statx(&dir, Some(&filename)).unwrap();
+        let mnt_id = get_mount_id(&dir, &filename).unwrap();
+
+        assert_eq!(st1.mnt_id, st2.mnt_id);
+        assert_eq!(st1.mnt_id, mnt_id);
+    }
+}

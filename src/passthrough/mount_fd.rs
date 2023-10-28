@@ -436,3 +436,57 @@ impl std::fmt::Display for MPRError {
 }
 
 impl std::error::Error for MPRError {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::passthrough::file_handle::FileHandle;
+
+    #[test]
+    fn test_mount_fd_get() {
+        let topdir = env!("CARGO_MANIFEST_DIR");
+        let dir = File::open(topdir).unwrap();
+        let filename = CString::new("build.rs").unwrap();
+        let mount_fds = MountFds::new(None).unwrap();
+        let handle = FileHandle::from_name_at(dir.as_raw_fd(), &filename).unwrap();
+
+        // Ensure that `MountFds::get()` works for new entry.
+        let fd1 = mount_fds
+            .get(handle.mnt_id, |_fd, _flags, _mode| File::open(topdir))
+            .unwrap();
+        assert_eq!(Arc::strong_count(&fd1), 1);
+        assert_eq!(mount_fds.map.read().unwrap().len(), 1);
+
+        // Ensure that `MountFds::get()` works for existing entry.
+        let fd2 = mount_fds
+            .get(handle.mnt_id, |_fd, _flags, _mode| File::open(topdir))
+            .unwrap();
+        assert_eq!(Arc::strong_count(&fd2), 2);
+        assert_eq!(mount_fds.map.read().unwrap().len(), 1);
+
+        // Ensure fd1 and fd2 are the same object.
+        assert_eq!(fd1.file().as_raw_fd(), fd2.file().as_raw_fd());
+
+        drop(fd1);
+        assert_eq!(Arc::strong_count(&fd2), 1);
+        assert_eq!(mount_fds.map.read().unwrap().len(), 1);
+
+        // Ensure that `MountFd::drop()` works as expected.
+        drop(fd2);
+        assert_eq!(mount_fds.map.read().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn test_mpr_error() {
+        let io_error = io::Error::new(io::ErrorKind::Other, "test");
+        let mpr_error = MPRError::from(io_error);
+
+        assert!(!mpr_error.silent);
+        assert!(mpr_error.fs_mount_id.is_none());
+        assert!(mpr_error.fs_mount_root.is_none());
+        let mpr_error = mpr_error.silence();
+        let msg = format!("{}", mpr_error);
+        assert!(msg.len() > 0);
+        assert!(mpr_error.silent());
+    }
+}
