@@ -5,7 +5,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use super::file_handle::FileHandle;
-use super::{FileOrHandle, Inode, InodeData, InodeStat};
+use super::{Inode, InodeData, InodeHandle, InodeStat};
 
 #[derive(Clone, Copy, Default, PartialOrd, Ord, PartialEq, Eq, Debug)]
 /// Identify an inode in `PassthroughFs` by `InodeId`.
@@ -41,7 +41,7 @@ impl InodeStore {
     /// will get lost.
     pub fn insert(&mut self, data: Arc<InodeData>) {
         self.by_id.insert(data.id, data.inode);
-        if let FileOrHandle::Handle(handle) = &data.file_or_handle {
+        if let InodeHandle::Handle(handle) = &data.handle {
             self.by_handle
                 .insert(handle.file_handle().clone(), data.inode);
         }
@@ -59,7 +59,7 @@ impl InodeStore {
         }
 
         if let Some(data) = data.as_ref() {
-            if let FileOrHandle::Handle(handle) = &data.file_or_handle {
+            if let InodeHandle::Handle(handle) = &data.handle {
                 self.by_handle.remove(handle.file_handle());
             }
             self.by_id.remove(&data.id);
@@ -116,11 +116,9 @@ mod test {
                 return false;
             }
 
-            match (&self.file_or_handle, &other.file_or_handle) {
-                (FileOrHandle::File(f1), FileOrHandle::File(f2)) => {
-                    f1.as_raw_fd() == f2.as_raw_fd()
-                }
-                (FileOrHandle::Handle(h1), FileOrHandle::Handle(h2)) => {
+            match (&self.handle, &other.handle) {
+                (InodeHandle::File(f1), InodeHandle::File(f2)) => f1.as_raw_fd() == f2.as_raw_fd(),
+                (InodeHandle::Handle(h1), InodeHandle::Handle(h2)) => {
                     h1.file_handle() == h2.file_handle()
                 }
                 _ => false,
@@ -167,8 +165,8 @@ mod test {
         };
         let id1 = InodeId::from_stat(&inode_stat1);
         let id2 = InodeId::from_stat(&inode_stat2);
-        let file_or_handle1 = FileOrHandle::File(tmpfile1.into_file());
-        let file_or_handle2 = FileOrHandle::File(tmpfile2.into_file());
+        let file_or_handle1 = InodeHandle::File(tmpfile1.into_file());
+        let file_or_handle2 = InodeHandle::File(tmpfile2.into_file());
         let data1 = InodeData::new(
             inode1,
             file_or_handle1,

@@ -227,12 +227,12 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
             fd = hd.get_handle_raw_fd();
             st = Self::stat_fd(fd, None);
         } else {
-            match &data.file_or_handle {
-                FileOrHandle::File(f) => {
+            match &data.handle {
+                InodeHandle::File(f) => {
                     fd = f.as_raw_fd();
                     st = Self::stat_fd(fd, None);
                 }
-                FileOrHandle::Handle(_h) => {
+                InodeHandle::Handle(_h) => {
                     let file = data.get_file()?;
                     fd = file.as_raw_fd();
                     st = Self::stat_fd(fd, None);
