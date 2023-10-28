@@ -9,6 +9,7 @@ use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
 use std::sync::{Arc, Mutex, RwLock, Weak};
 
 use super::statx::statx;
+use super::util::einval;
 
 const MOUNT_INFO_FILE: &str = "/proc/self/mountinfo";
 
@@ -261,7 +262,7 @@ impl MountFds {
             }
 
             None => Err(self
-                .error_for_nolookup(mount_id, io::Error::from_raw_os_error(libc::EINVAL))
+                .error_for_nolookup(mount_id, einval())
                 .set_desc(format!("Failed to find mount root for mount ID {mount_id}"))),
         }
     }
@@ -448,7 +449,7 @@ mod tests {
         let dir = File::open(topdir).unwrap();
         let filename = CString::new("build.rs").unwrap();
         let mount_fds = MountFds::new(None).unwrap();
-        let handle = FileHandle::from_name_at(dir.as_raw_fd(), &filename).unwrap();
+        let handle = FileHandle::from_name_at(&dir, &filename).unwrap();
 
         // Ensure that `MountFds::get()` works for new entry.
         let fd1 = mount_fds

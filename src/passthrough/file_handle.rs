@@ -174,7 +174,7 @@ extern "C" {
 
 impl FileHandle {
     /// Create a file handle for the given file.
-    pub fn from_name_at(dir_fd: RawFd, path: &CStr) -> io::Result<Self> {
+    pub fn from_name_at(dir_fd: &impl AsRawFd, path: &CStr) -> io::Result<Self> {
         let mut mount_id: libc::c_int = 0;
         let mut c_fh = CFileHandle::new(0);
 
@@ -186,7 +186,7 @@ impl FileHandle {
         // structure of the correct size.
         let ret = unsafe {
             name_to_handle_at(
-                dir_fd,
+                dir_fd.as_raw_fd(),
                 path.as_ptr(),
                 c_fh.wrapper.as_mut_fam_struct_ptr(),
                 &mut mount_id,
@@ -214,7 +214,7 @@ impl FileHandle {
         // the automount can be triggered by adding a "/" to the end of the pathname.
         let ret = unsafe {
             name_to_handle_at(
-                dir_fd,
+                dir_fd.as_raw_fd(),
                 path.as_ptr(),
                 c_fh.wrapper.as_mut_fam_struct_ptr(),
                 &mut mount_id,
@@ -259,7 +259,7 @@ impl OpenableFileHandle {
     /// If `path` is empty, `reopen_dir` may be invoked to duplicate `dir` with custom
     /// `libc::open()` flags.
     pub fn from_name_at<F>(
-        dir_fd: RawFd,
+        dir_fd: &impl AsRawFd,
         path: &CStr,
         mount_fds: &MountFds,
         reopen_dir: F,
@@ -412,9 +412,8 @@ mod tests {
         let dir = File::open(topdir).unwrap();
         let filename = CString::new("build.rs").unwrap();
 
-        let dir_handle =
-            FileHandle::from_name_at(dir.as_raw_fd(), &CString::new("").unwrap()).unwrap();
-        let file_handle = FileHandle::from_name_at(dir.as_raw_fd(), &filename).unwrap();
+        let dir_handle = FileHandle::from_name_at(&dir, &CString::new("").unwrap()).unwrap();
+        let file_handle = FileHandle::from_name_at(&dir, &filename).unwrap();
 
         assert_eq!(dir_handle.mnt_id, file_handle.mnt_id);
         assert_ne!(
@@ -434,13 +433,11 @@ mod tests {
         let filename = CString::new("build.rs").unwrap();
         let mount_fds = MountFds::new(None).unwrap();
 
-        let file_handle = OpenableFileHandle::from_name_at(
-            dir.as_raw_fd(),
-            &filename,
-            &mount_fds,
-            |_fd, _flags, _mode| File::open(topdir),
-        )
-        .unwrap();
+        let file_handle =
+            OpenableFileHandle::from_name_at(&dir, &filename, &mount_fds, |_fd, _flags, _mode| {
+                File::open(topdir)
+            })
+            .unwrap();
         assert_eq!(file_handle.handle.mnt_id, file_handle.mount_id());
 
         let mut file = file_handle.open(libc::O_RDONLY).unwrap();
