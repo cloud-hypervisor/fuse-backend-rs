@@ -8,7 +8,7 @@ use std::io::{self, Read, Seek};
 use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
 use std::sync::{Arc, Mutex, RwLock, Weak};
 
-use super::PassthroughFs;
+use super::statx::statx;
 
 const MOUNT_INFO_FILE: &str = "/proc/self/mountinfo";
 
@@ -195,9 +195,7 @@ impl MountFds {
         mount_point_file: &File,
         mount_point: &str,
     ) -> MPRResult<libc::mode_t> {
-        // liubo: TODO find mnt id
-        /*
-        let stx = statx(&mount_point_path, None).map_err(|e| {
+        let stx = statx(mount_point_file, None).map_err(|e| {
             self.error_for(mount_id, e)
                 .prefix(format!("Failed to stat mount point \"{mount_point}\""))
         })?;
@@ -210,13 +208,8 @@ impl MountFds {
                     mount_point, stx.mnt_id, mount_id
                 )));
         }
-         */
-        let st = PassthroughFs::<()>::stat_fd(mount_point_file.as_raw_fd(), None).map_err(|e| {
-            self.error_for(mount_id, e)
-                .prefix(format!("Failed to stat mount point \"{mount_point}\""))
-        })?;
 
-        Ok(st.st_mode)
+        Ok(stx.st.st_mode)
     }
 
     /// Given a mount ID, return the mount root path (by reading `/proc/self/mountinfo`)
