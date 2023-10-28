@@ -7,11 +7,60 @@ use std::io;
 use std::mem::MaybeUninit;
 use std::os::unix::io::AsRawFd;
 
-mod file_status;
-use crate::oslib;
-use file_status::{statx_st, STATX_BASIC_STATS, STATX_MNT_ID};
+use super::FileHandle;
+use crate::api::EMPTY_CSTR;
 
-const EMPTY_CSTR: &[u8] = b"\0";
+#[cfg(target_env = "gnu")]
+pub use libc::statx as statx_st;
+
+#[cfg(target_env = "gnu")]
+pub use libc::{STATX_BASIC_STATS, STATX_MNT_ID};
+
+// musl provides the 'struct statx', but without stx_mnt_id.
+// However, the libc crate does not provide libc::statx
+// if musl is used. So we add just the required struct and
+// constants to make it works.
+#[cfg(not(target_env = "gnu"))]
+#[repr(C)]
+pub struct statx_st_timestamp {
+    pub tv_sec: i64,
+    pub tv_nsec: u32,
+    pub __statx_timestamp_pad1: [i32; 1],
+}
+
+#[cfg(not(target_env = "gnu"))]
+#[repr(C)]
+pub struct statx_st {
+    pub stx_mask: u32,
+    pub stx_blksize: u32,
+    pub stx_attributes: u64,
+    pub stx_nlink: u32,
+    pub stx_uid: u32,
+    pub stx_gid: u32,
+    pub stx_mode: u16,
+    __statx_pad1: [u16; 1],
+    pub stx_ino: u64,
+    pub stx_size: u64,
+    pub stx_blocks: u64,
+    pub stx_attributes_mask: u64,
+    pub stx_atime: statx_st_timestamp,
+    pub stx_btime: statx_st_timestamp,
+    pub stx_ctime: statx_st_timestamp,
+    pub stx_mtime: statx_st_timestamp,
+    pub stx_rdev_major: u32,
+    pub stx_rdev_minor: u32,
+    pub stx_dev_major: u32,
+    pub stx_dev_minor: u32,
+    pub stx_mnt_id: u64,
+    __statx_pad2: u64,
+    __statx_pad3: [u64; 12],
+}
+
+#[cfg(not(target_env = "gnu"))]
+pub const STATX_BASIC_STATS: libc::c_uint = 0x07ff;
+
+#[cfg(not(target_env = "gnu"))]
+pub const STATX_MNT_ID: libc::c_uint = 0x1000;
 
 pub type MountId = u64;
 
@@ -84,12 +133,9 @@ impl SafeStatXAccess for statx_st {
 }
 
 fn get_mount_id(dir: &impl AsRawFd, path: &CStr) -> Option<MountId> {
-    let mut mount_id: libc::c_int = 0;
-    let mut c_fh = oslib::CFileHandle::default();
-
-    oslib::name_to_handle_at(dir, path, &mut c_fh, &mut mount_id, libc::AT_EMPTY_PATH)
+    FileHandle::from_name_at(dir.as_raw_fd(), path)
+        .map(|v| v.mnt_id)
         .ok()
-        .and(Some(mount_id as MountId))
 }
 
 // Only works on Linux, and libc::SYS_statx is only defined for these
@@ -109,7 +155,7 @@ unsafe fn do_statx(
     libc::syscall(libc::SYS_statx, dirfd, pathname, flags, mask, statxbuf) as libc::c_int
 }
 
-// Real statx() that depends on do_statx()
+/// Execute `statx()` to get extended status with mount id.
 pub fn statx(dir: &impl AsRawFd, path: Option<&CStr>) -> io::Result<StatExt> {
     let mut stx_ui = MaybeUninit::<statx_st>::zeroed();
 
@@ -138,13 +184,11 @@ pub fn statx(dir: &impl AsRawFd, path: Option<&CStr>) -> io::Result<StatExt> {
             .mount_id()
             .or_else(|| get_mount_id(dir, path))
             .unwrap_or(0);
+        let st = stx
+            .stat64()
+            .ok_or_else(|| io::Error::from_raw_os_error(libc::ENOSYS))?;
 
-        Ok(StatExt {
-            st: stx
-                .stat64()
-                .ok_or_else(|| io::Error::from_raw_os_error(libc::ENOSYS))?,
-            mnt_id,
-        })
+        Ok(StatExt { st, mnt_id })
     } else {
         Err(io::Error::last_os_error())
     }

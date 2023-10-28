@@ -45,6 +45,7 @@ mod async_io;
 mod file_handle;
 mod inode_store;
 mod mount_fd;
+mod statx;
 mod sync_io;
 
 type Inode = u64;
