@@ -14,6 +14,8 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
 
+use super::os_compat::LinuxDirent64;
+use super::util::stat_fd;
 use super::*;
 use crate::abi::fuse_abi::{CreateIn, Opcode, FOPEN_IN_KILL_SUIDGID, WRITE_KILL_PRIV};
 #[cfg(any(feature = "vhost-user-fs", feature = "virtiofs"))]
@@ -33,7 +35,7 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
         let data = self.inode_map.get(inode)?;
         let file = data.get_file()?;
 
-        Self::open_proc_file(&self.proc_self_fd, file.as_raw_fd(), new_flags, data.mode)
+        Self::open_proc_file(&self.proc_self_fd, &file, new_flags, data.mode)
     }
 
     /// Check the HandleData flags against the flags from the current request
@@ -138,7 +140,7 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
                 let name = bytes_to_cstr(name)
                     .map_err(|e| {
                         error!("fuse: do_readdir: {:?}", e);
-                        io::Error::from_raw_os_error(libc::EINVAL)
+                        einval()
                     })?
                     .to_bytes();
 
@@ -213,7 +215,6 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
         handle: Option<Handle>,
     ) -> io::Result<(libc::stat64, Duration)> {
         let st;
-        let fd;
         let data = self.inode_map.get(inode).map_err(|e| {
             error!("fuse: do_getattr ino {} Not find err {:?}", inode, e);
             e
@@ -224,27 +225,13 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
         if !self.no_open.load(Ordering::Relaxed) && handle.is_some() {
             // Safe as we just checked handle
             let hd = self.handle_map.get(handle.unwrap(), inode)?;
-            fd = hd.get_handle_raw_fd();
-            st = Self::stat_fd(fd, None);
+            st = stat_fd(hd.get_file(), None);
         } else {
-            match &data.handle {
-                InodeHandle::File(f) => {
-                    fd = f.as_raw_fd();
-                    st = Self::stat_fd(fd, None);
-                }
-                InodeHandle::Handle(_h) => {
-                    let file = data.get_file()?;
-                    fd = file.as_raw_fd();
-                    st = Self::stat_fd(fd, None);
-                }
-            }
+            st = data.handle.stat();
         }
 
         let st = st.map_err(|e| {
-            error!(
-                "fuse: do_getattr stat failed ino {} fd: {:?} err {:?}",
-                inode, fd, e
-            );
+            error!("fuse: do_getattr stat failed ino {} err {:?}", inode, e);
             e
         })?;
 
@@ -366,7 +353,7 @@ impl<S: BitmapSlice + Send + Sync> FileSystem for PassthroughFs<S> {
     fn lookup(&self, _ctx: &Context, parent: Inode, name: &CStr) -> io::Result<Entry> {
         // Don't use is_safe_path_component(), allow "." and ".." for NFS export support
         if name.to_bytes_with_nul().contains(&SLASH_ASCII) {
-            return Err(io::Error::from_raw_os_error(libc::EINVAL));
+            return Err(einval());
         }
         self.do_lookup(parent, name)
     }
@@ -558,12 +545,7 @@ impl<S: BitmapSlice + Send + Sync> FileSystem for PassthroughFs<S> {
             let (_uid, _gid) = set_creds(ctx.uid, ctx.gid)?;
 
             let flags = self.get_writeback_open_flags(args.flags as i32);
-            Self::create_file_excl(
-                dir_file.as_raw_fd(),
-                name,
-                flags,
-                args.mode & !(args.umask & 0o777),
-            )?
+            Self::create_file_excl(&dir_file, name, flags, args.mode & !(args.umask & 0o777))?
         };
 
         let entry = self.do_lookup(parent, name)?;
@@ -698,7 +680,7 @@ impl<S: BitmapSlice + Send + Sync> FileSystem for PassthroughFs<S> {
         self.check_fd_flags(data, f.as_raw_fd(), flags)?;
 
         if self.seal_size.load(Ordering::Relaxed) {
-            let st = Self::stat_fd(f.as_raw_fd(), None)?;
+            let st = stat_fd(&f, None)?;
             self.seal_size_check(Opcode::Write, st.st_size as u64, offset, size as u64, 0)?;
         }
 
@@ -1096,7 +1078,7 @@ impl<S: BitmapSlice + Send + Sync> FileSystem for PassthroughFs<S> {
 
     fn access(&self, ctx: &Context, inode: Inode, mask: u32) -> io::Result<()> {
         let data = self.inode_map.get(inode)?;
-        let st = Self::stat(&data.get_file()?, None)?;
+        let st = stat_fd(&data.get_file()?, None)?;
         let mode = mask as i32 & (libc::R_OK | libc::W_OK | libc::X_OK);
 
         if mode == libc::F_OK {
@@ -1282,7 +1264,7 @@ impl<S: BitmapSlice + Send + Sync> FileSystem for PassthroughFs<S> {
         let fd = data.get_handle_raw_fd();
 
         if self.seal_size.load(Ordering::Relaxed) {
-            let st = Self::stat_fd(fd, None)?;
+            let st = stat_fd(&fd, None)?;
             self.seal_size_check(
                 Opcode::Fallocate,
                 st.st_size as u64,

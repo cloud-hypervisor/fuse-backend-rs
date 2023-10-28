@@ -102,6 +102,7 @@ mod test {
     use super::*;
 
     use std::ffi::CStr;
+    use std::mem::MaybeUninit;
     use std::os::unix::io::{AsRawFd, RawFd};
     use std::sync::atomic::Ordering;
     use vmm_sys_util::tempfile::TempFile;

@@ -17,21 +17,21 @@ use std::ffi::{CStr, CString, OsString};
 use std::fs::File;
 use std::io;
 use std::marker::PhantomData;
-use std::mem::MaybeUninit;
 use std::ops::{Deref, DerefMut};
 use std::os::unix::ffi::OsStringExt;
-use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
+use std::os::unix::io::{AsRawFd, RawFd};
 use std::path::PathBuf;
-use std::str::FromStr;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, RwLock, RwLockWriteGuard};
 use std::time::Duration;
 
 use vm_memory::{bitmap::BitmapSlice, ByteValued};
 
+pub use self::config::{CachePolicy, Config};
 use self::file_handle::{FileHandle, OpenableFileHandle};
 use self::inode_store::{InodeId, InodeStore};
-use self::mount_fd::MountFds;
+use self::mount_fd::{MountFds, MountId};
+use self::util::{ebadf, einval, is_dir, is_safe_inode, openat, stat_fd, UniqueInodeGenerator};
 use crate::abi::fuse_abi as fuse;
 use crate::abi::fuse_abi::Opcode;
 use crate::api::filesystem::Entry;
@@ -39,14 +39,18 @@ use crate::api::{
     validate_path_component, BackendFileSystem, CURRENT_DIR_CSTR, EMPTY_CSTR, PARENT_DIR_CSTR,
     PROC_SELF_FD_CSTR, SLASH_ASCII, VFS_MAX_INO,
 };
+use crate::passthrough::util::reopen_fd_through_proc;
 
 #[cfg(feature = "async-io")]
 mod async_io;
+mod config;
 mod file_handle;
 mod inode_store;
 mod mount_fd;
+mod os_compat;
 mod statx;
 mod sync_io;
+mod util;
 
 type Inode = u64;
 type Handle = u64;
@@ -54,75 +58,10 @@ type Handle = u64;
 /// Maximum host inode number supported by passthroughfs
 const MAX_HOST_INO: u64 = 0x7fff_ffff_ffff;
 
-/// the 56th bit used to set the inode to 1 indicates virtual inode
-const VIRTUAL_INODE_FLAG: u64 = 1 << 55;
-
-/// Used to form a pair of dev and mntid as the key of the map
-#[derive(Clone, Copy, Default, PartialOrd, Ord, PartialEq, Eq, Debug)]
-pub struct DevMntIDPair(libc::dev_t, u64);
-
-// Used to generate a unique inode with a maximum of 56 bits. the format is
-// |1bit|8bit|47bit
-// when the highest bit is equal to 0, it means the host inode format, and the lower 47 bits normally store no more than 47-bit inode
-// When the highest bit is equal to 1, it indicates the virtual inode format,
-// which is used to store more than 47 bits of inodes
-// the middle 8bit is used to store the unique ID produced by the combination of dev+mntid
-struct UniqueInodeGenerator {
-    // Mapping (dev, mnt_id) pair to another small unique id
-    dev_mntid_map: Mutex<BTreeMap<DevMntIDPair, u8>>,
-    next_unique_id: AtomicU8,
-    next_virtual_inode: AtomicU64,
-}
-
-impl UniqueInodeGenerator {
-    fn new() -> Self {
-        UniqueInodeGenerator {
-            dev_mntid_map: Mutex::new(Default::default()),
-            next_unique_id: AtomicU8::new(1),
-            next_virtual_inode: AtomicU64::new(fuse::ROOT_ID + 1),
-        }
-    }
-
-    fn get_unique_inode(&self, alt_key: &InodeId) -> io::Result<libc::ino64_t> {
-        let unique_id = {
-            let id: DevMntIDPair = DevMntIDPair(alt_key.dev, alt_key.mnt);
-            let mut id_map_guard = self.dev_mntid_map.lock().unwrap();
-            match id_map_guard.entry(id) {
-                btree_map::Entry::Occupied(v) => *v.get(),
-                btree_map::Entry::Vacant(v) => {
-                    if self.next_unique_id.load(Ordering::Relaxed) == u8::MAX {
-                        return Err(io::Error::new(
-                            io::ErrorKind::Other,
-                            "the number of combinations of dev and mntid exceeds 255",
-                        ));
-                    }
-                    let next_id = self.next_unique_id.fetch_add(1, Ordering::Relaxed);
-                    v.insert(next_id);
-                    next_id
-                }
-            }
-        };
-
-        let inode = if alt_key.ino <= MAX_HOST_INO {
-            alt_key.ino
-        } else {
-            if self.next_virtual_inode.load(Ordering::Relaxed) > MAX_HOST_INO {
-                return Err(io::Error::new(
-                    io::ErrorKind::Other,
-                    format!("the virtual inode excess {}", MAX_HOST_INO),
-                ));
-            }
-            self.next_virtual_inode.fetch_add(1, Ordering::Relaxed) | VIRTUAL_INODE_FLAG
-        };
-
-        Ok((unique_id as u64) << 47 | inode)
-    }
-}
-
 #[derive(Clone, Copy)]
 struct InodeStat {
     stat: libc::stat64,
-    mnt_id: u64,
+    mnt_id: MountId,
 }
 
 impl InodeStat {
@@ -132,23 +71,8 @@ impl InodeStat {
     }
 
     #[inline]
-    fn get_mnt_id(&self) -> u64 {
+    fn get_mnt_id(&self) -> MountId {
         self.mnt_id
-    }
-}
-
-#[derive(Debug)]
-enum InodeHandle {
-    File(File),
-    Handle(Arc<OpenableFileHandle>),
-}
-
-impl InodeHandle {
-    fn handle(&self) -> Option<&FileHandle> {
-        match self {
-            InodeHandle::File(_) => None,
-            InodeHandle::Handle(h) => Some(h.file_handle().deref()),
-        }
     }
 }
 
@@ -176,6 +100,41 @@ impl AsRawFd for InodeFile<'_> {
     }
 }
 
+#[derive(Debug)]
+enum InodeHandle {
+    File(File),
+    Handle(Arc<OpenableFileHandle>),
+}
+
+impl InodeHandle {
+    fn file_handle(&self) -> Option<&FileHandle> {
+        match self {
+            InodeHandle::File(_) => None,
+            InodeHandle::Handle(h) => Some(h.file_handle().deref()),
+        }
+    }
+
+    fn get_file(&self) -> io::Result<InodeFile<'_>> {
+        match self {
+            InodeHandle::File(f) => Ok(InodeFile::Ref(f)),
+            InodeHandle::Handle(h) => {
+                let f = h.open(libc::O_PATH)?;
+                Ok(InodeFile::Owned(f))
+            }
+        }
+    }
+
+    fn stat(&self) -> io::Result<libc::stat64> {
+        match self {
+            InodeHandle::File(f) => stat_fd(f, None),
+            InodeHandle::Handle(_h) => {
+                let file = self.get_file()?;
+                stat_fd(&file, None)
+            }
+        }
+    }
+}
+
 /// Represents an inode in `PassthroughFs`.
 #[derive(Debug)]
 pub struct InodeData {
@@ -184,19 +143,8 @@ pub struct InodeData {
     handle: InodeHandle,
     id: InodeId,
     refcount: AtomicU64,
-    // File type and mode, not used for now
+    // File type and mode
     mode: u32,
-}
-
-// Returns true if it's safe to open this inode without O_PATH.
-fn is_safe_inode(mode: u32) -> bool {
-    // Only regular files and directories are considered safe to be opened from the file
-    // server without O_PATH.
-    matches!(mode & libc::S_IFMT, libc::S_IFREG | libc::S_IFDIR)
-}
-
-fn is_dir(mode: u32) -> bool {
-    (mode & libc::S_IFMT) == libc::S_IFDIR
 }
 
 impl InodeData {
@@ -211,13 +159,7 @@ impl InodeData {
     }
 
     fn get_file(&self) -> io::Result<InodeFile<'_>> {
-        match &self.handle {
-            InodeHandle::File(f) => Ok(InodeFile::Ref(f)),
-            InodeHandle::Handle(h) => {
-                let f = h.open(libc::O_PATH)?;
-                Ok(InodeFile::Owned(f))
-            }
-        }
+        self.handle.get_file()
     }
 }
 
@@ -283,7 +225,7 @@ impl InodeMap {
                     // inode ID.
                     // (This can happen when we look up a new file that has reused the inode ID
                     // of some previously unlinked inode we still have in `.inodes`.)
-                    handle.is_none() || data.handle.handle().is_none()
+                    handle.is_none() || data.handle.file_handle().is_none()
                 })
             })
             .map(Arc::clone)
@@ -320,6 +262,10 @@ impl HandleData {
             lock: Mutex::new(()),
             open_flags: AtomicU32::new(flags),
         }
+    }
+
+    fn get_file(&self) -> &File {
+        &self.file
     }
 
     fn get_file_mut(&self) -> (MutexGuard<()>, &File) {
@@ -389,204 +335,6 @@ impl HandleMap {
             .filter(|hd| hd.inode == inode)
             .map(Arc::clone)
             .ok_or_else(ebadf)
-    }
-}
-
-#[repr(C, packed)]
-#[derive(Clone, Copy, Debug, Default)]
-struct LinuxDirent64 {
-    d_ino: libc::ino64_t,
-    d_off: libc::off64_t,
-    d_reclen: libc::c_ushort,
-    d_ty: libc::c_uchar,
-}
-unsafe impl ByteValued for LinuxDirent64 {}
-
-/// The caching policy that the file system should report to the FUSE client. By default the FUSE
-/// protocol uses close-to-open consistency. This means that any cached contents of the file are
-/// invalidated the next time that file is opened.
-#[derive(Debug, Default, Clone, Eq, PartialEq)]
-pub enum CachePolicy {
-    /// The client should never cache file data and all I/O should be directly forwarded to the
-    /// server. This policy must be selected when file contents may change without the knowledge of
-    /// the FUSE client (i.e., the file system does not have exclusive access to the directory).
-    Never,
-
-    /// The client is free to choose when and how to cache file data. This is the default policy and
-    /// uses close-to-open consistency as described in the enum documentation.
-    #[default]
-    Auto,
-
-    /// The client should always cache file data. This means that the FUSE client will not
-    /// invalidate any cached data that was returned by the file system the last time the file was
-    /// opened. This policy should only be selected when the file system has exclusive access to the
-    /// directory.
-    Always,
-}
-
-impl FromStr for CachePolicy {
-    type Err = &'static str;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s {
-            "never" | "Never" | "NEVER" | "none" | "None" | "NONE" => Ok(CachePolicy::Never),
-            "auto" | "Auto" | "AUTO" => Ok(CachePolicy::Auto),
-            "always" | "Always" | "ALWAYS" => Ok(CachePolicy::Always),
-            _ => Err("invalid cache policy"),
-        }
-    }
-}
-
-/// Options that configure the behavior of the passthrough fuse file system.
-#[derive(Debug, Clone, Eq, PartialEq)]
-pub struct Config {
-    /// How long the FUSE client should consider file and directory attributes to be valid. If the
-    /// attributes of a file or directory can only be modified by the FUSE client (i.e., the file
-    /// system has exclusive access), then this should be set to a large value.
-    ///
-    /// The default value for this option is 5 seconds.
-    pub attr_timeout: Duration,
-
-    /// How long the FUSE client should consider directory entries to be valid. If the contents of a
-    /// directory can only be modified by the FUSE client (i.e., the file system has exclusive
-    /// access), then this should be a large value.
-    ///
-    /// The default value for this option is 5 seconds.
-    pub entry_timeout: Duration,
-
-    /// Same as `attr_timeout`, override `attr_timeout` config, but only take effect on directories
-    /// when specified. This is useful to set different timeouts for directories and regular files.
-    pub dir_attr_timeout: Option<Duration>,
-
-    /// Same as `entry_timeout`, override `entry_timeout` config, but only take effect on
-    /// directories when specified. This is useful to set different timeouts for directories and
-    /// regular files.
-    pub dir_entry_timeout: Option<Duration>,
-
-    /// The caching policy the file system should use. See the documentation of `CachePolicy` for
-    /// more details.
-    pub cache_policy: CachePolicy,
-
-    /// Whether the file system should enable writeback caching. This can improve performance as it
-    /// allows the FUSE client to cache and coalesce multiple writes before sending them to the file
-    /// system. However, enabling this option can increase the risk of data corruption if the file
-    /// contents can change without the knowledge of the FUSE client (i.e., the server does **NOT**
-    /// have exclusive access). Additionally, the file system should have read access to all files
-    /// in the directory it is serving as the FUSE client may send read requests even for files
-    /// opened with `O_WRONLY`.
-    ///
-    /// Therefore callers should only enable this option when they can guarantee that: 1) the file
-    /// system has exclusive access to the directory and 2) the file system has read permissions for
-    /// all files in that directory.
-    ///
-    /// The default value for this option is `false`.
-    pub writeback: bool,
-
-    /// The path of the root directory.
-    ///
-    /// The default is `/`.
-    pub root_dir: String,
-
-    /// Whether the file system should support Extended Attributes (xattr). Enabling this feature may
-    /// have a significant impact on performance, especially on write parallelism. This is the result
-    /// of FUSE attempting to remove the special file privileges after each write request.
-    ///
-    /// The default value for this options is `false`.
-    pub xattr: bool,
-
-    /// To be compatible with Vfs and PseudoFs, PassthroughFs needs to prepare
-    /// root inode before accepting INIT request.
-    ///
-    /// The default value for this option is `true`.
-    pub do_import: bool,
-
-    /// Control whether no_open is allowed.
-    ///
-    /// The default value for this option is `false`.
-    pub no_open: bool,
-
-    /// Control whether no_opendir is allowed.
-    ///
-    /// The default value for this option is `false`.
-    pub no_opendir: bool,
-
-    /// Control whether kill_priv_v2 is enabled.
-    ///
-    /// The default value for this option is `false`.
-    pub killpriv_v2: bool,
-
-    /// Whether to use file handles to reference inodes.  We need to be able to open file
-    /// descriptors for arbitrary inodes, and by default that is done by storing an `O_PATH` FD in
-    /// `InodeData`.  Not least because there is a maximum number of FDs a process can have open
-    /// users may find it preferable to store a file handle instead, which we can use to open an FD
-    /// when necessary.
-    /// So this switch allows to choose between the alternatives: When set to `false`, `InodeData`
-    /// will store `O_PATH` FDs.  Otherwise, we will attempt to generate and store a file handle
-    /// instead.
-    ///
-    /// The default is `false`.
-    pub inode_file_handles: bool,
-
-    /// Control whether readdir/readdirplus requests return zero dirent to client, as if the
-    /// directory is empty even if it has children.
-    pub no_readdir: bool,
-
-    /// Control whether to refuse operations which modify the size of the file. For a share memory
-    /// file mounted from host, seal_size can prohibit guest to increase the size of
-    /// share memory file to attack the host.
-    pub seal_size: bool,
-
-    /// Whether count mount ID or not when comparing two inodes. By default we think two inodes
-    /// are same if their inode number and st_dev are the same. When `enable_mntid` is set as
-    /// 'true', inode's mount ID will be taken into account as well. For example, bindmount the
-    /// same file into virtiofs' source dir, the two bindmounted files will be identified as two
-    /// different inodes when this option is true, so the don't share pagecache.
-    ///
-    /// The default value for this option is `false`.
-    pub enable_mntid: bool,
-
-    /// What size file supports dax
-    /// * If dax_file_size == None, DAX will disable to all files.
-    /// * If dax_file_size == 0, DAX will enable all files.
-    /// * If dax_file_size == N, DAX will enable only when the file size is greater than or equal
-    /// to N Bytes.
-    pub dax_file_size: Option<u64>,
-
-    /// Reduce memory consumption by directly use host inode when possible.
-    ///
-    /// When set to false, a virtual inode number will be allocated for each file managed by
-    /// the passthroughfs driver. A map is used to maintain the relationship between virtual
-    /// inode numbers and host file objects.
-    /// When set to true, the host inode number will be directly used as virtual inode number
-    /// if it's less than the threshold (1 << 47), so reduce memory consumed by the map.
-    /// A virtual inode number will still be allocated and maintained if the host inode number
-    /// is bigger than the threshold.
-    /// The default value for this option is `false`.
-    pub use_host_ino: bool,
-}
-
-impl Default for Config {
-    fn default() -> Self {
-        Config {
-            entry_timeout: Duration::from_secs(5),
-            attr_timeout: Duration::from_secs(5),
-            cache_policy: Default::default(),
-            writeback: false,
-            root_dir: String::from("/"),
-            xattr: false,
-            do_import: true,
-            no_open: false,
-            no_opendir: false,
-            killpriv_v2: false,
-            inode_file_handles: false,
-            no_readdir: false,
-            seal_size: false,
-            enable_mntid: false,
-            dax_file_size: None,
-            dir_entry_timeout: None,
-            dir_attr_timeout: None,
-            use_host_ino: false,
-        }
     }
 }
 
@@ -669,7 +417,7 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
         // Safe because this is a constant value and a valid C string.
         let proc_self_fd_cstr = unsafe { CStr::from_bytes_with_nul_unchecked(PROC_SELF_FD_CSTR) };
         let proc_self_fd = Self::open_file(
-            libc::AT_FDCWD,
+            &libc::AT_FDCWD,
             proc_self_fd_cstr,
             libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC,
             0,
@@ -718,13 +466,13 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
         let (handle, st, id) = Self::open_file_or_handle(
             self.cfg.inode_file_handles,
             self.cfg.enable_mntid,
-            libc::AT_FDCWD,
+            &libc::AT_FDCWD,
             &root,
             &self.mount_fds,
             |fd, flags, _mode| {
                 let pathname = CString::new(format!("{fd}"))
                     .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-                Self::open_file(self.proc_self_fd.as_raw_fd(), &pathname, flags, 0)
+                Self::open_file(&self.proc_self_fd, &pathname, flags, 0)
             },
         )
         .map_err(|e| {
@@ -793,103 +541,47 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
     }
 
     fn stat(dir: &impl AsRawFd, path: Option<&CStr>) -> io::Result<libc::stat64> {
-        Self::stat_fd(dir.as_raw_fd(), path)
-    }
-
-    fn stat_fd(dir_fd: RawFd, path: Option<&CStr>) -> io::Result<libc::stat64> {
-        // Safe because this is a constant value and a valid C string.
-        let pathname =
-            path.unwrap_or_else(|| unsafe { CStr::from_bytes_with_nul_unchecked(EMPTY_CSTR) });
-        let mut st = MaybeUninit::<libc::stat64>::zeroed();
-
-        // Safe because the kernel will only write data in `st` and we check the return value.
-        let res = unsafe {
-            libc::fstatat64(
-                dir_fd,
-                pathname.as_ptr(),
-                st.as_mut_ptr(),
-                libc::AT_EMPTY_PATH | libc::AT_SYMLINK_NOFOLLOW,
-            )
-        };
-        if res >= 0 {
-            // Safe because the kernel guarantees that the struct is now fully initialized.
-            Ok(unsafe { st.assume_init() })
-        } else {
-            Err(io::Error::last_os_error())
-        }
+        stat_fd(dir, path)
     }
 
     fn create_file_excl(
-        dfd: i32,
+        dir: &impl AsRawFd,
         pathname: &CStr,
         flags: i32,
         mode: u32,
     ) -> io::Result<Option<File>> {
-        // Safe because this doesn't modify any memory and we check the return value. We don't
-        // really check `flags` because if the kernel can't handle poorly specified flags then we
-        // have much bigger problems.
-        let fd = unsafe {
-            libc::openat(
-                dfd,
-                pathname.as_ptr(),
-                flags | libc::O_CREAT | libc::O_EXCL,
-                mode,
-            )
-        };
-        if fd < 0 {
-            // Ignore the error if the file exists and O_EXCL is not present in `flags`.
-            let err = io::Error::last_os_error();
-            if err.kind() == io::ErrorKind::AlreadyExists {
-                if (flags & libc::O_EXCL) != 0 {
-                    return Err(err);
+        match openat(dir, pathname, flags | libc::O_CREAT | libc::O_EXCL, mode) {
+            Ok(file) => Ok(Some(file)),
+            Err(err) => {
+                // Ignore the error if the file exists and O_EXCL is not present in `flags`.
+                if err.kind() == io::ErrorKind::AlreadyExists {
+                    if (flags & libc::O_EXCL) != 0 {
+                        return Err(err);
+                    }
+                    return Ok(None);
                 }
-                return Ok(None);
+                Err(err)
             }
-            return Err(err);
         }
-        // Safe because we just opened this fd
-        Ok(Some(unsafe { File::from_raw_fd(fd) }))
     }
 
-    fn open_file(dfd: i32, pathname: &CStr, flags: i32, mode: u32) -> io::Result<File> {
-        let fd = if flags & libc::O_CREAT == libc::O_CREAT {
-            unsafe { libc::openat(dfd, pathname.as_ptr(), flags, mode) }
-        } else {
-            unsafe { libc::openat(dfd, pathname.as_ptr(), flags) }
-        };
-
-        if fd < 0 {
-            return Err(io::Error::last_os_error());
-        }
-
-        // Safe because we just opened this fd.
-        Ok(unsafe { File::from_raw_fd(fd) })
+    fn open_file(dfd: &impl AsRawFd, pathname: &CStr, flags: i32, mode: u32) -> io::Result<File> {
+        openat(dfd, pathname, flags, mode)
     }
 
-    fn open_proc_file(proc: &File, fd: RawFd, flags: i32, mode: u32) -> io::Result<File> {
+    fn open_proc_file(proc: &File, fd: &impl AsRawFd, flags: i32, mode: u32) -> io::Result<File> {
         if !is_safe_inode(mode) {
             return Err(ebadf());
         }
 
-        let pathname = CString::new(format!("{fd}"))
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-
-        // We don't really check `flags` because if the kernel can't handle poorly specified flags
-        // then we have much bigger problems. Also, clear the `O_NOFOLLOW` flag if it is set since
-        // we need to follow the `/proc/self/fd` symlink to get the file.
-        Self::open_file(
-            proc.as_raw_fd(),
-            &pathname,
-            (flags | libc::O_CLOEXEC) & (!libc::O_NOFOLLOW),
-            0,
-        )
+        reopen_fd_through_proc(fd, flags | libc::O_CLOEXEC, proc)
     }
 
     /// Create a File or File Handle for `name` under directory `dir_fd` to support `lookup()`.
     fn open_file_or_handle<F>(
         use_handle: bool,
         use_mntid: bool,
-        dir_fd: RawFd,
+        dir_fd: &impl AsRawFd,
         name: &CStr,
         mount_fds: &MountFds,
         reopen_dir: F,
@@ -941,7 +633,7 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
                 }
             }
             InodeHandle::Handle(h) => InodeStat {
-                stat: Self::stat_fd(dir_fd, Some(name))?,
+                stat: stat_fd(dir_fd, Some(name))?,
                 mnt_id: h.mount_id(),
             },
         };
@@ -991,16 +683,16 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
         let (handle, st, id) = Self::open_file_or_handle(
             self.cfg.inode_file_handles,
             self.cfg.enable_mntid,
-            dir_file.as_raw_fd(),
+            &dir_file,
             name,
             &self.mount_fds,
-            |fd, flags, mode| Self::open_proc_file(&self.proc_self_fd, fd, flags, mode),
+            |fd, flags, mode| Self::open_proc_file(&self.proc_self_fd, &fd, flags, mode),
         )?;
 
         // Note that this will always be `None` if `cfg.inode_file_handles` is false, but we only
         // really need this alt key when we do not have an `O_PATH` fd open for every inode.  So if
         // `cfg.inode_file_handles` is false, we do not need this key anyway.
-        let handle_opt = handle.handle();
+        let handle_opt = handle.file_handle();
 
         // Whether to enable file DAX according to the value of dax_file_size
         let mut attr_flags: u32 = 0;
@@ -1159,7 +851,7 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
                 "fuse: {:?}: invalid `offset` + `size` ({}+{}) overflows u64::MAX",
                 opcode, offset, size
             );
-            return Err(io::Error::from_raw_os_error(libc::EINVAL));
+            return Err(einval());
         }
 
         match opcode {
@@ -1317,10 +1009,6 @@ fn drop_cap_fsetid() -> io::Result<Option<CapFsetid>> {
     Ok(Some(CapFsetid {}))
 }
 
-fn ebadf() -> io::Error {
-    io::Error::from_raw_os_error(libc::EBADF)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1332,56 +1020,9 @@ mod tests {
     use std::fs::File;
     use std::io::Read;
     use std::ops::Deref;
+    use std::os::unix::io::FromRawFd;
     use std::os::unix::prelude::MetadataExt;
     use vmm_sys_util::{tempdir::TempDir, tempfile::TempFile};
-
-    impl UniqueInodeGenerator {
-        fn decode_unique_inode(&self, inode: libc::ino64_t) -> io::Result<InodeId> {
-            if inode > VFS_MAX_INO {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    format!("the inode {} excess {}", inode, VFS_MAX_INO),
-                ));
-            }
-
-            let dev_mntid = (inode >> 47) as u8;
-            if dev_mntid == u8::MAX {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    format!("invalid dev and mntid {} excess 255", dev_mntid),
-                ));
-            }
-
-            let mut dev: libc::dev_t = 0;
-            let mut mnt: u64 = 0;
-
-            let mut found = false;
-            let id_map_guard = self.dev_mntid_map.lock().unwrap();
-            for (k, v) in id_map_guard.iter() {
-                if *v == dev_mntid {
-                    found = true;
-                    dev = k.0;
-                    mnt = k.1;
-                    break;
-                }
-            }
-
-            if !found {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    format!(
-                        "invalid dev and mntid {},there is no record in memory ",
-                        dev_mntid
-                    ),
-                ));
-            }
-            Ok(InodeId {
-                ino: inode & MAX_HOST_INO,
-                dev,
-                mnt,
-            })
-        }
-    }
 
     fn prepare_passthroughfs() -> PassthroughFs {
         let source = TempDir::new().expect("Cannot create temporary directory.");
@@ -1523,30 +1164,6 @@ mod tests {
     }
 
     #[test]
-    fn test_is_safe_inode() {
-        let mode = libc::S_IFREG;
-        assert!(is_safe_inode(mode));
-
-        let mode = libc::S_IFDIR;
-        assert!(is_safe_inode(mode));
-
-        let mode = libc::S_IFBLK;
-        assert!(!is_safe_inode(mode));
-
-        let mode = libc::S_IFCHR;
-        assert!(!is_safe_inode(mode));
-
-        let mode = libc::S_IFIFO;
-        assert!(!is_safe_inode(mode));
-
-        let mode = libc::S_IFLNK;
-        assert!(!is_safe_inode(mode));
-
-        let mode = libc::S_IFSOCK;
-        assert!(!is_safe_inode(mode));
-    }
-
-    #[test]
     fn test_get_writeback_open_flags() {
         // prepare a fs with writeback cache and open being true, so O_WRONLY should be promoted to
         // O_RDWR, as writeback may read files even if file being opened with write-only. And
@@ -1671,15 +1288,6 @@ mod tests {
         let mut buf = [0; 4];
         let n = f.read(&mut buf).unwrap();
         assert_eq!(n, 0);
-    }
-
-    #[test]
-    fn test_is_dir() {
-        let mode = libc::S_IFREG;
-        assert!(!is_dir(mode));
-
-        let mode = libc::S_IFDIR;
-        assert!(is_dir(mode));
     }
 
     #[test]
@@ -1855,113 +1463,6 @@ mod tests {
             m.insert(Arc::new(inode_data));
             let inode = fs.allocate_inode_locked(&m, &id, None).unwrap();
             assert_eq!(inode & MAX_HOST_INO, 2);
-        }
-    }
-    #[test]
-    fn test_generate_unique_inode() {
-        // use normal inode format
-        {
-            let generator = UniqueInodeGenerator::new();
-
-            let inode_alt_key = InodeId {
-                ino: 1,
-                dev: 0,
-                mnt: 0,
-            };
-            let unique_inode = generator.get_unique_inode(&inode_alt_key).unwrap();
-            // 56 bit = 0
-            // 55~48 bit = 0000 0001
-            // 47~1 bit  = 1
-            assert_eq!(unique_inode, 0x00800000000001);
-            let expect_inode_alt_key = generator.decode_unique_inode(unique_inode).unwrap();
-            assert_eq!(expect_inode_alt_key, inode_alt_key);
-
-            let inode_alt_key = InodeId {
-                ino: 1,
-                dev: 0,
-                mnt: 1,
-            };
-            let unique_inode = generator.get_unique_inode(&inode_alt_key).unwrap();
-            // 56 bit = 0
-            // 55~48 bit = 0000 0010
-            // 47~1 bit  = 1
-            assert_eq!(unique_inode, 0x01000000000001);
-            let expect_inode_alt_key = generator.decode_unique_inode(unique_inode).unwrap();
-            assert_eq!(expect_inode_alt_key, inode_alt_key);
-
-            let inode_alt_key = InodeId {
-                ino: 2,
-                dev: 0,
-                mnt: 1,
-            };
-            let unique_inode = generator.get_unique_inode(&inode_alt_key).unwrap();
-            // 56 bit = 0
-            // 55~48 bit = 0000 0010
-            // 47~1 bit  = 2
-            assert_eq!(unique_inode, 0x01000000000002);
-            let expect_inode_alt_key = generator.decode_unique_inode(unique_inode).unwrap();
-            assert_eq!(expect_inode_alt_key, inode_alt_key);
-
-            let inode_alt_key = InodeId {
-                ino: MAX_HOST_INO,
-                dev: 0,
-                mnt: 1,
-            };
-            let unique_inode = generator.get_unique_inode(&inode_alt_key).unwrap();
-            // 56 bit = 0
-            // 55~48 bit = 0000 0010
-            // 47~1 bit  = 0x7fffffffffff
-            assert_eq!(unique_inode, 0x017fffffffffff);
-            let expect_inode_alt_key = generator.decode_unique_inode(unique_inode).unwrap();
-            assert_eq!(expect_inode_alt_key, inode_alt_key);
-        }
-
-        // use virtual inode format
-        {
-            let generator = UniqueInodeGenerator::new();
-            let inode_alt_key = InodeId {
-                ino: MAX_HOST_INO + 1,
-                dev: u64::MAX,
-                mnt: u64::MAX,
-            };
-            let unique_inode = generator.get_unique_inode(&inode_alt_key).unwrap();
-            // 56 bit = 1
-            // 55~48 bit = 0000 0001
-            // 47~1 bit  = 2 virtual inode start from 2~MAX_HOST_INO
-            assert_eq!(unique_inode, 0x80800000000002);
-
-            let inode_alt_key = InodeId {
-                ino: MAX_HOST_INO + 2,
-                dev: u64::MAX,
-                mnt: u64::MAX,
-            };
-            let unique_inode = generator.get_unique_inode(&inode_alt_key).unwrap();
-            // 56 bit = 1
-            // 55~48 bit = 0000 0001
-            // 47~1 bit  = 3
-            assert_eq!(unique_inode, 0x80800000000003);
-
-            let inode_alt_key = InodeId {
-                ino: MAX_HOST_INO + 3,
-                dev: u64::MAX,
-                mnt: 0,
-            };
-            let unique_inode = generator.get_unique_inode(&inode_alt_key).unwrap();
-            // 56 bit = 1
-            // 55~48 bit = 0000 0010
-            // 47~1 bit  = 4
-            assert_eq!(unique_inode, 0x81000000000004);
-
-            let inode_alt_key = InodeId {
-                ino: u64::MAX,
-                dev: u64::MAX,
-                mnt: u64::MAX,
-            };
-            let unique_inode = generator.get_unique_inode(&inode_alt_key).unwrap();
-            // 56 bit = 1
-            // 55~48 bit = 0000 0001
-            // 47~1 bit  = 5
-            assert_eq!(unique_inode, 0x80800000000005);
         }
     }
 
