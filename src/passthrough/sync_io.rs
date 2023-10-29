@@ -31,11 +31,14 @@ use crate::transport::FsCacheReqHandler;
 impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
     fn open_inode(&self, inode: Inode, flags: i32) -> io::Result<File> {
         let new_flags = self.get_writeback_open_flags(flags);
-
         let data = self.inode_map.get(inode)?;
-        let file = data.get_file()?;
-
-        Self::open_proc_file(&self.proc_self_fd, &file, new_flags, data.mode)
+        if !is_safe_inode(data.mode) {
+            Err(ebadf())
+        } else {
+            // TODO: optimize
+            let file = data.get_file()?;
+            reopen_fd_through_proc(&file, new_flags | libc::O_CLOEXEC, &self.proc_self_fd)
+        }
     }
 
     /// Check the HandleData flags against the flags from the current request

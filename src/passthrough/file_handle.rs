@@ -13,8 +13,8 @@ use std::sync::Arc;
 
 use vmm_sys_util::fam::{FamStruct, FamStructWrapper};
 
-use super::mount_fd::{MountFd, MountFds, MountId};
-use super::util::enosys;
+use super::mount_fd::{MPRResult, MountFd, MountFds, MountId};
+use crate::api::EMPTY_CSTR;
 
 /// An arbitrary maximum size for CFileHandle::f_handle.
 ///
@@ -243,6 +243,33 @@ impl FileHandle {
             handle: c_fh,
         }))
     }
+
+    /// Create a file handle from a `fd`.
+    /// This is a wrapper around `from_name_at()` and so has the same interface.
+    pub fn from_fd(fd: &impl AsRawFd) -> io::Result<Option<Self>> {
+        // Safe because this is a constant value and a valid C string.
+        let empty_path = unsafe { CStr::from_bytes_with_nul_unchecked(EMPTY_CSTR) };
+        Self::from_name_at(fd, empty_path)
+    }
+
+    /// Return an openable copy of the file handle by ensuring that `mount_fd` contains a valid fd
+    /// for the mount the file handle is for.
+    ///
+    /// `reopen_fd` will be invoked to duplicate an `O_PATH` fd with custom `libc::open()` flags.
+    pub fn into_openable<F>(
+        self,
+        mount_fds: &MountFds,
+        reopen_fd: F,
+    ) -> MPRResult<OpenableFileHandle>
+    where
+        F: FnOnce(RawFd, libc::c_int, u32) -> io::Result<File>,
+    {
+        let mount_fd = mount_fds.get(self.mnt_id, reopen_fd)?;
+        Ok(OpenableFileHandle {
+            handle: Arc::new(self),
+            mount_fd,
+        })
+    }
 }
 
 pub struct OpenableFileHandle {
@@ -264,39 +291,6 @@ impl Debug for OpenableFileHandle {
 }
 
 impl OpenableFileHandle {
-    /// Create a file handle for the given file.
-    ///
-    /// Also ensure that `mount_fds` contains a valid fd for the mount the file is on (so that
-    /// `handle.open_with_mount_fds()` will work).
-    ///
-    /// If `path` is empty, `reopen_dir` may be invoked to duplicate `dir` with custom
-    /// `libc::open()` flags.
-    pub fn from_name_at<F>(
-        dir_fd: &impl AsRawFd,
-        path: &CStr,
-        mount_fds: &MountFds,
-        reopen_dir: F,
-    ) -> io::Result<OpenableFileHandle>
-    where
-        F: FnOnce(RawFd, libc::c_int, u32) -> io::Result<File>,
-    {
-        let handle = FileHandle::from_name_at(dir_fd, path)
-            .map_err(|e| {
-                error!("from_name_at failed error {:?}", e);
-                e
-            })?
-            .ok_or_else(enosys)?;
-
-        let mount_fd = mount_fds
-            .get(handle.mnt_id, reopen_dir)
-            .map_err(|e| e.into_inner())?;
-
-        Ok(OpenableFileHandle {
-            handle: Arc::new(handle),
-            mount_fd,
-        })
-    }
-
     /// Open a file from an openable file handle.
     pub fn open(&self, flags: libc::c_int) -> io::Result<File> {
         let ret = unsafe {
@@ -315,10 +309,6 @@ impl OpenableFileHandle {
             error!("open_by_handle_at failed error {:?}", e);
             Err(e)
         }
-    }
-
-    pub fn mount_id(&self) -> MountId {
-        self.handle.mnt_id
     }
 
     pub fn file_handle(&self) -> &Arc<FileHandle> {
@@ -442,30 +432,5 @@ mod tests {
             file_handle.handle.wrapper.as_fam_struct_ref().handle_bytes,
             0
         );
-    }
-
-    #[test]
-    fn test_openable_file_handle() {
-        let uid = getuid();
-        if !uid.is_root() {
-            return;
-        }
-
-        let topdir = env!("CARGO_MANIFEST_DIR");
-        let dir = File::open(topdir).unwrap();
-        let filename = CString::new("build.rs").unwrap();
-        let mount_fds = MountFds::new(None).unwrap();
-
-        let file_handle =
-            OpenableFileHandle::from_name_at(&dir, &filename, &mount_fds, |_fd, _flags, _mode| {
-                File::open(topdir)
-            })
-            .unwrap();
-        assert_eq!(file_handle.handle.mnt_id, file_handle.mount_id());
-
-        let mut file = file_handle.open(libc::O_RDONLY).unwrap();
-        let mut buffer = [0u8; 1024];
-        let res = file.read(&mut buffer).unwrap();
-        assert!(res > 0);
     }
 }
