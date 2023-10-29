@@ -5,7 +5,8 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use super::file_handle::FileHandle;
-use super::{Inode, InodeData, InodeHandle, InodeStat};
+use super::statx::StatExt;
+use super::{Inode, InodeData, InodeHandle};
 
 #[derive(Clone, Copy, Default, PartialOrd, Ord, PartialEq, Eq, Debug)]
 /// Identify an inode in `PassthroughFs` by `InodeId`.
@@ -17,12 +18,11 @@ pub struct InodeId {
 
 impl InodeId {
     #[inline]
-    pub(super) fn from_stat(ist: &InodeStat) -> Self {
-        let st = ist.get_stat();
+    pub(super) fn from_stat(st: &StatExt) -> Self {
         InodeId {
-            ino: st.st_ino,
-            dev: st.st_dev,
-            mnt: ist.get_mnt_id(),
+            ino: st.st.st_ino,
+            dev: st.st.st_dev,
+            mnt: st.mnt_id,
         }
     }
 }
@@ -103,7 +103,7 @@ mod test {
 
     use std::ffi::CStr;
     use std::mem::MaybeUninit;
-    use std::os::unix::io::{AsRawFd, RawFd};
+    use std::os::unix::io::AsRawFd;
     use std::sync::atomic::Ordering;
     use vmm_sys_util::tempfile::TempFile;
 
@@ -127,14 +127,14 @@ mod test {
         }
     }
 
-    fn stat_fd(fd: RawFd) -> io::Result<libc::stat64> {
+    fn stat_fd(fd: &impl AsRawFd) -> io::Result<libc::stat64> {
         let mut st = MaybeUninit::<libc::stat64>::zeroed();
         let null_path = unsafe { CStr::from_bytes_with_nul_unchecked(b"\0") };
 
         // Safe because the kernel will only write data in `st` and we check the return value.
         let res = unsafe {
             libc::fstatat64(
-                fd,
+                fd.as_raw_fd(),
                 null_path.as_ptr(),
                 st.as_mut_ptr(),
                 libc::AT_EMPTY_PATH | libc::AT_SYMLINK_NOFOLLOW,
@@ -156,32 +156,20 @@ mod test {
 
         let inode1: Inode = 3;
         let inode2: Inode = 4;
-        let inode_stat1 = InodeStat {
-            stat: stat_fd(tmpfile1.as_file().as_raw_fd()).unwrap(),
+        let inode_stat1 = StatExt {
+            st: stat_fd(tmpfile1.as_file()).unwrap(),
             mnt_id: 0,
         };
-        let inode_stat2 = InodeStat {
-            stat: stat_fd(tmpfile2.as_file().as_raw_fd()).unwrap(),
+        let inode_stat2 = StatExt {
+            st: stat_fd(tmpfile2.as_file()).unwrap(),
             mnt_id: 0,
         };
         let id1 = InodeId::from_stat(&inode_stat1);
         let id2 = InodeId::from_stat(&inode_stat2);
         let file_or_handle1 = InodeHandle::File(tmpfile1.into_file());
         let file_or_handle2 = InodeHandle::File(tmpfile2.into_file());
-        let data1 = InodeData::new(
-            inode1,
-            file_or_handle1,
-            2,
-            id1,
-            inode_stat1.get_stat().st_mode,
-        );
-        let data2 = InodeData::new(
-            inode2,
-            file_or_handle2,
-            2,
-            id2,
-            inode_stat2.get_stat().st_mode,
-        );
+        let data1 = InodeData::new(inode1, file_or_handle1, 2, id1, inode_stat1.st.st_mode);
+        let data2 = InodeData::new(inode2, file_or_handle2, 2, id2, inode_stat2.st.st_mode);
         let data1 = Arc::new(data1);
         let data2 = Arc::new(data2);
 

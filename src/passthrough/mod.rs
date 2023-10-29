@@ -30,8 +30,12 @@ use vm_memory::{bitmap::BitmapSlice, ByteValued};
 pub use self::config::{CachePolicy, Config};
 use self::file_handle::{FileHandle, OpenableFileHandle};
 use self::inode_store::{InodeId, InodeStore};
-use self::mount_fd::{MountFds, MountId};
-use self::util::{ebadf, einval, is_dir, is_safe_inode, openat, stat_fd, UniqueInodeGenerator};
+use self::mount_fd::MountFds;
+use self::statx::{statx, StatExt};
+use self::util::{
+    ebadf, einval, enosys, is_dir, is_safe_inode, openat, reopen_fd_through_proc, stat_fd,
+    UniqueInodeGenerator,
+};
 use crate::abi::fuse_abi as fuse;
 use crate::abi::fuse_abi::Opcode;
 use crate::api::filesystem::Entry;
@@ -39,7 +43,6 @@ use crate::api::{
     validate_path_component, BackendFileSystem, CURRENT_DIR_CSTR, EMPTY_CSTR, PARENT_DIR_CSTR,
     PROC_SELF_FD_CSTR, SLASH_ASCII, VFS_MAX_INO,
 };
-use crate::passthrough::util::reopen_fd_through_proc;
 
 #[cfg(feature = "async-io")]
 mod async_io;
@@ -57,24 +60,6 @@ type Handle = u64;
 
 /// Maximum host inode number supported by passthroughfs
 const MAX_HOST_INO: u64 = 0x7fff_ffff_ffff;
-
-#[derive(Clone, Copy)]
-struct InodeStat {
-    stat: libc::stat64,
-    mnt_id: MountId,
-}
-
-impl InodeStat {
-    #[inline]
-    pub fn get_stat(&self) -> libc::stat64 {
-        self.stat
-    }
-
-    #[inline]
-    fn get_mnt_id(&self) -> MountId {
-        self.mnt_id
-    }
-}
 
 /**
  * Represents the file associated with an inode (`InodeData`).
@@ -352,14 +337,14 @@ pub struct PassthroughFs<S: BitmapSlice + Send + Sync = ()> {
     // do with an fd opened with this flag.
     inode_map: InodeMap,
     next_inode: AtomicU64,
-    // Use to generate unique inode
-    ino_allocator: UniqueInodeGenerator,
 
     // File descriptors for open files and directories. Unlike the fds in `inodes`, these _can_ be
     // used for reading and writing data.
     handle_map: HandleMap,
     next_handle: AtomicU64,
 
+    // Use to generate unique inode
+    ino_allocator: UniqueInodeGenerator,
     // Maps mount IDs to an open FD on the respective ID for the purpose of open_by_handle_at().
     mount_fds: MountFds,
 
@@ -463,22 +448,17 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
     pub fn import(&self) -> io::Result<()> {
         let root = CString::new(self.cfg.root_dir.as_str()).expect("CString::new failed");
 
-        let (handle, st, id) = Self::open_file_or_handle(
-            self.cfg.inode_file_handles,
-            self.cfg.enable_mntid,
-            &libc::AT_FDCWD,
-            &root,
-            &self.mount_fds,
-            |fd, flags, _mode| {
-                let pathname = CString::new(format!("{fd}"))
-                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-                Self::open_file(&self.proc_self_fd, &pathname, flags, 0)
-            },
-        )
-        .map_err(|e| {
-            error!("fuse: import: failed to get file or handle: {:?}", e);
-            e
-        })?;
+        let (path_fd, handle_opt, st) = Self::open_file_and_handle(self, &libc::AT_FDCWD, &root)
+            .map_err(|e| {
+                error!("fuse: import: failed to get file or handle: {:?}", e);
+                e
+            })?;
+        let id = InodeId::from_stat(&st);
+        let handle = if let Some(h) = handle_opt {
+            InodeHandle::Handle(self.to_openable_handle(h)?)
+        } else {
+            InodeHandle::File(path_fd)
+        };
 
         // Safe because this doesn't modify any memory and there is no need to check the return
         // value because this system call always succeeds. We need to clear the umask here because
@@ -491,7 +471,7 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
             handle,
             2,
             id,
-            st.get_stat().st_mode,
+            st.st.st_mode,
         )));
 
         Ok(())
@@ -540,10 +520,6 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
         Self::readlinkat(self.proc_self_fd.as_raw_fd(), &pathname)
     }
 
-    fn stat(dir: &impl AsRawFd, path: Option<&CStr>) -> io::Result<libc::stat64> {
-        stat_fd(dir, path)
-    }
-
     fn create_file_excl(
         dir: &impl AsRawFd,
         pathname: &CStr,
@@ -569,81 +545,50 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
         openat(dfd, pathname, flags, mode)
     }
 
-    fn open_proc_file(proc: &File, fd: &impl AsRawFd, flags: i32, mode: u32) -> io::Result<File> {
-        if !is_safe_inode(mode) {
-            return Err(ebadf());
-        }
+    fn open_file_restricted(
+        &self,
+        dir: &impl AsRawFd,
+        pathname: &CStr,
+        flags: i32,
+        mode: u32,
+    ) -> io::Result<File> {
+        let flags = libc::O_NOFOLLOW | libc::O_CLOEXEC | flags;
 
-        reopen_fd_through_proc(fd, flags | libc::O_CLOEXEC, proc)
+        // TODO
+        //if self.os_facts.has_openat2 {
+        //    oslib::do_open_relative_to(dir, pathname, flags, mode)
+        //} else {
+        openat(dir, pathname, flags, mode)
+        //}
     }
 
     /// Create a File or File Handle for `name` under directory `dir_fd` to support `lookup()`.
-    fn open_file_or_handle<F>(
-        use_handle: bool,
-        use_mntid: bool,
-        dir_fd: &impl AsRawFd,
+    fn open_file_and_handle(
+        &self,
+        dir: &impl AsRawFd,
         name: &CStr,
-        mount_fds: &MountFds,
-        reopen_dir: F,
-    ) -> io::Result<(InodeHandle, InodeStat, InodeId)>
-    where
-        F: FnOnce(RawFd, libc::c_int, u32) -> io::Result<File>,
-    {
-        let handle = if use_handle {
-            OpenableFileHandle::from_name_at(dir_fd, name, mount_fds, reopen_dir)
-        } else {
-            Err(io::Error::from_raw_os_error(libc::ENOTSUP))
-        };
+    ) -> io::Result<(File, Option<FileHandle>, StatExt)> {
+        let path_file = self.open_file_restricted(dir, name, libc::O_PATH, 0)?;
+        let st = statx(&path_file, None)?;
+        let handle = FileHandle::from_fd(&path_file)?;
 
-        // Ignore errors, because having a handle is optional
-        let handle = if let Ok(h) = handle {
-            InodeHandle::Handle(Arc::new(h))
-        } else {
-            let f = Self::open_file(
-                dir_fd,
-                name,
-                libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-                0,
-            )?;
-
-            InodeHandle::File(f)
-        };
-
-        let inode_stat = match &handle {
-            InodeHandle::File(f) => {
-                // Count mount ID as part of alt key if use_mntid is true. Note that using
-                // name_to_handle_at() to get mntid is kind of expensive in Lookup intensive
-                // workloads, e.g. when cache is none and accessing lots of files.
-                //
-                // Some filesystems don't support file handle, for example overlayfs mounted
-                // without index feature, if so just use mntid 0 in that case.
-                //
-                // TODO: use statx(2) to query mntid when 5.8 kernel or later are widely used.
-                let mnt_id = if use_mntid {
-                    match FileHandle::from_name_at(dir_fd, name) {
-                        Ok(Some(h)) => h.mnt_id,
-                        _ => 0,
-                    }
-                } else {
-                    0
-                };
-                InodeStat {
-                    stat: Self::stat(f, None)?,
-                    mnt_id,
-                }
-            }
-            InodeHandle::Handle(h) => InodeStat {
-                stat: stat_fd(dir_fd, Some(name))?,
-                mnt_id: h.mount_id(),
-            },
-        };
-
-        let id = InodeId::from_stat(&inode_stat);
-
-        Ok((handle, inode_stat, id))
+        return Ok((path_file, handle, st));
     }
 
-    fn allocate_inode_locked(
+    fn to_openable_handle(&self, fh: FileHandle) -> io::Result<Arc<OpenableFileHandle>> {
+        fh.into_openable(&self.mount_fds, |fd, flags, _mode| {
+            reopen_fd_through_proc(&fd, flags, &self.proc_self_fd)
+        })
+        .map(|v| Arc::new(v))
+        .map_err(|e| {
+            if !e.silent() {
+                error!("{}", e);
+            }
+            e.into_inner()
+        })
+    }
+
+    fn allocate_inode(
         &self,
         inodes: &InodeStore,
         id: &InodeId,
@@ -656,7 +601,7 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
                 .unwrap_or_else(|| self.next_inode.fetch_add(1, Ordering::Relaxed)))
         } else {
             let inode = if id.ino > MAX_HOST_INO {
-                // Prefer look for previous mappings from memory
+                // Prefer looking for previous mappings from memory
                 match InodeMap::get_inode_locked(inodes, id, handle_opt) {
                     Some(ino) => ino,
                     None => self.ino_allocator.get_unique_inode(id)?,
@@ -680,35 +625,12 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
 
         let dir = self.inode_map.get(parent)?;
         let dir_file = dir.get_file()?;
-        let (handle, st, id) = Self::open_file_or_handle(
-            self.cfg.inode_file_handles,
-            self.cfg.enable_mntid,
-            &dir_file,
-            name,
-            &self.mount_fds,
-            |fd, flags, mode| Self::open_proc_file(&self.proc_self_fd, &fd, flags, mode),
-        )?;
-
-        // Note that this will always be `None` if `cfg.inode_file_handles` is false, but we only
-        // really need this alt key when we do not have an `O_PATH` fd open for every inode.  So if
-        // `cfg.inode_file_handles` is false, we do not need this key anyway.
-        let handle_opt = handle.file_handle();
-
-        // Whether to enable file DAX according to the value of dax_file_size
-        let mut attr_flags: u32 = 0;
-        if let Some(dax_file_size) = self.cfg.dax_file_size {
-            // st.stat.st_size is i64
-            if self.perfile_dax.load(Ordering::Relaxed)
-                && st.stat.st_size >= 0x0
-                && st.stat.st_size as u64 >= dax_file_size
-            {
-                attr_flags |= fuse::FUSE_ATTR_DAX;
-            }
-        }
+        let (path_fd, handle_opt, st) = Self::open_file_and_handle(self, &dir_file, name)?;
+        let id = InodeId::from_stat(&st);
 
         let mut found = None;
         'search: loop {
-            match self.inode_map.get_alt(&id, handle_opt) {
+            match self.inode_map.get_alt(&id, handle_opt.as_ref()) {
                 // No existing entry found
                 None => break 'search,
                 Some(data) => {
@@ -737,6 +659,12 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
         let inode = if let Some(v) = found {
             v
         } else {
+            let handle = if let Some(h) = handle_opt.clone() {
+                InodeHandle::Handle(self.to_openable_handle(h)?)
+            } else {
+                InodeHandle::File(path_fd)
+            };
+
             // Write guard get_alt_locked() and insert_lock() to avoid race conditions.
             let mut inodes = self.inode_map.get_map_mut();
 
@@ -744,13 +672,15 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
             // racing thread already added an inode with the same id while we're not holding
             // the lock. If so just use the newly added inode, otherwise the inode will be replaced
             // and results in EBADF.
-            match InodeMap::get_alt_locked(inodes.deref(), &id, handle_opt) {
+            match InodeMap::get_alt_locked(inodes.deref(), &id, handle_opt.as_ref()) {
                 Some(data) => {
+                    // An inode was added concurrently while we did not hold a lock on
+                    // `self.inodes_map`, so we use that instead. `handle` will be dropped.
                     data.refcount.fetch_add(1, Ordering::Relaxed);
                     data.inode
                 }
                 None => {
-                    let inode = self.allocate_inode_locked(inodes.deref(), &id, handle_opt)?;
+                    let inode = self.allocate_inode(inodes.deref(), &id, handle_opt.as_ref())?;
 
                     if inode > VFS_MAX_INO {
                         error!("fuse: max inode number reached: {}", VFS_MAX_INO);
@@ -762,23 +692,35 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
 
                     InodeMap::insert_locked(
                         inodes.deref_mut(),
-                        Arc::new(InodeData::new(inode, handle, 1, id, st.get_stat().st_mode)),
+                        Arc::new(InodeData::new(inode, handle, 1, id, st.st.st_mode)),
                     );
                     inode
                 }
             }
         };
 
-        let attr = st.get_stat();
-        let (entry_timeout, attr_timeout) = if is_dir(attr.st_mode) {
+        let (entry_timeout, attr_timeout) = if is_dir(st.st.st_mode) {
             (self.dir_entry_timeout, self.dir_attr_timeout)
         } else {
             (self.cfg.entry_timeout, self.cfg.attr_timeout)
         };
+
+        // Whether to enable file DAX according to the value of dax_file_size
+        let mut attr_flags: u32 = 0;
+        if let Some(dax_file_size) = self.cfg.dax_file_size {
+            // st.stat.st_size is i64
+            if self.perfile_dax.load(Ordering::Relaxed)
+                && st.st.st_size >= 0x0
+                && st.st.st_size as u64 >= dax_file_size
+            {
+                attr_flags |= fuse::FUSE_ATTR_DAX;
+            }
+        }
+
         Ok(Entry {
             inode,
             generation: 0,
-            attr,
+            attr: st.st,
             attr_flags,
             attr_timeout,
             entry_timeout,
@@ -1426,7 +1368,7 @@ mod tests {
             };
 
             // Default
-            let inode = fs.allocate_inode_locked(&m, &id, None).unwrap();
+            let inode = fs.allocate_inode(&m, &id, None).unwrap();
             assert_eq!(inode, 2);
         }
 
@@ -1440,7 +1382,7 @@ mod tests {
                 mnt: 1,
             };
             // direct return host inode 12345
-            let inode = fs.allocate_inode_locked(&m, &id, None).unwrap();
+            let inode = fs.allocate_inode(&m, &id, None).unwrap();
             assert_eq!(inode & MAX_HOST_INO, 12345)
         }
 
@@ -1454,14 +1396,14 @@ mod tests {
                 mnt: 1,
             };
             // allocate a virtual inode
-            let inode = fs.allocate_inode_locked(&m, &id, None).unwrap();
+            let inode = fs.allocate_inode(&m, &id, None).unwrap();
             assert_eq!(inode & MAX_HOST_INO, 2);
             let file = TempFile::new().expect("Cannot create temporary file.");
             let mode = file.as_file().metadata().unwrap().mode();
             let inode_data =
                 InodeData::new(inode, InodeHandle::File(file.into_file()), 1, id, mode);
             m.insert(Arc::new(inode_data));
-            let inode = fs.allocate_inode_locked(&m, &id, None).unwrap();
+            let inode = fs.allocate_inode(&m, &id, None).unwrap();
             assert_eq!(inode & MAX_HOST_INO, 2);
         }
     }

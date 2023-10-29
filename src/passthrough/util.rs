@@ -44,9 +44,9 @@ impl UniqueInodeGenerator {
         }
     }
 
-    pub fn get_unique_inode(&self, alt_key: &InodeId) -> io::Result<libc::ino64_t> {
+    pub fn get_unique_inode(&self, id: &InodeId) -> io::Result<libc::ino64_t> {
         let unique_id = {
-            let id: DevMntIDPair = DevMntIDPair(alt_key.dev, alt_key.mnt);
+            let id: DevMntIDPair = DevMntIDPair(id.dev, id.mnt);
             let mut id_map_guard = self.dev_mntid_map.lock().unwrap();
             match id_map_guard.entry(id) {
                 btree_map::Entry::Occupied(v) => *v.get(),
@@ -64,8 +64,8 @@ impl UniqueInodeGenerator {
             }
         };
 
-        let inode = if alt_key.ino <= MAX_HOST_INO {
-            alt_key.ino
+        let inode = if id.ino <= MAX_HOST_INO {
+            id.ino
         } else {
             if self.next_virtual_inode.load(Ordering::Relaxed) > MAX_HOST_INO {
                 return Err(io::Error::new(
