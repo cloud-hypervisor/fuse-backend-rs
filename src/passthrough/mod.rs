@@ -526,7 +526,7 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
         // Be careful:
         // - readlink() does not append a terminating null byte to buf
         // - OsString instances are not NUL terminated
-        return Ok(PathBuf::from(OsString::from_vec(buf)));
+        Ok(PathBuf::from(OsString::from_vec(buf)))
     }
 
     /// Get the file pathname corresponding to the Inode
@@ -621,8 +621,8 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
                 // TODO: use statx(2) to query mntid when 5.8 kernel or later are widely used.
                 let mnt_id = if use_mntid {
                     match FileHandle::from_name_at(dir_fd, name) {
-                        Ok(h) => h.mnt_id,
-                        Err(_) => 0,
+                        Ok(Some(h)) => h.mnt_id,
+                        _ => 0,
                     }
                 } else {
                     0

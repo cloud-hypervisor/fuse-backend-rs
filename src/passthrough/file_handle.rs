@@ -14,6 +14,7 @@ use std::sync::Arc;
 use vmm_sys_util::fam::{FamStruct, FamStructWrapper};
 
 use super::mount_fd::{MountFd, MountFds, MountId};
+use super::util::enosys;
 
 /// An arbitrary maximum size for CFileHandle::f_handle.
 ///
@@ -174,7 +175,15 @@ extern "C" {
 
 impl FileHandle {
     /// Create a file handle for the given file.
-    pub fn from_name_at(dir_fd: &impl AsRawFd, path: &CStr) -> io::Result<Self> {
+    ///
+    /// Return `Ok(None)` if no file handle can be generated for this file: Either because the
+    /// filesystem does not support it, or because it would require a larger file handle than we
+    /// can store.  These are not intermittent failures, i.e. if this function returns `Ok(None)`
+    /// for a specific file, it will always return `Ok(None)` for it.  Conversely, if this function
+    /// returns `Ok(Some)` at some point, it will never return `Ok(None)` later.
+    ///
+    /// Return an `io::Error` for all other errors.
+    pub fn from_name_at(dir_fd: &impl AsRawFd, path: &CStr) -> io::Result<Option<Self>> {
         let mut mount_id: libc::c_int = 0;
         let mut c_fh = CFileHandle::new(0);
 
@@ -194,10 +203,14 @@ impl FileHandle {
             )
         };
         if ret == -1 {
-            let e = io::Error::last_os_error();
-            // unwrap is safe as e is obtained from last_os_error().
-            if e.raw_os_error().unwrap() != libc::EOVERFLOW {
-                return Err(e);
+            let err = io::Error::last_os_error();
+            match err.raw_os_error() {
+                // Got the needed buffer size.
+                Some(libc::EOVERFLOW) => {}
+                // Filesystem does not support file handles
+                Some(libc::EOPNOTSUPP) => return Ok(None),
+                // Other error
+                _ => return Err(err),
             }
         } else {
             return Err(io::Error::from(io::ErrorKind::InvalidData));
@@ -221,14 +234,14 @@ impl FileHandle {
                 libc::AT_EMPTY_PATH,
             )
         };
-        if ret == 0 {
-            Ok(FileHandle {
-                mnt_id: mount_id as u64,
-                handle: c_fh,
-            })
-        } else {
-            Err(io::Error::last_os_error())
+        if ret == -1 {
+            return Err(io::Error::last_os_error());
         }
+
+        Ok(Some(FileHandle {
+            mnt_id: mount_id as MountId,
+            handle: c_fh,
+        }))
     }
 }
 
@@ -243,7 +256,7 @@ impl Debug for OpenableFileHandle {
         write!(
             f,
             "Openable file handle: mountfd {}, type {}, len {}",
-            self.mount_fd.file().as_raw_fd(),
+            self.mount_fd.as_raw_fd(),
             fh.handle_type,
             fh.handle_bytes
         )
@@ -267,10 +280,12 @@ impl OpenableFileHandle {
     where
         F: FnOnce(RawFd, libc::c_int, u32) -> io::Result<File>,
     {
-        let handle = FileHandle::from_name_at(dir_fd, path).map_err(|e| {
-            error!("from_name_at failed error {:?}", e);
-            e
-        })?;
+        let handle = FileHandle::from_name_at(dir_fd, path)
+            .map_err(|e| {
+                error!("from_name_at failed error {:?}", e);
+                e
+            })?
+            .ok_or_else(enosys)?;
 
         let mount_fd = mount_fds
             .get(handle.mnt_id, reopen_dir)
@@ -286,7 +301,7 @@ impl OpenableFileHandle {
     pub fn open(&self, flags: libc::c_int) -> io::Result<File> {
         let ret = unsafe {
             open_by_handle_at(
-                self.mount_fd.file().as_raw_fd(),
+                self.mount_fd.as_raw_fd(),
                 self.handle.handle.wrapper.as_fam_struct_ptr(),
                 flags,
             )
@@ -314,6 +329,7 @@ impl OpenableFileHandle {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use nix::unistd::getuid;
     use std::ffi::CString;
     use std::io::Read;
 
@@ -412,8 +428,10 @@ mod tests {
         let dir = File::open(topdir).unwrap();
         let filename = CString::new("build.rs").unwrap();
 
-        let dir_handle = FileHandle::from_name_at(&dir, &CString::new("").unwrap()).unwrap();
-        let file_handle = FileHandle::from_name_at(&dir, &filename).unwrap();
+        let dir_handle = FileHandle::from_name_at(&dir, &CString::new("").unwrap())
+            .unwrap()
+            .unwrap();
+        let file_handle = FileHandle::from_name_at(&dir, &filename).unwrap().unwrap();
 
         assert_eq!(dir_handle.mnt_id, file_handle.mnt_id);
         assert_ne!(
@@ -428,6 +446,11 @@ mod tests {
 
     #[test]
     fn test_openable_file_handle() {
+        let uid = getuid();
+        if !uid.is_root() {
+            return;
+        }
+
         let topdir = env!("CARGO_MANIFEST_DIR");
         let dir = File::open(topdir).unwrap();
         let filename = CString::new("build.rs").unwrap();

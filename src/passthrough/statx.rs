@@ -82,7 +82,10 @@ impl SafeStatXAccess for statx_st {
 }
 
 fn get_mount_id(dir: &impl AsRawFd, path: &CStr) -> Option<MountId> {
-    FileHandle::from_name_at(dir, path).map(|v| v.mnt_id).ok()
+    match FileHandle::from_name_at(dir, path) {
+        Ok(Some(v)) => Some(v.mnt_id),
+        _ => None,
+    }
 }
 
 // Only works on Linux, and libc::SYS_statx is only defined for these
