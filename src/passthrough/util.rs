@@ -216,6 +216,10 @@ pub fn einval() -> io::Error {
     io::Error::from_raw_os_error(libc::EINVAL)
 }
 
+pub fn enosys() -> io::Error {
+    io::Error::from_raw_os_error(libc::ENOSYS)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

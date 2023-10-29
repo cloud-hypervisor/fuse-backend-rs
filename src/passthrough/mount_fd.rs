@@ -5,25 +5,26 @@ use std::collections::{HashMap, HashSet};
 use std::ffi::CString;
 use std::fs::File;
 use std::io::{self, Read, Seek};
-use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
+use std::os::unix::io::{AsRawFd, RawFd};
 use std::sync::{Arc, Mutex, RwLock, Weak};
 
 use super::statx::statx;
-use super::util::einval;
+use super::util::{einval, is_safe_inode};
 
 const MOUNT_INFO_FILE: &str = "/proc/self/mountinfo";
 
+/// Type alias for mount id.
 pub type MountId = u64;
 
 pub struct MountFd {
-    map: Weak<RwLock<HashMap<MountId, Weak<MountFd>>>>,
-    mount_id: MountId,
     file: File,
+    mount_id: MountId,
+    map: Weak<RwLock<HashMap<MountId, Weak<MountFd>>>>,
 }
 
-impl MountFd {
-    pub fn file(&self) -> &File {
-        &self.file
+impl AsRawFd for MountFd {
+    fn as_raw_fd(&self) -> RawFd {
+        self.file.as_raw_fd()
     }
 }
 
@@ -132,15 +133,12 @@ impl MountFds {
                     .prefix(format!("Failed to open mount point \"{mount_point}\"")));
             }
 
-            // Safe because we have just opened this FD
-            let mount_point_file = unsafe { File::from_raw_fd(mount_point_fd) };
-
             // Check the mount point has the expected `mount_id`.
-            let st_mode = self.validate_mount_id(mount_id, &mount_point_file, &mount_point)?;
+            let st_mode = self.validate_mount_id(mount_id, &mount_point_fd, &mount_point)?;
 
             // Ensure that we can safely reopen `mount_point_path` with `O_RDONLY`
             let file_type = st_mode & libc::S_IFMT;
-            if file_type != libc::S_IFREG && file_type != libc::S_IFDIR {
+            if !is_safe_inode(file_type) {
                 return Err(self
                     .error_for(mount_id, io::Error::from_raw_os_error(libc::EIO))
                     .set_desc(format!(
@@ -150,7 +148,7 @@ impl MountFds {
 
             // Now that we know that this is a regular file or directory, really open it
             let file = reopen_fd(
-                mount_point_file.as_raw_fd(),
+                mount_point_fd.as_raw_fd(),
                 libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
                 st_mode,
             )
@@ -177,9 +175,9 @@ impl MountFds {
                     file.as_raw_fd(),
                 );
                 let mount_fd = Arc::new(MountFd {
-                    map: Arc::downgrade(&self.map),
-                    mount_id,
                     file,
+                    mount_id,
+                    map: Arc::downgrade(&self.map),
                 });
                 mount_fds_locked.insert(mount_id, Arc::downgrade(&mount_fd));
                 mount_fd
@@ -193,10 +191,10 @@ impl MountFds {
     fn validate_mount_id(
         &self,
         mount_id: MountId,
-        mount_point_file: &File,
+        mount_point_fd: &impl AsRawFd,
         mount_point: &str,
     ) -> MPRResult<libc::mode_t> {
-        let stx = statx(mount_point_file, None).map_err(|e| {
+        let stx = statx(mount_point_fd, None).map_err(|e| {
             self.error_for(mount_id, e)
                 .prefix(format!("Failed to stat mount point \"{mount_point}\""))
         })?;
@@ -449,7 +447,7 @@ mod tests {
         let dir = File::open(topdir).unwrap();
         let filename = CString::new("build.rs").unwrap();
         let mount_fds = MountFds::new(None).unwrap();
-        let handle = FileHandle::from_name_at(&dir, &filename).unwrap();
+        let handle = FileHandle::from_name_at(&dir, &filename).unwrap().unwrap();
 
         // Ensure that `MountFds::get()` works for new entry.
         let fd1 = mount_fds
@@ -466,7 +464,7 @@ mod tests {
         assert_eq!(mount_fds.map.read().unwrap().len(), 1);
 
         // Ensure fd1 and fd2 are the same object.
-        assert_eq!(fd1.file().as_raw_fd(), fd2.file().as_raw_fd());
+        assert_eq!(fd1.as_raw_fd(), fd2.as_raw_fd());
 
         drop(fd1);
         assert_eq!(Arc::strong_count(&fd2), 1);
