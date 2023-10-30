@@ -1,0 +1,11 @@
+# Exclude list for tests that we know are broken in passthrough fs
+#
+generic/002
+generic/184
+generic/426
+generic/434
+generic/467
+generic/471
+generic/477
+generic/591
+generic/633
