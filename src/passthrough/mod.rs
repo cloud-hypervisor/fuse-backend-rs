@@ -813,30 +813,35 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
 
         match opcode {
             // write should not exceed the file size.
-            Opcode::Write if size + offset > file_size => Err(eperm()),
-
-            // fallocate operation should not allocate blocks exceed the file size.
-            //
-            // FALLOC_FL_COLLAPSE_RANGE or FALLOC_FL_INSERT_RANGE mode will change file size which
-            // is not allowed.
-            //
-            // FALLOC_FL_PUNCH_HOLE mode won't change file size, as it must be ORed with
-            // FALLOC_FL_KEEP_SIZE.
-            Opcode::Fallocate
-                if ((mode == 0
-                    || mode == libc::FALLOC_FL_KEEP_SIZE
-                    || mode & libc::FALLOC_FL_ZERO_RANGE != 0)
-                    && size + offset > file_size)
-                    || (mode & libc::FALLOC_FL_COLLAPSE_RANGE != 0
-                        || mode & libc::FALLOC_FL_INSERT_RANGE != 0) =>
-            {
-                Err(eperm())
+            Opcode::Write => {
+                if size + offset > file_size {
+                    return Err(eperm());
+                }
             }
 
-            // setattr operation should be handled in setattr handler, other operations won't
-            // change file size.
-            _ => Ok(()),
+            Opcode::Fallocate => {
+                let op = mode & !(libc::FALLOC_FL_KEEP_SIZE | libc::FALLOC_FL_UNSHARE_RANGE);
+                match op {
+                    // Allocate, punch and zero, must not change file size.
+                    0 | libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_ZERO_RANGE => {
+                        if size + offset > file_size {
+                            return Err(eperm());
+                        }
+                    }
+                    // collapse and insert will change file size, forbid.
+                    libc::FALLOC_FL_COLLAPSE_RANGE | libc::FALLOC_FL_INSERT_RANGE => {
+                        return Err(eperm());
+                    }
+                    // Invalid operation
+                    _ => return Err(einval()),
+                }
+            }
+
+            // setattr operation should be handled in setattr handler.
+            _ => return Err(enosys()),
         }
+
+        Ok(())
     }
 
     fn get_writeback_open_flags(&self, flags: i32) -> i32 {
