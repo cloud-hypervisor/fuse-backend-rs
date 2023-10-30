@@ -8,6 +8,7 @@ use std::ffi::CStr;
 use std::fmt::{Debug, Formatter};
 use std::fs::File;
 use std::io;
+use std::os::fd::AsFd;
 use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
 use std::sync::Arc;
 
@@ -283,7 +284,7 @@ impl Debug for OpenableFileHandle {
         write!(
             f,
             "Openable file handle: mountfd {}, type {}, len {}",
-            self.mount_fd.as_raw_fd(),
+            self.mount_fd.as_fd().as_raw_fd(),
             fh.handle_type,
             fh.handle_bytes
         )
@@ -295,7 +296,7 @@ impl OpenableFileHandle {
     pub fn open(&self, flags: libc::c_int) -> io::Result<File> {
         let ret = unsafe {
             open_by_handle_at(
-                self.mount_fd.as_raw_fd(),
+                self.mount_fd.as_fd().as_raw_fd(),
                 self.handle.handle.wrapper.as_fam_struct_ptr(),
                 flags,
             )

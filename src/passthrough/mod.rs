@@ -18,6 +18,7 @@ use std::fs::File;
 use std::io;
 use std::marker::PhantomData;
 use std::ops::{Deref, DerefMut};
+use std::os::fd::{AsFd, BorrowedFd};
 use std::os::unix::ffi::OsStringExt;
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::path::PathBuf;
@@ -81,6 +82,15 @@ impl AsRawFd for InodeFile<'_> {
         match self {
             Self::Owned(file) => file.as_raw_fd(),
             Self::Ref(file_ref) => file_ref.as_raw_fd(),
+        }
+    }
+}
+
+impl AsFd for InodeFile<'_> {
+    fn as_fd(&self) -> BorrowedFd<'_> {
+        match self {
+            Self::Owned(file) => file.as_fd(),
+            Self::Ref(file_ref) => file_ref.as_fd(),
         }
     }
 }
@@ -268,12 +278,8 @@ impl HandleData {
         (self.lock.lock().unwrap(), &self.file)
     }
 
-    // When making use of the underlying RawFd, the caller must ensure that the Arc<HandleData>
-    // object is within scope. Otherwise it may cause race window to access wrong target fd.
-    // By introducing this method, we could explicitly audit all callers making use of the
-    // underlying RawFd.
-    fn get_handle_raw_fd(&self) -> RawFd {
-        self.file.as_raw_fd()
+    fn borrow_fd(&self) -> BorrowedFd {
+        self.file.as_fd()
     }
 
     fn get_flags(&self) -> u32 {
@@ -977,10 +983,8 @@ mod tests {
     use crate::api::{Vfs, VfsOptions};
     use caps::{CapSet, Capability};
     use log;
-    use std::fs::File;
     use std::io::Read;
     use std::ops::Deref;
-    use std::os::unix::io::FromRawFd;
     use std::os::unix::prelude::MetadataExt;
     use vmm_sys_util::{tempdir::TempDir, tempfile::TempFile};
 
@@ -1231,7 +1235,7 @@ mod tests {
         };
         let (entry, handle, _, _) = fs.create(&ctx, ROOT_ID, &fname, args).unwrap();
         let handle_data = fs.handle_map.get(handle.unwrap(), entry.inode).unwrap();
-        let mut f = unsafe { File::from_raw_fd(handle_data.get_handle_raw_fd()) };
+        let (_guard, mut f) = handle_data.get_file_mut();
         let mut buf = [0; 4];
         // Buggy code return EBADF on read
         let n = f.read(&mut buf).unwrap();
@@ -1244,7 +1248,7 @@ mod tests {
             .open(&ctx, entry.inode, libc::O_WRONLY as u32, 0)
             .unwrap();
         let handle_data = fs.handle_map.get(handle.unwrap(), entry.inode).unwrap();
-        let mut f = unsafe { File::from_raw_fd(handle_data.get_handle_raw_fd()) };
+        let (_guard, mut f) = handle_data.get_file_mut();
         let mut buf = [0; 4];
         let n = f.read(&mut buf).unwrap();
         assert_eq!(n, 0);

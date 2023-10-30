@@ -5,6 +5,7 @@ use std::collections::{HashMap, HashSet};
 use std::ffi::CString;
 use std::fs::File;
 use std::io::{self, Read, Seek};
+use std::os::fd::{AsFd, BorrowedFd};
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::sync::{Arc, Mutex, RwLock, Weak};
 
@@ -22,9 +23,9 @@ pub struct MountFd {
     map: Weak<RwLock<HashMap<MountId, Weak<MountFd>>>>,
 }
 
-impl AsRawFd for MountFd {
-    fn as_raw_fd(&self) -> RawFd {
-        self.file.as_raw_fd()
+impl AsFd for MountFd {
+    fn as_fd(&self) -> BorrowedFd {
+        self.file.as_fd()
     }
 }
 
@@ -464,7 +465,7 @@ mod tests {
         assert_eq!(mount_fds.map.read().unwrap().len(), 1);
 
         // Ensure fd1 and fd2 are the same object.
-        assert_eq!(fd1.as_raw_fd(), fd2.as_raw_fd());
+        assert_eq!(fd1.as_fd().as_raw_fd(), fd2.as_fd().as_raw_fd());
 
         drop(fd1);
         assert_eq!(Arc::strong_count(&fd2), 1);

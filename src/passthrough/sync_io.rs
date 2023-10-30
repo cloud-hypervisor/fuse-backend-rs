@@ -152,7 +152,7 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
                         type_: u32::from(dirent64.d_ty),
                         name,
                     },
-                    data.get_handle_raw_fd(),
+                    data.borrow_fd().as_raw_fd(),
                 )
             };
 
@@ -663,7 +663,7 @@ impl<S: BitmapSlice + Send + Sync> FileSystem for PassthroughFs<S> {
         // Manually implement File::try_clone() by borrowing fd of data.file instead of dup().
         // It's safe because the `data` variable's lifetime spans the whole function,
         // so data.file won't be closed.
-        let f = unsafe { File::from_raw_fd(data.get_handle_raw_fd()) };
+        let f = unsafe { File::from_raw_fd(data.borrow_fd().as_raw_fd()) };
 
         self.check_fd_flags(data, f.as_raw_fd(), flags)?;
 
@@ -690,7 +690,7 @@ impl<S: BitmapSlice + Send + Sync> FileSystem for PassthroughFs<S> {
         // Manually implement File::try_clone() by borrowing fd of data.file instead of dup().
         // It's safe because the `data` variable's lifetime spans the whole function,
         // so data.file won't be closed.
-        let f = unsafe { File::from_raw_fd(data.get_handle_raw_fd()) };
+        let f = unsafe { File::from_raw_fd(data.borrow_fd().as_raw_fd()) };
 
         self.check_fd_flags(data, f.as_raw_fd(), flags)?;
 
@@ -732,7 +732,7 @@ impl<S: BitmapSlice + Send + Sync> FileSystem for PassthroughFs<S> {
         let inode_data = self.inode_map.get(inode)?;
 
         enum Data {
-            Handle(Arc<HandleData>, RawFd),
+            Handle(Arc<HandleData>),
             ProcPath(CString),
         }
 
@@ -745,8 +745,7 @@ impl<S: BitmapSlice + Send + Sync> FileSystem for PassthroughFs<S> {
             // If we have a handle then use it otherwise get a new fd from the inode.
             if let Some(handle) = handle {
                 let hd = self.handle_map.get(handle, inode)?;
-                let fd = hd.get_handle_raw_fd();
-                Data::Handle(hd, fd)
+                Data::Handle(hd)
             } else {
                 let pathname = CString::new(format!("{}", file.as_raw_fd()))
                     .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
@@ -762,7 +761,7 @@ impl<S: BitmapSlice + Send + Sync> FileSystem for PassthroughFs<S> {
             // Safe because this doesn't modify any memory and we check the return value.
             let res = unsafe {
                 match data {
-                    Data::Handle(_, fd) => libc::fchmod(fd, attr.st_mode),
+                    Data::Handle(ref h) => libc::fchmod(h.borrow_fd().as_raw_fd(), attr.st_mode),
                     Data::ProcPath(ref p) => {
                         libc::fchmodat(self.proc_self_fd.as_raw_fd(), p.as_ptr(), attr.st_mode, 0)
                     }
@@ -817,7 +816,9 @@ impl<S: BitmapSlice + Send + Sync> FileSystem for PassthroughFs<S> {
 
             // Safe because this doesn't modify any memory and we check the return value.
             let res = match data {
-                Data::Handle(_, fd) => unsafe { libc::ftruncate(fd, attr.st_size) },
+                Data::Handle(ref h) => unsafe {
+                    libc::ftruncate(h.borrow_fd().as_raw_fd(), attr.st_size)
+                },
                 _ => {
                     // There is no `ftruncateat` so we need to get a new fd and truncate it.
                     let f = self.open_inode(inode, libc::O_NONBLOCK | libc::O_RDWR)?;
@@ -857,7 +858,9 @@ impl<S: BitmapSlice + Send + Sync> FileSystem for PassthroughFs<S> {
 
             // Safe because this doesn't modify any memory and we check the return value.
             let res = match data {
-                Data::Handle(_, fd) => unsafe { libc::futimens(fd, tvs.as_ptr()) },
+                Data::Handle(ref h) => unsafe {
+                    libc::futimens(h.borrow_fd().as_raw_fd(), tvs.as_ptr())
+                },
                 Data::ProcPath(ref p) => unsafe {
                     libc::utimensat(self.proc_self_fd.as_raw_fd(), p.as_ptr(), tvs.as_ptr(), 0)
                 },
@@ -1043,7 +1046,7 @@ impl<S: BitmapSlice + Send + Sync> FileSystem for PassthroughFs<S> {
         // behavior by doing the same thing (dup-ing the fd and then immediately closing it). Safe
         // because this doesn't modify any memory and we check the return values.
         unsafe {
-            let newfd = libc::dup(data.get_handle_raw_fd());
+            let newfd = libc::dup(data.borrow_fd().as_raw_fd());
             if newfd < 0 {
                 return Err(io::Error::last_os_error());
             }
@@ -1064,14 +1067,14 @@ impl<S: BitmapSlice + Send + Sync> FileSystem for PassthroughFs<S> {
         handle: Handle,
     ) -> io::Result<()> {
         let data = self.get_data(handle, inode, libc::O_RDONLY)?;
-        let fd = data.get_handle_raw_fd();
+        let fd = data.borrow_fd();
 
         // Safe because this doesn't modify any memory and we check the return value.
         let res = unsafe {
             if datasync {
-                libc::fdatasync(fd)
+                libc::fdatasync(fd.as_raw_fd())
             } else {
-                libc::fsync(fd)
+                libc::fsync(fd.as_raw_fd())
             }
         };
         if res == 0 {
@@ -1276,7 +1279,7 @@ impl<S: BitmapSlice + Send + Sync> FileSystem for PassthroughFs<S> {
     ) -> io::Result<()> {
         // Let the Arc<HandleData> in scope, otherwise fd may get invalid.
         let data = self.get_data(handle, inode, libc::O_RDWR)?;
-        let fd = data.get_handle_raw_fd();
+        let fd = data.borrow_fd();
 
         if self.seal_size.load(Ordering::Relaxed) {
             let st = stat_fd(&fd, None)?;
@@ -1292,7 +1295,7 @@ impl<S: BitmapSlice + Send + Sync> FileSystem for PassthroughFs<S> {
         // Safe because this doesn't modify any memory and we check the return value.
         let res = unsafe {
             libc::fallocate64(
-                fd,
+                fd.as_raw_fd(),
                 mode as libc::c_int,
                 offset as libc::off64_t,
                 length as libc::off64_t,
