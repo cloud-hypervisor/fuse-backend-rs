@@ -14,8 +14,16 @@ env:
 jobs:
   CI:
     runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        arch: [amd64, arm64, ppc64le, riscv64, s390x]
     steps:
     - uses: actions/checkout@v3
+    - name: Cache cargo
+      uses: Swatinem/rust-cache@v2.2.0
+      with:
+        cache-on-failure: true
+        key: ${{ runner.os }}-cargo-${{ matrix.arch }}
 
     - name: Install Rust
       uses: actions-rs/toolchain@v1
@@ -25,9 +33,16 @@ jobs:
         override: true
 
     - name: build and check
-      run: make check
-    - name: smoke
       run: |
+        declare -A rust_target_map=( ["amd64"]="x86_64-unknown-linux-musl" ["arm64"]="aarch64-unknown-linux-musl" ["ppc64le"]="powerpc64le-unknown-linux-gnu" ["riscv64"]="riscv64gc-unknown-linux-gnu" ["s390x"]="s390x-unknown-linux-gnu")
+        RUST_TARGET=${rust_target_map[${{ matrix.arch }}]}
+        cargo install --version 0.2.4 cross
+        rustup component add rustfmt clippy
+        make -e RUST_TARGET=$RUST_TARGET -e CARGO=cross check
+    - name: smoke
+      if: ${{ matrix.arch == 'amd64' }}
+      run: |
+        make test
         echo user_allow_other | sudo tee --append /etc/fuse.conf
         make smoke-all
 
