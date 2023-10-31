@@ -1345,3 +1345,291 @@ impl<S: BitmapSlice + Send + Sync> FileSystem for PassthroughFs<S> {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::convert::TryInto;
+
+    use super::*;
+    use crate::abi::fuse_abi::ROOT_ID;
+    use std::path::Path;
+    use vmm_sys_util::{tempdir::TempDir, tempfile::TempFile};
+
+    fn prepare_fs_tmpdir() -> (PassthroughFs, TempDir) {
+        let source = TempDir::new().expect("Cannot create temporary directory.");
+        let fs_cfg = Config {
+            writeback: true,
+            do_import: true,
+            no_open: false,
+            no_readdir: false,
+            inode_file_handles: true,
+            xattr: true,
+            killpriv_v2: true, //enable killpriv_v2
+            root_dir: source
+                .as_path()
+                .to_str()
+                .expect("source path to string")
+                .to_string(),
+            ..Default::default()
+        };
+        let fs = PassthroughFs::<()>::new(fs_cfg).unwrap();
+        fs.import().unwrap();
+
+        // enable all fuse options
+        let opt = FsOptions::all();
+        fs.init(opt).unwrap();
+
+        (fs, source)
+    }
+
+    fn prepare_context() -> Context {
+        Context {
+            uid: unsafe { libc::getuid() },
+            gid: unsafe { libc::getgid() },
+            pid: unsafe { libc::getpid() },
+            ..Default::default()
+        }
+    }
+
+    fn create_file_with_sugid(ctx: &Context, fs: &PassthroughFs<()>) -> (Entry, Handle) {
+        let fname = CString::new("testfile").unwrap();
+        let args = CreateIn {
+            flags: libc::O_WRONLY as u32,
+            mode: 0o6777,
+            umask: 0,
+            fuse_flags: 0,
+        };
+        let (test_entry, handle, _, _) = fs.create(&ctx, ROOT_ID, &fname, args).unwrap();
+
+        (test_entry, handle.unwrap())
+    }
+
+    #[test]
+    fn test_dir_operations() {
+        let (fs, _source) = prepare_fs_tmpdir();
+        let ctx = prepare_context();
+
+        let dir = CString::new("testdir").unwrap();
+        fs.mkdir(&ctx, ROOT_ID, &dir, 0o755, 0).unwrap();
+
+        let (handle, _) = fs.opendir(&ctx, ROOT_ID, libc::O_RDONLY as u32).unwrap();
+
+        assert!(fs
+            .readdir(&ctx, ROOT_ID, handle.unwrap(), 10, 0, &mut |_| Ok(1))
+            .is_err());
+
+        assert!(fs
+            .readdirplus(&ctx, ROOT_ID, handle.unwrap(), 10, 0, &mut |_, _| Ok(1))
+            .is_err());
+
+        assert!(fs.fsyncdir(&ctx, ROOT_ID, true, handle.unwrap()).is_ok());
+
+        assert!(fs.releasedir(&ctx, ROOT_ID, 0, handle.unwrap()).is_ok());
+        assert!(fs.rmdir(&ctx, ROOT_ID, &dir).is_ok());
+    }
+
+    #[test]
+    fn test_link_rename() {
+        let (fs, _source) = prepare_fs_tmpdir();
+        let ctx = prepare_context();
+
+        let fname = CString::new("testfile").unwrap();
+        let args = CreateIn::default();
+        let (test_entry, _, _, _) = fs.create(&ctx, ROOT_ID, &fname, args).unwrap();
+
+        let link_name = CString::new("testlink").unwrap();
+        fs.link(&ctx, test_entry.inode, ROOT_ID, &link_name)
+            .unwrap();
+
+        let new_name = CString::new("newlink").unwrap();
+        fs.rename(&ctx, ROOT_ID, &link_name, ROOT_ID, &new_name, 0)
+            .unwrap();
+
+        let link_entry = fs.lookup(&ctx, ROOT_ID, &new_name).unwrap();
+
+        assert_eq!(link_entry.inode, test_entry.inode);
+    }
+
+    #[test]
+    fn test_unlink_delete_file() {
+        let (fs, source) = prepare_fs_tmpdir();
+        let child_path = TempFile::new_in(source.as_path()).expect("Cannot create temporary file.");
+
+        let ctx = prepare_context();
+
+        let child_str = child_path
+            .as_path()
+            .file_name()
+            .unwrap()
+            .to_str()
+            .expect("path to string");
+        let child = CString::new(child_str).unwrap();
+
+        fs.unlink(&ctx, ROOT_ID, &child).unwrap();
+
+        assert!(!Path::new(child_str).exists())
+    }
+
+    #[test]
+    // test virtiofs CVE-2020-35517, should not open device file
+    fn test_mknod_and_open_device() {
+        let (fs, _source) = prepare_fs_tmpdir();
+
+        let ctx = prepare_context();
+
+        let device_name = CString::new("test_device").unwrap();
+        let mode = libc::S_IFBLK;
+        let mask = 0o777;
+        let device_no = libc::makedev(0, 103) as u32;
+
+        let device_entry = fs
+            .mknod(&ctx, ROOT_ID, &device_name, mode, device_no, mask)
+            .unwrap();
+        let (d_st, _) = fs.getattr(&ctx, device_entry.inode, None).unwrap();
+
+        assert_eq!(d_st.st_mode & libc::S_IFMT, libc::S_IFBLK);
+        assert_eq!(d_st.st_rdev as u32, device_no);
+
+        // open device should fail because of is_safe_inode check
+        let err = fs
+            .open(&ctx, device_entry.inode, libc::O_RDWR as u32, 0)
+            .is_err();
+        assert_eq!(err, true);
+    }
+
+    #[test]
+    fn test_create_access() {
+        let (fs, _source) = prepare_fs_tmpdir();
+        let ctx = prepare_context();
+
+        let fname = CString::new("testfile").unwrap();
+        let args = CreateIn {
+            flags: libc::O_WRONLY as u32,
+            mode: 0644,
+            umask: 0,
+            fuse_flags: 0,
+        };
+        let (test_entry, _, _, _) = fs.create(&ctx, ROOT_ID, &fname, args).unwrap();
+
+        let mask = (libc::R_OK | libc::W_OK) as u32;
+        assert_eq!(fs.access(&ctx, test_entry.inode, mask).is_ok(), true);
+        let mask = (libc::R_OK | libc::W_OK | libc::X_OK) as u32;
+        assert_eq!(fs.access(&ctx, test_entry.inode, mask).is_ok(), false);
+        assert!(fs
+            .release(&ctx, test_entry.inode, 0, 0, false, false, Some(0))
+            .is_err());
+    }
+
+    #[test]
+    fn test_symlink_escape_root() {
+        let (fs, _source) = prepare_fs_tmpdir();
+        let child_path =
+            TempFile::new_in(_source.as_path()).expect("Cannot create temporary file.");
+        let ctx = prepare_context();
+
+        let eval_sym_dest = CString::new("/root").unwrap();
+        let eval_sym_name = CString::new("eval_sym").unwrap();
+        let normal_sym_dest = CString::new(child_path.as_path().to_str().unwrap()).unwrap();
+        let normal_sym_name = CString::new("normal_sym").unwrap();
+
+        let normal_sym_entry = fs
+            .symlink(&ctx, &normal_sym_dest, ROOT_ID, &normal_sym_name)
+            .unwrap();
+
+        let eval_sym_entry = fs
+            .symlink(&ctx, &eval_sym_dest, ROOT_ID, &eval_sym_name)
+            .unwrap();
+
+        let normal_buf = fs.readlink(&ctx, normal_sym_entry.inode).unwrap();
+        let eval_buf = fs.readlink(&ctx, eval_sym_entry.inode).unwrap();
+        let normal_dest_name = CString::new(String::from_utf8(normal_buf).unwrap()).unwrap();
+        let eval_dest_name = CString::new(String::from_utf8(eval_buf).unwrap()).unwrap();
+
+        assert_eq!(normal_dest_name, normal_sym_dest);
+        assert_eq!(eval_dest_name, eval_sym_dest);
+    }
+
+    #[test]
+    fn test_setattr_and_drop_priv() {
+        let (fs, _source) = prepare_fs_tmpdir();
+        let ctx = prepare_context();
+
+        let (test_entry, _) = create_file_with_sugid(&ctx, &fs);
+
+        let (mut old_att, _) = fs.getattr(&ctx, test_entry.inode, None).unwrap();
+
+        old_att.st_size = 4096;
+        let mut valid = SetattrValid::SIZE | SetattrValid::KILL_SUIDGID;
+        let (attr_not_drop, _) = fs
+            .setattr(&ctx, test_entry.inode, old_att, None, valid)
+            .unwrap();
+        // during file size change,
+        // suid/sgid should be dropped because of killpriv_v2
+        assert_eq!(attr_not_drop.st_mode, 0o100777);
+
+        old_att.st_size = 0;
+        old_att.st_uid = 1;
+        old_att.st_gid = 1;
+        old_att.st_atime = 0;
+        old_att.st_mtime = 0;
+        valid = SetattrValid::SIZE
+            | SetattrValid::ATIME
+            | SetattrValid::MTIME
+            | SetattrValid::UID
+            | SetattrValid::GID;
+
+        let (attr, _) = fs
+            .setattr(&ctx, test_entry.inode, old_att, None, valid)
+            .unwrap();
+        // suid/sgid is dropped because chmod is called
+        assert_eq!(attr.st_mode, 0o100777);
+        assert_eq!(attr.st_size, 0);
+    }
+
+    #[test]
+    // fallocate missing killpriv logic, should be fixed
+    fn test_fallocate_drop_priv() {
+        let (fs, _source) = prepare_fs_tmpdir();
+        let ctx = prepare_context();
+
+        let (test_entry, handle) = create_file_with_sugid(&ctx, &fs);
+
+        let offset = fs
+            .lseek(
+                &ctx,
+                test_entry.inode,
+                handle,
+                4096,
+                libc::SEEK_SET.try_into().unwrap(),
+            )
+            .unwrap();
+        fs.fallocate(&ctx, test_entry.inode, handle, 0, offset, 4096)
+            .unwrap();
+
+        let (att, _) = fs.getattr(&ctx, test_entry.inode, None).unwrap();
+
+        assert_eq!(att.st_size, 8192);
+        // suid/sgid not dropped
+        assert_eq!(att.st_mode, 0o106777);
+    }
+
+    #[test]
+    fn test_fsync_flush() {
+        let (fs, _source) = prepare_fs_tmpdir();
+        let ctx = prepare_context();
+
+        let (test_entry, handle) = create_file_with_sugid(&ctx, &fs);
+
+        assert!(fs.fsync(&ctx, test_entry.inode, false, handle).is_ok());
+        assert!(fs.flush(&ctx, test_entry.inode, handle, 0).is_ok());
+    }
+
+    #[test]
+    fn test_statfs() {
+        let (fs, _source) = prepare_fs_tmpdir();
+        let ctx = prepare_context();
+
+        let statfs = fs.statfs(&ctx, ROOT_ID).unwrap();
+        assert_eq!(statfs.f_namemax, 255);
+    }
+}
