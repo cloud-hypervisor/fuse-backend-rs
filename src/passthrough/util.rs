@@ -1,5 +1,6 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE-BSD-3-Clause file.
+// Copyright (C) 2023 Alibaba Cloud. All rights reserved.
 
 use std::collections::{btree_map, BTreeMap};
 use std::ffi::{CStr, CString};
@@ -160,7 +161,7 @@ pub fn openat(
 pub fn reopen_fd_through_proc(
     fd: &impl AsRawFd,
     flags: libc::c_int,
-    proc_self_fd: &File,
+    proc_self_fd: &impl AsRawFd,
 ) -> io::Result<File> {
     let name = CString::new(format!("{}", fd.as_raw_fd()).as_str())?;
     // Clear the `O_NOFOLLOW` flag if it is set since we need to follow the `/proc/self/fd` symlink
@@ -218,6 +219,10 @@ pub fn einval() -> io::Error {
 
 pub fn enosys() -> io::Error {
     io::Error::from_raw_os_error(libc::ENOSYS)
+}
+
+pub fn eperm() -> io::Error {
+    io::Error::from_raw_os_error(libc::EPERM)
 }
 
 #[cfg(test)]
