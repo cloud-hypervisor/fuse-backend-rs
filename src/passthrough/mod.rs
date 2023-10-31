@@ -109,6 +109,13 @@ impl InodeHandle {
         }
     }
 
+    fn open_file(&self, flags: libc::c_int, proc_self_fd: &File) -> io::Result<File> {
+        match self {
+            InodeHandle::File(f) => reopen_fd_through_proc(f, flags, proc_self_fd),
+            InodeHandle::Handle(h) => h.open(flags),
+        }
+    }
+
     fn stat(&self) -> io::Result<libc::stat64> {
         match self {
             InodeHandle::File(f) => stat_fd(f, None),
@@ -145,6 +152,10 @@ impl InodeData {
 
     fn get_file(&self) -> io::Result<InodeFile<'_>> {
         self.handle.get_file()
+    }
+
+    fn open_file(&self, flags: libc::c_int, proc_self_fd: &File) -> io::Result<File> {
+        self.handle.open_file(flags, proc_self_fd)
     }
 }
 

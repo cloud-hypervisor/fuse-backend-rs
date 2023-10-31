@@ -30,14 +30,12 @@ use crate::transport::FsCacheReqHandler;
 
 impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
     fn open_inode(&self, inode: Inode, flags: i32) -> io::Result<File> {
-        let new_flags = self.get_writeback_open_flags(flags);
         let data = self.inode_map.get(inode)?;
         if !is_safe_inode(data.mode) {
             Err(ebadf())
         } else {
-            // TODO: optimize
-            let file = data.get_file()?;
-            reopen_fd_through_proc(&file, new_flags | libc::O_CLOEXEC, &self.proc_self_fd)
+            let new_flags = self.get_writeback_open_flags(flags);
+            data.open_file(new_flags | libc::O_CLOEXEC, &self.proc_self_fd)
         }
     }
 
@@ -418,11 +416,11 @@ impl<S: BitmapSlice + Send + Sync> FileSystem for PassthroughFs<S> {
             // Safe because this doesn't modify any memory and we check the return value.
             unsafe { libc::mkdirat(file.as_raw_fd(), name.as_ptr(), mode & !umask) }
         };
-        if res == 0 {
-            self.do_lookup(parent, name)
-        } else {
-            Err(io::Error::last_os_error())
+        if res < 0 {
+            return Err(io::Error::last_os_error());
         }
+
+        self.do_lookup(parent, name)
     }
 
     fn rmdir(&self, _ctx: &Context, parent: Inode, name: &CStr) -> io::Result<()> {
