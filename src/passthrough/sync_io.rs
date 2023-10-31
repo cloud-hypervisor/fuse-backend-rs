@@ -203,7 +203,19 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
                 OpenOptions::DIRECT_IO,
                 flags & (libc::O_DIRECTORY as u32) == 0,
             ),
-            CachePolicy::Always => opts |= OpenOptions::KEEP_CACHE,
+            CachePolicy::Metadata => {
+                if flags & (libc::O_DIRECTORY as u32) == 0 {
+                    opts |= OpenOptions::DIRECT_IO;
+                } else {
+                    opts |= OpenOptions::CACHE_DIR | OpenOptions::KEEP_CACHE;
+                }
+            }
+            CachePolicy::Always => {
+                opts |= OpenOptions::KEEP_CACHE;
+                if flags & (libc::O_DIRECTORY as u32) != 0 {
+                    opts |= OpenOptions::CACHE_DIR;
+                }
+            }
             _ => {}
         };
 
@@ -584,6 +596,7 @@ impl<S: BitmapSlice + Send + Sync> FileSystem for PassthroughFs<S> {
         let mut opts = OpenOptions::empty();
         match self.cfg.cache_policy {
             CachePolicy::Never => opts |= OpenOptions::DIRECT_IO,
+            CachePolicy::Metadata => opts |= OpenOptions::DIRECT_IO,
             CachePolicy::Always => opts |= OpenOptions::KEEP_CACHE,
             _ => {}
         };
