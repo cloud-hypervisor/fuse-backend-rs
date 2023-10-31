@@ -1,6 +1,21 @@
 # Changelog
 ## [Unreleased]
 
+## [0.11.0]
+### Added
+- [144](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/144): feat: implement fuse-t feature
+- [149](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/149): feat: add "persist" feature
+- [152](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/152): Add the ability to clean up the dentry cache can be used to clean up resources when VFS umount.
+- [153](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/153): linux_session: Make allow_other mount option optional
+- [159](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/159): UID/GID remapping support
+- [162](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/162): abi: Disable unsupported flags and functionality on MacOS
+- [163](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/163): vfs: add method to export root pseudofs's reference
+- [167](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/167): CI: add xfstests for passthrough fs
+
+### Fixed
+- [154](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/154): fuse: Ensure fd has same flags as read/write
+- [165](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/165): build: fix a build failure related to conditional compilation
+
 ## [0.10.5]
 ### Added
 - [138](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/138): linuxsession: support mount in given mount namespace
