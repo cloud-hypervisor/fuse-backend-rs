@@ -339,8 +339,8 @@ impl<S: BitmapSlice + Send + Sync> FileSystem for PassthroughFs<S> {
     }
 
     fn statfs(&self, _ctx: &Context, inode: Inode) -> io::Result<libc::statvfs64> {
-        let data = self.inode_map.get(inode)?;
         let mut out = MaybeUninit::<libc::statvfs64>::zeroed();
+        let data = self.inode_map.get(inode)?;
         let file = data.get_file()?;
 
         // Safe because this will only modify `out` and we check the return value.
@@ -381,7 +381,7 @@ impl<S: BitmapSlice + Send + Sync> FileSystem for PassthroughFs<S> {
     ) -> io::Result<(Option<Handle>, OpenOptions)> {
         if self.no_opendir.load(Ordering::Relaxed) {
             info!("fuse: opendir is not supported.");
-            Err(io::Error::from_raw_os_error(libc::ENOSYS))
+            Err(enosys())
         } else {
             self.do_open(inode, flags | (libc::O_DIRECTORY as u32), 0)
         }
@@ -507,7 +507,7 @@ impl<S: BitmapSlice + Send + Sync> FileSystem for PassthroughFs<S> {
     ) -> io::Result<(Option<Handle>, OpenOptions)> {
         if self.no_open.load(Ordering::Relaxed) {
             info!("fuse: open is not supported.");
-            Err(io::Error::from_raw_os_error(libc::ENOSYS))
+            Err(enosys())
         } else {
             self.do_open(inode, flags, fuse_flags)
         }
@@ -524,7 +524,7 @@ impl<S: BitmapSlice + Send + Sync> FileSystem for PassthroughFs<S> {
         _lock_owner: Option<u64>,
     ) -> io::Result<()> {
         if self.no_open.load(Ordering::Relaxed) {
-            Err(io::Error::from_raw_os_error(libc::ENOSYS))
+            Err(enosys())
         } else {
             self.do_release(inode, handle)
         }
@@ -764,13 +764,13 @@ impl<S: BitmapSlice + Send + Sync> FileSystem for PassthroughFs<S> {
                 attr.st_uid
             } else {
                 // Cannot use -1 here because these are unsigned values.
-                ::std::u32::MAX
+                u32::MAX
             };
             let gid = if valid.contains(SetattrValid::GID) {
                 attr.st_gid
             } else {
                 // Cannot use -1 here because these are unsigned values.
-                ::std::u32::MAX
+                u32::MAX
             };
 
             // Safe because this is a constant value and a valid C string.
@@ -1020,7 +1020,7 @@ impl<S: BitmapSlice + Send + Sync> FileSystem for PassthroughFs<S> {
         _lock_owner: u64,
     ) -> io::Result<()> {
         if self.no_open.load(Ordering::Relaxed) {
-            return Err(io::Error::from_raw_os_error(libc::ENOSYS));
+            return Err(enosys());
         }
 
         let data = self.handle_map.get(handle, inode)?;
@@ -1128,7 +1128,7 @@ impl<S: BitmapSlice + Send + Sync> FileSystem for PassthroughFs<S> {
         flags: u32,
     ) -> io::Result<()> {
         if !self.cfg.xattr {
-            return Err(io::Error::from_raw_os_error(libc::ENOSYS));
+            return Err(enosys());
         }
 
         let data = self.inode_map.get(inode)?;
@@ -1163,7 +1163,7 @@ impl<S: BitmapSlice + Send + Sync> FileSystem for PassthroughFs<S> {
         size: u32,
     ) -> io::Result<GetxattrReply> {
         if !self.cfg.xattr {
-            return Err(io::Error::from_raw_os_error(libc::ENOSYS));
+            return Err(enosys());
         }
 
         let data = self.inode_map.get(inode)?;
@@ -1198,7 +1198,7 @@ impl<S: BitmapSlice + Send + Sync> FileSystem for PassthroughFs<S> {
 
     fn listxattr(&self, _ctx: &Context, inode: Inode, size: u32) -> io::Result<ListxattrReply> {
         if !self.cfg.xattr {
-            return Err(io::Error::from_raw_os_error(libc::ENOSYS));
+            return Err(enosys());
         }
 
         let data = self.inode_map.get(inode)?;
@@ -1232,7 +1232,7 @@ impl<S: BitmapSlice + Send + Sync> FileSystem for PassthroughFs<S> {
 
     fn removexattr(&self, _ctx: &Context, inode: Inode, name: &CStr) -> io::Result<()> {
         if !self.cfg.xattr {
-            return Err(io::Error::from_raw_os_error(libc::ENOSYS));
+            return Err(enosys());
         }
 
         let data = self.inode_map.get(inode)?;

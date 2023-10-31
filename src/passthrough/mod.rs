@@ -33,7 +33,7 @@ use self::inode_store::{InodeId, InodeStore};
 use self::mount_fd::MountFds;
 use self::statx::{statx, StatExt};
 use self::util::{
-    ebadf, einval, enosys, is_dir, is_safe_inode, openat, reopen_fd_through_proc, stat_fd,
+    ebadf, einval, enosys, eperm, is_dir, is_safe_inode, openat, reopen_fd_through_proc, stat_fd,
     UniqueInodeGenerator,
 };
 use crate::abi::fuse_abi as fuse;
@@ -581,16 +581,20 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
     ) -> io::Result<(File, Option<FileHandle>, StatExt)> {
         let path_file = self.open_file_restricted(dir, name, libc::O_PATH, 0)?;
         let st = statx(&path_file, None)?;
-        let handle = FileHandle::from_fd(&path_file)?;
+        let handle = if self.cfg.inode_file_handles {
+            FileHandle::from_fd(&path_file)?
+        } else {
+            None
+        };
 
-        return Ok((path_file, handle, st));
+        Ok((path_file, handle, st))
     }
 
     fn to_openable_handle(&self, fh: FileHandle) -> io::Result<Arc<OpenableFileHandle>> {
         fh.into_openable(&self.mount_fds, |fd, flags, _mode| {
             reopen_fd_through_proc(&fd, flags, &self.proc_self_fd)
         })
-        .map(|v| Arc::new(v))
+        .map(Arc::new)
         .map_err(|e| {
             if !e.silent() {
                 error!("{}", e);
@@ -809,9 +813,7 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
 
         match opcode {
             // write should not exceed the file size.
-            Opcode::Write if size + offset > file_size => {
-                Err(io::Error::from_raw_os_error(libc::EPERM))
-            }
+            Opcode::Write if size + offset > file_size => Err(eperm()),
 
             // fallocate operation should not allocate blocks exceed the file size.
             //
@@ -828,7 +830,7 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
                     || (mode & libc::FALLOC_FL_COLLAPSE_RANGE != 0
                         || mode & libc::FALLOC_FL_INSERT_RANGE != 0) =>
             {
-                Err(io::Error::from_raw_os_error(libc::EPERM))
+                Err(eperm())
             }
 
             // setattr operation should be handled in setattr handler, other operations won't
