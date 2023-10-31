@@ -14,6 +14,15 @@ pub enum CachePolicy {
     /// the FUSE client (i.e., the file system does not have exclusive access to the directory).
     Never,
 
+    /// This is almost same as Never, but it allows page cache of directories, dentries and attr
+    /// cache in guest. In other words, it acts like cache=never for normal files, and like
+    /// cache=always for directories, besides, metadata like dentries and attrs are kept as well.
+    /// This policy can be used if:
+    /// 1. the client wants to use Never policy but it's performance in I/O is not good enough
+    /// 2. the file system has exclusive access to the directory
+    /// 3. cache directory content and other fs metadata can make a difference on performance.
+    Metadata,
+
     /// The client is free to choose when and how to cache file data. This is the default policy and
     /// uses close-to-open consistency as described in the enum documentation.
     #[default]
@@ -32,6 +41,7 @@ impl FromStr for CachePolicy {
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
             "never" | "Never" | "NEVER" | "none" | "None" | "NONE" => Ok(CachePolicy::Never),
+            "metadata" => Ok(CachePolicy::Metadata),
             "auto" | "Auto" | "AUTO" => Ok(CachePolicy::Auto),
             "always" | "Always" | "ALWAYS" => Ok(CachePolicy::Always),
             _ => Err("invalid cache policy"),
