@@ -1,12 +1,42 @@
 current_dir := $(shell dirname $(realpath $(firstword $(MAKEFILE_LIST))))
+CARGO ?= $(shell which cargo)
+
+ifdef RUST_TARGET
+	TARGET = --target ${RUST_TARGET}
+endif
 
 build:
-	cargo build --features="fusedev"
-	cargo build --features="virtiofs"
-	cargo build --features="vhost-user-fs"
-	cargo build --features="fusedev,async-io"
-	cargo build --features="virtiofs,async-io"
-	cargo build --features="vhost-user-fs,async-io"
+	${CARGO} build ${TARGET} --features="fusedev"
+	${CARGO} build ${TARGET} --features="virtiofs"
+	${CARGO} build ${TARGET} --features="vhost-user-fs"
+	${CARGO} build ${TARGET} --features="fusedev,async-io"
+	${CARGO} build ${TARGET} --features="virtiofs,async-io"
+	${CARGO} build ${TARGET} --features="vhost-user-fs,async-io"
+
+check: build
+	${CARGO} fmt -- --check
+	${CARGO} clippy ${TARGET} --features="fusedev" --no-default-features -- -Dwarnings
+	${CARGO} clippy ${TARGET} --features="virtiofs" --no-default-features -- -Dwarnings
+	${CARGO} clippy ${TARGET} --features="vhost-user-fs" --no-default-features -- -Dwarnings
+	${CARGO} clippy ${TARGET} --features="fusedev,virtiofs" --no-default-features -- -Dwarnings
+
+test:
+	cargo test ${TARGET} --features="fusedev" --no-default-features -- --nocapture --skip integration
+	cargo test ${TARGET} --features="virtiofs" --no-default-features  -- --nocapture --skip integration
+	cargo test ${TARGET} --features="vhost-user-fs" --no-default-features -- --nocapture --skip integration
+	cargo test ${TARGET} --features="fusedev,virtiofs" --no-default-features -- --nocapture --skip integration
+	cargo test ${TARGET} --features="fusedev,async-io" --no-default-features -- --nocapture --skip integration
+	cargo test ${TARGET} --features="virtiofs,async-io" --no-default-features -- --nocapture --skip integration
+	cargo test ${TARGET} --features="vhost-user-fs,async-io" --no-default-features -- --nocapture --skip integration
+	cargo test ${TARGET} --features="fusedev,virtiofs,async-io" --no-default-features -- --nocapture --skip integration
+	cargo test ${TARGET} --features="fusedev,persist" --no-default-features -- --nocapture --skip integration
+	cargo test ${TARGET} --all-features -- --nocapture --skip integration
+
+smoke:
+	cargo test ${TARGET} --features="fusedev,persist" -- --nocapture
+
+smoke-all: smoke
+	cargo test ${TARGET} --features="fusedev,persist" -- --nocapture --ignored
 
 build-macos:
 	cargo build --features="fusedev"
@@ -18,29 +48,6 @@ check-macos: build-macos
 	cargo test --features="fusedev" -- --nocapture --skip integration
 	cargo clippy --features="fusedev,fuse-t" -- -Dwarnings
 	cargo test --features="fusedev,fuse-t" -- --nocapture --skip integration
-
-check: build
-	cargo fmt -- --check
-	cargo clippy --features="fusedev" --no-default-features -- -Dwarnings
-	cargo clippy --features="virtiofs" --no-default-features -- -Dwarnings
-	cargo clippy --features="vhost-user-fs" --no-default-features -- -Dwarnings
-	cargo clippy --features="fusedev,virtiofs" --no-default-features -- -Dwarnings
-	cargo test --features="fusedev" --no-default-features -- --nocapture --skip integration
-	cargo test --features="virtiofs" --no-default-features  -- --nocapture --skip integration
-	cargo test --features="vhost-user-fs" --no-default-features -- --nocapture --skip integration
-	cargo test --features="fusedev,virtiofs" --no-default-features -- --nocapture --skip integration
-	cargo test --features="fusedev,async-io" --no-default-features -- --nocapture --skip integration
-	cargo test --features="virtiofs,async-io" --no-default-features -- --nocapture --skip integration
-	cargo test --features="vhost-user-fs,async-io" --no-default-features -- --nocapture --skip integration
-	cargo test --features="fusedev,virtiofs,async-io" --no-default-features -- --nocapture --skip integration
-	cargo test --features="fusedev,persist" --no-default-features -- --nocapture --skip integration
-	cargo test --all-features -- --nocapture --skip integration
-
-smoke: check
-	cargo test --features="fusedev,persist" -- --nocapture
-
-smoke-all: smoke
-	cargo test --features="fusedev,persist" -- --nocapture --ignored
 
 smoke-macos: check-macos
 	cargo test --features="fusedev,fuse-t" -- --nocapture
