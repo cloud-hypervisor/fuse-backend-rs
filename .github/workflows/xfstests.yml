@@ -1,4 +1,4 @@
-name: Rust
+name: xfstests
 
 on:
   push:
