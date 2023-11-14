@@ -1401,3 +1401,152 @@ fn add_dirent<S: BitmapSlice>(
         Ok(total_len)
     }
 }
+
+#[cfg(test)]
+mod tests {
+
+    #[cfg(all(feature = "fusedev", target_os = "linux"))]
+    mod tests_fusedev {
+        use super::super::*;
+        use crate::passthrough::{Config, PassthroughFs};
+        use crate::transport::FuseBuf;
+
+        use std::fs::File;
+        use std::os::unix::io::AsRawFd;
+        use vmm_sys_util::tempfile::TempFile;
+
+        fn prepare_srvcontext<'a>(
+            read_buf: &'a mut [u8],
+            write_buf: &'a mut [u8],
+        ) -> (SrvContext<'a, PassthroughFs>, File) {
+            let file = TempFile::new().unwrap().into_file();
+            let reader = Reader::<()>::from_fuse_buffer(FuseBuf::new(read_buf)).unwrap();
+            let writer = FuseDevWriter::<()>::new(file.as_raw_fd(), write_buf).unwrap();
+            let in_header = InHeader::default();
+            (
+                SrvContext::<PassthroughFs>::new(in_header, reader, writer.into()),
+                file,
+            )
+        }
+
+        #[test]
+        fn test_server_init() {
+            let fs = PassthroughFs::<()>::new(Config::default()).unwrap();
+            let server = Server::new(fs);
+
+            let mut read_buf = [
+                0x8u8, 0x0, 0x0, 0x0, // major = 0x0008
+                0x0u8, 0x0, 0x0, 0x0, // minor = 0x0008
+                0x0, 0x0, 0x0, 0x0, // max_readahead = 0x0000
+                0x0, 0x0, 0x0, 0x0, // flags = 0x0000
+            ];
+            let mut write_buf = [0u8; 4096];
+            let (ctx, _file) = prepare_srvcontext(&mut read_buf, &mut write_buf);
+
+            let res = server.init(ctx).unwrap();
+            assert_eq!(res, 80);
+
+            let mut read_buf1 = [
+                0x7u8, 0x0, 0x0, 0x0, // major = 0x0007
+                0x0u8, 0x0, 0x0, 0x0, // minor = 0x0000
+                0x0, 0x0, 0x0, 0x0, // max_readahead = 0x0000
+                0x0, 0x0, 0x0, 0x0, // flags = 0x0000
+            ];
+            let mut write_buf1 = [0u8; 4096];
+            let (ctx1, _file) = prepare_srvcontext(&mut read_buf1, &mut write_buf1);
+
+            let res = server.init(ctx1).unwrap();
+            assert_eq!(res, 24);
+        }
+
+        #[test]
+        fn test_server_write() {
+            let fs = PassthroughFs::<()>::new(Config::default()).unwrap();
+            let server = Server::new(fs);
+
+            let mut read_buf = [0u8; 4096];
+            let mut write_buf = [0u8; 4096];
+            let (ctx, _file) = prepare_srvcontext(&mut read_buf, &mut write_buf);
+
+            let res = server.write(ctx).unwrap();
+            assert_eq!(res, 16);
+        }
+
+        #[test]
+        fn test_server_read() {
+            let fs = PassthroughFs::<()>::new(Config::default()).unwrap();
+            let server = Server::new(fs);
+
+            let mut read_buf = [0u8; 4096];
+            let mut write_buf = [0u8; 4096];
+            let (ctx, _file) = prepare_srvcontext(&mut read_buf, &mut write_buf);
+
+            let res = server.read(ctx).unwrap();
+            assert_eq!(res, 16);
+        }
+
+        #[test]
+        fn test_server_readdir() {
+            let fs = PassthroughFs::<()>::new(Config::default()).unwrap();
+            let server = Server::new(fs);
+
+            let mut read_buf = [0u8; 4096];
+            let mut write_buf = [0u8; 4096];
+            let (ctx, _file) = prepare_srvcontext(&mut read_buf, &mut write_buf);
+
+            let res = server.do_readdir(ctx, true).unwrap();
+            assert_eq!(res, 16);
+        }
+
+        #[test]
+        fn test_server_ioctl() {
+            let fs = PassthroughFs::<()>::new(Config::default()).unwrap();
+            let server = Server::new(fs);
+
+            let mut read_buf = [0u8; 4096];
+            let mut write_buf = [0u8; 4096];
+            let (ctx, _file) = prepare_srvcontext(&mut read_buf, &mut write_buf);
+
+            let res = server.ioctl(ctx).unwrap();
+            assert!(res > 0);
+
+            // construct IoctlIn with invalid in_size
+            let mut read_buf_fail = [
+                0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, //fh = 0
+                0x0, 0x0, 0x0, 0x0, //flags = 0
+                0x0, 0x0, 0x0, 0x0, //cmd = 0
+                0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, //arg = 0
+                0x7u8, 0x3u8, 0x0, 0x0, //in_size = 0x307
+                0x0, 0x0, 0x0, 0x0, //out_size = 0
+            ];
+            let mut write_buf_fail = [0u8; 48];
+            let (ctx_fail, _file) = prepare_srvcontext(&mut read_buf_fail, &mut write_buf_fail);
+            let res = server.ioctl(ctx_fail).unwrap();
+            assert!(res > 0);
+        }
+
+        #[test]
+        fn test_server_batch_forget() {
+            let fs = PassthroughFs::<()>::new(Config::default()).unwrap();
+            let server = Server::new(fs);
+
+            let mut read_buf = [0u8; 4096];
+            let mut write_buf = [0u8; 4096];
+            let (ctx, _file) = prepare_srvcontext(&mut read_buf, &mut write_buf);
+            // forget should return 0 anyway
+            assert_eq!(server.batch_forget(ctx).unwrap(), 0);
+        }
+
+        #[test]
+        fn test_server_forget() {
+            let fs = PassthroughFs::<()>::new(Config::default()).unwrap();
+            let server = Server::new(fs);
+
+            let mut read_buf = [0x1u8, 0x2u8, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0];
+            let mut write_buf = [0u8; 4096];
+            let (ctx, _file) = prepare_srvcontext(&mut read_buf, &mut write_buf);
+
+            assert_eq!(server.forget(ctx).unwrap(), 0);
+        }
+    }
+}
