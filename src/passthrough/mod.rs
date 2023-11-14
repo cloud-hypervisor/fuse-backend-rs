@@ -749,7 +749,7 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
         })
     }
 
-    fn forget_one(&self, inodes: &mut InodeStore, inode: Inode, count: u64) {
+    fn forget_one_locked(&self, inodes: &mut InodeStore, inode: Inode, count: u64) {
         // ROOT_ID should not be forgotten, or we're not able to access to files any more.
         if inode == fuse::ROOT_ID {
             return;
@@ -784,6 +784,11 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
                 }
             }
         }
+    }
+
+    fn forget_one(&self, inode: Inode, count: u64) {
+        let mut inodes = self.inode_map.get_map_mut();
+        self.forget_one_locked(&mut inodes, inode, count)
     }
 
     fn do_release(&self, inode: Inode, handle: Handle) -> io::Result<()> {
