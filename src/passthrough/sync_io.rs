@@ -43,16 +43,34 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
     /// if these do not match update the file descriptor flags and store the new
     /// result in the HandleData entry
     #[inline(always)]
-    fn check_fd_flags(&self, data: Arc<HandleData>, fd: RawFd, flags: u32) -> io::Result<()> {
-        let open_flags = data.get_flags();
-        if open_flags != flags {
-            let ret = unsafe { libc::fcntl(fd, libc::F_SETFL, flags) };
+    fn ensure_file_flags<'a>(
+        &self,
+        data: &'a Arc<HandleData>,
+        file: &File,
+        mut flags: u32,
+    ) -> io::Result<FileFlagGuard<'a, u32>> {
+        let guard = data.open_flags.read().unwrap();
+        if *guard & libc::O_DIRECT as u32 == flags & libc::O_DIRECT as u32 {
+            return Ok(FileFlagGuard::Reader(guard));
+        }
+        drop(guard);
+
+        let mut guard = data.open_flags.write().unwrap();
+        // Update the O_DIRECT flag if needed
+        if *guard & libc::O_DIRECT as u32 != flags & libc::O_DIRECT as u32 {
+            if flags & libc::O_DIRECT as u32 != 0 {
+                flags = *guard | libc::O_DIRECT as u32;
+            } else {
+                flags = *guard & !libc::O_DIRECT as u32;
+            }
+            let ret = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_SETFL, flags) };
             if ret != 0 {
                 return Err(io::Error::last_os_error());
             }
-            data.set_flags(flags);
+            *guard = flags;
         }
-        Ok(())
+
+        Ok(FileFlagGuard::Writer(guard))
     }
 
     fn do_readdir(
@@ -665,7 +683,7 @@ impl<S: BitmapSlice + Send + Sync> FileSystem for PassthroughFs<S> {
         // so data.file won't be closed.
         let f = unsafe { File::from_raw_fd(data.borrow_fd().as_raw_fd()) };
 
-        self.check_fd_flags(data, f.as_raw_fd(), flags)?;
+        self.ensure_file_flags(&data, &f, flags)?;
 
         let mut f = ManuallyDrop::new(f);
 
@@ -692,7 +710,7 @@ impl<S: BitmapSlice + Send + Sync> FileSystem for PassthroughFs<S> {
         // so data.file won't be closed.
         let f = unsafe { File::from_raw_fd(data.borrow_fd().as_raw_fd()) };
 
-        self.check_fd_flags(data, f.as_raw_fd(), flags)?;
+        self.ensure_file_flags(&data, &f, flags)?;
 
         if self.seal_size.load(Ordering::Relaxed) {
             let st = stat_fd(&f, None)?;

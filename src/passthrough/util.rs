@@ -7,9 +7,10 @@ use std::ffi::{CStr, CString};
 use std::fs::File;
 use std::io;
 use std::mem::MaybeUninit;
+use std::ops::Deref;
 use std::os::unix::io::{AsRawFd, FromRawFd};
 use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
-use std::sync::Mutex;
+use std::sync::{Mutex, RwLockReadGuard, RwLockWriteGuard};
 
 use super::inode_store::InodeId;
 use super::MAX_HOST_INO;
@@ -223,6 +224,23 @@ pub fn enosys() -> io::Error {
 
 pub fn eperm() -> io::Error {
     io::Error::from_raw_os_error(libc::EPERM)
+}
+
+/// A helper structure to hold RwLock guard.
+pub enum FileFlagGuard<'a, T> {
+    Reader(RwLockReadGuard<'a, T>),
+    Writer(RwLockWriteGuard<'a, T>),
+}
+
+impl<'a, T> Deref for FileFlagGuard<'a, T> {
+    type Target = T;
+
+    fn deref(&self) -> &Self::Target {
+        match self {
+            FileFlagGuard::Reader(v) => v.deref(),
+            FileFlagGuard::Writer(v) => v.deref(),
+        }
+    }
 }
 
 #[cfg(test)]

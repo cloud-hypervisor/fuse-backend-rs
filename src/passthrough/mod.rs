@@ -22,8 +22,8 @@ use std::os::fd::{AsFd, BorrowedFd};
 use std::os::unix::ffi::OsStringExt;
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, RwLock, RwLockWriteGuard};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, RwLock, RwLockWriteGuard};
 use std::time::Duration;
 
 use vm_memory::{bitmap::BitmapSlice, ByteValued};
@@ -35,7 +35,7 @@ use self::mount_fd::MountFds;
 use self::statx::{statx, StatExt};
 use self::util::{
     ebadf, einval, enosys, eperm, is_dir, is_safe_inode, openat, reopen_fd_through_proc, stat_fd,
-    UniqueInodeGenerator,
+    FileFlagGuard, UniqueInodeGenerator,
 };
 use crate::abi::fuse_abi as fuse;
 use crate::abi::fuse_abi::Opcode;
@@ -256,8 +256,7 @@ impl InodeMap {
 struct HandleData {
     inode: Inode,
     file: File,
-    lock: Mutex<()>,
-    open_flags: AtomicU32,
+    open_flags: RwLock<u32>,
 }
 
 impl HandleData {
@@ -265,8 +264,7 @@ impl HandleData {
         HandleData {
             inode,
             file,
-            lock: Mutex::new(()),
-            open_flags: AtomicU32::new(flags),
+            open_flags: RwLock::new(flags),
         }
     }
 
@@ -274,20 +272,13 @@ impl HandleData {
         &self.file
     }
 
-    fn get_file_mut(&self) -> (MutexGuard<()>, &File) {
-        (self.lock.lock().unwrap(), &self.file)
+    fn get_file_mut(&self) -> (FileFlagGuard<u32>, &File) {
+        let guard = self.open_flags.write().unwrap();
+        (FileFlagGuard::Writer(guard), &self.file)
     }
 
     fn borrow_fd(&self) -> BorrowedFd {
         self.file.as_fd()
-    }
-
-    fn get_flags(&self) -> u32 {
-        self.open_flags.load(Ordering::Relaxed)
-    }
-
-    fn set_flags(&self, flags: u32) {
-        self.open_flags.store(flags, Ordering::Relaxed);
     }
 }
 
