@@ -213,6 +213,8 @@ impl<'a, F: FileSystem, S: BitmapSlice> SrvContext<'a, F, S> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "fusedev")]
+    use crate::transport::FuseBuf;
 
     #[test]
     fn test_extract_cstrs() {
@@ -248,5 +250,43 @@ mod tests {
         ServerUtil::extract_two_cstrs(&[0x1u8, 0x2u8, 0x0, 0x3]).unwrap_err();
         ServerUtil::extract_two_cstrs(&[0x1u8, 0x2u8, 0x0]).unwrap_err();
         ServerUtil::extract_two_cstrs(&[0x1u8, 0x2u8]).unwrap_err();
+    }
+
+    #[cfg(feature = "fusedev")]
+    #[test]
+    fn test_get_message_body() {
+        let mut read_buf = [0u8; 4096];
+
+        let mut r = Reader::<()>::from_fuse_buffer(FuseBuf::new(&mut read_buf)).unwrap();
+        let in_header = InHeader {
+            len: 0x1000,
+            ..Default::default()
+        };
+        let buf = ServerUtil::get_message_body(&mut r, &in_header, 0).unwrap();
+        assert_eq!(buf.len(), 0x1000 - size_of::<InHeader>());
+
+        let mut r = Reader::<()>::from_fuse_buffer(FuseBuf::new(&mut read_buf)).unwrap();
+        let in_header = InHeader {
+            len: 0x1000,
+            ..Default::default()
+        };
+        let buf = ServerUtil::get_message_body(&mut r, &in_header, 0x100).unwrap();
+        assert_eq!(buf.len(), 0x1000 - size_of::<InHeader>() - 0x100);
+
+        let mut r = Reader::<()>::from_fuse_buffer(FuseBuf::new(&mut read_buf)).unwrap();
+        let in_header = InHeader {
+            len: 0x1000,
+            ..Default::default()
+        };
+        // shoutld fail because of invalid sub header size
+        assert!(ServerUtil::get_message_body(&mut r, &in_header, 0x1000).is_err());
+
+        let mut r = Reader::<()>::from_fuse_buffer(FuseBuf::new(&mut read_buf)).unwrap();
+        let in_header = InHeader {
+            len: 0x1000,
+            ..Default::default()
+        };
+        // shoutld fail because of invalid sub header size
+        assert!(ServerUtil::get_message_body(&mut r, &in_header, 0x1001).is_err());
     }
 }
