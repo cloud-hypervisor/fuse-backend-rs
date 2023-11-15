@@ -46,7 +46,7 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
     fn ensure_file_flags<'a>(
         &self,
         data: &'a Arc<HandleData>,
-        file: &File,
+        fd: &impl AsRawFd,
         mut flags: u32,
     ) -> io::Result<FileFlagGuard<'a, u32>> {
         let guard = data.open_flags.read().unwrap();
@@ -63,7 +63,7 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
             } else {
                 flags = *guard & !libc::O_DIRECT as u32;
             }
-            let ret = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_SETFL, flags) };
+            let ret = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETFL, flags) };
             if ret != 0 {
                 return Err(io::Error::last_os_error());
             }
@@ -134,8 +134,7 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
 
             let (front, back) = rem.split_at(size_of::<LinuxDirent64>());
 
-            let dirent64 = LinuxDirent64::from_slice(front)
-                .expect("fuse: unable to get LinuxDirent64 from slice");
+            let dirent64 = LinuxDirent64::from_slice(front).ok_or_else(einval)?;
 
             let namelen = dirent64.d_reclen as usize - size_of::<LinuxDirent64>();
             debug_assert!(
@@ -677,16 +676,14 @@ impl<S: BitmapSlice + Send + Sync> FileSystem for PassthroughFs<S> {
         flags: u32,
     ) -> io::Result<usize> {
         let data = self.get_data(handle, inode, libc::O_RDONLY)?;
+        let fd = data.borrow_fd();
+
+        self.ensure_file_flags(&data, &fd, flags)?;
 
         // Manually implement File::try_clone() by borrowing fd of data.file instead of dup().
         // It's safe because the `data` variable's lifetime spans the whole function,
         // so data.file won't be closed.
-        let f = unsafe { File::from_raw_fd(data.borrow_fd().as_raw_fd()) };
-
-        self.ensure_file_flags(&data, &f, flags)?;
-
-        let mut f = ManuallyDrop::new(f);
-
+        let mut f = unsafe { ManuallyDrop::new(File::from_raw_fd(fd.as_raw_fd())) };
         w.write_from(&mut *f, size as usize, offset)
     }
 
@@ -704,20 +701,13 @@ impl<S: BitmapSlice + Send + Sync> FileSystem for PassthroughFs<S> {
         fuse_flags: u32,
     ) -> io::Result<usize> {
         let data = self.get_data(handle, inode, libc::O_RDWR)?;
+        let fd = data.borrow_fd();
 
-        // Manually implement File::try_clone() by borrowing fd of data.file instead of dup().
-        // It's safe because the `data` variable's lifetime spans the whole function,
-        // so data.file won't be closed.
-        let f = unsafe { File::from_raw_fd(data.borrow_fd().as_raw_fd()) };
-
-        self.ensure_file_flags(&data, &f, flags)?;
-
+        self.ensure_file_flags(&data, &fd, flags)?;
         if self.seal_size.load(Ordering::Relaxed) {
-            let st = stat_fd(&f, None)?;
+            let st = stat_fd(&fd, None)?;
             self.seal_size_check(Opcode::Write, st.st_size as u64, offset, size as u64, 0)?;
         }
-
-        let mut f = ManuallyDrop::new(f);
 
         // Cap restored when _killpriv is dropped
         let _killpriv =
@@ -727,6 +717,10 @@ impl<S: BitmapSlice + Send + Sync> FileSystem for PassthroughFs<S> {
                 None
             };
 
+        // Manually implement File::try_clone() by borrowing fd of data.file instead of dup().
+        // It's safe because the `data` variable's lifetime spans the whole function,
+        // so data.file won't be closed.
+        let mut f = unsafe { ManuallyDrop::new(File::from_raw_fd(fd.as_raw_fd())) };
         r.read_to(&mut *f, size as usize, offset)
     }
 
