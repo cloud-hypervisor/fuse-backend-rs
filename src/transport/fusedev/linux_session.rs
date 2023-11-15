@@ -133,6 +133,35 @@ impl FuseSession {
         self.file = Some(file);
     }
 
+    /// Clone fuse file using ioctl FUSE_DEV_IOC_CLONE.
+    pub fn clone_fuse_file(&self) -> Result<File> {
+        let mut old_fd = self
+            .file
+            .as_ref()
+            .ok_or(SessionFailure(
+                "fuse session file doesn't exist".to_string(),
+            ))?
+            .as_raw_fd();
+
+        let cloned_file = OpenOptions::new()
+            .create(false)
+            .read(true)
+            .write(true)
+            .open(FUSE_DEVICE)
+            .map_err(|e| SessionFailure(format!("open {FUSE_DEVICE}: {e}")))?;
+
+        // define the function which invokes "ioctl FUSE_DEV_IOC_CLONE"
+        // refer: https://github.com/torvalds/linux/blob/c42d9eeef8e5ba9292eda36fd8e3c11f35ee065c/include/uapi/linux/fuse.h#L1051-L1052
+        // #define FUSE_DEV_IOC_MAGIC   229
+        // #define FUSE_DEV_IOC_CLONE   _IOR(FUSE_DEV_IOC_MAGIC, 0, uint32_t)
+        nix::ioctl_read!(clone_fuse_fd, 229, 0, i32);
+
+        unsafe { clone_fuse_fd(cloned_file.as_raw_fd(), (&mut old_fd) as *mut i32) }
+            .map_err(|e| SessionFailure(format!("failed to clone fuse file: {:?}", e)))?;
+
+        Ok(cloned_file)
+    }
+
     /// Get the mountpoint of the session.
     pub fn mountpoint(&self) -> &Path {
         &self.mountpoint
@@ -642,6 +671,20 @@ mod tests {
 
         se.set_fusermount("fusermount");
         assert_eq!(se.get_fusermount(), "fusermount");
+    }
+
+    #[test]
+    fn test_clone_fuse_file() {
+        let dir = TempDir::new().unwrap();
+        let mut se = FuseSession::new(dir.as_path(), "foo", "bar", true).unwrap();
+        se.mount().unwrap();
+
+        let cloned_file = se.clone_fuse_file().unwrap();
+        assert!(cloned_file.as_raw_fd() > 0);
+
+        se.umount().unwrap();
+        se.set_fuse_file(cloned_file);
+        se.mount().unwrap();
     }
 }
 
