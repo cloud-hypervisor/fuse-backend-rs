@@ -42,8 +42,8 @@ jobs:
     - name: smoke
       if: ${{ matrix.arch == 'amd64' }}
       run: |
-        make test
         echo user_allow_other | sudo tee --append /etc/fuse.conf
+        make test
         make smoke-all
 
   Macos-CI:
