@@ -1107,7 +1107,11 @@ impl<F: FileSystem + Sync> Server<F> {
         let BatchForgetIn { count, .. } = ctx.r.read_obj().map_err(Error::DecodeMessage)?;
 
         if let Some(size) = (count as usize).checked_mul(size_of::<ForgetOne>()) {
-            if size > MAX_BUFFER_SIZE as usize {
+            if size
+                > (MAX_BUFFER_SIZE + BUFFER_HEADER_SIZE
+                    - size_of::<BatchForgetIn>() as u32
+                    - size_of::<InHeader>() as u32) as usize
+            {
                 return Err(Error::InvalidMessage(io::Error::from_raw_os_error(
                     libc::EOVERFLOW,
                 )));
