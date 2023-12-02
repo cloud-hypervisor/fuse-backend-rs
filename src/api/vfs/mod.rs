@@ -19,14 +19,17 @@ use std::any::Any;
 use std::collections::HashMap;
 use std::ffi::CStr;
 use std::fmt;
-use std::io;
-use std::io::{Error, ErrorKind, Result};
+use std::fs::File;
+use std::io::{self, Error, ErrorKind, Result, Read};
 use std::ops::Deref;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use arc_swap::ArcSwap;
+
+#[cfg(feature = "persist")]
+use {versionize::{VersionMap, Versionize, VersionizeResult}, versionize_derive::Versionize};
 
 use crate::abi::fuse_abi::*;
 use crate::api::filesystem::*;
@@ -67,6 +70,8 @@ pub type VfsIndex = u8;
 // VfsIndex is type of 'u8', so maximum 256 entries.
 const MAX_VFS_INDEX: usize = 256;
 
+// The default overflow uid/gid
+const DEFAULT_OVERFLOWID: u32 = 65534;
 /// Data struct to store inode number for the VFS filesystem.
 #[derive(Clone, Copy, Eq, PartialEq, Hash, Debug)]
 pub struct VfsInode(u64);
@@ -223,7 +228,7 @@ struct MountPointData {
     _path: String,
 }
 
-#[derive(Debug, Copy, Clone)]
+#[derive(Debug, Clone)]
 /// vfs init options
 pub struct VfsOptions {
     /// Make readdir/readdirplus request return zero dirent even if dir has children.
@@ -235,11 +240,14 @@ pub struct VfsOptions {
     pub in_opts: FsOptions,
     /// File system options returned to client
     pub out_opts: FsOptions,
-    /// Declaration of ID mapping, in the format (internal ID, external ID, range).
-    /// For example, (0, 1, 65536) represents mapping the external UID/GID range of `1~65536`
+    /// Declaration of UID mappings, each mapping is consists of internal UID, external UID, and size.
+    /// For example, (0, 1, 65536) represents mapping the external UID range of `1~65536`
     /// to the range of `0~65535` within the filesystem.
-    pub id_mapping: (u32, u32, u32),
-
+    pub uid_mappings: Vec<VfsIdMapping>,
+    /// Declaration of GID mappings, each mapping is consists of internal GID, external GID, and size.
+    /// For example, (0, 1, 65536) represents mapping the external GID range of `1~65536`
+    /// to the range of `0~65535` within the filesystem.
+    pub gid_mappings: Vec<VfsIdMapping>,
     /// Disable fuse open request handling. When enabled, fuse open
     /// requests are always replied with ENOSYS.
     #[cfg(target_os = "linux")]
@@ -294,7 +302,8 @@ impl Default for VfsOptions {
             killpriv_v2: false,
             in_opts: FsOptions::empty(),
             out_opts,
-            id_mapping: (0, 0, 0),
+            uid_mappings: vec![],
+            gid_mappings: vec![],
         }
     }
 
@@ -306,7 +315,31 @@ impl Default for VfsOptions {
             seal_size: false,
             in_opts: FsOptions::empty(),
             out_opts,
-            id_mapping: (0, 0, 0),
+            uid_mappings: vec![],
+            gid_mappings: vec![],
+        }
+    }
+}
+
+#[derive(Debug, Copy, Clone)]
+#[cfg_attr(feature = "persist", derive(Versionize))]
+/// vfs id mapping
+pub struct VfsIdMapping {
+    /// internal id used by the server
+    pub internal_id: u32,
+    /// external id used by the client
+    pub external_id: u32,
+    /// the length of this mapping
+    pub size: u32,
+}
+
+impl VfsIdMapping {
+    /// Create a new vfs id mapping
+    pub fn new(internal_id: u32, external_id: u32, size: u32) -> Self {
+        Self {
+            internal_id,
+            external_id,
+            size,
         }
     }
 }
@@ -323,7 +356,10 @@ pub struct Vfs {
     initialized: AtomicBool,
     lock: Mutex<()>,
     remove_pseudo_root: bool,
-    id_mapping: Option<(u32, u32, u32)>,
+    uid_mappings: Vec<VfsIdMapping>,
+    gid_mappings: Vec<VfsIdMapping>,
+    overflow_uid: u32,
+    overflow_gid: u32,
 }
 
 impl Default for Vfs {
@@ -335,19 +371,34 @@ impl Default for Vfs {
 impl Vfs {
     /// Create a new vfs instance
     pub fn new(opts: VfsOptions) -> Self {
+        let mut overflow_uid = DEFAULT_OVERFLOWID;
+        let mut overflow_gid = DEFAULT_OVERFLOWID;
+        if let Ok(mut overflowuid) = File::open("/proc/sys/kernel/overflowuid") {
+            let mut ouid = String::new();
+            if overflowuid.read_to_string(&mut ouid).is_ok() {
+                overflow_uid = ouid.trim().parse().unwrap_or(DEFAULT_OVERFLOWID);
+            }
+        }
+        if let Ok(mut overflowgid) = File::open("/proc/sys/kernel/overflowgid") {
+            let mut ogid = String::new();
+            if overflowgid.read_to_string(&mut ogid).is_ok() {
+                overflow_gid = ogid.trim().parse().unwrap_or(DEFAULT_OVERFLOWID);
+            }
+        }
+
         Vfs {
             next_super: AtomicU8::new(VFS_PSEUDO_FS_IDX + 1),
             mountpoints: ArcSwap::new(Arc::new(HashMap::new())),
             superblocks: ArcSwap::new(Arc::new(vec![None; MAX_VFS_INDEX])),
             root: PseudoFs::new(),
-            opts: ArcSwap::new(Arc::new(opts)),
+            opts: ArcSwap::new(Arc::new(opts.clone())),
             lock: Mutex::new(()),
             initialized: AtomicBool::new(false),
             remove_pseudo_root: false,
-            id_mapping: match opts.id_mapping.2 {
-                0 => None,
-                _ => Some(opts.id_mapping),
-            },
+            uid_mappings: opts.uid_mappings.clone(),
+            gid_mappings: opts.gid_mappings.clone(),
+            overflow_uid,
+            overflow_gid,
         }
     }
 
@@ -364,7 +415,7 @@ impl Vfs {
 
     /// Get a snapshot of the current vfs options.
     pub fn options(&self) -> VfsOptions {
-        *self.opts.load_full()
+        self.opts.load_full().deref().clone()
     }
 
     fn insert_mount_locked(
@@ -555,18 +606,38 @@ impl Vfs {
             entry.inode = ino;
             entry.attr.st_ino = ino;
             // If id_mapping is enabled, map the internal ID to the external ID.
-            if let Some((internal_id, external_id, range)) = self.id_mapping {
-                if entry.attr.st_uid >= internal_id && entry.attr.st_uid < internal_id + range {
-                    entry.attr.st_uid += external_id - internal_id;
-                }
-                if entry.attr.st_gid >= internal_id && entry.attr.st_gid < internal_id + range {
-                    entry.attr.st_gid += external_id - internal_id;
-                }
-            }
+            entry.attr.st_uid = self.do_mapping(entry.attr.st_uid, true, true);
+            entry.attr.st_gid = self.do_mapping(entry.attr.st_gid, true, false);
             *entry
         })
     }
 
+    fn do_mapping(&self, id: u32, map_internal_to_external: bool, is_uid: bool) -> u32 {
+        let (mut mapped_id, id_mappings) = if is_uid {
+            (self.overflow_uid, &self.uid_mappings)
+        } else {
+            (self.overflow_gid, &self.gid_mappings)
+        };
+
+        if id_mappings.is_empty() {
+            return id;
+        }
+
+        for id_mapping in id_mappings {
+            let (src_id, dst_id, size) = if map_internal_to_external {
+                (id_mapping.internal_id, id_mapping.external_id, id_mapping.size)
+            } else {
+                (id_mapping.external_id, id_mapping.internal_id, id_mapping.size)
+            };
+
+            if id >= src_id && id < src_id + size {
+                mapped_id = dst_id + id - src_id;
+                break;
+            }
+        }
+
+        mapped_id
+    }
     /// If id_mapping is enabled, remap the uid/gid in attributes.
     ///
     /// If `map_internal_to_external` is true, the IDs inside VFS will be mapped
@@ -574,32 +645,8 @@ impl Vfs {
     /// If `map_internal_to_external` is false, the external IDs will be mapped
     /// to VFS internal IDs.
     fn remap_attr_id(&self, map_internal_to_external: bool, attr: &mut stat64) {
-        if let Some((internal_id, external_id, range)) = self.id_mapping {
-            if map_internal_to_external
-                && attr.st_uid >= internal_id
-                && attr.st_uid < internal_id + range
-            {
-                attr.st_uid += external_id - internal_id;
-            }
-            if map_internal_to_external
-                && attr.st_gid >= internal_id
-                && attr.st_gid < internal_id + range
-            {
-                attr.st_gid += external_id - internal_id;
-            }
-            if !map_internal_to_external
-                && attr.st_uid >= external_id
-                && attr.st_uid < external_id + range
-            {
-                attr.st_uid += internal_id - external_id;
-            }
-            if !map_internal_to_external
-                && attr.st_gid >= external_id
-                && attr.st_gid < external_id + range
-            {
-                attr.st_gid += internal_id - external_id;
-            }
-        }
+        attr.st_uid = self.do_mapping(attr.st_uid, map_internal_to_external, true);
+        attr.st_gid = self.do_mapping(attr.st_gid, map_internal_to_external, false);
     }
 
     fn allocate_fs_idx(&self) -> Result<VfsIndex> {
@@ -706,7 +753,7 @@ pub mod persist {
     use crate::api::{
         filesystem::FsOptions,
         pseudo_fs::persist::PseudoFsState,
-        vfs::{VfsError, VfsResult},
+        vfs::{VfsError, VfsResult, VfsIdMapping},
         Vfs, VfsOptions,
     };
 
@@ -727,9 +774,8 @@ pub mod persist {
         out_opts: u64,
         no_readdir: bool,
         seal_size: bool,
-        id_mapping_internal: u32,
-        id_mapping_external: u32,
-        id_mapping_range: u32,
+        uid_mappings: Vec<VfsIdMapping>,
+        gid_mappings: Vec<VfsIdMapping>,
 
         #[cfg(target_os = "linux")]
         no_open: bool,
@@ -748,9 +794,8 @@ pub mod persist {
                 out_opts: self.out_opts.bits(),
                 no_readdir: self.no_readdir,
                 seal_size: self.seal_size,
-                id_mapping_internal: self.id_mapping.0,
-                id_mapping_external: self.id_mapping.1,
-                id_mapping_range: self.id_mapping.2,
+                uid_mappings: self.uid_mappings.clone(),
+                gid_mappings: self.gid_mappings.clone(),
 
                 #[cfg(target_os = "linux")]
                 no_open: self.no_open,
@@ -773,11 +818,8 @@ pub mod persist {
                 ))?,
                 no_readdir: state.no_readdir,
                 seal_size: state.seal_size,
-                id_mapping: (
-                    state.id_mapping_internal,
-                    state.id_mapping_external,
-                    state.id_mapping_range,
-                ),
+                uid_mappings: state.uid_mappings.clone(),
+                gid_mappings: state.gid_mappings.clone(),
 
                 #[cfg(target_os = "linux")]
                 no_open: state.no_open,

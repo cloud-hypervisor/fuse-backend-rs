@@ -80,8 +80,6 @@ pub enum Error {
     FailedToWrite(io::Error),
     /// Failed to split a writer.
     FailedToSplitWriter(transport::Error),
-    /// Failed to remap uid/gid.
-    FailedToRemapID((u32, u32)),
 }
 
 impl error::Error for Error {}
@@ -103,10 +101,6 @@ impl fmt::Display for Error {
             InvalidMessage(err) => write!(f, "cannot process fuse message: {err}"),
             FailedToWrite(err) => write!(f, "cannot write to buffer: {err}"),
             FailedToSplitWriter(err) => write!(f, "cannot split a writer: {err}"),
-            FailedToRemapID((uid, gid)) => write!(
-                f,
-                "failed to remap the context of user (uid={uid}, gid={gid})."
-            ),
         }
     }
 }
