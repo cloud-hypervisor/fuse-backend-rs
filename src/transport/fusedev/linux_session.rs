@@ -644,6 +644,14 @@ mod tests {
     use std::path::Path;
     use vmm_sys_util::tempdir::TempDir;
 
+    fn is_root() -> bool {
+        if unsafe { libc::getuid() } == 0 {
+            true
+        } else {
+            false
+        }
+    }
+
     #[test]
     fn test_new_session() {
         let se = FuseSession::new(Path::new("haha"), "foo", "bar", true);
@@ -675,6 +683,10 @@ mod tests {
 
     #[test]
     fn test_clone_fuse_file() {
+        // skip test if not root user
+        if !is_root() {
+            return;
+        }
         let dir = TempDir::new().unwrap();
         let mut se = FuseSession::new(dir.as_path(), "foo", "bar", true).unwrap();
         se.mount().unwrap();
