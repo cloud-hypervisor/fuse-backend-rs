@@ -12,7 +12,7 @@ sudo apt-get install acl attr automake bc dbench dump e2fsprogs fio gawk \
 
 # clone xfstests and install.
 cd /tmp/
-git clone git://git.kernel.org/pub/scm/fs/xfs/xfstests-dev.git
+git clone -b v2023.12.10 git://git.kernel.org/pub/scm/fs/xfs/xfstests-dev.git
 cd xfstests-dev
 make
 sudo make install
