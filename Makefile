@@ -54,3 +54,10 @@ smoke-macos: check-macos
 
 docker-smoke:
 	docker run --env RUST_BACKTRACE=1 --rm --privileged --volume ${current_dir}:/fuse-rs rust:1.68 sh -c "rustup component add clippy rustfmt; cd /fuse-rs; make smoke-all"
+
+testoverlay:
+	cd tests/testoverlay && cargo build
+
+# Setup xfstests env and run.
+xfstests:
+	./tests/scripts/xfstests.sh

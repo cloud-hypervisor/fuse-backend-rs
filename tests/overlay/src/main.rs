@@ -52,7 +52,7 @@ fn new_passthroughfs_layer(rootdir: &str) -> Result<BoxedLayer> {
 
 fn help() {
     println!(
-        "Usage:\n   testoverlay -o lowerdir=<lower1>:<lower2>:<more>,upperdir=<upper>,workdir=<work> <name> <mountpoint> [-l log_level]\n"
+        "Usage:\n   overlay -o lowerdir=<lower1>:<lower2>:<more>,upperdir=<upper>,workdir=<work> <name> <mountpoint> [-l log_level]\n"
     );
 }
 

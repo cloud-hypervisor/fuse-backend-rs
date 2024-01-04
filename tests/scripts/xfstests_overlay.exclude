@@ -1,0 +1,24 @@
+# Exclude list for tests that we know are broken in smb3
+#
+generic/011 # Broken: dirstress 5 processes.
+generic/020 # ENOSPC, suppose to be FUSE compatibility issue.
+generic/023 # Rename is not supported currently.
+generic/024 # Rename is not supported currently.
+generic/025 # Rename is not supported currently.
+generic/035 # Rename is not supported currently.
+generic/078 # Rename is not supported currently.
+generic/089 # Rename is not supported currently.
+generic/099 # Suppose to be FUSE compatibility issue.
+generic/184 # Special device isn't supported due to 'nodev' mount option.
+generic/241 # Rename is not supported currently.
+generic/245 # Rename is not supported currently.
+generic/375 # Suppose to be FUSE compatibility issue, about posix acl support
+generic/426 # Suppose to be FUSE compatibility issue: 'open_by_handle'
+generic/434 # Special device isn't supported due to 'nodev' mount option.
+generic/444 # Suppose to be FUSE compatibility issue, about posix acl support
+generic/467 # Suppose to be FUSE compatibility issue: 'open_by_handle'
+generic/477 # Suppose to be FUSE compatibility issue: 'open_by_handle'
+generic/591 # Broken.
+generic/633 # Suppose to be FUSE compatibility issue.
+generic/697 # Suppose to be FUSE compatibility issue.
+generic/736
