@@ -58,10 +58,6 @@ mod config;
 mod file_handle;
 mod inode_store;
 #[cfg(target_os = "linux")]
-mod linux_sync_io;
-#[cfg(target_os = "macos")]
-mod macos_sync_io;
-#[cfg(target_os = "linux")]
 mod mount_fd;
 #[cfg(target_os = "linux")]
 mod os_compat;
@@ -69,6 +65,7 @@ mod os_compat;
 mod stat;
 #[cfg(target_os = "linux")]
 mod statx;
+mod sync_io;
 mod util;
 
 type Inode = u64;
@@ -88,6 +85,16 @@ type InodeMode = u16;
 type LibCStat = libc::stat64;
 #[cfg(target_os = "macos")]
 type LibCStat = libc::stat;
+
+#[cfg(target_os = "linux")]
+type OffT = libc::off64_t;
+#[cfg(target_os = "macos")]
+type OffT = libc::off_t;
+
+#[cfg(target_os = "linux")]
+type StatVfs = libc::statvfs64;
+#[cfg(target_os = "macos")]
+type StatVfs = libc::statvfs;
 
 /// Maximum host inode number supported by passthroughfs
 const MAX_HOST_INO: u64 = 0x7fff_ffff_ffff;

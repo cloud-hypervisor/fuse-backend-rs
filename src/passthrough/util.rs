@@ -298,7 +298,10 @@ mod tests {
             // 56 bit = 0
             // 55~48 bit = 0000 0010
             // 47~1 bit  = 1
+            #[cfg(target_os = "linux")]
             assert_eq!(unique_inode, 0x01000000000001);
+            #[cfg(target_os = "macos")]
+            assert_eq!(unique_inode, 0x00800000000001);
             let expect_inode_alt_key = generator.decode_unique_inode(unique_inode).unwrap();
             assert_eq!(expect_inode_alt_key, inode_alt_key);
 
@@ -326,7 +329,10 @@ mod tests {
             // 56 bit = 0
             // 55~48 bit = 0000 0010
             // 47~1 bit  = 0x7fffffffffff
+            #[cfg(target_os = "linux")]
             assert_eq!(unique_inode, 0x017fffffffffff);
+            #[cfg(target_os = "macos")]
+            assert_eq!(unique_inode, 0x01ffffffffffff);
             let expect_inode_alt_key = generator.decode_unique_inode(unique_inode).unwrap();
             assert_eq!(expect_inode_alt_key, inode_alt_key);
         }
@@ -362,7 +368,10 @@ mod tests {
             // 56 bit = 1
             // 55~48 bit = 0000 0001
             // 47~1 bit  = 3
+            #[cfg(target_os = "linux")]
             assert_eq!(unique_inode, 0x80800000000003);
+            #[cfg(target_os = "macos")]
+            assert_eq!(format!("0x{:x}", unique_inode), "0x81000000000003");
 
             let inode_alt_key = InodeId {
                 ino: MAX_HOST_INO + 3,
@@ -377,7 +386,10 @@ mod tests {
             // 56 bit = 1
             // 55~48 bit = 0000 0010
             // 47~1 bit  = 4
+            #[cfg(target_os = "linux")]
             assert_eq!(unique_inode, 0x81000000000004);
+            #[cfg(target_os = "macos")]
+            assert_eq!(unique_inode, 0x81800000000004);
 
             let inode_alt_key = InodeId {
                 ino: u64::MAX,
@@ -392,7 +404,10 @@ mod tests {
             // 56 bit = 1
             // 55~48 bit = 0000 0001
             // 47~1 bit  = 5
+            #[cfg(target_os = "linux")]
             assert_eq!(unique_inode, 0x80800000000005);
+            #[cfg(target_os = "macos")]
+            assert_eq!(format!("0x{:x}", unique_inode), "0x82000000000005");
         }
     }
 

@@ -27,7 +27,9 @@ impl Daemon {
     pub fn new(src: &str, mountpoint: &str, thread_cnt: u32) -> Result<Self> {
         // create vfs
         let vfs = Vfs::new(VfsOptions {
+            #[cfg(target_os = "linux")]
             no_open: false,
+            #[cfg(target_os = "linux")]
             no_opendir: false,
             ..Default::default()
         });
