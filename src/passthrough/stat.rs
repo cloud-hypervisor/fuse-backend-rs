@@ -14,10 +14,8 @@ pub fn stat(path_file: &impl AsRawFd) -> io::Result<Stat> {
     let mut st_ui = MaybeUninit::<libc::stat>::zeroed();
 
     let res = unsafe { libc::fstat(path_file.as_raw_fd(), st_ui.as_mut_ptr()) };
-
     if res >= 0 {
         let st = unsafe { st_ui.assume_init() };
-
         Ok(Stat { st })
     } else {
         Err(io::Error::last_os_error())

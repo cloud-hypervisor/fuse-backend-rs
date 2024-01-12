@@ -683,7 +683,7 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
 
     #[cfg(target_os = "macos")]
     fn open_file(&self, pathname: &CStr) -> io::Result<(File, Stat)> {
-        let path_file = self.open_file_restricted(pathname, libc::O_NOFOLLOW, 0)?;
+        let path_file = self.open_file_restricted(pathname, libc::O_NOFOLLOW, 0o40777)?;
         let st = stat(&path_file)?;
 
         Ok((path_file, st))
@@ -1070,7 +1070,6 @@ impl<S: BitmapSlice + Send + Sync + 'static> BackendFileSystem for PassthroughFs
     }
 }
 
-#[cfg(target_os = "linux")]
 macro_rules! scoped_cred {
     ($name:ident, $ty:ty, $syscall_nr:expr) => {
         #[derive(Debug)]
@@ -1099,7 +1098,10 @@ macro_rules! scoped_cred {
 
                 // This call is safe because it doesn't modify any memory and we
                 // check the return value.
+                #[cfg(target_os = "linux")]
                 let res = unsafe { libc::syscall($syscall_nr, -1, val, -1) };
+                #[cfg(target_os = "macos")]
+                let res = unsafe { $syscall_nr(val) };
                 if res == 0 {
                     Ok(Some($name))
                 } else {
@@ -1110,7 +1112,10 @@ macro_rules! scoped_cred {
 
         impl Drop for $name {
             fn drop(&mut self) {
+                #[cfg(target_os = "linux")]
                 let res = unsafe { libc::syscall($syscall_nr, -1, 0, -1) };
+                let res = unsafe { $syscall_nr(0) };
+                #[cfg(target_os = "macos")]
                 if res < 0 {
                     error!(
                         "fuse: failed to change credentials back to root: {}",
@@ -1127,45 +1132,45 @@ scoped_cred!(ScopedUid, libc::uid_t, libc::SYS_setresuid);
 #[cfg(target_os = "linux")]
 scoped_cred!(ScopedGid, libc::gid_t, libc::SYS_setresgid);
 
-#[cfg(target_os = "macos")]
-macro_rules! scoped_cred {
-    ($name:ident, $ty:ty, $set_func:path) => {
-        #[derive(Debug)]
-        pub(crate) struct $name;
+// #[cfg(target_os = "macos")]
+// macro_rules! scoped_cred {
+//     ($name:ident, $ty:ty, $set_func:path) => {
+//         #[derive(Debug)]
+//         pub(crate) struct $name;
 
-        impl $name {
-            fn new(val: $ty) -> io::Result<Option<$name>> {
-                if val == 0 {
-                    return Ok(None);
-                }
+//         impl $name {
+//             fn new(val: $ty) -> io::Result<Option<$name>> {
+//                 if val == 0 {
+//                     return Ok(None);
+//                 }
 
-                let current_val = unsafe { $set_func(0) };
+//                 let current_val = unsafe { $set_func(0) };
 
-                if current_val == -1 {
-                    return Err(io::Error::last_os_error());
-                }
+//                 if current_val == -1 {
+//                     return Err(io::Error::last_os_error());
+//                 }
 
-                let res = unsafe { $set_func(val) };
-                if res == 0 {
-                    Ok(Some($name))
-                } else {
-                    unsafe { $set_func(current_val as u32) };
-                    return Err(io::Error::last_os_error());
-                }
-            }
-        }
+//                 let res = unsafe { $set_func(val) };
+//                 if res == 0 {
+//                     Ok(Some($name))
+//                 } else {
+//                     unsafe { $set_func(current_val as u32) };
+//                     return Err(io::Error::last_os_error());
+//                 }
+//             }
+//         }
 
-        impl Drop for $name {
-            fn drop(&mut self) {
-                let res = unsafe { $set_func(0) };
-                error!(
-                    "fuse: failed to change credentials back to root: {}",
-                    io::Error::last_os_error(),
-                );
-            }
-        }
-    };
-}
+//         impl Drop for $name {
+//             fn drop(&mut self) {
+//                 let res = unsafe { $set_func(0) };
+//                 error!(
+//                     "fuse: failed to change credentials back to root: {}",
+//                     io::Error::last_os_error(),
+//                 );
+//             }
+//         }
+//     };
+// }
 
 #[cfg(target_os = "macos")]
 scoped_cred!(ScopedUid, libc::uid_t, libc::seteuid);
@@ -1209,20 +1214,30 @@ fn drop_cap_fsetid() -> io::Result<Option<CapFsetid>> {
     Ok(Some(CapFsetid {}))
 }
 
-#[cfg(target_os = "linux")]
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::abi::fuse_abi::CreateIn;
     use crate::api::filesystem::*;
     use crate::api::{Vfs, VfsOptions};
+    #[cfg(target_os = "linux")]
     use caps::{CapSet, Capability};
     use log;
     use std::io::Read;
     use std::ops::Deref;
     use std::os::unix::prelude::MetadataExt;
+
+    use std::fs;
+    use std::fs::Permissions;
+    use std::os::unix::fs::PermissionsExt;
+
+    #[cfg(target_os = "linux")]
     use vmm_sys_util::{tempdir::TempDir, tempfile::TempFile};
 
+    #[cfg(target_os = "macos")]
+    use tempfile::{tempdir, tempdir_in, NamedTempFile, TempDir};
+
+    #[cfg(target_os = "linux")]
     fn prepare_passthroughfs() -> PassthroughFs {
         let source = TempDir::new().expect("Cannot create temporary directory.");
         let parent_path =
@@ -1248,14 +1263,77 @@ mod tests {
         fs
     }
 
+    #[cfg(target_os = "macos")]
+    fn set_dir_permissions(dir_path: &str) {
+        let mut permissions = fs::metadata(&dir_path)
+            .expect("Failed to get directory metadata")
+            .permissions();
+        permissions.set_mode(0o40777);
+        let r = permissions.mode();
+        set_permissions_recursive(&dir_path).expect("Failed to set permissions");
+    }
+
+    #[cfg(target_os = "macos")]
+    fn set_permissions_recursive(path: &str) -> std::io::Result<()> {
+        let mut permissions = fs::metadata(path)
+            .expect("Failed to get directory metadata")
+            .permissions();
+        permissions.set_mode(0o40777);
+
+        let entries = fs::read_dir(path)?;
+
+        for entry in entries {
+            let entry = entry?;
+            let entry_path = entry.path();
+
+            if entry_path.is_dir() {
+                set_permissions_recursive(entry_path.to_str().unwrap())?;
+            } else {
+                let mut permissions = fs::metadata(entry_path)
+                    .expect("Failed to get directory metadata")
+                    .permissions();
+                permissions.set_mode(0o40777);
+            }
+        }
+
+        Ok(())
+    }
+
+    #[cfg(target_os = "macos")]
+    fn prepare_passthroughfs() -> PassthroughFs {
+        let source = tempdir().expect("Cannot create temporary directory.");
+        let tmp_path = source.into_path();
+        let parent = tempdir_in(&tmp_path).expect("Cannot create temporary directory.");
+        let parent_path = parent.into_path();
+        let child = NamedTempFile::new_in(&parent_path).expect("Cannot create temporary file.");
+        child.keep().unwrap();
+        set_dir_permissions(tmp_path.to_str().unwrap());
+
+        // Rest of the code remains unchanged
+        let fs_cfg = Config {
+            writeback: true,
+            do_import: true,
+            no_open: true,
+            inode_file_handles: false,
+            root_dir: tmp_path.to_string_lossy().to_string(),
+            ..Default::default()
+        };
+        let fs = PassthroughFs::<()>::new(fs_cfg).unwrap();
+        fs.import().unwrap();
+        fs
+    }
+
+    #[cfg(target_os = "linux")]
     fn passthroughfs_no_open(cfg: bool) {
         let opts = VfsOptions {
+            #[cfg(target_os = "linux")]
             no_open: cfg,
             ..Default::default()
         };
 
         let vfs = &Vfs::new(opts);
         // Assume that fuse kernel supports no_open.
+
         vfs.init(FsOptions::ZERO_MESSAGE_OPEN).unwrap();
 
         let fs_cfg = Config {
@@ -1277,6 +1355,7 @@ mod tests {
             .unwrap();
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn test_passthroughfs_no_open() {
         passthroughfs_no_open(true);
@@ -1287,6 +1366,7 @@ mod tests {
     fn test_passthroughfs_inode_file_handles() {
         log::set_max_level(log::LevelFilter::Trace);
 
+        #[cfg(target_os = "linux")]
         match caps::has_cap(None, CapSet::Effective, Capability::CAP_DAC_READ_SEARCH) {
             Ok(false) | Err(_) => {
                 println!("invoking open_by_handle_at needs CAP_DAC_READ_SEARCH");
@@ -1295,22 +1375,40 @@ mod tests {
             Ok(true) => {}
         }
 
-        let source = TempDir::new().expect("Cannot create temporary directory.");
-        let parent_path =
-            TempDir::new_in(source.as_path()).expect("Cannot create temporary directory.");
-        let child_path =
-            TempFile::new_in(parent_path.as_path()).expect("Cannot create temporary file.");
+        #[cfg(target_os = "linux")]
+        let (source, parent_path, child_path) = {
+            let source = TempDir::new().expect("Cannot create temporary directory.");
+            let parent_path =
+                TempDir::new_in(source.as_path()).expect("Cannot create temporary directory.");
+            let child_path =
+                TempFile::new_in(parent_path.as_path()).expect("Cannot create temporary file.");
+            (source, parent_path, child_path)
+        };
+
+        #[cfg(target_os = "macos")]
+        let (source, parent_path, child_path) = {
+            let source = tempdir().expect("Cannot create temporary directory.");
+            let tmp_path = source.into_path();
+            let parent = tempdir_in(&tmp_path).expect("Cannot create temporary directory.");
+            let parent_path = parent.into_path();
+            let child = NamedTempFile::new_in(&parent_path).expect("Cannot create temporary file.");
+            let (_, child_path) = child.keep().unwrap();
+            (tmp_path, parent_path, child_path)
+        };
 
         let fs_cfg = Config {
             writeback: true,
             do_import: true,
             no_open: true,
             inode_file_handles: true,
+            #[cfg(target_os = "linux")]
             root_dir: source
                 .as_path()
                 .to_str()
                 .expect("source path to string")
                 .to_string(),
+            #[cfg(target_os = "macos")]
+            root_dir: source.to_str().expect("source path to string").to_string(),
             ..Default::default()
         };
         let fs = PassthroughFs::<()>::new(fs_cfg).unwrap();
@@ -1320,8 +1418,15 @@ mod tests {
 
         // read a few files to inode map.
         let parent = CString::new(
+            #[cfg(target_os = "linux")]
             parent_path
                 .as_path()
+                .file_name()
+                .unwrap()
+                .to_str()
+                .expect("path to string"),
+            #[cfg(target_os = "macos")]
+            parent_path
                 .file_name()
                 .unwrap()
                 .to_str()
@@ -1332,8 +1437,15 @@ mod tests {
         let p_inode = p_entry.inode;
 
         let child = CString::new(
+            #[cfg(target_os = "linux")]
             child_path
                 .as_path()
+                .file_name()
+                .unwrap()
+                .to_str()
+                .expect("path to string"),
+            #[cfg(target_os = "macos")]
+            child_path
                 .file_name()
                 .unwrap()
                 .to_str()
@@ -1432,10 +1544,20 @@ mod tests {
     fn test_writeback_open_and_create() {
         // prepare a fs with writeback cache and open being true, so a write-only opened file
         // should have read permission as well.
+        #[cfg(target_os = "linux")]
         let source = TempDir::new().expect("Cannot create temporary directory.");
+        #[cfg(target_os = "macos")]
+        let source = tempdir().expect("Cannot create temporary directory.");
+        #[cfg(target_os = "linux")]
         let _ = std::process::Command::new("sh")
             .arg("-c")
             .arg(format!("touch {}/existfile", source.as_path().to_str().unwrap()).as_str())
+            .output()
+            .unwrap();
+        #[cfg(target_os = "macos")]
+        let _ = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(format!("touch {}/existfile", source.path().to_str().unwrap()).as_str())
             .output()
             .unwrap();
         let fs_cfg = Config {
@@ -1443,13 +1565,22 @@ mod tests {
             do_import: true,
             no_open: false,
             inode_file_handles: false,
+            #[cfg(target_os = "linux")]
             root_dir: source
                 .as_path()
                 .to_str()
                 .expect("source path to string")
                 .to_string(),
+            #[cfg(target_os = "macos")]
+            root_dir: source
+                .path()
+                .to_str()
+                .expect("source path to string")
+                .to_string(),
             ..Default::default()
         };
+        #[cfg(target_os = "macos")]
+        set_dir_permissions(source.path().to_str().unwrap());
         let mut fs = PassthroughFs::<()>::new(fs_cfg).unwrap();
         fs.writeback = AtomicBool::new(true);
         fs.no_open = AtomicBool::new(false);
@@ -1464,7 +1595,10 @@ mod tests {
         let fname = CString::new("testfile").unwrap();
         let args = CreateIn {
             flags: libc::O_WRONLY as u32,
+            #[cfg(target_os = "linux")]
             mode: 0644,
+            #[cfg(target_os = "macos")]
+            mode: 0o40777,
             umask: 0,
             fuse_flags: 0,
         };
@@ -1493,11 +1627,26 @@ mod tests {
     fn test_passthroughfs_dir_timeout() {
         log::set_max_level(log::LevelFilter::Trace);
 
-        let source = TempDir::new().expect("Cannot create temporary directory.");
-        let parent_path =
-            TempDir::new_in(source.as_path()).expect("Cannot create temporary directory.");
-        let child_path =
-            TempFile::new_in(parent_path.as_path()).expect("Cannot create temporary file.");
+        #[cfg(target_os = "linux")]
+        let (source, parent_path, child_path) = {
+            let source = TempDir::new().expect("Cannot create temporary directory.");
+            let parent_path =
+                TempDir::new_in(source.as_path()).expect("Cannot create temporary directory.");
+            let child_path =
+                TempFile::new_in(parent_path.as_path()).expect("Cannot create temporary file.");
+            (source, parent_path, child_path)
+        };
+
+        #[cfg(target_os = "macos")]
+        let (source, parent_path, child_path) = {
+            let source = tempdir().expect("Cannot create temporary directory.");
+            let tmp_path = source.into_path();
+            let parent = tempdir_in(&tmp_path).expect("Cannot create temporary directory.");
+            let parent_path = parent.into_path();
+            let child = NamedTempFile::new_in(&parent_path).expect("Cannot create temporary file.");
+            let (_, child_path) = child.keep().unwrap();
+            (tmp_path, parent_path, child_path)
+        };
 
         // passthroughfs with cache=none, but non-zero dir entry/attr timeout.
         let fs_cfg = Config {
@@ -1555,8 +1704,21 @@ mod tests {
     #[test]
     fn test_stable_inode() {
         use std::os::unix::fs::MetadataExt;
-        let source = TempDir::new().expect("Cannot create temporary directory.");
-        let child_path = TempFile::new_in(source.as_path()).expect("Cannot create temporary file.");
+        #[cfg(target_os = "linux")]
+        let (source, child_path) = {
+            let source = TempDir::new().expect("Cannot create temporary directory.");
+            let child_path =
+                TempFile::new_in(source.as_path()).expect("Cannot create temporary file.");
+            (source, child_path)
+        };
+        #[cfg(target_os = "macos")]
+        let (source, chile_file, child_path) = {
+            let source = tempdir().expect("Cannot create temporary directory.");
+            let tmp_path = source.into_path();
+            let child = NamedTempFile::new_in(&tmp_path).expect("Cannot create temporary file.");
+            let (chile_file, child_path) = child.keep().unwrap();
+            (tmp_path, chile_file, child_path)
+        };
         let child = CString::new(
             child_path
                 .as_path()
@@ -1566,7 +1728,10 @@ mod tests {
                 .expect("path to string"),
         )
         .unwrap();
+        #[cfg(target_os = "linux")]
         let meta = child_path.as_file().metadata().unwrap();
+        #[cfg(target_os = "macos")]
+        let meta = chile_file.metadata().unwrap();
         let ctx = Context::default();
         {
             let fs_cfg = Config {
@@ -1621,11 +1786,16 @@ mod tests {
             let id = InodeId {
                 ino: MAX_HOST_INO + 1,
                 dev: 1,
+                #[cfg(target_os = "linux")]
                 mnt: 1,
             };
 
             // Default
+            #[cfg(target_os = "linux")]
             let inode = fs.allocate_inode(&m, &id, None).unwrap();
+
+            #[cfg(target_os = "macos")]
+            let inode = fs.allocate_inode(&m, &id).unwrap();
             assert_eq!(inode, 2);
         }
 
@@ -1636,10 +1806,15 @@ mod tests {
             let id = InodeId {
                 ino: 12345,
                 dev: 1,
+                #[cfg(target_os = "linux")]
                 mnt: 1,
             };
             // direct return host inode 12345
+            #[cfg(target_os = "linux")]
             let inode = fs.allocate_inode(&m, &id, None).unwrap();
+
+            #[cfg(target_os = "macos")]
+            let inode = fs.allocate_inode(&m, &id).unwrap();
             assert_eq!(inode & MAX_HOST_INO, 12345)
         }
 
@@ -1650,17 +1825,48 @@ mod tests {
             let id = InodeId {
                 ino: MAX_HOST_INO + 1,
                 dev: 1,
+                #[cfg(target_os = "linux")]
                 mnt: 1,
             };
             // allocate a virtual inode
+            #[cfg(target_os = "linux")]
             let inode = fs.allocate_inode(&m, &id, None).unwrap();
+
+            #[cfg(target_os = "macos")]
+            let inode = fs.allocate_inode(&m, &id).unwrap();
             assert_eq!(inode & MAX_HOST_INO, 2);
+            #[cfg(target_os = "linux")]
             let file = TempFile::new().expect("Cannot create temporary file.");
+            #[cfg(target_os = "macos")]
+            let (_, file, child_path) = {
+                let source = tempdir().expect("Cannot create temporary directory.");
+                let tmp_path = source.into_path();
+                let child =
+                    NamedTempFile::new_in(&tmp_path).expect("Cannot create temporary file.");
+                let (chile_file, child_path) = child.keep().unwrap();
+                (tmp_path, chile_file, child_path)
+            };
+            #[cfg(target_os = "linux")]
             let mode = file.as_file().metadata().unwrap().mode();
+            #[cfg(target_os = "macos")]
+            let (mode, cstring_path) = {
+                let mode = file.metadata().unwrap().mode();
+                let cstring_path = CString::new(child_path.to_string_lossy().to_string())
+                    .expect("Failed to convert to CString");
+                (mode as u16, cstring_path)
+            };
+            #[cfg(target_os = "linux")]
             let inode_data =
                 InodeData::new(inode, InodeHandle::File(file.into_file()), 1, id, mode);
+            #[cfg(target_os = "macos")]
+            let inode_data =
+                InodeData::new(inode, InodeHandle::File(file, cstring_path), 1, id, mode);
             m.insert(Arc::new(inode_data));
+            #[cfg(target_os = "linux")]
             let inode = fs.allocate_inode(&m, &id, None).unwrap();
+
+            #[cfg(target_os = "macos")]
+            let inode = fs.allocate_inode(&m, &id).unwrap();
             assert_eq!(inode & MAX_HOST_INO, 2);
         }
     }
@@ -1713,36 +1919,5 @@ mod tests {
         let fs = PassthroughFs::<()>::new(fs_cfg).unwrap();
         assert!(!fs.cfg.no_open);
         assert!(!fs.cfg.writeback);
-    }
-}
-
-#[cfg(target_os = "macos")]
-#[cfg(test)]
-mod tests {
-    use fuse::ROOT_ID;
-
-    use crate::api::filesystem::{Context, FileSystem};
-
-    use super::*;
-
-    fn prepare_passthroughfs() -> PassthroughFs {
-        let fs_cfg = Config {
-            root_dir: std::env::temp_dir().into_os_string().into_string().unwrap(),
-            ..Default::default()
-        };
-        let fs = PassthroughFs::<()>::new(fs_cfg).unwrap();
-        fs.import().unwrap();
-
-        fs
-    }
-
-    #[test]
-    fn test_lookup_escape_root() {
-        let fs = prepare_passthroughfs();
-        let ctx = Context::default();
-
-        let name = CString::new("..").unwrap();
-        let entry = fs.lookup(&ctx, ROOT_ID, &name).unwrap();
-        assert_eq!(entry.inode, ROOT_ID);
     }
 }
