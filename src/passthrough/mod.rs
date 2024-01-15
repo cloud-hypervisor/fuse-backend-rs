@@ -13,12 +13,15 @@
 
 use std::any::Any;
 use std::collections::{btree_map, BTreeMap};
-use std::ffi::{CStr, CString, OsString};
+#[cfg(target_os = "linux")]
+use std::ffi::OsString;
+use std::ffi::{CStr, CString};
 use std::fs::File;
 use std::io;
 use std::marker::PhantomData;
 use std::ops::{Deref, DerefMut};
 use std::os::fd::{AsFd, BorrowedFd};
+#[cfg(target_os = "linux")]
 use std::os::unix::ffi::OsStringExt;
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::path::PathBuf;
@@ -26,15 +29,17 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, RwLock, RwLockWriteGuard};
 use std::time::Duration;
 
-use vm_memory::{bitmap::BitmapSlice, ByteValued};
-
 pub use self::config::{CachePolicy, Config};
 #[cfg(target_os = "linux")]
 use self::file_handle::{FileHandle, OpenableFileHandle};
 use self::inode_store::{InodeId, InodeStore};
 #[cfg(target_os = "linux")]
 use self::mount_fd::MountFds;
+use vm_memory::bitmap::BitmapSlice;
+#[cfg(target_os = "linux")]
+use vm_memory::ByteValued;
 
+#[cfg(target_os = "macos")]
 use self::stat::{open, stat, Stat};
 #[cfg(target_os = "linux")]
 use self::statx::{statx, StatExt};
@@ -46,9 +51,11 @@ use self::util::{reopen_fd_through_proc, stat_fd};
 use crate::abi::fuse_abi as fuse;
 use crate::abi::fuse_abi::Opcode;
 use crate::api::filesystem::Entry;
+#[cfg(target_os = "linux")]
+use crate::api::PROC_SELF_FD_CSTR;
 use crate::api::{
     validate_path_component, BackendFileSystem, CURRENT_DIR_CSTR, EMPTY_CSTR, PARENT_DIR_CSTR,
-    PROC_SELF_FD_CSTR, SLASH_ASCII, VFS_MAX_INO,
+    SLASH_ASCII, VFS_MAX_INO,
 };
 
 #[cfg(feature = "async-io")]
@@ -108,6 +115,7 @@ const MAX_HOST_INO: u64 = 0x7fff_ffff_ffff;
  */
 #[derive(Debug)]
 enum InodeFile<'a> {
+    #[cfg(target_os = "linux")]
     Owned(File),
     Ref(&'a File),
 }
@@ -117,6 +125,7 @@ impl AsRawFd for InodeFile<'_> {
     /// Note: This fd is only valid as long as the `InodeFile` exists.
     fn as_raw_fd(&self) -> RawFd {
         match self {
+            #[cfg(target_os = "linux")]
             Self::Owned(file) => file.as_raw_fd(),
             Self::Ref(file_ref) => file_ref.as_raw_fd(),
         }
@@ -126,6 +135,7 @@ impl AsRawFd for InodeFile<'_> {
 impl AsFd for InodeFile<'_> {
     fn as_fd(&self) -> BorrowedFd<'_> {
         match self {
+            #[cfg(target_os = "linux")]
             Self::Owned(file) => file.as_fd(),
             Self::Ref(file_ref) => file_ref.as_fd(),
         }
@@ -490,6 +500,7 @@ pub struct PassthroughFs<S: BitmapSlice + Send + Sync = ()> {
     no_opendir: AtomicBool,
 
     // Whether kill_priv_v2 is enabled.
+    #[cfg(target_os = "linux")]
     killpriv_v2: AtomicBool,
 
     // Whether no_readdir is enabled.
@@ -562,6 +573,7 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
             writeback: AtomicBool::new(false),
             no_open: AtomicBool::new(false),
             no_opendir: AtomicBool::new(false),
+            #[cfg(target_os = "linux")]
             killpriv_v2: AtomicBool::new(false),
             no_readdir: AtomicBool::new(cfg.no_readdir),
             seal_size: AtomicBool::new(cfg.seal_size),
@@ -995,7 +1007,8 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
         file_size: u64,
         offset: u64,
         size: u64,
-        mode: i32,
+        #[cfg(target_os = "linux")] mode: i32,
+        #[cfg(target_os = "macos")] _mode: i32,
     ) -> io::Result<()> {
         if offset.checked_add(size).is_none() {
             error!(
@@ -1121,8 +1134,8 @@ macro_rules! scoped_cred {
             fn drop(&mut self) {
                 #[cfg(target_os = "linux")]
                 let res = unsafe { libc::syscall($syscall_nr, -1, 0, -1) };
-                let res = unsafe { $syscall_nr(0) };
                 #[cfg(target_os = "macos")]
+                let res = unsafe { $syscall_nr(0) };
                 if res < 0 {
                     error!(
                         "fuse: failed to change credentials back to root: {}",
@@ -1226,15 +1239,18 @@ mod tests {
     use super::*;
     use crate::abi::fuse_abi::CreateIn;
     use crate::api::filesystem::*;
+    #[cfg(target_os = "linux")]
     use crate::api::{Vfs, VfsOptions};
     #[cfg(target_os = "linux")]
     use caps::{CapSet, Capability};
     use log;
     use std::io::Read;
+    #[cfg(target_os = "linux")]
     use std::ops::Deref;
     use std::os::unix::prelude::MetadataExt;
 
     use std::fs;
+    #[cfg(target_os = "linux")]
     use std::fs::Permissions;
     use std::os::unix::fs::PermissionsExt;
 
@@ -1242,7 +1258,7 @@ mod tests {
     use vmm_sys_util::{tempdir::TempDir, tempfile::TempFile};
 
     #[cfg(target_os = "macos")]
-    use tempfile::{tempdir, tempdir_in, NamedTempFile, TempDir};
+    use tempfile::{tempdir, tempdir_in, NamedTempFile};
 
     #[cfg(target_os = "linux")]
     fn prepare_passthroughfs() -> PassthroughFs {
@@ -1276,7 +1292,7 @@ mod tests {
             .expect("Failed to get directory metadata")
             .permissions();
         permissions.set_mode(0o40777);
-        let r = permissions.mode();
+        let _r = permissions.mode();
         set_permissions_recursive(&dir_path).expect("Failed to set permissions");
     }
 

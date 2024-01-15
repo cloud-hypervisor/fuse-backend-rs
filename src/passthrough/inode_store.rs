@@ -10,7 +10,10 @@ use super::file_handle::FileHandle;
 use super::stat::Stat;
 #[cfg(target_os = "linux")]
 use super::statx::StatExt;
-use super::{InoT, Inode, InodeData, InodeHandle};
+
+#[cfg(target_os = "linux")]
+use super::InodeHandle;
+use super::{InoT, Inode, InodeData};
 
 #[derive(Clone, Copy, Default, PartialOrd, Ord, PartialEq, Eq, Debug)]
 /// Identify an inode in `PassthroughFs` by `InodeId`.

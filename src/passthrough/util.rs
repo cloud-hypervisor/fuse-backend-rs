@@ -3,9 +3,13 @@
 // Copyright (C) 2023 Alibaba Cloud. All rights reserved.
 
 use std::collections::{btree_map, BTreeMap};
-use std::ffi::{CStr, CString};
+use std::ffi::CStr;
+#[cfg(target_os = "linux")]
+use std::ffi::CString;
 use std::fs::File;
 use std::io;
+
+#[cfg(target_os = "linux")]
 use std::mem::MaybeUninit;
 use std::os::unix::io::{AsRawFd, FromRawFd};
 use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
@@ -14,6 +18,8 @@ use std::sync::Mutex;
 use super::inode_store::InodeId;
 use super::{InoT, InodeMode, MAX_HOST_INO};
 use crate::abi::fuse_abi as fuse;
+
+#[cfg(target_os = "linux")]
 use crate::api::EMPTY_CSTR;
 
 /// the 56th bit used to set the inode to 1 indicates virtual inode

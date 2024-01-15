@@ -8,7 +8,9 @@
 use std::ffi::{CStr, CString};
 use std::fs::File;
 use std::io;
-use std::mem::{self, size_of, ManuallyDrop, MaybeUninit};
+#[cfg(target_os = "linux")]
+use std::mem::size_of;
+use std::mem::{self, ManuallyDrop, MaybeUninit};
 use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -19,9 +21,9 @@ use super::os_compat::LinuxDirent64;
 #[cfg(target_os = "linux")]
 use super::util::stat_fd;
 use super::*;
+use crate::abi::fuse_abi::{CreateIn, Opcode};
 #[cfg(target_os = "linux")]
-use crate::abi::fuse_abi::WRITE_KILL_PRIV;
-use crate::abi::fuse_abi::{CreateIn, Opcode, FOPEN_IN_KILL_SUIDGID};
+use crate::abi::fuse_abi::{FOPEN_IN_KILL_SUIDGID, WRITE_KILL_PRIV};
 #[cfg(any(feature = "vhost-user-fs", feature = "virtiofs"))]
 use crate::abi::virtio_fs;
 use crate::api::filesystem::{
@@ -224,7 +226,10 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
                 add_entry(
                     DirEntry {
                         ino: dirent.d_ino,
+                        #[cfg(target_os = "linux")]
                         offset: dirent.d_seekoff as u64,
+                        #[cfg(target_os = "macos")]
+                        offset: dirent.d_seekoff,
                         type_: dirent.d_type as u32,
                         name,
                     },
@@ -252,7 +257,8 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
         &self,
         inode: Inode,
         flags: u32,
-        fuse_flags: u32,
+        #[cfg(target_os = "linux")] fuse_flags: u32,
+        #[cfg(target_os = "macos")] _fuse_flags: u32,
     ) -> io::Result<(Option<Handle>, OpenOptions, Option<u32>)> {
         #[cfg(target_os = "linux")]
         let killpriv = if self.killpriv_v2.load(Ordering::Relaxed)
@@ -392,52 +398,58 @@ impl<S: BitmapSlice + Send + Sync> FileSystem for PassthroughFs<S> {
     type Inode = Inode;
     type Handle = Handle;
 
+    #[cfg(target_os = "linux")]
     fn init(&self, capable: FsOptions) -> io::Result<FsOptions> {
         if self.cfg.do_import {
             self.import()?;
         }
 
-        #[cfg(target_os = "linux")]
         let mut opts = FsOptions::DO_READDIRPLUS | FsOptions::READDIRPLUS_AUTO;
         // !cfg.do_import means we are under vfs, in which case capable is already
         // negotiated and must be honored.
-        #[cfg(target_os = "linux")]
-        {
-            if (!self.cfg.do_import || self.cfg.writeback)
-                && capable.contains(FsOptions::WRITEBACK_CACHE)
-            {
-                opts |= FsOptions::WRITEBACK_CACHE;
-                self.writeback.store(true, Ordering::Relaxed);
-            }
-            if (!self.cfg.do_import || self.cfg.no_open)
-                && capable.contains(FsOptions::ZERO_MESSAGE_OPEN)
-            {
-                opts |= FsOptions::ZERO_MESSAGE_OPEN;
-                // We can't support FUSE_ATOMIC_O_TRUNC with no_open
-                opts.remove(FsOptions::ATOMIC_O_TRUNC);
-                self.no_open.store(true, Ordering::Relaxed);
-            }
-            if (!self.cfg.do_import || self.cfg.no_opendir)
-                && capable.contains(FsOptions::ZERO_MESSAGE_OPENDIR)
-            {
-                opts |= FsOptions::ZERO_MESSAGE_OPENDIR;
-                self.no_opendir.store(true, Ordering::Relaxed);
-            }
-            if (!self.cfg.do_import || self.cfg.killpriv_v2)
-                && capable.contains(FsOptions::HANDLE_KILLPRIV_V2)
-            {
-                opts |= FsOptions::HANDLE_KILLPRIV_V2;
-                self.killpriv_v2.store(true, Ordering::Relaxed);
-            }
 
-            if capable.contains(FsOptions::PERFILE_DAX) {
-                opts |= FsOptions::PERFILE_DAX;
-                self.perfile_dax.store(true, Ordering::Relaxed);
-            }
+        if (!self.cfg.do_import || self.cfg.writeback)
+            && capable.contains(FsOptions::WRITEBACK_CACHE)
+        {
+            opts |= FsOptions::WRITEBACK_CACHE;
+            self.writeback.store(true, Ordering::Relaxed);
+        }
+        if (!self.cfg.do_import || self.cfg.no_open)
+            && capable.contains(FsOptions::ZERO_MESSAGE_OPEN)
+        {
+            opts |= FsOptions::ZERO_MESSAGE_OPEN;
+            // We can't support FUSE_ATOMIC_O_TRUNC with no_open
+            opts.remove(FsOptions::ATOMIC_O_TRUNC);
+            self.no_open.store(true, Ordering::Relaxed);
+        }
+        if (!self.cfg.do_import || self.cfg.no_opendir)
+            && capable.contains(FsOptions::ZERO_MESSAGE_OPENDIR)
+        {
+            opts |= FsOptions::ZERO_MESSAGE_OPENDIR;
+            self.no_opendir.store(true, Ordering::Relaxed);
+        }
+        if (!self.cfg.do_import || self.cfg.killpriv_v2)
+            && capable.contains(FsOptions::HANDLE_KILLPRIV_V2)
+        {
+            opts |= FsOptions::HANDLE_KILLPRIV_V2;
+            self.killpriv_v2.store(true, Ordering::Relaxed);
         }
 
-        #[cfg(target_os = "macos")]
-        let mut opts = FsOptions::FILE_OPS;
+        if capable.contains(FsOptions::PERFILE_DAX) {
+            opts |= FsOptions::PERFILE_DAX;
+            self.perfile_dax.store(true, Ordering::Relaxed);
+        }
+
+        Ok(opts)
+    }
+
+    #[cfg(target_os = "macos")]
+    fn init(&self, _capable: FsOptions) -> io::Result<FsOptions> {
+        if self.cfg.do_import {
+            self.import()?;
+        }
+
+        let opts = FsOptions::FILE_OPS;
 
         Ok(opts)
     }
@@ -803,7 +815,8 @@ impl<S: BitmapSlice + Send + Sync> FileSystem for PassthroughFs<S> {
         _lock_owner: Option<u64>,
         _delayed_write: bool,
         flags: u32,
-        fuse_flags: u32,
+        #[cfg(target_os = "linux")] fuse_flags: u32,
+        #[cfg(target_os = "macos")] _fuse_flags: u32,
     ) -> io::Result<usize> {
         let data = self.get_data(handle, inode, libc::O_RDWR)?;
 
@@ -1051,7 +1064,8 @@ impl<S: BitmapSlice + Send + Sync> FileSystem for PassthroughFs<S> {
         oldname: &CStr,
         newdir: Inode,
         newname: &CStr,
-        flags: u32,
+        #[cfg(target_os = "linux")] flags: u32,
+        #[cfg(target_os = "macos")] _flags: u32,
     ) -> io::Result<()> {
         self.validate_path_component(oldname)?;
         self.validate_path_component(newname)?;
@@ -1104,7 +1118,9 @@ impl<S: BitmapSlice + Send + Sync> FileSystem for PassthroughFs<S> {
         self.validate_path_component(name)?;
 
         let data = self.inode_map.get(parent)?;
+        #[cfg(target_os = "linux")]
         let file = data.get_file()?;
+        #[cfg(target_os = "macos")]
         let pathname = data.get_path()?;
 
         let res = {
@@ -1266,7 +1282,8 @@ impl<S: BitmapSlice + Send + Sync> FileSystem for PassthroughFs<S> {
         &self,
         _ctx: &Context,
         inode: Inode,
-        datasync: bool,
+        #[cfg(target_os = "linux")] datasync: bool,
+        #[cfg(target_os = "macos")] _datasync: bool,
         handle: Handle,
     ) -> io::Result<()> {
         let data = self.get_data(handle, inode, libc::O_RDONLY)?;
@@ -1358,6 +1375,7 @@ impl<S: BitmapSlice + Send + Sync> FileSystem for PassthroughFs<S> {
         }
 
         let data = self.inode_map.get(inode)?;
+        #[cfg(target_os = "linux")]
         let file = data.get_file()?;
         #[cfg(target_os = "linux")]
         let pathname = CString::new(format!("/proc/self/fd/{}", file.as_raw_fd()))
@@ -1409,6 +1427,7 @@ impl<S: BitmapSlice + Send + Sync> FileSystem for PassthroughFs<S> {
         }
 
         let data = self.inode_map.get(inode)?;
+        #[cfg(target_os = "linux")]
         let file = data.get_file()?;
         let mut buf = Vec::<u8>::with_capacity(size as usize);
         #[cfg(target_os = "linux")]
@@ -1460,6 +1479,7 @@ impl<S: BitmapSlice + Send + Sync> FileSystem for PassthroughFs<S> {
         }
 
         let data = self.inode_map.get(inode)?;
+        #[cfg(target_os = "linux")]
         let file = data.get_file()?;
         let mut buf = Vec::<u8>::with_capacity(size as usize);
         #[cfg(target_os = "linux")]
@@ -1508,6 +1528,7 @@ impl<S: BitmapSlice + Send + Sync> FileSystem for PassthroughFs<S> {
         }
 
         let data = self.inode_map.get(inode)?;
+        #[cfg(target_os = "linux")]
         let file = data.get_file()?;
         #[cfg(target_os = "linux")]
         let pathname = CString::new(format!("/proc/self/fd/{}", file.as_raw_fd()))
