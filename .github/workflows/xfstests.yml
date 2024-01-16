@@ -52,3 +52,24 @@ jobs:
       run: |
         cd $GITHUB_WORKSPACE
         sudo ./tests/scripts/xfstests_overlay.sh
+
+  unionmount_testsuite_on_overlayfs:
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+    - name: Install Rust
+      uses: actions-rs/toolchain@v1
+      with:
+        profile: minimal
+        toolchain: stable
+        override: true
+    - name: Build overlay binary
+      run: |
+        cd tests/overlay
+        cargo build --release
+        sudo install -t /usr/sbin/ -m 700 ./target/release/overlay
+    - name: Setup and run unionmount testsuite
+      run: |
+        cd $GITHUB_WORKSPACE
+        sudo ./tests/scripts/unionmount_test_overlay.sh
