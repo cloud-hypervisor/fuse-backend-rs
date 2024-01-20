@@ -19,7 +19,7 @@ mod fusedev_tests {
     use vmm_sys_util::tempdir::TempDir;
 
     #[cfg(target_os = "macos")]
-    use tempfile::{tempdir, tempdir_in, NamedTempFile, TempDir};
+    use tempfile::tempdir;
 
     use crate::example::passthroughfs;
 

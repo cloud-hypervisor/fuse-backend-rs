@@ -7,7 +7,7 @@ use std::sync::Arc;
 #[cfg(target_os = "linux")]
 use super::file_handle::FileHandle;
 #[cfg(target_os = "macos")]
-use super::stat::Stat;
+use super::stat::Stat as StatExt;
 #[cfg(target_os = "linux")]
 use super::statx::StatExt;
 
@@ -25,22 +25,13 @@ pub struct InodeId {
 }
 
 impl InodeId {
-    #[cfg(target_os = "linux")]
     #[inline]
     pub(super) fn from_stat(st: &StatExt) -> Self {
         InodeId {
             ino: st.st.st_ino,
             dev: st.st.st_dev,
+            #[cfg(target_os = "linux")]
             mnt: st.mnt_id,
-        }
-    }
-
-    #[cfg(target_os = "macos")]
-    #[inline]
-    pub(super) fn from_stat(st: &Stat) -> Self {
-        InodeId {
-            ino: st.st.st_ino,
-            dev: st.st.st_dev,
         }
     }
 }
@@ -125,7 +116,9 @@ mod test {
     use super::super::*;
     use super::*;
 
+    #[cfg(target_os = "linux")]
     use std::ffi::CStr;
+    #[cfg(target_os = "linux")]
     use std::mem::MaybeUninit;
     use std::os::unix::io::AsRawFd;
     use std::sync::atomic::Ordering;
@@ -134,6 +127,7 @@ mod test {
     #[cfg(target_os = "linux")]
     use vmm_sys_util::tempfile::TempFile;
 
+    #[cfg(target_os = "macos")]
     use stat::stat;
 
     impl PartialEq for InodeData {

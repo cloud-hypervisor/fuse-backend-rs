@@ -10,20 +10,18 @@
 //! The code is derived from the
 //! [CrosVM](https://chromium.googlesource.com/chromiumos/platform/crosvm/) project,
 //! with heavy modification/enhancements from Alibaba Cloud OS team.
+#![allow(missing_docs)]
 
 use std::any::Any;
 use std::collections::{btree_map, BTreeMap};
-#[cfg(target_os = "linux")]
-use std::ffi::OsString;
 use std::ffi::{CStr, CString};
 use std::fs::File;
 use std::io;
 use std::marker::PhantomData;
 use std::ops::{Deref, DerefMut};
 use std::os::fd::{AsFd, BorrowedFd};
-#[cfg(target_os = "linux")]
-use std::os::unix::ffi::OsStringExt;
 use std::os::unix::io::{AsRawFd, RawFd};
+#[cfg(target_os = "macos")]
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, RwLock, RwLockWriteGuard};
@@ -31,25 +29,16 @@ use std::time::Duration;
 
 pub use self::config::{CachePolicy, Config};
 #[cfg(target_os = "linux")]
-use self::file_handle::{FileHandle, OpenableFileHandle};
+use self::file_handle::FileHandle;
 use self::inode_store::{InodeId, InodeStore};
 #[cfg(target_os = "linux")]
 use self::mount_fd::MountFds;
 use vm_memory::bitmap::BitmapSlice;
-#[cfg(target_os = "linux")]
-use vm_memory::ByteValued;
 
 #[cfg(target_os = "macos")]
-use self::stat::{open, stat, Stat};
-#[cfg(target_os = "linux")]
-use self::statx::{statx, StatExt};
-use self::util::{
-    ebadf, einval, enosys, eperm, is_dir, is_safe_inode, openat, UniqueInodeGenerator,
-};
-#[cfg(target_os = "linux")]
-use self::util::{reopen_fd_through_proc, stat_fd};
+use self::stat::stat;
+use self::util::{ebadf, einval, enosys, is_dir, is_safe_inode, openat, UniqueInodeGenerator};
 use crate::abi::fuse_abi as fuse;
-use crate::abi::fuse_abi::Opcode;
 use crate::api::filesystem::Entry;
 #[cfg(target_os = "linux")]
 use crate::api::PROC_SELF_FD_CSTR;
@@ -75,33 +64,23 @@ mod statx;
 mod sync_io;
 mod util;
 
+#[cfg(target_os = "linux")]
+mod passthrough_fs_linux;
+#[cfg(target_os = "macos")]
+mod passthrough_fs_macos;
+
+#[cfg(target_os = "linux")]
+mod sync_io_linux;
+#[cfg(target_os = "macos")]
+mod sync_io_macos;
+
+#[cfg(target_os = "linux")]
+pub use passthrough_fs_linux::*;
+#[cfg(target_os = "macos")]
+pub use passthrough_fs_macos::*;
+
 type Inode = u64;
 type Handle = u64;
-
-#[cfg(target_os = "linux")]
-type InoT = libc::ino64_t;
-#[cfg(target_os = "macos")]
-type InoT = libc::ino_t;
-
-#[cfg(target_os = "linux")]
-type InodeMode = u32;
-#[cfg(target_os = "macos")]
-type InodeMode = u16;
-
-#[cfg(target_os = "linux")]
-type LibCStat = libc::stat64;
-#[cfg(target_os = "macos")]
-type LibCStat = libc::stat;
-
-#[cfg(target_os = "linux")]
-type OffT = libc::off64_t;
-#[cfg(target_os = "macos")]
-type OffT = libc::off_t;
-
-#[cfg(target_os = "linux")]
-type StatVfs = libc::statvfs64;
-#[cfg(target_os = "macos")]
-type StatVfs = libc::statvfs;
 
 /// Maximum host inode number supported by passthroughfs
 const MAX_HOST_INO: u64 = 0x7fff_ffff_ffff;
@@ -114,7 +93,7 @@ const MAX_HOST_INO: u64 = 0x7fff_ffff_ffff;
  * case the object's lifetime is that of the respective `InodeData` object.
  */
 #[derive(Debug)]
-enum InodeFile<'a> {
+pub enum InodeFile<'a> {
     #[cfg(target_os = "linux")]
     Owned(File),
     Ref(&'a File),
@@ -138,85 +117,6 @@ impl AsFd for InodeFile<'_> {
             #[cfg(target_os = "linux")]
             Self::Owned(file) => file.as_fd(),
             Self::Ref(file_ref) => file_ref.as_fd(),
-        }
-    }
-}
-
-#[derive(Debug)]
-#[cfg(target_os = "linux")]
-enum InodeHandle {
-    File(File),
-    Handle(Arc<OpenableFileHandle>),
-}
-
-#[derive(Debug)]
-#[cfg(target_os = "macos")]
-enum InodeHandle {
-    File(File, CString),
-}
-
-impl InodeHandle {
-    #[cfg(target_os = "linux")]
-    fn file_handle(&self) -> Option<&FileHandle> {
-        match self {
-            InodeHandle::File(_) => None,
-            InodeHandle::Handle(h) => Some(h.file_handle().deref()),
-        }
-    }
-
-    fn get_file(&self) -> io::Result<InodeFile<'_>> {
-        #[cfg(target_os = "linux")]
-        match self {
-            InodeHandle::File(f) => Ok(InodeFile::Ref(f)),
-            InodeHandle::Handle(h) => {
-                let f = h.open(libc::O_PATH)?;
-                Ok(InodeFile::Owned(f))
-            }
-        }
-        #[cfg(target_os = "macos")]
-        match self {
-            InodeHandle::File(f, _) => Ok(InodeFile::Ref(f)),
-        }
-    }
-
-    fn open_file(
-        &self,
-        flags: libc::c_int,
-        #[cfg(target_os = "linux")] proc_self_fd: &File,
-    ) -> io::Result<File> {
-        #[cfg(target_os = "linux")]
-        match self {
-            InodeHandle::File(f) => reopen_fd_through_proc(f, flags, proc_self_fd),
-            InodeHandle::Handle(h) => h.open(flags),
-        }
-        #[cfg(target_os = "macos")]
-        match self {
-            InodeHandle::File(_, pathname) => open(pathname, flags, 0),
-        }
-    }
-
-    #[cfg(target_os = "linux")]
-    fn stat(&self) -> io::Result<LibCStat> {
-        match self {
-            InodeHandle::File(f) => stat_fd(f, None),
-            InodeHandle::Handle(_h) => {
-                let file = self.get_file()?;
-                stat_fd(&file, None)
-            }
-        }
-    }
-
-    #[cfg(target_os = "macos")]
-    fn stat(&self) -> io::Result<Stat> {
-        match self {
-            InodeHandle::File(f, _) => stat(f),
-        }
-    }
-
-    #[cfg(target_os = "macos")]
-    fn get_path(&self) -> io::Result<CString> {
-        match self {
-            InodeHandle::File(_, pathname) => Ok(pathname.clone()),
         }
     }
 }
@@ -247,21 +147,6 @@ impl InodeData {
     fn get_file(&self) -> io::Result<InodeFile<'_>> {
         self.handle.get_file()
     }
-
-    #[cfg(target_os = "linux")]
-    fn open_file(&self, flags: libc::c_int, proc_self_fd: &File) -> io::Result<File> {
-        self.handle.open_file(flags, proc_self_fd)
-    }
-
-    #[cfg(target_os = "macos")]
-    fn open_file(&self, flags: libc::c_int) -> io::Result<File> {
-        self.handle.open_file(flags)
-    }
-
-    #[cfg(target_os = "macos")]
-    fn get_path(&self) -> io::Result<CString> {
-        self.handle.get_path()
-    }
 }
 
 /// Data structures to manage accessed inodes.
@@ -291,67 +176,6 @@ impl InodeMap {
             .ok_or_else(ebadf)
     }
 
-    #[cfg(target_os = "linux")]
-    fn get_inode_locked(
-        inodes: &InodeStore,
-        id: &InodeId,
-        handle: Option<&FileHandle>,
-    ) -> Option<Inode> {
-        match handle {
-            Some(h) => inodes.inode_by_handle(h).copied(),
-            None => inodes.inode_by_id(id).copied(),
-        }
-    }
-
-    #[cfg(target_os = "macos")]
-    fn get_inode_locked(inodes: &InodeStore, id: &InodeId) -> Option<Inode> {
-        inodes.inode_by_id(id).copied()
-    }
-
-    #[cfg(target_os = "linux")]
-    fn get_alt(&self, id: &InodeId, handle: Option<&FileHandle>) -> Option<Arc<InodeData>> {
-        // Do not expect poisoned lock here, so safe to unwrap().
-        let inodes = self.inodes.read().unwrap();
-
-        Self::get_alt_locked(inodes.deref(), id, handle)
-    }
-
-    #[cfg(target_os = "macos")]
-    fn get_alt(&self, id: &InodeId) -> Option<Arc<InodeData>> {
-        let inodes = self.inodes.read().unwrap();
-
-        Self::get_alt_locked(inodes.deref(), id)
-    }
-
-    #[cfg(target_os = "linux")]
-    fn get_alt_locked(
-        inodes: &InodeStore,
-        id: &InodeId,
-        handle: Option<&FileHandle>,
-    ) -> Option<Arc<InodeData>> {
-        handle
-            .and_then(|h| inodes.get_by_handle(h))
-            .or_else(|| {
-                inodes.get_by_id(id).filter(|data| {
-                    // When we have to fall back to looking up an inode by its IDs, ensure that
-                    // we hit an entry that does not have a file handle.  Entries with file
-                    // handles must also have a handle alt key, so if we have not found it by
-                    // that handle alt key, we must have found an entry with a mismatching
-                    // handle; i.e. an entry for a different file, even though it has the same
-                    // inode ID.
-                    // (This can happen when we look up a new file that has reused the inode ID
-                    // of some previously unlinked inode we still have in `.inodes`.)
-                    handle.is_none() || data.handle.file_handle().is_none()
-                })
-            })
-            .map(Arc::clone)
-    }
-
-    #[cfg(target_os = "macos")]
-    fn get_alt_locked(inodes: &InodeStore, id: &InodeId) -> Option<Arc<InodeData>> {
-        inodes.get_by_id(id).map(Arc::clone)
-    }
-
     fn get_map_mut(&self) -> RwLockWriteGuard<InodeStore> {
         // Do not expect poisoned lock here, so safe to unwrap().
         self.inodes.write().unwrap()
@@ -368,7 +192,7 @@ impl InodeMap {
     }
 }
 
-struct HandleData {
+pub struct HandleData {
     inode: Inode,
     file: File,
     lock: Mutex<()>,
@@ -591,26 +415,33 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
         let root = CString::new(self.cfg.root_dir.as_str()).expect("CString::new failed");
 
         #[cfg(target_os = "linux")]
-        let (path_fd, handle_opt, st) = Self::open_file_and_handle(self, &libc::AT_FDCWD, &root)
-            .map_err(|e| {
-                error!("fuse: import: failed to get file or handle: {:?}", e);
-                e
-            })?;
+        let (st, id, handle) = {
+            let (path_fd, handle_opt, st) =
+                Self::open_file_and_handle(self, &libc::AT_FDCWD, &root).map_err(|e| {
+                    error!("fuse: import: failed to get file or handle: {:?}", e);
+                    e
+                })?;
 
-        #[cfg(target_os = "macos")]
-        let (path_fd, st) = self.open_file(&root).unwrap();
+            let id = InodeId::from_stat(&st);
 
-        let id = InodeId::from_stat(&st);
+            let handle = if let Some(h) = handle_opt {
+                InodeHandle::Handle(self.to_openable_handle(h)?)
+            } else {
+                InodeHandle::File(path_fd)
+            };
 
-        #[cfg(target_os = "linux")]
-        let handle = if let Some(h) = handle_opt {
-            InodeHandle::Handle(self.to_openable_handle(h)?)
-        } else {
-            InodeHandle::File(path_fd)
+            (st, id, handle)
         };
 
         #[cfg(target_os = "macos")]
-        let handle = InodeHandle::File(path_fd, root);
+        let (st, id, handle) = {
+            let (path_fd, st) = self.open_file(&root).unwrap();
+
+            let id = InodeId::from_stat(&st);
+
+            let handle = InodeHandle::File(path_fd, root);
+            (st, id, handle)
+        };
 
         // Safe because this doesn't modify any memory and there is no need to check the return
         // value because this system call always succeeds. We need to clear the umask here because
@@ -627,52 +458,6 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
         )));
 
         Ok(())
-    }
-
-    /// Get the list of file descriptors which should be reserved across live upgrade.
-    #[cfg(target_os = "linux")]
-    pub fn keep_fds(&self) -> Vec<RawFd> {
-        vec![self.proc_self_fd.as_raw_fd()]
-    }
-
-    #[cfg(target_os = "linux")]
-    fn readlinkat(dfd: i32, pathname: &CStr) -> io::Result<PathBuf> {
-        let mut buf = Vec::with_capacity(libc::PATH_MAX as usize);
-
-        // Safe because the kernel will only write data to buf and we check the return value
-        let buf_read = unsafe {
-            libc::readlinkat(
-                dfd,
-                pathname.as_ptr(),
-                buf.as_mut_ptr() as *mut libc::c_char,
-                buf.capacity(),
-            )
-        };
-        if buf_read < 0 {
-            error!("fuse: readlinkat error");
-            return Err(io::Error::last_os_error());
-        }
-
-        // Safe because we trust the value returned by kernel.
-        unsafe { buf.set_len(buf_read as usize) };
-        buf.shrink_to_fit();
-
-        // Be careful:
-        // - readlink() does not append a terminating null byte to buf
-        // - OsString instances are not NUL terminated
-        Ok(PathBuf::from(OsString::from_vec(buf)))
-    }
-
-    /// Get the file pathname corresponding to the Inode
-    /// This function is used by Nydus blobfs
-    #[cfg(target_os = "linux")]
-    pub fn readlinkat_proc_file(&self, inode: Inode) -> io::Result<PathBuf> {
-        let data = self.inode_map.get(inode)?;
-        let file = data.get_file()?;
-        let pathname = CString::new(format!("{}", file.as_raw_fd()))
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-
-        Self::readlinkat(self.proc_self_fd.as_raw_fd(), &pathname)
     }
 
     fn create_file_excl(
@@ -693,110 +478,6 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
                 }
                 Err(err)
             }
-        }
-    }
-    #[cfg(target_os = "linux")]
-    fn open_file(dfd: &impl AsRawFd, pathname: &CStr, flags: i32, mode: u32) -> io::Result<File> {
-        openat(dfd, pathname, flags, mode)
-    }
-
-    #[cfg(target_os = "macos")]
-    fn open_file(&self, pathname: &CStr) -> io::Result<(File, Stat)> {
-        let path_file = self.open_file_restricted(pathname, libc::O_NOFOLLOW, 0o40777)?;
-        let st = stat(&path_file)?;
-
-        Ok((path_file, st))
-    }
-
-    #[cfg(target_os = "linux")]
-    fn open_file_restricted(
-        &self,
-        dir: &impl AsRawFd,
-        pathname: &CStr,
-        flags: i32,
-        mode: u32,
-    ) -> io::Result<File> {
-        let flags = libc::O_NOFOLLOW | libc::O_CLOEXEC | flags;
-
-        // TODO
-        //if self.os_facts.has_openat2 {
-        //    oslib::do_open_relative_to(dir, pathname, flags, mode)
-        //} else {
-        openat(dir, pathname, flags, mode)
-        //}
-    }
-
-    #[cfg(target_os = "macos")]
-    fn open_file_restricted(&self, pathname: &CStr, flags: i32, mode: u32) -> io::Result<File> {
-        let flags = libc::O_NOFOLLOW | libc::O_CLOEXEC | flags;
-        open(pathname, flags, mode)
-    }
-
-    /// Create a File or File Handle for `name` under directory `dir_fd` to support `lookup()`.
-    #[cfg(target_os = "linux")]
-    fn open_file_and_handle(
-        &self,
-        dir: &impl AsRawFd,
-        name: &CStr,
-    ) -> io::Result<(File, Option<FileHandle>, StatExt)> {
-        let path_file = self.open_file_restricted(dir, name, libc::O_PATH, 0)?;
-        let st = statx(&path_file, None)?;
-        let handle = if self.cfg.inode_file_handles {
-            FileHandle::from_fd(&path_file)?
-        } else {
-            None
-        };
-
-        Ok((path_file, handle, st))
-    }
-
-    #[cfg(target_os = "linux")]
-    fn to_openable_handle(&self, fh: FileHandle) -> io::Result<Arc<OpenableFileHandle>> {
-        fh.into_openable(&self.mount_fds, |fd, flags, _mode| {
-            reopen_fd_through_proc(&fd, flags, &self.proc_self_fd)
-        })
-        .map(Arc::new)
-        .map_err(|e| {
-            if !e.silent() {
-                error!("{}", e);
-            }
-            e.into_inner()
-        })
-    }
-
-    fn allocate_inode(
-        &self,
-        inodes: &InodeStore,
-        id: &InodeId,
-        #[cfg(target_os = "linux")] handle_opt: Option<&FileHandle>,
-    ) -> io::Result<Inode> {
-        if !self.cfg.use_host_ino {
-            // If the inode has already been assigned before, the new inode is not reassigned,
-            // ensuring that the same file is always the same inode
-            #[cfg(target_os = "linux")]
-            return Ok(InodeMap::get_inode_locked(inodes, id, handle_opt)
-                .unwrap_or_else(|| self.next_inode.fetch_add(1, Ordering::Relaxed)));
-            #[cfg(target_os = "macos")]
-            return Ok(InodeMap::get_inode_locked(inodes, id)
-                .unwrap_or_else(|| self.next_inode.fetch_add(1, Ordering::Relaxed)));
-        } else {
-            let inode = if id.ino > MAX_HOST_INO {
-                // Prefer looking for previous mappings from memory
-                #[cfg(target_os = "linux")]
-                match InodeMap::get_inode_locked(inodes, id, handle_opt) {
-                    Some(ino) => ino,
-                    None => self.ino_allocator.get_unique_inode(id)?,
-                }
-                #[cfg(target_os = "macos")]
-                match InodeMap::get_inode_locked(inodes, id) {
-                    Some(ino) => ino,
-                    None => self.ino_allocator.get_unique_inode(id)?,
-                }
-            } else {
-                self.ino_allocator.get_unique_inode(id)?
-            };
-
-            Ok(inode)
         }
     }
 
@@ -999,59 +680,6 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
         validate_path_component(name)
     }
 
-    // When seal_size is set, we don't allow operations that could change file size nor allocate
-    // space beyond EOF
-    fn seal_size_check(
-        &self,
-        opcode: Opcode,
-        file_size: u64,
-        offset: u64,
-        size: u64,
-        #[cfg(target_os = "linux")] mode: i32,
-        #[cfg(target_os = "macos")] _mode: i32,
-    ) -> io::Result<()> {
-        if offset.checked_add(size).is_none() {
-            error!(
-                "fuse: {:?}: invalid `offset` + `size` ({}+{}) overflows u64::MAX",
-                opcode, offset, size
-            );
-            return Err(einval());
-        }
-
-        match opcode {
-            // write should not exceed the file size.
-            Opcode::Write => {
-                if size + offset > file_size {
-                    return Err(eperm());
-                }
-            }
-
-            #[cfg(target_os = "linux")]
-            Opcode::Fallocate => {
-                let op = mode & !(libc::FALLOC_FL_KEEP_SIZE | libc::FALLOC_FL_UNSHARE_RANGE);
-                match op {
-                    // Allocate, punch and zero, must not change file size.
-                    0 | libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_ZERO_RANGE => {
-                        if size + offset > file_size {
-                            return Err(eperm());
-                        }
-                    }
-                    // collapse and insert will change file size, forbid.
-                    libc::FALLOC_FL_COLLAPSE_RANGE | libc::FALLOC_FL_INSERT_RANGE => {
-                        return Err(eperm());
-                    }
-                    // Invalid operation
-                    _ => return Err(einval()),
-                }
-            }
-
-            // setattr operation should be handled in setattr handler.
-            _ => return Err(enosys()),
-        }
-
-        Ok(())
-    }
-
     fn get_writeback_open_flags(&self, flags: i32) -> i32 {
         let mut new_flags = flags;
         let writeback = self.writeback.load(Ordering::Relaxed);
@@ -1152,46 +780,6 @@ scoped_cred!(ScopedUid, libc::uid_t, libc::SYS_setresuid);
 #[cfg(target_os = "linux")]
 scoped_cred!(ScopedGid, libc::gid_t, libc::SYS_setresgid);
 
-// #[cfg(target_os = "macos")]
-// macro_rules! scoped_cred {
-//     ($name:ident, $ty:ty, $set_func:path) => {
-//         #[derive(Debug)]
-//         pub(crate) struct $name;
-
-//         impl $name {
-//             fn new(val: $ty) -> io::Result<Option<$name>> {
-//                 if val == 0 {
-//                     return Ok(None);
-//                 }
-
-//                 let current_val = unsafe { $set_func(0) };
-
-//                 if current_val == -1 {
-//                     return Err(io::Error::last_os_error());
-//                 }
-
-//                 let res = unsafe { $set_func(val) };
-//                 if res == 0 {
-//                     Ok(Some($name))
-//                 } else {
-//                     unsafe { $set_func(current_val as u32) };
-//                     return Err(io::Error::last_os_error());
-//                 }
-//             }
-//         }
-
-//         impl Drop for $name {
-//             fn drop(&mut self) {
-//                 let res = unsafe { $set_func(0) };
-//                 error!(
-//                     "fuse: failed to change credentials back to root: {}",
-//                     io::Error::last_os_error(),
-//                 );
-//             }
-//         }
-//     };
-// }
-
 #[cfg(target_os = "macos")]
 scoped_cred!(ScopedUid, libc::uid_t, libc::seteuid);
 #[cfg(target_os = "macos")]
@@ -1204,34 +792,6 @@ fn set_creds(
     // We have to change the gid before we change the uid because if we change the uid first then we
     // lose the capability to change the gid.  However changing back can happen in any order.
     ScopedGid::new(gid).and_then(|gid| Ok((ScopedUid::new(uid)?, gid)))
-}
-
-#[cfg(target_os = "linux")]
-struct CapFsetid {}
-
-#[cfg(target_os = "linux")]
-impl Drop for CapFsetid {
-    fn drop(&mut self) {
-        if let Err(e) = caps::raise(None, caps::CapSet::Effective, caps::Capability::CAP_FSETID) {
-            error!("fail to restore thread cap_fsetid: {}", e);
-        };
-    }
-}
-
-#[cfg(target_os = "linux")]
-fn drop_cap_fsetid() -> io::Result<Option<CapFsetid>> {
-    if !caps::has_cap(None, caps::CapSet::Effective, caps::Capability::CAP_FSETID)
-        .map_err(|_e| io::Error::new(io::ErrorKind::PermissionDenied, "no CAP_FSETID capability"))?
-    {
-        return Ok(None);
-    }
-    caps::drop(None, caps::CapSet::Effective, caps::Capability::CAP_FSETID).map_err(|_e| {
-        io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            "failed to drop CAP_FSETID capability",
-        )
-    })?;
-    Ok(Some(CapFsetid {}))
 }
 
 #[cfg(test)]
@@ -1249,9 +809,9 @@ mod tests {
     use std::ops::Deref;
     use std::os::unix::prelude::MetadataExt;
 
+    #[cfg(target_os = "macos")]
     use std::fs;
-    #[cfg(target_os = "linux")]
-    use std::fs::Permissions;
+    #[cfg(target_os = "macos")]
     use std::os::unix::fs::PermissionsExt;
 
     #[cfg(target_os = "linux")]
