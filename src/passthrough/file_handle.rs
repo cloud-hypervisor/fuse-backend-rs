@@ -320,9 +320,7 @@ impl OpenableFileHandle {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use nix::unistd::getuid;
     use std::ffi::CString;
-    use std::io::Read;
 
     fn generate_c_file_handle(
         handle_bytes: usize,
