@@ -1,3 +1,8 @@
+// Copyright (C) 2023 Alibaba Cloud. All rights reserved.
+// Copyright 2021 Red Hat, Inc. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE-BSD-3-Clause file.
+
 use std::{
     ffi::{CStr, OsString},
     fs::File,
@@ -25,7 +30,7 @@ use super::{
 
 pub type InoT = libc::ino64_t;
 pub type InodeMode = u32;
-pub type LibCStat = libc::stat64;
+pub type LibcStat = libc::stat64;
 pub type OffT = libc::off64_t;
 pub type StatVfs = libc::statvfs64;
 
@@ -60,7 +65,7 @@ impl InodeHandle {
         }
     }
 
-    pub fn stat(&self) -> io::Result<LibCStat> {
+    pub fn stat(&self) -> io::Result<LibcStat> {
         match self {
             InodeHandle::File(f) => stat_fd(f, None),
             InodeHandle::Handle(_h) => {
@@ -192,7 +197,6 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
     }
 
     /// Create a File or File Handle for `name` under directory `dir_fd` to support `lookup()`.
-    #[cfg(target_os = "linux")]
     pub fn open_file_and_handle(
         &self,
         dir: &impl AsRawFd,
@@ -274,7 +278,6 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
                 }
             }
 
-            #[cfg(target_os = "linux")]
             Opcode::Fallocate => {
                 let op = mode & !(libc::FALLOC_FL_KEEP_SIZE | libc::FALLOC_FL_UNSHARE_RANGE);
                 match op {

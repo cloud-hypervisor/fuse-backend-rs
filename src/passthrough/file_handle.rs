@@ -320,10 +320,8 @@ impl OpenableFileHandle {
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[cfg(target_os = "macos")]
     use nix::unistd::getuid;
     use std::ffi::CString;
-    #[cfg(target_os = "macos")]
     use std::io::Read;
 
     fn generate_c_file_handle(

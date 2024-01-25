@@ -2,8 +2,6 @@ use std::{
     io,
     mem::{self, size_of},
     os::fd::{AsRawFd, RawFd},
-    sync::atomic::Ordering,
-    time::Duration,
 };
 use vm_memory::{bitmap::BitmapSlice, ByteValued};
 
@@ -13,7 +11,7 @@ use crate::{
     passthrough::{os_compat::LinuxDirent64, util::einval},
 };
 
-use super::{util::stat_fd, Handle, Inode, LibCStat, OffT, PassthroughFs};
+use super::{Handle, Inode, OffT, PassthroughFs};
 
 impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
     pub fn do_readdir(
@@ -67,7 +65,6 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
         let mut rem = &buf[..];
         let orig_rem_len = rem.len();
 
-        #[cfg(target_os = "linux")]
         while !rem.is_empty() {
             // We only use debug asserts here because these values are coming from the kernel and we
             // trust them implicitly.
@@ -136,33 +133,5 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
         }
 
         Ok(())
-    }
-
-    pub fn do_getattr(
-        &self,
-        inode: Inode,
-        handle: Option<Handle>,
-    ) -> io::Result<(LibCStat, Duration)> {
-        let st;
-        let data = self.inode_map.get(inode).map_err(|e| {
-            error!("fuse: do_getattr ino {} Not find err {:?}", inode, e);
-            e
-        })?;
-
-        // kernel sends 0 as handle in case of no_open, and it depends on fuse server to handle
-        // this case correctly.
-        if !self.no_open.load(Ordering::Relaxed) && handle.is_some() {
-            // Safe as we just checked handle
-            let hd = self.handle_map.get(handle.unwrap(), inode)?;
-            st = stat_fd(hd.get_file(), None);
-        } else {
-            st = data.handle.stat();
-        }
-
-        let st = st.map_err(|e| {
-            error!("fuse: do_getattr stat failed ino {} err {:?}", inode, e);
-            e
-        })?;
-        Ok((st, self.cfg.attr_timeout))
     }
 }

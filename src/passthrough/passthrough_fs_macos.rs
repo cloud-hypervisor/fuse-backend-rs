@@ -1,4 +1,7 @@
-#![allow(missing_docs)]
+// Copyright (C) 2023 Alibaba Cloud. All rights reserved.
+// Copyright 2021 Red Hat, Inc. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE-BSD-3-Clause file.
 
 use std::{
     ffi::{CStr, CString},
@@ -21,7 +24,7 @@ use super::{
 
 pub type InoT = libc::ino_t;
 pub type InodeMode = u16;
-pub type LibCStat = libc::stat;
+pub type LibcStat = libc::stat;
 pub type OffT = libc::off_t;
 pub type StatVfs = libc::statvfs;
 

@@ -14,6 +14,8 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
 
+#[cfg(target_os = "macos")]
+use super::stat::stat as stat_fd;
 #[cfg(target_os = "linux")]
 use super::util::stat_fd;
 use super::*;
@@ -57,6 +59,44 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
             data.set_flags(flags);
         }
         Ok(())
+    }
+
+    pub fn do_getattr(
+        &self,
+        inode: Inode,
+        handle: Option<Handle>,
+    ) -> io::Result<(LibcStat, Duration)> {
+        let st;
+        let data = self.inode_map.get(inode).map_err(|e| {
+            error!("fuse: do_getattr ino {} Not find err {:?}", inode, e);
+            e
+        })?;
+
+        // kernel sends 0 as handle in case of no_open, and it depends on fuse server to handle
+        // this case correctly.
+        if !self.no_open.load(Ordering::Relaxed) && handle.is_some() {
+            // Safe as we just checked handle
+            let hd = self.handle_map.get(handle.unwrap(), inode)?;
+            st = stat_fd(
+                hd.get_file(),
+                #[cfg(target_os = "linux")]
+                None,
+            )
+        } else {
+            st = data.handle.stat();
+        }
+
+        let st = st.map_err(|e| {
+            error!("fuse: do_getattr stat failed ino {} err {:?}", inode, e);
+            e
+        })?;
+        Ok((
+            #[cfg(target_os = "linux")]
+            st,
+            #[cfg(target_os = "macos")]
+            st.st,
+            self.cfg.attr_timeout,
+        ))
     }
 
     fn do_open(
@@ -622,7 +662,7 @@ impl<S: BitmapSlice + Send + Sync> FileSystem for PassthroughFs<S> {
         _ctx: &Context,
         inode: Inode,
         handle: Option<Handle>,
-    ) -> io::Result<(LibCStat, Duration)> {
+    ) -> io::Result<(LibcStat, Duration)> {
         self.do_getattr(inode, handle)
     }
 
@@ -630,10 +670,10 @@ impl<S: BitmapSlice + Send + Sync> FileSystem for PassthroughFs<S> {
         &self,
         _ctx: &Context,
         inode: Inode,
-        attr: LibCStat,
+        attr: LibcStat,
         handle: Option<Handle>,
         valid: SetattrValid,
-    ) -> io::Result<(LibCStat, Duration)> {
+    ) -> io::Result<(LibcStat, Duration)> {
         let inode_data = self.inode_map.get(inode)?;
 
         enum Data {
