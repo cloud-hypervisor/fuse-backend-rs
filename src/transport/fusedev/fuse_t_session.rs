@@ -9,6 +9,7 @@
 //! A FUSE session can have multiple FUSE channels so that FUSE requests are handled in parallel.
 
 use std::fs::File;
+use std::io;
 use std::mem::size_of;
 use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
 use std::os::unix::prelude::CommandExt;
@@ -259,12 +260,16 @@ impl FuseChannel {
         })
     }
 
-    fn read(&mut self, len: usize, offset: usize) -> Result<()> {
+    fn read(&mut self, len: usize, offset: usize) -> Result<bool> {
         let read_buf = &mut self.buf[offset..offset + len];
         let mut total: usize = 0;
         let fd = self.file.as_raw_fd();
         while total < len {
             match read(fd, read_buf) {
+                Ok(0) => {
+                    trace!("Read EOF");
+                    return Ok(true);
+                }
                 Ok(size) => {
                     total += size;
                 }
@@ -286,7 +291,7 @@ impl FuseChannel {
                     }
                     Errno::ENODEV => {
                         info!("fuse filesystem umounted");
-                        return Ok(());
+                        return Ok(true);
                     }
                     e => {
                         warn! {"read fuse dev failed on fd {}: {}", fd, e};
@@ -295,7 +300,7 @@ impl FuseChannel {
                 },
             }
         }
-        Ok(())
+        Ok(false)
     }
 
     /// Get next available FUSE request from the underlying fuse device file.
@@ -316,12 +321,17 @@ impl FuseChannel {
         let fd = self.file.as_raw_fd();
         let size = size_of::<InHeader>();
         // read header
-        self.read(size, 0)?;
+        if self.read(size, 0)? {
+            return Ok(None);
+        }
         let in_header = InHeader::from_slice(&self.buf[0..size]);
         let header_len = in_header.unwrap().len as usize;
         let should_read_size = header_len - size;
-        if should_read_size > 0 {
-            self.read(should_read_size, size)?;
+        if should_read_size > 0 && !self.read(should_read_size, size)? {
+            return Err(IoError(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "Unexpected EOF",
+            )));
         }
         drop(result);
 
