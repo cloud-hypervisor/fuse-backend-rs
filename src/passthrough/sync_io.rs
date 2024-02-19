@@ -256,7 +256,17 @@ impl<S: BitmapSlice + Send + Sync> FileSystem for PassthroughFs<S> {
             self.import()?;
         }
 
-        let opts = FsOptions::FILE_OPS;
+        let opts = FsOptions::ASYNC_READ | FsOptions::BIG_WRITES | FsOptions::ATOMIC_O_TRUNC;
+
+        if !self.cfg.do_import || self.cfg.writeback {
+            self.writeback.store(true, Ordering::Relaxed);
+        }
+        if !self.cfg.do_import || self.cfg.no_open {
+            self.no_open.store(true, Ordering::Relaxed);
+        }
+        if !self.cfg.do_import || self.cfg.no_opendir {
+            self.no_opendir.store(true, Ordering::Relaxed);
+        }
 
         Ok(opts)
     }
