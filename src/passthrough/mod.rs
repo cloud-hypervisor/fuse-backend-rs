@@ -801,10 +801,12 @@ mod tests {
     use crate::api::filesystem::*;
     #[cfg(target_os = "linux")]
     use crate::api::{Vfs, VfsOptions};
+    use crate::common::file_buf::FileVolatileSlice;
+    use crate::common::file_traits::FileReadWriteVolatile;
     #[cfg(target_os = "linux")]
     use caps::{CapSet, Capability};
     use log;
-    use std::io::Read;
+    use std::io::{Read, Seek, SeekFrom, Write};
     #[cfg(target_os = "linux")]
     use std::ops::Deref;
     use std::os::unix::prelude::MetadataExt;
@@ -818,7 +820,7 @@ mod tests {
     use vmm_sys_util::{tempdir::TempDir, tempfile::TempFile};
 
     #[cfg(target_os = "macos")]
-    use tempfile::{tempdir, tempdir_in, NamedTempFile};
+    use tempfile::{tempdir, tempdir_in, tempfile, NamedTempFile};
 
     #[cfg(target_os = "linux")]
     fn prepare_passthroughfs() -> PassthroughFs {
@@ -1502,5 +1504,164 @@ mod tests {
         let fs = PassthroughFs::<()>::new(fs_cfg).unwrap();
         assert!(!fs.cfg.no_open);
         assert!(!fs.cfg.writeback);
+    }
+
+    impl ZeroCopyReader for File {
+        // Copies at most count bytes from self directly into f at offset off
+        // without storing it in any intermediate buffers.
+        fn read_to(
+            &mut self,
+            f: &mut dyn FileReadWriteVolatile,
+            count: usize,
+            off: u64,
+        ) -> io::Result<usize> {
+            let mut buf = vec![0_u8; count];
+            let slice = unsafe { FileVolatileSlice::from_raw_ptr(buf.as_mut_ptr(), count) };
+
+            // Read from self to slice.
+            let ret = self.read_volatile(slice)?;
+            if ret > 0 {
+                let slice = unsafe { FileVolatileSlice::from_raw_ptr(buf.as_mut_ptr(), ret) };
+                // Write from slice to f at offset off.
+                f.write_at_volatile(slice, off)
+            } else {
+                Ok(0)
+            }
+        }
+    }
+
+    impl ZeroCopyWriter for File {
+        // Copies at most count bytes from f at offset off directly into self
+        // without storing it in any intermediate buffers.
+        fn write_from(
+            &mut self,
+            f: &mut dyn FileReadWriteVolatile,
+            count: usize,
+            off: u64,
+        ) -> io::Result<usize> {
+            let mut buf = vec![0_u8; count];
+            let slice = unsafe { FileVolatileSlice::from_raw_ptr(buf.as_mut_ptr(), count) };
+            // Read from f at offset off to slice.
+            let ret = f.read_at_volatile(slice, off)?;
+
+            if ret > 0 {
+                let slice = unsafe { FileVolatileSlice::from_raw_ptr(buf.as_mut_ptr(), ret) };
+                // Write from slice to self.
+                self.write_volatile(slice)
+            } else {
+                Ok(0)
+            }
+        }
+
+        fn available_bytes(&self) -> usize {
+            // Max usize
+            usize::MAX
+        }
+    }
+
+    #[test]
+    fn test_generic_read_write_noopen() {
+        #[cfg(target_os = "linux")]
+        let tmpdir = TempDir::new().expect("Cannot create temporary directory.");
+        #[cfg(target_os = "macos")]
+        let source = tempdir().expect("Cannot create temporary directory.");
+        #[cfg(target_os = "macos")]
+        let tmp_path = source.into_path();
+        // Prepare passthrough fs.
+        let fs_cfg = Config {
+            do_import: false,
+            no_open: true,
+            #[cfg(target_os = "linux")]
+            root_dir: tmpdir.as_path().to_string_lossy().to_string(),
+            #[cfg(target_os = "macos")]
+            root_dir: tmp_path.to_string_lossy().to_string(),
+            ..Default::default()
+        };
+        let fs = PassthroughFs::<()>::new(fs_cfg.clone()).unwrap();
+        fs.import().unwrap();
+        #[cfg(target_os = "linux")]
+        fs.init(FsOptions::ZERO_MESSAGE_OPEN).unwrap();
+        #[cfg(target_os = "macos")]
+        fs.init(FsOptions::ASYNC_READ).unwrap();
+        fs.mount().unwrap();
+
+        // Create a new file for testing.
+        let ctx = Context::default();
+        let createin = CreateIn {
+            flags: libc::O_CREAT as u32,
+            mode: 0o644,
+            umask: 0,
+            fuse_flags: 0,
+        };
+        let file_name = CString::new("test_file").unwrap();
+
+        let (entry, _, _, _) = fs
+            .create(&ctx, ROOT_ID, file_name.as_c_str(), createin)
+            .unwrap();
+        let ino = entry.inode;
+        assert_ne!(ino, 0);
+        assert_ne!(ino, ROOT_ID);
+
+        // Write on the inode
+        let data = b"hello world";
+        // Write to one intermidiate temp file.
+        #[cfg(target_os = "linux")]
+        let buffer_file = TempFile::new().expect("Cannot create temporary file.");
+        #[cfg(target_os = "linux")]
+        let mut buffer_file = buffer_file.into_file();
+        #[cfg(target_os = "macos")]
+        let mut buffer_file = tempfile().expect("Cannot create temporary file.");
+        buffer_file.write_all(data).unwrap();
+        let _ = buffer_file.flush();
+
+        // Read back and check.
+        let mut newbuf = Vec::new();
+        buffer_file.seek(SeekFrom::Start(0)).unwrap();
+        buffer_file.read_to_end(&mut newbuf).unwrap();
+        assert_eq!(newbuf, data);
+
+        // Call fs.write to write content to the file
+        buffer_file.seek(SeekFrom::Start(0)).unwrap();
+        let write_sz = fs
+            .write(
+                &ctx,
+                ino,
+                0,
+                &mut buffer_file,
+                data.len() as u32,
+                0,
+                None,
+                false,
+                0,
+                0,
+            )
+            .unwrap();
+        assert_eq!(write_sz, data.len());
+
+        // Create a new temp file as read buffer.
+        #[cfg(target_os = "linux")]
+        let read_buffer_file = TempFile::new().expect("Cannot create temporary file.");
+        #[cfg(target_os = "linux")]
+        let mut read_buffer_file = read_buffer_file.into_file();
+        #[cfg(target_os = "macos")]
+        let mut read_buffer_file = tempfile().expect("Cannot create temporary file.");
+        let read_sz = fs
+            .read(
+                &ctx,
+                ino,
+                0,
+                &mut read_buffer_file,
+                data.len() as u32,
+                0,
+                None,
+                0,
+            )
+            .unwrap();
+        assert_eq!(read_sz, data.len());
+
+        read_buffer_file.seek(SeekFrom::Start(0)).unwrap();
+        let mut newbuf = Vec::new();
+        read_buffer_file.read_to_end(&mut newbuf).unwrap();
+        assert_eq!(newbuf, data);
     }
 }

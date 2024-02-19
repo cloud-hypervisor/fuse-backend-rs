@@ -408,7 +408,7 @@ fn fuse_kern_mount(
 
             let mut cmd = Command::new(FUSE_NFSSRV_PATH);
             cmd.arg("--noatime=true")
-                .arg("--noatime=true")
+                .arg("--dontbrowse=true")
                 // .arg("-d")
                 // .arg("-c")
                 .args(["--volname", &format!("{}-{}", fsname, subtype)]);

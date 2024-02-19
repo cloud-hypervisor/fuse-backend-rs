@@ -604,7 +604,7 @@ impl<S: BitmapSlice + Send + Sync> FileSystem for PassthroughFs<S> {
         // so data.file won't be closed.
         let f = unsafe { File::from_raw_fd(data.borrow_fd().as_raw_fd()) };
 
-        self.check_fd_flags(data, f.as_raw_fd(), flags)?;
+        self.check_fd_flags(data.clone(), f.as_raw_fd(), flags)?;
 
         let mut f = ManuallyDrop::new(f);
 
@@ -632,7 +632,7 @@ impl<S: BitmapSlice + Send + Sync> FileSystem for PassthroughFs<S> {
         // so data.file won't be closed.
         let f = unsafe { File::from_raw_fd(data.borrow_fd().as_raw_fd()) };
 
-        self.check_fd_flags(data, f.as_raw_fd(), flags)?;
+        self.check_fd_flags(data.clone(), f.as_raw_fd(), flags)?;
 
         if self.seal_size.load(Ordering::Relaxed) {
             #[cfg(target_os = "linux")]
