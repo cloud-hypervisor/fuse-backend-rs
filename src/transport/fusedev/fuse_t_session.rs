@@ -260,10 +260,10 @@ impl FuseChannel {
     }
 
     fn read(&mut self, len: usize, offset: usize) -> Result<()> {
-        let read_buf = &mut self.buf[offset..offset + len];
         let mut total: usize = 0;
         let fd = self.file.as_raw_fd();
         while total < len {
+            let read_buf = &mut self.buf[offset + total..offset + len];
             match read(fd, read_buf) {
                 Ok(size) => {
                     total += size;
