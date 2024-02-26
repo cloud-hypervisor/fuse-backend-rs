@@ -2,7 +2,7 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 
-#[cfg(all(feature = "fusedev", target_os = "linux"))]
+#[cfg(all(feature = "fusedev"))]
 pub(crate) mod passthroughfs;
 
 #[cfg(all(feature = "fusedev", target_os = "macos"))]

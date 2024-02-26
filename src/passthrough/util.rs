@@ -3,17 +3,23 @@
 // Copyright (C) 2023 Alibaba Cloud. All rights reserved.
 
 use std::collections::{btree_map, BTreeMap};
-use std::ffi::{CStr, CString};
+use std::ffi::CStr;
+#[cfg(target_os = "linux")]
+use std::ffi::CString;
 use std::fs::File;
 use std::io;
+
+#[cfg(target_os = "linux")]
 use std::mem::MaybeUninit;
 use std::os::unix::io::{AsRawFd, FromRawFd};
 use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use std::sync::Mutex;
 
 use super::inode_store::InodeId;
-use super::MAX_HOST_INO;
+use super::{InoT, InodeMode, MAX_HOST_INO};
 use crate::abi::fuse_abi as fuse;
+
+#[cfg(target_os = "linux")]
 use crate::api::EMPTY_CSTR;
 
 /// the 56th bit used to set the inode to 1 indicates virtual inode
@@ -45,9 +51,12 @@ impl UniqueInodeGenerator {
         }
     }
 
-    pub fn get_unique_inode(&self, id: &InodeId) -> io::Result<libc::ino64_t> {
+    pub fn get_unique_inode(&self, id: &InodeId) -> io::Result<InoT> {
         let unique_id = {
+            #[cfg(target_os = "linux")]
             let id: DevMntIDPair = DevMntIDPair(id.dev, id.mnt);
+            #[cfg(target_os = "macos")]
+            let id: DevMntIDPair = DevMntIDPair(id.dev, id.ino);
             let mut id_map_guard = self.dev_mntid_map.lock().unwrap();
             match id_map_guard.entry(id) {
                 btree_map::Entry::Occupied(v) => *v.get(),
@@ -81,7 +90,7 @@ impl UniqueInodeGenerator {
     }
 
     #[cfg(test)]
-    fn decode_unique_inode(&self, inode: libc::ino64_t) -> io::Result<InodeId> {
+    fn decode_unique_inode(&self, inode: InoT) -> io::Result<InodeId> {
         if inode > crate::api::VFS_MAX_INO {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -123,6 +132,7 @@ impl UniqueInodeGenerator {
         Ok(InodeId {
             ino: inode & MAX_HOST_INO,
             dev,
+            #[cfg(target_os = "linux")]
             mnt,
         })
     }
@@ -158,6 +168,7 @@ pub fn openat(
 
 /// Open `/proc/self/fd/{fd}` with the given flags to effectively duplicate the given `fd` with new
 /// flags (e.g. to turn an `O_PATH` file descriptor into one that can be used for I/O).
+#[cfg(target_os = "linux")]
 pub fn reopen_fd_through_proc(
     fd: &impl AsRawFd,
     flags: libc::c_int,
@@ -174,6 +185,7 @@ pub fn reopen_fd_through_proc(
     )
 }
 
+#[cfg(target_os = "linux")]
 pub fn stat_fd(dir: &impl AsRawFd, path: Option<&CStr>) -> io::Result<libc::stat64> {
     // Safe because this is a constant value and a valid C string.
     let pathname =
@@ -198,14 +210,14 @@ pub fn stat_fd(dir: &impl AsRawFd, path: Option<&CStr>) -> io::Result<libc::stat
 }
 
 /// Returns true if it's safe to open this inode without O_PATH.
-pub fn is_safe_inode(mode: u32) -> bool {
+pub fn is_safe_inode(mode: InodeMode) -> bool {
     // Only regular files and directories are considered safe to be opened from the file
     // server without O_PATH.
     matches!(mode & libc::S_IFMT, libc::S_IFREG | libc::S_IFDIR)
 }
 
 /// Returns true if the mode is for a directory.
-pub fn is_dir(mode: u32) -> bool {
+pub fn is_dir(mode: InodeMode) -> bool {
     (mode & libc::S_IFMT) == libc::S_IFDIR
 }
 
@@ -271,6 +283,7 @@ mod tests {
             let inode_alt_key = InodeId {
                 ino: 1,
                 dev: 0,
+                #[cfg(target_os = "linux")]
                 mnt: 0,
             };
             let unique_inode = generator.get_unique_inode(&inode_alt_key).unwrap();
@@ -284,19 +297,24 @@ mod tests {
             let inode_alt_key = InodeId {
                 ino: 1,
                 dev: 0,
+                #[cfg(target_os = "linux")]
                 mnt: 1,
             };
             let unique_inode = generator.get_unique_inode(&inode_alt_key).unwrap();
             // 56 bit = 0
             // 55~48 bit = 0000 0010
             // 47~1 bit  = 1
+            #[cfg(target_os = "linux")]
             assert_eq!(unique_inode, 0x01000000000001);
+            #[cfg(target_os = "macos")]
+            assert_eq!(unique_inode, 0x00800000000001);
             let expect_inode_alt_key = generator.decode_unique_inode(unique_inode).unwrap();
             assert_eq!(expect_inode_alt_key, inode_alt_key);
 
             let inode_alt_key = InodeId {
                 ino: 2,
                 dev: 0,
+                #[cfg(target_os = "linux")]
                 mnt: 1,
             };
             let unique_inode = generator.get_unique_inode(&inode_alt_key).unwrap();
@@ -310,13 +328,17 @@ mod tests {
             let inode_alt_key = InodeId {
                 ino: MAX_HOST_INO,
                 dev: 0,
+                #[cfg(target_os = "linux")]
                 mnt: 1,
             };
             let unique_inode = generator.get_unique_inode(&inode_alt_key).unwrap();
             // 56 bit = 0
             // 55~48 bit = 0000 0010
             // 47~1 bit  = 0x7fffffffffff
+            #[cfg(target_os = "linux")]
             assert_eq!(unique_inode, 0x017fffffffffff);
+            #[cfg(target_os = "macos")]
+            assert_eq!(unique_inode, 0x01ffffffffffff);
             let expect_inode_alt_key = generator.decode_unique_inode(unique_inode).unwrap();
             assert_eq!(expect_inode_alt_key, inode_alt_key);
         }
@@ -326,7 +348,11 @@ mod tests {
             let generator = UniqueInodeGenerator::new();
             let inode_alt_key = InodeId {
                 ino: MAX_HOST_INO + 1,
+                #[cfg(target_os = "macos")]
+                dev: i32::MAX,
+                #[cfg(target_os = "linux")]
                 dev: u64::MAX,
+                #[cfg(target_os = "linux")]
                 mnt: u64::MAX,
             };
             let unique_inode = generator.get_unique_inode(&inode_alt_key).unwrap();
@@ -337,40 +363,62 @@ mod tests {
 
             let inode_alt_key = InodeId {
                 ino: MAX_HOST_INO + 2,
+                #[cfg(target_os = "macos")]
+                dev: i32::MAX,
+                #[cfg(target_os = "linux")]
                 dev: u64::MAX,
+                #[cfg(target_os = "linux")]
                 mnt: u64::MAX,
             };
             let unique_inode = generator.get_unique_inode(&inode_alt_key).unwrap();
             // 56 bit = 1
             // 55~48 bit = 0000 0001
             // 47~1 bit  = 3
+            #[cfg(target_os = "linux")]
             assert_eq!(unique_inode, 0x80800000000003);
+            #[cfg(target_os = "macos")]
+            assert_eq!(format!("0x{:x}", unique_inode), "0x81000000000003");
 
             let inode_alt_key = InodeId {
                 ino: MAX_HOST_INO + 3,
+                #[cfg(target_os = "macos")]
+                dev: i32::MAX,
+                #[cfg(target_os = "linux")]
                 dev: u64::MAX,
+                #[cfg(target_os = "linux")]
                 mnt: 0,
             };
             let unique_inode = generator.get_unique_inode(&inode_alt_key).unwrap();
             // 56 bit = 1
             // 55~48 bit = 0000 0010
             // 47~1 bit  = 4
+            #[cfg(target_os = "linux")]
             assert_eq!(unique_inode, 0x81000000000004);
+            #[cfg(target_os = "macos")]
+            assert_eq!(unique_inode, 0x81800000000004);
 
             let inode_alt_key = InodeId {
                 ino: u64::MAX,
+                #[cfg(target_os = "macos")]
+                dev: i32::MAX,
+                #[cfg(target_os = "linux")]
                 dev: u64::MAX,
+                #[cfg(target_os = "linux")]
                 mnt: u64::MAX,
             };
             let unique_inode = generator.get_unique_inode(&inode_alt_key).unwrap();
             // 56 bit = 1
             // 55~48 bit = 0000 0001
             // 47~1 bit  = 5
+            #[cfg(target_os = "linux")]
             assert_eq!(unique_inode, 0x80800000000005);
+            #[cfg(target_os = "macos")]
+            assert_eq!(format!("0x{:x}", unique_inode), "0x82000000000005");
         }
     }
 
     #[test]
+    #[cfg(target_os = "linux")]
     fn test_stat_fd() {
         let topdir = env!("CARGO_MANIFEST_DIR");
         let dir = File::open(topdir).unwrap();

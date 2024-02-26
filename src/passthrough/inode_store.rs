@@ -4,15 +4,23 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
+#[cfg(target_os = "linux")]
 use super::file_handle::FileHandle;
+#[cfg(target_os = "macos")]
+use super::stat::Stat as StatExt;
+#[cfg(target_os = "linux")]
 use super::statx::StatExt;
-use super::{Inode, InodeData, InodeHandle};
+
+#[cfg(target_os = "linux")]
+use super::InodeHandle;
+use super::{InoT, Inode, InodeData};
 
 #[derive(Clone, Copy, Default, PartialOrd, Ord, PartialEq, Eq, Debug)]
 /// Identify an inode in `PassthroughFs` by `InodeId`.
 pub struct InodeId {
-    pub ino: libc::ino64_t,
+    pub ino: InoT,
     pub dev: libc::dev_t,
+    #[cfg(target_os = "linux")]
     pub mnt: u64,
 }
 
@@ -22,6 +30,7 @@ impl InodeId {
         InodeId {
             ino: st.st.st_ino,
             dev: st.st.st_dev,
+            #[cfg(target_os = "linux")]
             mnt: st.mnt_id,
         }
     }
@@ -31,6 +40,7 @@ impl InodeId {
 pub struct InodeStore {
     data: BTreeMap<Inode, Arc<InodeData>>,
     by_id: BTreeMap<InodeId, Inode>,
+    #[cfg(target_os = "linux")]
     by_handle: BTreeMap<Arc<FileHandle>, Inode>,
 }
 
@@ -41,6 +51,7 @@ impl InodeStore {
     /// will get lost.
     pub fn insert(&mut self, data: Arc<InodeData>) {
         self.by_id.insert(data.id, data.inode);
+        #[cfg(target_os = "linux")]
         if let InodeHandle::Handle(handle) = &data.handle {
             self.by_handle
                 .insert(handle.file_handle().clone(), data.inode);
@@ -59,6 +70,7 @@ impl InodeStore {
         }
 
         if let Some(data) = data.as_ref() {
+            #[cfg(target_os = "linux")]
             if let InodeHandle::Handle(handle) = &data.handle {
                 self.by_handle.remove(handle.file_handle());
             }
@@ -69,6 +81,7 @@ impl InodeStore {
 
     pub fn clear(&mut self) {
         self.data.clear();
+        #[cfg(target_os = "linux")]
         self.by_handle.clear();
         self.by_id.clear();
     }
@@ -82,6 +95,7 @@ impl InodeStore {
         self.get(inode)
     }
 
+    #[cfg(target_os = "linux")]
     pub fn get_by_handle(&self, handle: &FileHandle) -> Option<&Arc<InodeData>> {
         let inode = self.inode_by_handle(handle)?;
         self.get(inode)
@@ -91,6 +105,7 @@ impl InodeStore {
         self.by_id.get(id)
     }
 
+    #[cfg(target_os = "linux")]
     pub fn inode_by_handle(&self, handle: &FileHandle) -> Option<&Inode> {
         self.by_handle.get(handle)
     }
@@ -101,11 +116,19 @@ mod test {
     use super::super::*;
     use super::*;
 
+    #[cfg(target_os = "linux")]
     use std::ffi::CStr;
+    #[cfg(target_os = "linux")]
     use std::mem::MaybeUninit;
     use std::os::unix::io::AsRawFd;
     use std::sync::atomic::Ordering;
+    #[cfg(target_os = "macos")]
+    use tempfile::Builder;
+    #[cfg(target_os = "linux")]
     use vmm_sys_util::tempfile::TempFile;
+
+    #[cfg(target_os = "macos")]
+    use stat::stat;
 
     impl PartialEq for InodeData {
         fn eq(&self, other: &Self) -> bool {
@@ -117,6 +140,7 @@ mod test {
                 return false;
             }
 
+            #[cfg(target_os = "linux")]
             match (&self.handle, &other.handle) {
                 (InodeHandle::File(f1), InodeHandle::File(f2)) => f1.as_raw_fd() == f2.as_raw_fd(),
                 (InodeHandle::Handle(h1), InodeHandle::Handle(h2)) => {
@@ -124,9 +148,18 @@ mod test {
                 }
                 _ => false,
             }
+
+            #[cfg(target_os = "macos")]
+            match (&self.handle, &other.handle) {
+                (InodeHandle::File(f1, _), InodeHandle::File(f2, _)) => {
+                    f1.as_raw_fd() == f2.as_raw_fd()
+                }
+                _ => false,
+            }
         }
     }
 
+    #[cfg(target_os = "linux")]
     fn stat_fd(fd: &impl AsRawFd) -> io::Result<libc::stat64> {
         let mut st = MaybeUninit::<libc::stat64>::zeroed();
         let null_path = unsafe { CStr::from_bytes_with_nul_unchecked(b"\0") };
@@ -148,6 +181,7 @@ mod test {
         }
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn test_inode_store() {
         let mut m = InodeStore::default();
@@ -209,6 +243,67 @@ mod test {
         assert!(m.get(&1).is_none());
         assert!(m.get_by_id(&InodeId::default()).is_none());
         assert!(m.get_by_handle(&FileHandle::default()).is_none());
+        assert!(m.get(&inode1).is_none());
+        assert!(m.get_by_id(&id1).is_none());
+        assert!(m.get(&inode2).is_none());
+        assert!(m.get_by_id(&id2).is_none());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_inode_store() {
+        let mut m = InodeStore::default();
+        let tmpfile1 = Builder::new().tempfile().unwrap();
+        let tmpfile2 = Builder::new().tempfile().unwrap();
+
+        let inode1: Inode = 3;
+        let inode2: Inode = 4;
+        let inode_stat1 = stat(tmpfile1.as_file()).unwrap();
+        let inode_stat2 = stat(tmpfile2.as_file()).unwrap();
+        let id1 = InodeId::from_stat(&inode_stat1);
+        let id2 = InodeId::from_stat(&inode_stat2);
+        let cstr1 = CString::new(tmpfile1.path().to_string_lossy().to_string()).unwrap();
+        let cstr2 = CString::new(tmpfile2.path().to_string_lossy().to_string()).unwrap();
+        let file_or_handle1 = InodeHandle::File(tmpfile1.into_file(), cstr1);
+        let file_or_handle2 = InodeHandle::File(tmpfile2.into_file(), cstr2);
+        let data1 = InodeData::new(inode1, file_or_handle1, 2, id1, inode_stat1.st.st_mode);
+        let data2 = InodeData::new(inode2, file_or_handle2, 2, id2, inode_stat2.st.st_mode);
+        let data1 = Arc::new(data1);
+        let data2 = Arc::new(data2);
+
+        m.insert(data1.clone());
+
+        // get not present key, expect none
+        assert!(m.get(&1).is_none());
+
+        // get just inserted value by key, by id, by handle
+        assert!(m.get_by_id(&InodeId::default()).is_none());
+        assert_eq!(m.get(&inode1).unwrap(), &data1);
+        assert_eq!(m.get_by_id(&id1).unwrap(), &data1);
+
+        // insert another value, and check again
+        m.insert(data2.clone());
+        assert!(m.get(&1).is_none());
+        assert!(m.get_by_id(&InodeId::default()).is_none());
+        assert_eq!(m.get(&inode1).unwrap(), &data1);
+        assert_eq!(m.get_by_id(&id1).unwrap(), &data1);
+        assert_eq!(m.get(&inode2).unwrap(), &data2);
+        assert_eq!(m.get_by_id(&id2).unwrap(), &data2);
+
+        // remove non-present key
+        assert!(m.remove(&1, false).is_none());
+
+        // remove present key, return its value
+        assert_eq!(m.remove(&inode1, false).unwrap(), data1.clone());
+        assert!(m.get(&inode1).is_none());
+        assert!(m.get_by_id(&id1).is_none());
+        assert_eq!(m.get(&inode2).unwrap(), &data2);
+        assert_eq!(m.get_by_id(&id2).unwrap(), &data2);
+
+        // clear the map
+        m.clear();
+        assert!(m.get(&1).is_none());
+        assert!(m.get_by_id(&InodeId::default()).is_none());
         assert!(m.get(&inode1).is_none());
         assert!(m.get_by_id(&id1).is_none());
         assert!(m.get(&inode2).is_none());

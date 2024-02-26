@@ -143,9 +143,9 @@ impl<F: FileSystem + Sync> Server<F> {
             x if x == Opcode::Rename2 as u32 => self.rename2(ctx),
             #[cfg(target_os = "linux")]
             x if x == Opcode::Lseek as u32 => self.lseek(ctx),
-            #[cfg(feature = "virtiofs")]
+            #[cfg(all(target_os = "linux", feature = "virtiofs"))]
             x if x == Opcode::SetupMapping as u32 => self.setupmapping(ctx, vu_req),
-            #[cfg(feature = "virtiofs")]
+            #[cfg(all(target_os = "linux", feature = "virtiofs"))]
             x if x == Opcode::RemoveMapping as u32 => self.removemapping(ctx, vu_req),
             // Group reqeusts don't need reply together
             x => match x {

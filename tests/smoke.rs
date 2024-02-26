@@ -3,19 +3,23 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 
-#[cfg(all(feature = "fusedev", target_os = "linux"))]
+#[cfg(all(feature = "fusedev"))]
 #[macro_use]
 extern crate log;
 
 mod example;
 
-#[cfg(all(feature = "fusedev", target_os = "linux"))]
+#[cfg(feature = "fusedev")]
 mod fusedev_tests {
     use std::io::Result;
     use std::path::Path;
     use std::process::Command;
 
+    #[cfg(target_os = "linux")]
     use vmm_sys_util::tempdir::TempDir;
+
+    #[cfg(target_os = "macos")]
+    use tempfile::tempdir;
 
     use crate::example::passthroughfs;
 
@@ -37,7 +41,6 @@ mod fusedev_tests {
             );
             return false;
         }
-
         let src_md5 = exec(
             format!(
                 "cd {}; git ls-files --recurse-submodules | grep --invert-match rust-vmm-ci | xargs md5sum; cd - > /dev/null",
@@ -85,7 +88,16 @@ mod fusedev_tests {
         // test the fuse-rs repository
         let src = Path::new(".").canonicalize().unwrap();
         let src_dir = src.to_str().unwrap();
+
+        #[cfg(target_os = "linux")]
         let tmp_dir = TempDir::new().unwrap();
+
+        #[cfg(target_os = "macos")]
+        let tmp_dir = {
+            let source = tempdir().expect("Cannot create temporary directory.");
+            source.into_path()
+        };
+
         let mnt_dir = tmp_dir.as_path().to_str().unwrap();
         info!(
             "test passthroughfs src {:?} mountpoint {}",
