@@ -88,11 +88,19 @@ mod fusedev_tests {
         let tmp_dir = TempDir::new().unwrap();
         let mnt_dir = tmp_dir.as_path().to_str().unwrap();
         info!(
-            "test passthroughfs src {:?} mountpoint {}",
+            "test passthroughfs src {:?} mountpoint {} splice false",
             src_dir, mnt_dir
         );
 
-        let mut daemon = passthroughfs::Daemon::new(src_dir, mnt_dir, 2).unwrap();
+        let mut daemon = passthroughfs::Daemon::new(src_dir, mnt_dir, 2, false).unwrap();
+        daemon.mount().unwrap();
+        std::thread::sleep(std::time::Duration::from_secs(1));
+        assert!(validate_two_git_directory(src_dir, mnt_dir));
+        daemon.umount().unwrap();
+        drop(daemon);
+        // test with splice
+        std::thread::sleep(std::time::Duration::from_secs(1));
+        let mut daemon = passthroughfs::Daemon::new(src_dir, mnt_dir, 2, true).unwrap();
         daemon.mount().unwrap();
         std::thread::sleep(std::time::Duration::from_secs(1));
         assert!(validate_two_git_directory(src_dir, mnt_dir));

@@ -656,6 +656,21 @@ impl<S: BitmapSlice + Send + Sync> FileSystem for PassthroughFs<S> {
 
         let mut f = ManuallyDrop::new(f);
 
+        #[cfg(all(target_os = "linux", feature = "fusedev"))]
+        match w.append_fd_buf(&f.as_raw_fd(), size as usize, Some(offset)) {
+            Ok(len) => {
+                return Ok(len);
+            }
+            Err(e) => {
+                let err_code = e.raw_os_error().unwrap_or(-1);
+                if err_code != libc::ENOSYS && err_code != libc::ENOTSUP && err_code != libc::EINVAL
+                {
+                    return Err(e);
+                }
+                // fallback to write_from
+            }
+        }
+
         w.write_from(&mut *f, size as usize, offset)
     }
 
@@ -695,6 +710,21 @@ impl<S: BitmapSlice + Send + Sync> FileSystem for PassthroughFs<S> {
             } else {
                 None
             };
+
+        #[cfg(all(target_os = "linux", feature = "fusedev"))]
+        match r.splice_to(&f.as_raw_fd(), size as usize, Some(offset)) {
+            Ok(len) => {
+                return Ok(len);
+            }
+            Err(e) => {
+                let err_code = e.raw_os_error().unwrap_or(-1);
+                if err_code != libc::ENOSYS && err_code != libc::ENOTSUP && err_code != libc::EINVAL
+                {
+                    return Err(e);
+                }
+                // fallback to read_to
+            }
+        }
 
         r.read_to(&mut *f, size as usize, offset)
     }
