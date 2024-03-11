@@ -1,6 +1,25 @@
 # Changelog
 ## [Unreleased]
 
+## [0.12.0]
+### Added
+- [156](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/156): Fuse OverlayFs implementation.
+- [166](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/166): Import latest improvement for passthroughfs from virtiofsd project.
+- [169](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/169): Optimize implementation of lookup() for passthroughfs.
+- [170](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/170): abi: unify st_nlink.
+- [172](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/172): ptfs: refine implementation of seal_size_check().
+- [173](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/173): ptfs: use BorrowedFd instead of RawFd when possible.
+- [174](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/174): ptfs: add support for new cache mode Metadata.
+- [177](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/177): fusedev: add clone_fuse_file method to FuseSession.
+
+### Fixed
+- [125](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/125): fusedev: add fd-passthrough support.
+- [178](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/178): Fix batch forget can't handle too large msg.
+- [180](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/180): fix: fuse-t nobrowse.
+- [181](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/181): Fix CI: xfstests: restrict xfstests version.
+- [184](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/184): bugfix: read/write fd dropped unexpectedly.
+- [185](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/185): fix: fuse t channel read bug in during multiple reads
+
 ## [0.11.0]
 ### Added
 - [144](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/144): feat: implement fuse-t feature
