@@ -1,6 +1,6 @@
 [package]
 name = "fuse-backend-rs"
-version = "0.11.0"
+version = "0.12.0"
 keywords = ["fuse", "virtio", "virtio-fs", "vhost-user-fs"]
 categories = ["filesystem", "os::linux-apis"]
 description = "A rust library for Fuse(filesystem in userspace) servers and virtio-fs devices"
