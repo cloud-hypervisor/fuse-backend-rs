@@ -19,12 +19,13 @@ pub struct Daemon {
     server: Arc<Server<Arc<Vfs>>>,
     thread_cnt: u32,
     session: Option<FuseSession>,
+    enable_splice: bool,
 }
 
 #[allow(dead_code)]
 impl Daemon {
     /// Creates a fusedev daemon instance
-    pub fn new(src: &str, mountpoint: &str, thread_cnt: u32) -> Result<Self> {
+    pub fn new(src: &str, mountpoint: &str, thread_cnt: u32, enable_splice: bool) -> Result<Self> {
         // create vfs
         let vfs = Vfs::new(VfsOptions {
             no_open: false,
@@ -47,6 +48,7 @@ impl Daemon {
             server: Arc::new(Server::new(Arc::new(vfs))),
             thread_cnt,
             session: None,
+            enable_splice,
         })
     }
 
@@ -60,6 +62,7 @@ impl Daemon {
             let mut server = FuseServer {
                 server: self.server.clone(),
                 ch: se.new_channel().unwrap(),
+                enable_splice: self.enable_splice,
             };
             let _thread = thread::Builder::new()
                 .name("fuse_server".to_string())
@@ -93,12 +96,21 @@ impl Drop for Daemon {
 struct FuseServer {
     server: Arc<Server<Arc<Vfs>>>,
     ch: FuseChannel,
+    enable_splice: bool,
 }
 
 impl FuseServer {
     fn svc_loop(&mut self) -> Result<()> {
         // Given error EBADF, it means kernel has shut down this session.
         let _ebadf = std::io::Error::from_raw_os_error(libc::EBADF);
+        if self.enable_splice {
+            if self.server.is_support_splice_write() {
+                self.ch.enable_splice_write().unwrap();
+            }
+            if self.server.is_support_splice_read() {
+                self.ch.enable_splice_read().unwrap();
+            }
+        }
         loop {
             if let Some((reader, writer)) = self
                 .ch
