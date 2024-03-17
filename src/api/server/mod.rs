@@ -51,6 +51,7 @@ pub const MAX_REQ_PAGES: u16 = 256; // 1MB
 pub struct Server<F: FileSystem + Sync> {
     fs: F,
     vers: ArcSwap<ServerVersion>,
+    enabled: Option<FsOptions>,
 }
 
 impl<F: FileSystem + Sync> Server<F> {
@@ -62,6 +63,7 @@ impl<F: FileSystem + Sync> Server<F> {
                 major: KERNEL_VERSION,
                 minor: KERNEL_MINOR_VERSION,
             })),
+            enabled: None,
         }
     }
 }

@@ -197,6 +197,9 @@ const INIT_EXT: u64 = 0x4000_0000;
 // This flag indicates whether the guest kernel enable per-file dax
 const PERFILE_DAX: u64 = 0x2_0000_0000;
 
+// this flag indicates whether the guest kernel enable resend
+const HAS_RESEND: u64 = 1_u64 << 39;
+
 // This flag indicates whether to enable fd-passthrough. It was defined in the
 // Anolis kernel but not in the upstream kernel. To avoid collision, we'll set
 // it to the most significant bit.
@@ -458,6 +461,9 @@ bitflags! {
         /// If this feature is enabled, filesystem will notify guest kernel whether file
         /// enable DAX by EntryOut.Attr.flags of inode when lookup
         const PERFILE_DAX = PERFILE_DAX;
+
+        /// indicates whether the kernel support resend inflight request
+        const HAS_RESEND = HAS_RESEND;
     }
 }
 
@@ -755,7 +761,8 @@ pub enum NotifyOpcode {
     Store = 4,
     Retrieve = 5,
     Delete = 6,
-    CodeMax = 7,
+    Resend = 7,
+    CodeMax = 8,
 }
 
 #[repr(C)]

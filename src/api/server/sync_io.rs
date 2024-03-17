@@ -57,6 +57,27 @@ impl<F: FileSystem + Sync> Server<F> {
             .map_err(Error::FailedToWrite)?;
         buffer_writer.commit(None).map_err(Error::InvalidMessage)
     }
+
+    #[cfg(feature = "fusedev")]
+    pub fn notify_resend<S: BitmapSlice>(
+        &self, 
+        mut w: FuseDevWriter<'_, S>,
+    ) -> Result<()> {
+        if !self.enabled.map_or(false,|enabled| {
+            enabled.contains(FsOptions::HAS_RESEND)
+        }) {
+            return Ok(0)
+        }
+        let mut buffer_writer = w.split_at(0).map_err(Error::FailedToSplitWriter)?;
+        let mut header = OutHeader::default();
+        header.unique = 0;
+        header.error = NotifyOpcode::Resend as i32;
+        buffer_writer
+            .write_obj(header)
+            .map_err(Error::FailedToWrite)?;
+        buffer_writer.commit(None).map_err(Error::InvalidMessage)
+    }
+
     /// Main entrance to handle requests from the transport layer.
     ///
     /// It receives Fuse requests from transport layers, parses the request according to Fuse ABI,
@@ -744,6 +765,7 @@ impl<F: FileSystem + Sync> Server<F> {
                 }
                 let vers = ServerVersion { major, minor };
                 self.vers.store(Arc::new(vers));
+                self.enabled = Some(enabled);
                 if minor < KERNEL_MINOR_VERSION_INIT_OUT_SIZE {
                     ctx.reply_ok(
                         Some(
