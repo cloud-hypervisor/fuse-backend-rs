@@ -63,11 +63,6 @@ impl<F: FileSystem + Sync> Server<F> {
         &self, 
         mut w: FuseDevWriter<'_, S>,
     ) -> Result<()> {
-        if !self.enabled.map_or(false,|enabled| {
-            enabled.contains(FsOptions::HAS_RESEND)
-        }) {
-            return Ok(0)
-        }
         let mut buffer_writer = w.split_at(0).map_err(Error::FailedToSplitWriter)?;
         let mut header = OutHeader::default();
         header.unique = 0;
@@ -75,7 +70,8 @@ impl<F: FileSystem + Sync> Server<F> {
         buffer_writer
             .write_obj(header)
             .map_err(Error::FailedToWrite)?;
-        buffer_writer.commit(None).map_err(Error::InvalidMessage)
+        buffer_writer.commit(None).map_err(Error::InvalidMessage)?;
+        Ok(())
     }
 
     /// Main entrance to handle requests from the transport layer.
@@ -765,7 +761,6 @@ impl<F: FileSystem + Sync> Server<F> {
                 }
                 let vers = ServerVersion { major, minor };
                 self.vers.store(Arc::new(vers));
-                self.enabled = Some(enabled);
                 if minor < KERNEL_MINOR_VERSION_INIT_OUT_SIZE {
                     ctx.reply_ok(
                         Some(
