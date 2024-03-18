@@ -59,14 +59,22 @@ impl<F: FileSystem + Sync> Server<F> {
     }
 
     #[cfg(feature = "fusedev")]
+    /// Send a resend notification message to the kernel via FUSE. This function should be invoked as part of 
+    /// the crash recovery routine. Given that FUSE initialization does not occur again during recovery, 
+    /// the capability to support resend notifications may not be automatically detected. It is the responsibility 
+    /// of the upper layers to verify and persist the kernel's support for this feature upon the initial FUSE setup.
     pub fn notify_resend<S: BitmapSlice>(
         &self, 
         mut w: FuseDevWriter<'_, S>,
     ) -> Result<()> {
         let mut buffer_writer = w.split_at(0).map_err(Error::FailedToSplitWriter)?;
-        let mut header = OutHeader::default();
-        header.unique = 0;
-        header.error = NotifyOpcode::Resend as i32;
+        let header = {
+            OutHeader{
+                unique: 0,
+                error: NotifyOpcode::Resend as i32,
+                ..Default::default()
+            }
+        };
         buffer_writer
             .write_obj(header)
             .map_err(Error::FailedToWrite)?;
