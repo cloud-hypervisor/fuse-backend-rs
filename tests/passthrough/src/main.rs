@@ -1,5 +1,3 @@
-use fuse_backend_rs::transport::FuseDevWriter;
-use fuse_backend_rs::transport::Writer;
 use log::{error, info, warn, LevelFilter};
 use std::env;
 use std::fs;
@@ -13,7 +11,6 @@ use signal_hook::{consts::TERM_SIGNALS, iterator::Signals};
 use fuse_backend_rs::api::{server::Server, Vfs, VfsOptions};
 use fuse_backend_rs::passthrough::{Config, PassthroughFs};
 use fuse_backend_rs::transport::{FuseChannel, FuseSession};
-use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
 
 use simple_logger::SimpleLogger;
 
@@ -63,7 +60,9 @@ impl Daemon {
         se.mount().unwrap();
         
         se.with_writer(|writer| {
-            self.server.notify_resend(writer).unwrap();
+            self.server
+                .notify_resend(writer)
+                .unwrap_or_else(|e| println!("failed to send resend notification {}", e));
         });
 
         for _ in 0..self.thread_cnt {
