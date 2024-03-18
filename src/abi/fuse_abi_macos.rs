@@ -498,7 +498,8 @@ pub enum NotifyOpcode {
     Store = 4,
     Retrieve = 5,
     Delete = 6,
-    CodeMax = 7,
+    Resend = 7,
+    CodeMax = 8,
 }
 
 #[repr(C)]
