@@ -466,7 +466,7 @@ impl Vfs {
         let mut mountpoints = self.mountpoints.load().deref().deref().clone();
         let fs_idx = mountpoints
             .get(&inode)
-            .map(Arc::clone)
+            .cloned()
             .map(|x| {
                 // Do not remove pseudofs inode. We keep all pseudofs inode so that
                 // 1. they can be reused later on
@@ -650,7 +650,7 @@ impl Vfs {
         if inode.is_pseudo_fs() {
             // ROOT_ID is special, we need to check if we have a mountpoint on the vfs root
             if inode.ino() == ROOT_ID {
-                if let Some(mnt) = self.mountpoints.load().get(&inode.ino()).map(Arc::clone) {
+                if let Some(mnt) = self.mountpoints.load().get(&inode.ino()).cloned() {
                     let fs = self.get_fs_by_idx(mnt.fs_idx)?;
                     return Ok((Right(fs), VfsInode::new(mnt.fs_idx, mnt.ino)));
                 }

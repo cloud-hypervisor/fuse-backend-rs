@@ -193,7 +193,7 @@ impl InodeMap {
             .read()
             .unwrap()
             .get(&inode)
-            .map(Arc::clone)
+            .cloned()
             .ok_or_else(ebadf)
     }
 
@@ -235,7 +235,7 @@ impl InodeMap {
                     handle.is_none() || data.handle.file_handle().is_none()
                 })
             })
-            .map(Arc::clone)
+            .cloned()
     }
 
     fn get_map_mut(&self) -> RwLockWriteGuard<InodeStore> {
@@ -336,7 +336,7 @@ impl HandleMap {
             .unwrap()
             .get(&handle)
             .filter(|hd| hd.inode == inode)
-            .map(Arc::clone)
+            .cloned()
             .ok_or_else(ebadf)
     }
 }
