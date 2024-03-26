@@ -14,6 +14,7 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
 
+use super::credentials::{drop_cap_fssetid, UnixCredentials};
 use super::os_compat::LinuxDirent64;
 use super::util::stat_fd;
 use super::*;
@@ -185,7 +186,7 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
         let killpriv = if self.killpriv_v2.load(Ordering::Relaxed)
             && (fuse_flags & FOPEN_IN_KILL_SUIDGID != 0)
         {
-            self::drop_cap_fsetid()?
+            drop_cap_fssetid()?
         } else {
             None
         };
@@ -372,16 +373,14 @@ impl<S: BitmapSlice + Send + Sync> FileSystem for PassthroughFs<S> {
     }
 
     fn forget(&self, _ctx: &Context, inode: Inode, count: u64) {
-        let mut inodes = self.inode_map.get_map_mut();
-
-        self.forget_one(&mut inodes, inode, count)
+        self.forget_one(inode, count)
     }
 
     fn batch_forget(&self, _ctx: &Context, requests: Vec<(Inode, u64)>) {
         let mut inodes = self.inode_map.get_map_mut();
 
         for (inode, count) in requests {
-            self.forget_one(&mut inodes, inode, count)
+            self.forget_one_locked(&mut inodes, inode, count)
         }
     }
 
@@ -428,8 +427,7 @@ impl<S: BitmapSlice + Send + Sync> FileSystem for PassthroughFs<S> {
         let data = self.inode_map.get(parent)?;
 
         let res = {
-            let (_uid, _gid) = set_creds(ctx.uid, ctx.gid)?;
-
+            let _guard = UnixCredentials::new(ctx.uid, ctx.gid).set()?;
             let file = data.get_file()?;
             // Safe because this doesn't modify any memory and we check the return value.
             unsafe { libc::mkdirat(file.as_raw_fd(), name.as_ptr(), mode & !umask) }
@@ -470,8 +468,7 @@ impl<S: BitmapSlice + Send + Sync> FileSystem for PassthroughFs<S> {
                 };
 
                 let entry = self.do_lookup(inode, name)?;
-                let mut inodes = self.inode_map.get_map_mut();
-                self.forget_one(&mut inodes, entry.inode, 1);
+                self.forget_one(entry.inode, 1);
                 entry.inode
             };
 
@@ -508,8 +505,7 @@ impl<S: BitmapSlice + Send + Sync> FileSystem for PassthroughFs<S> {
                 // true when size is not large enough to hold entry.
                 if r == 0 {
                     // Release the refcount acquired by self.do_lookup().
-                    let mut inodes = self.inode_map.get_map_mut();
-                    self.forget_one(&mut inodes, ino, 1);
+                    self.forget_one(ino, 1);
                 }
                 r
             })
@@ -561,8 +557,7 @@ impl<S: BitmapSlice + Send + Sync> FileSystem for PassthroughFs<S> {
         let dir_file = dir.get_file()?;
 
         let new_file = {
-            let (_uid, _gid) = set_creds(ctx.uid, ctx.gid)?;
-
+            let _guard = UnixCredentials::new(ctx.uid, ctx.gid).set()?;
             let flags = self.get_writeback_open_flags(args.flags as i32);
             Self::create_file_excl(&dir_file, name, flags, args.mode & !(args.umask & 0o777))?
         };
@@ -578,12 +573,12 @@ impl<S: BitmapSlice + Send + Sync> FileSystem for PassthroughFs<S> {
                 let _killpriv = if self.killpriv_v2.load(Ordering::Relaxed)
                     && (args.fuse_flags & FOPEN_IN_KILL_SUIDGID != 0)
                 {
-                    self::drop_cap_fsetid()?
+                    drop_cap_fssetid()?
                 } else {
                     None
                 };
 
-                let (_uid, _gid) = set_creds(ctx.uid, ctx.gid)?;
+                let _guard = UnixCredentials::new(ctx.uid, ctx.gid).set()?;
                 self.open_inode(entry.inode, args.flags as i32)?
             }
         };
@@ -709,7 +704,7 @@ impl<S: BitmapSlice + Send + Sync> FileSystem for PassthroughFs<S> {
         // Cap restored when _killpriv is dropped
         let _killpriv =
             if self.killpriv_v2.load(Ordering::Relaxed) && (fuse_flags & WRITE_KILL_PRIV != 0) {
-                self::drop_cap_fsetid()?
+                drop_cap_fssetid()?
             } else {
                 None
             };
@@ -814,7 +809,7 @@ impl<S: BitmapSlice + Send + Sync> FileSystem for PassthroughFs<S> {
             let _killpriv = if self.killpriv_v2.load(Ordering::Relaxed)
                 && valid.contains(SetattrValid::KILL_SUIDGID)
             {
-                self::drop_cap_fsetid()?
+                drop_cap_fssetid()?
             } else {
                 None
             };
@@ -930,7 +925,7 @@ impl<S: BitmapSlice + Send + Sync> FileSystem for PassthroughFs<S> {
         let file = data.get_file()?;
 
         let res = {
-            let (_uid, _gid) = set_creds(ctx.uid, ctx.gid)?;
+            let _guard = UnixCredentials::new(ctx.uid, ctx.gid).set()?;
 
             // Safe because this doesn't modify any memory and we check the return value.
             unsafe {
@@ -995,8 +990,7 @@ impl<S: BitmapSlice + Send + Sync> FileSystem for PassthroughFs<S> {
         let data = self.inode_map.get(parent)?;
 
         let res = {
-            let (_uid, _gid) = set_creds(ctx.uid, ctx.gid)?;
-
+            let _guard = UnixCredentials::new(ctx.uid, ctx.gid).set()?;
             let file = data.get_file()?;
             // Safe because this doesn't modify any memory and we check the return value.
             unsafe { libc::symlinkat(linkname.as_ptr(), file.as_raw_fd(), name.as_ptr()) }
