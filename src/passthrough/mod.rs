@@ -776,8 +776,8 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
                     if new == 0 {
                         // We just removed the last refcount for this inode.
                         // The allocated inode number should be kept in the map when use_host_ino
-                        // is false or inode is bigger than MAX_HOST_INO.
-                        let keep_mapping = !self.cfg.use_host_ino || inode > MAX_HOST_INO;
+                        // is false or host inode(don't use the virtual 56bit inode) is bigger than MAX_HOST_INO.
+                        let keep_mapping = !self.cfg.use_host_ino || data.id.ino > MAX_HOST_INO;
                         inodes.remove(&inode, keep_mapping);
                     }
                     break;
@@ -1373,7 +1373,18 @@ mod tests {
             fs.import().unwrap();
             let entry = fs.lookup(&ctx, ROOT_ID, &child).unwrap();
             assert_eq!(entry.inode & MAX_HOST_INO, meta.ino());
+            let inode_store = fs.inode_map.get_map_mut();
+            let inode_data = inode_store.get(&entry.inode).unwrap();
+            assert!(inode_store.inode_by_id(&inode_data.id).is_some());
+            let id = inode_data.id.clone();
+            drop(inode_store);
+
             fs.forget(&ctx, entry.inode, 1);
+            let inode_store = fs.inode_map.get_map_mut();
+            assert!(inode_store.get(&entry.inode).is_none());
+            assert!(inode_store.inode_by_id(&id).is_none());
+            drop(inode_store);
+
             let entry = fs.lookup(&ctx, ROOT_ID, &child).unwrap();
             assert_eq!(entry.inode & MAX_HOST_INO, meta.ino());
         }
