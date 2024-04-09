@@ -328,7 +328,7 @@ mod tests {
         buf: Vec<libc::c_char>,
     ) -> CFileHandle {
         let mut wrapper = CFileHandle::new(handle_bytes);
-        let fh = wrapper.wrapper.as_mut_fam_struct();
+        let fh = unsafe { wrapper.wrapper.as_mut_fam_struct() };
         fh.handle_type = handle_type;
         unsafe {
             fh.f_handle
@@ -401,7 +401,7 @@ mod tests {
     fn test_c_file_handle_wrapper() {
         let buf = (0..=127).collect::<Vec<libc::c_char>>();
         let mut wrapper = generate_c_file_handle(MAX_HANDLE_SIZE, 3, buf.clone());
-        let fh = wrapper.wrapper.as_mut_fam_struct();
+        let fh = unsafe { wrapper.wrapper.as_mut_fam_struct() };
 
         assert_eq!(fh.handle_bytes as usize, MAX_HANDLE_SIZE);
         assert_eq!(fh.handle_type, 3);

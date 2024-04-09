@@ -15,7 +15,7 @@ use std::os::unix::io::RawFd;
 
 use nix::sys::uio::writev;
 use nix::unistd::write;
-use vm_memory::{ByteValued, VolatileMemory, VolatileSlice};
+use vm_memory::{ByteValued, VolatileSlice};
 
 use super::{Error, FileReadWriteVolatile, IoBuffers, Reader, Result, Writer};
 use crate::file_buf::FileVolatileSlice;
@@ -63,7 +63,7 @@ impl<'a, S: BitmapSlice + Default> Reader<'a, S> {
         let mut buffers: VecDeque<VolatileSlice<'a, S>> = VecDeque::new();
         // Safe because Reader has the same lifetime with buf.
         buffers.push_back(unsafe {
-            VolatileSlice::with_bitmap(buf.mem.as_mut_ptr(), buf.mem.len(), S::default())
+            VolatileSlice::with_bitmap(buf.mem.as_mut_ptr(), buf.mem.len(), S::default(), None)
         });
 
         Ok(Reader {
