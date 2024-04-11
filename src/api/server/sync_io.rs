@@ -436,10 +436,6 @@ impl<F: FileSystem + Sync> Server<F> {
             ..
         } = ctx.r.read_obj().map_err(Error::DecodeMessage)?;
 
-        if size > MAX_BUFFER_SIZE {
-            return ctx.reply_error_explicit(io::Error::from_raw_os_error(libc::ENOMEM));
-        }
-
         let owner = if read_flags & READ_LOCKOWNER != 0 {
             Some(lock_owner)
         } else {
@@ -494,10 +490,6 @@ impl<F: FileSystem + Sync> Server<F> {
             flags,
             ..
         } = ctx.r.read_obj().map_err(Error::DecodeMessage)?;
-
-        if size > MAX_BUFFER_SIZE {
-            return ctx.reply_error_explicit(io::Error::from_raw_os_error(libc::ENOMEM));
-        }
 
         let owner = if fuse_flags & WRITE_LOCKOWNER != 0 {
             Some(lock_owner)
@@ -618,9 +610,6 @@ impl<F: FileSystem + Sync> Server<F> {
 
     pub(super) fn getxattr<S: BitmapSlice>(&self, mut ctx: SrvContext<'_, F, S>) -> Result<usize> {
         let GetxattrIn { size, .. } = ctx.r.read_obj().map_err(Error::DecodeMessage)?;
-        if size > MAX_BUFFER_SIZE {
-            return ctx.reply_error_explicit(io::Error::from_raw_os_error(libc::ENOMEM));
-        }
 
         let buf =
             ServerUtil::get_message_body(&mut ctx.r, &ctx.in_header, size_of::<GetxattrIn>())?;
@@ -646,10 +635,6 @@ impl<F: FileSystem + Sync> Server<F> {
 
     pub(super) fn listxattr<S: BitmapSlice>(&self, mut ctx: SrvContext<'_, F, S>) -> Result<usize> {
         let GetxattrIn { size, .. } = ctx.r.read_obj().map_err(Error::DecodeMessage)?;
-
-        if size > MAX_BUFFER_SIZE {
-            return ctx.reply_error_explicit(io::Error::from_raw_os_error(libc::ENOMEM));
-        }
 
         match self.fs.listxattr(ctx.context(), ctx.nodeid(), size) {
             Ok(ListxattrReply::Names(val)) => ctx.reply_ok(None::<u8>, Some(&val)),
@@ -819,10 +804,6 @@ impl<F: FileSystem + Sync> Server<F> {
         let ReadIn {
             fh, offset, size, ..
         } = ctx.r.read_obj().map_err(Error::DecodeMessage)?;
-
-        if size > MAX_BUFFER_SIZE {
-            return ctx.reply_error_explicit(io::Error::from_raw_os_error(libc::ENOMEM));
-        }
 
         let available_bytes = ctx.w.available_bytes();
         if available_bytes < size as usize {
