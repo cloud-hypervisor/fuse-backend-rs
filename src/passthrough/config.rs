@@ -175,6 +175,12 @@ pub struct Config {
     /// is bigger than the threshold.
     /// The default value for this option is `false`.
     pub use_host_ino: bool,
+
+    /// Whether the file system should honor the O_DIRECT flag. If this option is disabled,
+    /// that flag will be filtered out at `open_inode`.
+    ///
+    /// The default is `true`.
+    pub allow_direct_io: bool,
 }
 
 impl Default for Config {
@@ -198,6 +204,7 @@ impl Default for Config {
             dir_entry_timeout: None,
             dir_attr_timeout: None,
             use_host_ino: false,
+            allow_direct_io: true,
         }
     }
 }

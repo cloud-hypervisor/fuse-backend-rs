@@ -34,7 +34,10 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
         if !is_safe_inode(data.mode) {
             Err(ebadf())
         } else {
-            let new_flags = self.get_writeback_open_flags(flags);
+            let mut new_flags = self.get_writeback_open_flags(flags);
+            if !self.cfg.allow_direct_io && flags & libc::O_DIRECT != 0 {
+                new_flags &= !libc::O_DIRECT;
+            }
             data.open_file(new_flags | libc::O_CLOEXEC, &self.proc_self_fd)
         }
     }
