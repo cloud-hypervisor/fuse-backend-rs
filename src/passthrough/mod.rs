@@ -32,6 +32,7 @@ pub use self::config::{CachePolicy, Config};
 use self::file_handle::{FileHandle, OpenableFileHandle};
 use self::inode_store::{InodeId, InodeStore};
 use self::mount_fd::MountFds;
+use self::os_compat::SafeOpenAt;
 use self::statx::{statx, StatExt};
 use self::util::{
     ebadf, einval, enosys, eperm, is_dir, is_safe_inode, openat, reopen_fd_through_proc, stat_fd,
@@ -365,6 +366,7 @@ pub struct PassthroughFs<S: BitmapSlice + Send + Sync = ()> {
     ino_allocator: UniqueInodeGenerator,
     // Maps mount IDs to an open FD on the respective ID for the purpose of open_by_handle_at().
     mount_fds: MountFds,
+    opener: SafeOpenAt,
 
     // File descriptor pointing to the `/proc/self/fd` directory. This is used to convert an fd from
     // `inodes` into one that can go into `handles`. This is accomplished by reading the
@@ -446,6 +448,7 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
 
             mount_fds,
             proc_self_fd,
+            opener: SafeOpenAt::new(),
 
             writeback: AtomicBool::new(false),
             no_open: AtomicBool::new(false),
@@ -466,8 +469,8 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
     pub fn import(&self) -> io::Result<()> {
         let root = CString::new(self.cfg.root_dir.as_str()).expect("CString::new failed");
 
-        let (path_fd, handle_opt, st) = Self::open_file_and_handle(self, &libc::AT_FDCWD, &root)
-            .map_err(|e| {
+        let (path_fd, handle_opt, st) =
+            Self::open_file_and_handle(self, &libc::AT_FDCWD, &root, false).map_err(|e| {
                 error!("fuse: import: failed to get file or handle: {:?}", e);
                 e
             })?;
@@ -563,30 +566,19 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
         openat(dfd, pathname, flags, mode)
     }
 
-    fn open_file_restricted(
-        &self,
-        dir: &impl AsRawFd,
-        pathname: &CStr,
-        flags: i32,
-        mode: u32,
-    ) -> io::Result<File> {
-        let flags = libc::O_NOFOLLOW | libc::O_CLOEXEC | flags;
-
-        // TODO
-        //if self.os_facts.has_openat2 {
-        //    oslib::do_open_relative_to(dir, pathname, flags, mode)
-        //} else {
-        openat(dir, pathname, flags, mode)
-        //}
-    }
-
     /// Create a File or File Handle for `name` under directory `dir_fd` to support `lookup()`.
     fn open_file_and_handle(
         &self,
         dir: &impl AsRawFd,
         name: &CStr,
+        use_openat2: bool,
     ) -> io::Result<(File, Option<FileHandle>, StatExt)> {
-        let path_file = self.open_file_restricted(dir, name, libc::O_PATH, 0)?;
+        let flags = libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_PATH;
+        let path_file = if use_openat2 {
+            self.opener.openat(dir, name, flags, 0)?
+        } else {
+            openat(dir, name, flags, 0)?
+        };
         let st = statx(&path_file, None)?;
         let handle = if self.cfg.inode_file_handles {
             FileHandle::from_fd(&path_file)?
@@ -647,7 +639,7 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
 
         let dir = self.inode_map.get(parent)?;
         let dir_file = dir.get_file()?;
-        let (path_fd, handle_opt, st) = Self::open_file_and_handle(self, &dir_file, name)?;
+        let (path_fd, handle_opt, st) = Self::open_file_and_handle(self, &dir_file, name, true)?;
         let id = InodeId::from_stat(&st);
 
         let mut found = None;
