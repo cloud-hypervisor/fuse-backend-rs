@@ -434,12 +434,25 @@ fn fuse_kern_mount(
     let meta = mountpoint
         .metadata()
         .map_err(|e| SessionFailure(format!("stat {mountpoint:?}: {e}")))?;
+    // the current implementation of fuse-backend-rs uses a fixed buffer to store the fuse response,
+    // the default value of this buffer is as follows, but in fact, the kernel in the direct io path,
+    // the size of the request may be larger than the length of this buffer (this is determined by
+    // the max_read option to determine the maximum size of kernel requests, the default value is
+    // a very large number), which leads to the buffer is not enough to fill the read content,
+    // resulting in read failure. so here we limit the size of max_read to the length of our buffer,
+    // so that the fuse kernel will not send requests that exceed the length of the buffer.
+    // in virtiofs scene max_read can't be adjusted, his default is UINT_MAX, but we don't have to
+    // worry about it, because the buffer is allocated by the kernel driver, we just use this buffer
+    // to fill the response, so we don't need to do any adjustment.
+    let max_read = FUSE_KERN_BUF_PAGES * pagesize() + FUSE_HEADER_SIZE;
+
     let mut opts = format!(
-        "default_permissions,fd={},rootmode={:o},user_id={},group_id={}",
+        "default_permissions,fd={},rootmode={:o},user_id={},group_id={},max_read={}",
         file.as_raw_fd(),
         meta.permissions().mode() & libc::S_IFMT,
         getuid(),
         getgid(),
+        max_read
     );
     if allow_other {
         opts.push_str(",allow_other");

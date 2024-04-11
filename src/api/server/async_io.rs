@@ -322,12 +322,6 @@ impl<F: AsyncFileSystem + Sync> Server<F> {
             ..
         } = ctx.r.read_obj().map_err(Error::DecodeMessage)?;
 
-        if size > MAX_BUFFER_SIZE {
-            return ctx
-                .async_reply_error_explicit(io::Error::from_raw_os_error(libc::ENOMEM))
-                .await;
-        }
-
         let owner = if read_flags & READ_LOCKOWNER != 0 {
             Some(lock_owner)
         } else {
