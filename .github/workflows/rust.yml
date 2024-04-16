@@ -43,8 +43,11 @@ jobs:
       if: ${{ matrix.arch == 'amd64' }}
       run: |
         echo user_allow_other | sudo tee --append /etc/fuse.conf
-        make test
-        make smoke-all
+        CARGO_HOME=${HOME}/.cargo
+        CARGO_BIN=$(which cargo)
+        sudo -E CARGO=${CARGO_BIN} make test
+        sudo -E CARGO=${CARGO_BIN} make smoke-all
+        sudo chown -R $(id -u):$(id -g) "${HOME}/.cargo"
 
   Macos-CI:
     runs-on: macos-latest
@@ -56,7 +59,8 @@ jobs:
           sudo installer -pkg fuse-t-macos-installer-1.0.24.pkg -target /
       - uses: actions/checkout@v3
       - name: build and check
-        run: make smoke-macos
+        run: |
+          make smoke-macos
 
   deny:
     name: Cargo Deny
