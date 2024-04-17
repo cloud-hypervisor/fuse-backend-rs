@@ -741,7 +741,7 @@ pub fn pagesize() -> usize {
 #[cfg(test)]
 mod tests {
     use crate::transport::IoBuffers;
-    use std::collections::VecDeque;
+    use std::{collections::VecDeque, num::NonZeroUsize};
     use vm_memory::{
         bitmap::{AtomicBitmap, Bitmap},
         VolatileSlice,
@@ -797,7 +797,7 @@ mod tests {
     #[test]
     fn test_mark_dirty() {
         let mut buf1 = vec![0x0u8; 16];
-        let bitmap1 = AtomicBitmap::new(16, 2);
+        let bitmap1 = AtomicBitmap::new(16, NonZeroUsize::new(2).unwrap());
 
         assert_eq!(bitmap1.len(), 8);
         for i in 0..8 {
@@ -805,7 +805,7 @@ mod tests {
         }
 
         let mut buf2 = vec![0x0u8; 16];
-        let bitmap2 = AtomicBitmap::new(16, 2);
+        let bitmap2 = AtomicBitmap::new(16, NonZeroUsize::new(2).unwrap());
         let mut bufs = VecDeque::new();
 
         unsafe {
@@ -813,11 +813,13 @@ mod tests {
                 buf1.as_mut_ptr(),
                 buf1.len(),
                 bitmap1.slice_at(0),
+                None,
             ));
             bufs.push_back(VolatileSlice::with_bitmap(
                 buf2.as_mut_ptr(),
                 buf2.len(),
                 bitmap2.slice_at(0),
+                None,
             ));
         }
         let mut buffers = IoBuffers {
