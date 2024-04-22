@@ -19,7 +19,7 @@ impl FileSystem for Vfs {
             error!("vfs is already initialized");
             return Err(Error::from_raw_os_error(libc::EINVAL));
         }
-        let mut n_opts = *self.opts.load().deref().deref();
+        let mut n_opts = self.opts.load().deref().deref().clone();
         #[cfg(target_os = "linux")]
         {
             if n_opts.no_open {
@@ -44,7 +44,7 @@ impl FileSystem for Vfs {
         n_opts.in_opts = opts;
 
         n_opts.out_opts &= opts;
-        self.opts.store(Arc::new(n_opts));
+        self.opts.store(Arc::new(n_opts.clone()));
         {
             // Serialize mount operations. Do not expect poisoned lock here.
             // Ensure that every backend fs only get init()ed once.
@@ -648,18 +648,10 @@ impl FileSystem for Vfs {
     }
 
     #[inline]
-    fn id_remap(&self, ctx: &mut Context) -> Result<()> {
+    fn id_remap(&self, ctx: &mut Context) {
         // If id_mapping is enabled, map the external ID to the internal ID.
-        if let Some((internal_id, external_id, range)) = self.id_mapping {
-            if ctx.uid >= external_id && ctx.uid < external_id + range {
-                ctx.uid += internal_id - external_id;
-            }
-            if ctx.gid >= external_id && ctx.gid < external_id + range {
-                ctx.gid += internal_id - external_id;
-            }
-        }
-
-        Ok(())
+        ctx.uid = self.do_mapping(ctx.uid, false, true);
+        ctx.gid = self.do_mapping(ctx.gid, false, false);
     }
 
     #[cfg(any(feature = "vhost-user-fs", feature = "virtiofs"))]
