@@ -44,6 +44,7 @@ use std::io::{self, IoSlice, Write};
 use std::ops::Deref;
 use std::ptr::copy_nonoverlapping;
 
+use crate::transport::ReaderInner;
 use virtio_queue::DescriptorChain;
 use vm_memory::bitmap::{BitmapSlice, MS};
 use vm_memory::{Address, ByteValued, GuestMemory, GuestMemoryRegion, MemoryRegionAddress};
@@ -97,12 +98,11 @@ impl<'a> Reader<'a> {
             );
         }
 
-        Ok(Reader {
-            buffers: IoBuffers {
-                buffers,
-                bytes_consumed: 0,
-            },
+        Ok(ReaderInner::Buffer(IoBuffers {
+            buffers,
+            bytes_consumed: 0,
         })
+        .into())
     }
 }
 
@@ -247,7 +247,7 @@ impl<'a, S: BitmapSlice> VirtioFsWriter<'a, S> {
     /// Commit all internal buffers of self and others
     ///
     /// This is provided just to be compatible with fusedev
-    pub fn commit(&mut self, _other: Option<&Writer<'a, S>>) -> io::Result<usize> {
+    pub fn commit(&mut self, _other: Option<&mut Writer<'a, '_, S>>) -> io::Result<usize> {
         Ok(0)
     }
 
@@ -380,7 +380,10 @@ mod async_io {
 
         /// Commit all internal buffers of self and others
         /// We need this because the lifetime of others is usually shorter than self.
-        pub async fn async_commit(&mut self, other: Option<&Writer<'a, S>>) -> io::Result<usize> {
+        pub async fn async_commit(
+            &mut self,
+            other: Option<&mut Writer<'a, '_, S>>,
+        ) -> io::Result<usize> {
             self.commit(other)
         }
     }

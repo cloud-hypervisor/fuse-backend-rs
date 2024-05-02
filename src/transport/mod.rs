@@ -19,6 +19,8 @@ use std::collections::VecDeque;
 use std::io::{self, IoSlice, Read};
 use std::marker::PhantomData;
 use std::mem::{size_of, MaybeUninit};
+#[cfg(all(target_os = "linux", feature = "fusedev"))]
+use std::os::unix::io::AsRawFd;
 use std::ptr::copy_nonoverlapping;
 use std::{cmp, fmt};
 
@@ -32,6 +34,8 @@ use crate::file_buf::FileVolatileSlice;
 #[cfg(feature = "async-io")]
 use crate::file_traits::AsyncFileReadWriteVolatile;
 use crate::file_traits::FileReadWriteVolatile;
+#[cfg(all(target_os = "linux", feature = "fusedev"))]
+use crate::transport::fusedev::splice;
 use crate::BitmapSlice;
 
 mod fs_cache_req_handler;
@@ -72,6 +76,12 @@ pub enum Error {
     #[cfg(feature = "virtiofs")]
     /// Invalid Indirect Virtio descriptors.
     ConvertIndirectDescriptor(virtio_queue::Error),
+}
+
+impl From<io::Error> for Error {
+    fn from(e: io::Error) -> Self {
+        Self::IoError(e)
+    }
 }
 
 impl fmt::Display for Error {
@@ -354,22 +364,31 @@ impl<S: BitmapSlice> IoBuffers<'_, S> {
     }
 }
 
-/// Reader to access FUSE requests from the transport layer data buffers.
+enum ReaderInner<'a, S = ()> {
+    Buffer(IoBuffers<'a, S>),
+    #[cfg(all(target_os = "linux", feature = "fusedev"))]
+    Pipe(splice::PipeReader<'a>),
+}
+
+/// Reader to access FUSE requests.
 ///
 /// Note that virtio spec requires driver to place any device-writable
 /// descriptors after any device-readable descriptors (2.6.4.2 in Virtio Spec v1.1).
 /// Reader will skip iterating over descriptor chain when first writable
 /// descriptor is encountered.
-#[derive(Clone)]
 pub struct Reader<'a, S = ()> {
-    buffers: IoBuffers<'a, S>,
+    inner: ReaderInner<'a, S>,
 }
 
 impl<S: BitmapSlice> Default for Reader<'_, S> {
     fn default() -> Self {
-        Reader {
-            buffers: IoBuffers::default(),
-        }
+        ReaderInner::Buffer(IoBuffers::default()).into()
+    }
+}
+
+impl<'a, S: BitmapSlice> From<ReaderInner<'a, S>> for Reader<'a, S> {
+    fn from(r: ReaderInner<'a, S>) -> Reader<'a, S> {
+        Self { inner: r }
     }
 }
 
@@ -400,8 +419,30 @@ impl<S: BitmapSlice> Reader<'_, S> {
         mut dst: F,
         count: usize,
     ) -> io::Result<usize> {
-        self.buffers
-            .consume_for_read(count, |bufs| dst.write_vectored_volatile(bufs))
+        match &mut self.inner {
+            ReaderInner::Buffer(buffers) => {
+                buffers.consume_for_read(count, |bufs| dst.write_vectored_volatile(bufs))
+            }
+            #[cfg(all(target_os = "linux", feature = "fusedev"))]
+            ReaderInner::Pipe(p) => {
+                let mut buf = vec![0_u8; count];
+                let n = p.read(&mut buf)?;
+                let slice = unsafe { FileVolatileSlice::from_mut_slice(&mut buf[..n]) };
+                dst.write_volatile(slice)
+            }
+        }
+    }
+
+    /// Reads data into a file descriptor using syscall splice.
+    /// Returns the number of bytes read.
+    #[cfg(all(target_os = "linux", feature = "fusedev"))]
+    pub fn splice_to<F: AsRawFd + ?Sized>(&mut self, f: &F, count: usize) -> io::Result<usize> {
+        let fd = f.as_raw_fd();
+        if let ReaderInner::Pipe(p) = &mut self.inner {
+            p.splice_to(fd, count)
+        } else {
+            Err(io::Error::from_raw_os_error(libc::ENOTSUP))
+        }
     }
 
     /// Reads data from the descriptor chain buffer into a File at offset `off`.
@@ -414,8 +455,36 @@ impl<S: BitmapSlice> Reader<'_, S> {
         count: usize,
         off: u64,
     ) -> io::Result<usize> {
-        self.buffers
-            .consume_for_read(count, |bufs| dst.write_vectored_at_volatile(bufs, off))
+        match &mut self.inner {
+            ReaderInner::Buffer(buffers) => {
+                buffers.consume_for_read(count, |bufs| dst.write_vectored_at_volatile(bufs, off))
+            }
+            #[cfg(all(target_os = "linux", feature = "fusedev"))]
+            ReaderInner::Pipe(p) => {
+                let mut buf = vec![0_u8; count];
+                let n = p.read(&mut buf)?;
+                let slice = unsafe { FileVolatileSlice::from_mut_slice(&mut buf[..n]) };
+                dst.write_at_volatile(slice, off)
+            }
+        }
+    }
+
+    /// Reads data into a file descriptor using syscall splice at offset `off`.
+    /// Returns the number of bytes read.
+    #[cfg(all(target_os = "linux", feature = "fusedev"))]
+    pub fn splice_to_at<F: AsRawFd + ?Sized>(
+        &mut self,
+        f: &F,
+        count: usize,
+        off: u64,
+    ) -> io::Result<usize> {
+        let fd = f.as_raw_fd();
+        if let ReaderInner::Pipe(p) = &mut self.inner {
+            let mut _off = off as i64;
+            p.splice_to_at(fd, count, &mut _off)
+        } else {
+            Err(io::Error::from_raw_os_error(libc::ENOTSUP))
+        }
     }
 
     /// Reads exactly size of data from the descriptor chain buffer into a file descriptor.
@@ -446,12 +515,20 @@ impl<S: BitmapSlice> Reader<'_, S> {
     /// May return an error if the combined lengths of all the buffers in the DescriptorChain
     /// would cause an integer overflow.
     pub fn available_bytes(&self) -> usize {
-        self.buffers.available_bytes()
+        match &self.inner {
+            ReaderInner::Buffer(buffers) => buffers.available_bytes(),
+            #[cfg(all(target_os = "linux", feature = "fusedev"))]
+            ReaderInner::Pipe(p) => p.available_bytes(),
+        }
     }
 
     /// Returns number of bytes already read from the descriptor chain buffer.
     pub fn bytes_read(&self) -> usize {
-        self.buffers.bytes_consumed()
+        match &self.inner {
+            ReaderInner::Buffer(buffers) => buffers.bytes_consumed(),
+            #[cfg(all(target_os = "linux", feature = "fusedev"))]
+            ReaderInner::Pipe(p) => p.bytes_consumed(),
+        }
     }
 
     /// Splits this `Reader` into two at the given offset in the `DescriptorChain` buffer.
@@ -459,29 +536,43 @@ impl<S: BitmapSlice> Reader<'_, S> {
     /// `Reader` can read up to `available_bytes() - offset` bytes.  Returns an error if
     /// `offset > self.available_bytes()`.
     pub fn split_at(&mut self, offset: usize) -> Result<Self> {
-        self.buffers
-            .split_at(offset)
-            .map(|buffers| Reader { buffers })
+        match &mut self.inner {
+            ReaderInner::Buffer(buffers) => buffers
+                .split_at(offset)
+                .map(|buffers| ReaderInner::Buffer(buffers).into()),
+            // pipe mode doesn't support split
+            #[cfg(all(target_os = "linux", feature = "fusedev"))]
+            ReaderInner::Pipe(_) => Err(io::Error::from_raw_os_error(libc::EINVAL).into()),
+        }
     }
 }
 
 impl<S: BitmapSlice> io::Read for Reader<'_, S> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        self.buffers.consume_for_read(buf.len(), |bufs| {
-            let mut rem = buf;
-            let mut total = 0;
-            for buf in bufs {
-                let copy_len = cmp::min(rem.len(), buf.len());
-
-                // Safe because we have already verified that `buf` points to valid memory.
-                unsafe {
-                    copy_nonoverlapping(buf.as_ptr() as *const u8, rem.as_mut_ptr(), copy_len);
-                }
-                rem = &mut rem[copy_len..];
-                total += copy_len;
+        match &mut self.inner {
+            #[cfg(all(target_os = "linux", feature = "fusedev"))]
+            ReaderInner::Pipe(p) => p.read(buf),
+            ReaderInner::Buffer(buffers) => {
+                buffers.consume_for_read(buf.len(), |bufs| {
+                    let mut rem = buf;
+                    let mut total = 0;
+                    for buf in bufs {
+                        let copy_len = cmp::min(rem.len(), buf.len());
+                        // Safe because we have already verified that `buf` points to valid memory.
+                        unsafe {
+                            copy_nonoverlapping(
+                                buf.as_ptr() as *const u8,
+                                rem.as_mut_ptr(),
+                                copy_len,
+                            );
+                        }
+                        rem = &mut rem[copy_len..];
+                        total += copy_len;
+                    }
+                    Ok(total)
+                })
             }
-            Ok(total)
-        })
+        }
     }
 }
 
@@ -501,36 +592,42 @@ mod async_io {
             off: u64,
         ) -> io::Result<usize> {
             // Safe because `bufs` doesn't out-live `self`.
-            let bufs = unsafe { self.buffers.prepare_io_buf(count) };
-            if bufs.is_empty() {
-                Ok(0)
-            } else {
-                let (res, _) = dst.async_write_vectored_at_volatile(bufs, off).await;
-                match res {
-                    Ok(cnt) => {
-                        self.buffers.mark_used(cnt)?;
-                        Ok(cnt)
+            match &mut self.inner {
+                ReaderInner::Buffer(buffers) => {
+                    let bufs = unsafe { buffers.prepare_io_buf(count) };
+                    if bufs.is_empty() {
+                        Ok(0)
+                    } else {
+                        let (res, _) = dst.async_write_vectored_at_volatile(bufs, off).await;
+                        match res {
+                            Ok(cnt) => {
+                                buffers.mark_used(cnt)?;
+                                Ok(cnt)
+                            }
+                            Err(e) => Err(e),
+                        }
                     }
-                    Err(e) => Err(e),
                 }
+                #[cfg(all(target_os = "linux", feature = "fusedev"))]
+                ReaderInner::Pipe(_) => Err(std::io::Error::from_raw_os_error(libc::ENOTSUP)),
             }
         }
     }
 }
 
 /// Writer to send reply message to '/dev/fuse` or virtiofs queue.
-pub enum Writer<'a, S: BitmapSlice = ()> {
+pub enum Writer<'a, 'b, S: BitmapSlice = ()> {
     #[cfg(feature = "fusedev")]
     /// Writer for FuseDev transport driver.
-    FuseDev(FuseDevWriter<'a, S>),
+    FuseDev(FuseDevWriter<'a, 'b, S>),
     #[cfg(feature = "virtiofs")]
     /// Writer for virtiofs transport driver.
     VirtioFs(VirtioFsWriter<'a, S>),
     /// Writer for Noop transport driver.
-    Noop(PhantomData<&'a S>),
+    Noop(PhantomData<(&'a S, &'b S)>),
 }
 
-impl<'a, S: BitmapSlice> Writer<'a, S> {
+impl<'a, 'b, S: BitmapSlice> Writer<'a, 'b, S> {
     /// Write data to the descriptor chain buffer from a File at offset `off`.
     ///
     /// Return the number of bytes written to the descriptor chain buffer.
@@ -546,6 +643,23 @@ impl<'a, S: BitmapSlice> Writer<'a, S> {
             #[cfg(feature = "virtiofs")]
             Writer::VirtioFs(w) => w.write_from_at(src, count, off),
             _ => Err(std::io::Error::from_raw_os_error(libc::EINVAL)),
+        }
+    }
+
+    /// Append `count` bytes data from `src` at offset `off`
+    /// `src` should be file description or socket
+    #[cfg(all(target_os = "linux", feature = "fusedev"))]
+    pub fn append_fd_buf<F: AsRawFd + ?Sized>(
+        &mut self,
+        src: &F,
+        count: usize,
+        off: Option<u64>,
+    ) -> io::Result<usize> {
+        match self {
+            Writer::FuseDev(w) => {
+                w.append_fd_buf(src.as_raw_fd(), count as u64, off.map(|v| v as i64))
+            }
+            _ => Err(std::io::Error::from_raw_os_error(libc::ENOSYS)),
         }
     }
 
@@ -590,7 +704,7 @@ impl<'a, S: BitmapSlice> Writer<'a, S> {
     }
 
     /// Commit all internal buffers of self and others
-    pub fn commit(&mut self, other: Option<&Self>) -> io::Result<usize> {
+    pub fn commit(&mut self, other: Option<&mut Self>) -> io::Result<usize> {
         match self {
             #[cfg(feature = "fusedev")]
             Writer::FuseDev(w) => w.commit(other),
@@ -601,7 +715,7 @@ impl<'a, S: BitmapSlice> Writer<'a, S> {
     }
 }
 
-impl<'a, S: BitmapSlice> io::Write for Writer<'a, S> {
+impl<'a, 'b, S: BitmapSlice> io::Write for Writer<'a, 'b, S> {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         match self {
             #[cfg(feature = "fusedev")]
@@ -634,7 +748,7 @@ impl<'a, S: BitmapSlice> io::Write for Writer<'a, S> {
 }
 
 #[cfg(feature = "async-io")]
-impl<'a, S: BitmapSlice> Writer<'a, S> {
+impl<'a, 'b, S: BitmapSlice> Writer<'a, 'b, S> {
     /// Write data from a buffer into this writer in asynchronous mode.
     pub async fn async_write(&mut self, data: &[u8]) -> io::Result<usize> {
         match self {
@@ -703,7 +817,10 @@ impl<'a, S: BitmapSlice> Writer<'a, S> {
     }
 
     /// Commit all internal buffers of self and others
-    pub async fn async_commit(&mut self, other: Option<&Writer<'a, S>>) -> io::Result<usize> {
+    pub async fn async_commit(
+        &mut self,
+        other: Option<&mut Writer<'a, 'b, S>>,
+    ) -> io::Result<usize> {
         match self {
             #[cfg(feature = "fusedev")]
             Writer::FuseDev(w) => w.async_commit(other).await,
@@ -715,14 +832,14 @@ impl<'a, S: BitmapSlice> Writer<'a, S> {
 }
 
 #[cfg(feature = "fusedev")]
-impl<'a, S: BitmapSlice> From<FuseDevWriter<'a, S>> for Writer<'a, S> {
-    fn from(w: FuseDevWriter<'a, S>) -> Self {
+impl<'a, 'b, S: BitmapSlice> From<FuseDevWriter<'a, 'b, S>> for Writer<'a, 'b, S> {
+    fn from(w: FuseDevWriter<'a, 'b, S>) -> Self {
         Writer::FuseDev(w)
     }
 }
 
 #[cfg(feature = "virtiofs")]
-impl<'a, S: BitmapSlice> From<VirtioFsWriter<'a, S>> for Writer<'a, S> {
+impl<'a, 'b, S: BitmapSlice> From<VirtioFsWriter<'a, S>> for Writer<'a, 'b, S> {
     fn from(w: VirtioFsWriter<'a, S>) -> Self {
         Writer::VirtioFs(w)
     }

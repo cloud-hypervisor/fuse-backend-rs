@@ -20,6 +20,8 @@ use std::ffi::CStr;
 use std::io::{self, Read};
 use std::marker::PhantomData;
 use std::mem::size_of;
+#[cfg(all(target_os = "linux", feature = "fusedev"))]
+use std::os::unix::io::AsRawFd;
 use std::sync::Arc;
 
 use arc_swap::ArcSwap;
@@ -50,7 +52,7 @@ pub const MAX_REQ_PAGES: u16 = 256; // 1MB
 /// Fuse Server to handle requests from the Fuse client and vhost user master.
 pub struct Server<F: FileSystem + Sync> {
     fs: F,
-    vers: ArcSwap<ServerVersion>,
+    meta: ArcSwap<ServerMeta>,
 }
 
 impl<F: FileSystem + Sync> Server<F> {
@@ -58,11 +60,18 @@ impl<F: FileSystem + Sync> Server<F> {
     pub fn new(fs: F) -> Server<F> {
         Server {
             fs,
-            vers: ArcSwap::new(Arc::new(ServerVersion {
-                major: KERNEL_VERSION,
-                minor: KERNEL_MINOR_VERSION,
-            })),
+            meta: ArcSwap::new(Arc::new(ServerMeta::default())),
         }
+    }
+
+    /// Whether FUSE module support splice read
+    pub fn is_support_splice_read(&self) -> bool {
+        self.meta.load().support_splice_read
+    }
+
+    /// Whether FUSE module support splice write
+    pub fn is_support_splice_write(&self) -> bool {
+        self.meta.load().support_splice_write
     }
 }
 
@@ -77,6 +86,14 @@ impl<'a, S: BitmapSlice> ZeroCopyReader for ZcReader<'a, S> {
     ) -> io::Result<usize> {
         self.0.read_to_at(f, count, off)
     }
+
+    #[cfg(all(target_os = "linux", feature = "fusedev"))]
+    fn splice_to(&mut self, f: &dyn AsRawFd, count: usize, off: Option<u64>) -> io::Result<usize> {
+        match off {
+            None => self.0.splice_to(f, count),
+            Some(off) => self.0.splice_to_at(f, count, off),
+        }
+    }
 }
 
 impl<'a, S: BitmapSlice> io::Read for ZcReader<'a, S> {
@@ -85,9 +102,9 @@ impl<'a, S: BitmapSlice> io::Read for ZcReader<'a, S> {
     }
 }
 
-struct ZcWriter<'a, S: BitmapSlice = ()>(Writer<'a, S>);
+struct ZcWriter<'a, 'b, S: BitmapSlice = ()>(Writer<'a, 'b, S>);
 
-impl<'a, S: BitmapSlice> ZeroCopyWriter for ZcWriter<'a, S> {
+impl<'a, 'b, S: BitmapSlice> ZeroCopyWriter for ZcWriter<'a, 'b, S> {
     fn write_from(
         &mut self,
         f: &mut dyn FileReadWriteVolatile,
@@ -97,12 +114,22 @@ impl<'a, S: BitmapSlice> ZeroCopyWriter for ZcWriter<'a, S> {
         self.0.write_from_at(f, count, off)
     }
 
+    #[cfg(all(target_os = "linux", feature = "fusedev"))]
+    fn append_fd_buf(
+        &mut self,
+        f: &dyn AsRawFd,
+        count: usize,
+        off: Option<u64>,
+    ) -> io::Result<usize> {
+        self.0.append_fd_buf(f, count, off)
+    }
+
     fn available_bytes(&self) -> usize {
         self.0.available_bytes()
     }
 }
 
-impl<'a, S: BitmapSlice> io::Write for ZcWriter<'a, S> {
+impl<'a, 'b, S: BitmapSlice> io::Write for ZcWriter<'a, 'b, S> {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         self.0.write(buf)
     }
@@ -116,6 +143,23 @@ impl<'a, S: BitmapSlice> io::Write for ZcWriter<'a, S> {
 struct ServerVersion {
     major: u32,
     minor: u32,
+}
+
+#[derive(Default)]
+struct ServerMeta {
+    #[allow(dead_code)]
+    version: ServerVersion,
+    support_splice_read: bool,
+    support_splice_write: bool,
+}
+
+impl Default for ServerVersion {
+    fn default() -> Self {
+        Self {
+            major: KERNEL_VERSION,
+            minor: KERNEL_MINOR_VERSION,
+        }
+    }
 }
 
 struct ServerUtil();
@@ -166,17 +210,17 @@ pub trait MetricsHook {
     fn release(&self, oh: Option<&OutHeader>);
 }
 
-struct SrvContext<'a, F, S: BitmapSlice = ()> {
+struct SrvContext<'a, 'b, F, S: BitmapSlice = ()> {
     in_header: InHeader,
     context: Context,
     r: Reader<'a, S>,
-    w: Writer<'a, S>,
+    w: Writer<'a, 'b, S>,
     phantom: PhantomData<F>,
     phantom2: PhantomData<S>,
 }
 
-impl<'a, F: FileSystem, S: BitmapSlice> SrvContext<'a, F, S> {
-    fn new(in_header: InHeader, r: Reader<'a, S>, w: Writer<'a, S>) -> Self {
+impl<'a, 'b, F: FileSystem, S: BitmapSlice> SrvContext<'a, 'b, F, S> {
+    fn new(in_header: InHeader, r: Reader<'a, S>, w: Writer<'a, 'b, S>) -> Self {
         let context = Context::from(&in_header);
 
         SrvContext {
