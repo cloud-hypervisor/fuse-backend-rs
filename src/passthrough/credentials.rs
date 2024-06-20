@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: BSD-3-Clause
 
-use crate::oslib;
-use crate::passthrough::util::einval;
 use std::io;
+
+use super::util::{dropsupgroups, seteffgid, seteffuid, setsupgroup};
 
 pub struct UnixCredentials {
     uid: libc::uid_t,
@@ -24,6 +24,7 @@ impl UnixCredentials {
     /// Set a supplementary group. Set `supported_extension` to `false` to signal that a
     /// supplementary group maybe required, but the guest was not able to tell us which,
     /// so we have to rely on keeping the DAC_OVERRIDE capability.
+    #[allow(dead_code)]
     pub fn supplementary_gid(self, supported_extension: bool, sup_gid: Option<u32>) -> Self {
         UnixCredentials {
             uid: self.uid,
@@ -33,8 +34,9 @@ impl UnixCredentials {
         }
     }
 
-    /// Changes the effective uid/gid of the current thread to `val`.  Changes
-    /// the thread's credentials back to root when the returned struct is dropped.
+    /// Changes the effective uid/gid of the current thread to `val`.
+    ///
+    /// Changes the thread's credentials back to root when the returned struct is dropped.
     pub fn set(self) -> io::Result<Option<UnixCredentialsGuard>> {
         let change_uid = self.uid != 0;
         let change_gid = self.gid != 0;
@@ -43,15 +45,15 @@ impl UnixCredentials {
         // change the uid first then we lose the capability to change the gid.
         // However changing back can happen in any order.
         if let Some(sup_gid) = self.sup_gid {
-            oslib::setsupgroup(sup_gid)?;
+            setsupgroup(sup_gid)?;
         }
 
         if change_gid {
-            oslib::seteffgid(self.gid)?;
+            seteffgid(self.gid)?;
         }
 
         if change_uid {
-            oslib::seteffuid(self.uid)?;
+            seteffuid(self.uid)?;
         }
 
         if change_uid && self.keep_capability {
@@ -61,7 +63,7 @@ impl UnixCredentials {
             // user ID, so we still have the 'DAC_OVERRIDE' in the permitted set.
             // After switching back to root the permitted set is copied to the effective set,
             // so no additional steps are required.
-            if let Err(e) = crate::util::add_cap_to_eff("DAC_OVERRIDE") {
+            if let Err(e) = add_cap_to_eff(caps::Capability::CAP_DAC_OVERRIDE) {
                 warn!("failed to add 'DAC_OVERRIDE' to the effective set of capabilities: {e}");
             }
         }
@@ -87,19 +89,19 @@ pub struct UnixCredentialsGuard {
 impl Drop for UnixCredentialsGuard {
     fn drop(&mut self) {
         if self.reset_uid {
-            oslib::seteffuid(0).unwrap_or_else(|e| {
+            seteffuid(0).unwrap_or_else(|e| {
                 error!("failed to change uid back to root: {e}");
             });
         }
 
         if self.reset_gid {
-            oslib::seteffgid(0).unwrap_or_else(|e| {
+            seteffgid(0).unwrap_or_else(|e| {
                 error!("failed to change gid back to root: {e}");
             });
         }
 
         if self.drop_sup_gid {
-            oslib::dropsupgroups().unwrap_or_else(|e| {
+            dropsupgroups().unwrap_or_else(|e| {
                 error!("failed to drop supplementary groups: {e}");
             });
         }
@@ -107,68 +109,85 @@ impl Drop for UnixCredentialsGuard {
 }
 
 pub struct ScopedCaps {
-    cap: capng::Capability,
-}
-
-impl ScopedCaps {
-    fn new(cap_name: &str) -> io::Result<Option<Self>> {
-        use capng::{Action, CUpdate, Set, Type};
-
-        let cap = capng::name_to_capability(cap_name).map_err(|_| {
-            let err = io::Error::last_os_error();
-            error!(
-                "couldn't get the capability id for name {}: {:?}",
-                cap_name, err
-            );
-            err
-        })?;
-
-        if capng::have_capability(Type::EFFECTIVE, cap) {
-            let req = vec![CUpdate {
-                action: Action::DROP,
-                cap_type: Type::EFFECTIVE,
-                capability: cap,
-            }];
-            capng::update(req).map_err(|e| {
-                error!("couldn't drop {} capability: {:?}", cap, e);
-                einval()
-            })?;
-            capng::apply(Set::CAPS).map_err(|e| {
-                error!(
-                    "couldn't apply capabilities after dropping {}: {:?}",
-                    cap, e
-                );
-                einval()
-            })?;
-            Ok(Some(Self { cap }))
-        } else {
-            Ok(None)
-        }
-    }
+    capability: caps::Capability,
 }
 
 impl Drop for ScopedCaps {
     fn drop(&mut self) {
-        use capng::{Action, CUpdate, Set, Type};
-
-        let req = vec![CUpdate {
-            action: Action::ADD,
-            cap_type: Type::EFFECTIVE,
-            capability: self.cap,
-        }];
-
-        if let Err(e) = capng::update(req) {
-            panic!("couldn't restore {} capability: {:?}", self.cap, e);
-        }
-        if let Err(e) = capng::apply(Set::CAPS) {
-            panic!(
-                "couldn't apply capabilities after restoring {}: {:?}",
-                self.cap, e
-            );
-        }
+        if let Err(e) = caps::raise(None, caps::CapSet::Effective, self.capability) {
+            error!("fail to restore thread cap_fsetid: {}", e);
+        };
     }
 }
 
-pub fn drop_effective_cap(cap_name: &str) -> io::Result<Option<ScopedCaps>> {
-    ScopedCaps::new(cap_name)
+pub fn scoped_drop_capability(capability: caps::Capability) -> io::Result<Option<ScopedCaps>> {
+    if !caps::has_cap(None, caps::CapSet::Effective, capability)
+        .map_err(|_e| io::Error::new(io::ErrorKind::PermissionDenied, "no capability"))?
+    {
+        return Ok(None);
+    }
+    caps::drop(None, caps::CapSet::Effective, capability).map_err(|_e| {
+        io::Error::new(io::ErrorKind::PermissionDenied, "failed to drop capability")
+    })?;
+    Ok(Some(ScopedCaps { capability }))
+}
+
+pub fn drop_cap_fssetid() -> io::Result<Option<ScopedCaps>> {
+    scoped_drop_capability(caps::Capability::CAP_FSETID)
+}
+
+/// Add a capability to the effective set
+///
+/// # Errors
+/// An error variant will be returned:
+/// - if the input string does not match the name, without the 'CAP_' prefix,
+/// of any of the capability defined in `linux/capabiliy.h`.
+/// - if `capng::get_caps_process()` cannot get the capabilities and bounding set of the process.
+/// - if `capng::update()` fails to update the internal posix capabilities settings.
+/// - if `capng::apply()` fails to transfer the specified internal posix capabilities
+///   settings to the kernel.
+pub fn add_cap_to_eff(capability: caps::Capability) -> io::Result<()> {
+    caps::raise(None, caps::CapSet::Effective, capability).map_err(|_e| {
+        io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "failed to raise capability",
+        )
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use nix::unistd::getuid;
+
+    #[test]
+    fn test_unix_credentials_set() {
+        if getuid().is_root() {
+            let cred = UnixCredentials::new(0, 0).set().unwrap();
+            assert!(cred.is_none());
+            drop(cred);
+
+            let cred = UnixCredentials::new(1, 1);
+            let cred = cred.supplementary_gid(false, Some(2));
+            let guard = cred.set().unwrap();
+            assert!(guard.is_some());
+            drop(guard);
+        }
+    }
+
+    #[test]
+    fn test_drop_cap_fssetid() {
+        let cap = drop_cap_fssetid().unwrap();
+        let has_cap =
+            caps::has_cap(None, caps::CapSet::Effective, caps::Capability::CAP_FSETID).unwrap();
+        assert_eq!(has_cap, false);
+        drop(cap);
+    }
+
+    #[test]
+    fn test_add_cap_to_eff() {
+        if getuid().is_root() {
+            add_cap_to_eff(caps::Capability::CAP_DAC_OVERRIDE).unwrap();
+        }
+    }
 }
