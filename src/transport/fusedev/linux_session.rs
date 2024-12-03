@@ -351,7 +351,7 @@ impl FuseChannel {
                         }
                     }
                 } else if event.is_error() {
-                    info!("FUSE channel already closed!");
+                    debug!("FUSE channel already closed!");
                     return Err(SessionFailure("epoll error".to_string()));
                 } else {
                     // We should not step into this branch as other event is not registered.
@@ -362,7 +362,7 @@ impl FuseChannel {
             // Handle wake up event first. We don't read the event fd so that a LEVEL triggered
             // event can still be delivered to other threads/daemons.
             if need_exit {
-                info!("Will exit from fuse service");
+                debug!("Will exit from fuse service");
                 return Ok(None);
             }
             if fusereq_available {
@@ -399,7 +399,7 @@ impl FuseChannel {
                             continue;
                         }
                         Errno::ENODEV => {
-                            info!("fuse filesystem umounted");
+                            debug!("got ENODEV when reading fuse fd, assuming fuse filesystem was umounted.");
                             return Ok(None);
                         }
                         e => {
@@ -464,7 +464,7 @@ fn fuse_kern_mount(
     }
 
     if let Some(mountpoint) = mountpoint.to_str() {
-        info!(
+        debug!(
             "mount source {} dest {} with fstype {} opts {} fd {}",
             fsname,
             mountpoint,
