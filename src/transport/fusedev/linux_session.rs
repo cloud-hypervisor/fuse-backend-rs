@@ -339,7 +339,8 @@ impl FuseChannel {
             }
 
             for event in events.iter() {
-                if event.is_readable() {
+                // We will handle errors when reading from the fuse device
+                if event.is_readable() || event.is_error() {
                     match event.token() {
                         EXIT_FUSE_EVENT => need_exit = true,
                         FUSE_DEV_EVENT => fusereq_available = true,
@@ -348,9 +349,6 @@ impl FuseChannel {
                             return Err(SessionFailure(format!("unexpected epoll event: {}", x.0)));
                         }
                     }
-                } else if event.is_error() {
-                    info!("FUSE channel already closed!");
-                    return Err(SessionFailure("epoll error".to_string()));
                 } else {
                     // We should not step into this branch as other event is not registered.
                     panic!("unknown epoll result events");
