@@ -125,6 +125,7 @@ impl<'a> FileVolatileSlice<'a> {
     /// [`vm_memory::BitmapSlice`]: https://docs.rs/vm-memory/latest/vm_memory/bitmap/trait.BitmapSlice.html
     /// [`vm_memory::VolatileSlice`]: https://docs.rs/vm-memory/latest/vm_memory/volatile_memory/struct.VolatileSlice.html
     pub fn from_volatile_slice<S: BitmapSlice>(s: &VolatileSlice<'a, S>) -> Self {
+        #[allow(deprecated)]
         Self::new(s.as_ptr(), s.len())
     }
 
@@ -179,7 +180,7 @@ impl<'a> FileVolatileSlice<'a> {
     }
 }
 
-impl<'a> Bytes<usize> for FileVolatileSlice<'a> {
+impl Bytes<usize> for FileVolatileSlice<'_> {
     type E = VError;
 
     fn write(&self, buf: &[u8], addr: usize) -> Result<usize, Self::E> {
@@ -202,6 +203,7 @@ impl<'a> Bytes<usize> for FileVolatileSlice<'a> {
     where
         F: Read,
     {
+        #[allow(deprecated)]
         VolatileSlice::read_from(&self.as_volatile_slice(), addr, src, count)
     }
 
@@ -209,6 +211,7 @@ impl<'a> Bytes<usize> for FileVolatileSlice<'a> {
     where
         F: Read,
     {
+        #[allow(deprecated)]
         VolatileSlice::read_exact_from(&self.as_volatile_slice(), addr, src, count)
     }
 
@@ -216,6 +219,7 @@ impl<'a> Bytes<usize> for FileVolatileSlice<'a> {
     where
         F: Write,
     {
+        #[allow(deprecated)]
         VolatileSlice::write_to(&self.as_volatile_slice(), addr, dst, count)
     }
 
@@ -223,6 +227,7 @@ impl<'a> Bytes<usize> for FileVolatileSlice<'a> {
     where
         F: Write,
     {
+        #[allow(deprecated)]
         VolatileSlice::write_all_to(&self.as_volatile_slice(), addr, dst, count)
     }
 

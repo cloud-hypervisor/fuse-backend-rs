@@ -230,7 +230,6 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
         inode: Inode,
         handle: Option<Handle>,
     ) -> io::Result<(libc::stat64, Duration)> {
-        let st;
         let data = self.inode_map.get(inode).map_err(|e| {
             error!("fuse: do_getattr ino {} Not find err {:?}", inode, e);
             e
@@ -238,13 +237,13 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
 
         // kernel sends 0 as handle in case of no_open, and it depends on fuse server to handle
         // this case correctly.
-        if !self.no_open.load(Ordering::Relaxed) && handle.is_some() {
+        let st = if !self.no_open.load(Ordering::Relaxed) && handle.is_some() {
             // Safe as we just checked handle
             let hd = self.handle_map.get(handle.unwrap(), inode)?;
-            st = stat_fd(hd.get_file(), None);
+            stat_fd(hd.get_file(), None)
         } else {
-            st = data.handle.stat();
-        }
+            data.handle.stat()
+        };
 
         let st = st.map_err(|e| {
             error!("fuse: do_getattr stat failed ino {} err {:?}", inode, e);
@@ -507,14 +506,13 @@ impl<S: BitmapSlice + Send + Sync> FileSystem for PassthroughFs<S> {
             let ino = entry.inode;
             dir_entry.ino = entry.attr.st_ino;
 
-            add_entry(dir_entry, entry).map(|r| {
+            add_entry(dir_entry, entry).inspect(|&r| {
                 // true when size is not large enough to hold entry.
                 if r == 0 {
                     // Release the refcount acquired by self.do_lookup().
                     let mut inodes = self.inode_map.get_map_mut();
                     self.forget_one(&mut inodes, ino, 1);
                 }
-                r
             })
         })
     }

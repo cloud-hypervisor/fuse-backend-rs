@@ -68,7 +68,7 @@ impl<F: FileSystem + Sync> Server<F> {
 
 struct ZcReader<'a, S: BitmapSlice = ()>(Reader<'a, S>);
 
-impl<'a, S: BitmapSlice> ZeroCopyReader for ZcReader<'a, S> {
+impl<S: BitmapSlice> ZeroCopyReader for ZcReader<'_, S> {
     fn read_to(
         &mut self,
         f: &mut dyn FileReadWriteVolatile,
@@ -79,7 +79,7 @@ impl<'a, S: BitmapSlice> ZeroCopyReader for ZcReader<'a, S> {
     }
 }
 
-impl<'a, S: BitmapSlice> io::Read for ZcReader<'a, S> {
+impl<S: BitmapSlice> io::Read for ZcReader<'_, S> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         self.0.read(buf)
     }
@@ -87,7 +87,7 @@ impl<'a, S: BitmapSlice> io::Read for ZcReader<'a, S> {
 
 struct ZcWriter<'a, S: BitmapSlice = ()>(Writer<'a, S>);
 
-impl<'a, S: BitmapSlice> ZeroCopyWriter for ZcWriter<'a, S> {
+impl<S: BitmapSlice> ZeroCopyWriter for ZcWriter<'_, S> {
     fn write_from(
         &mut self,
         f: &mut dyn FileReadWriteVolatile,
@@ -102,7 +102,7 @@ impl<'a, S: BitmapSlice> ZeroCopyWriter for ZcWriter<'a, S> {
     }
 }
 
-impl<'a, S: BitmapSlice> io::Write for ZcWriter<'a, S> {
+impl<S: BitmapSlice> io::Write for ZcWriter<'_, S> {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         self.0.write(buf)
     }

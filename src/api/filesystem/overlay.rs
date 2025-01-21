@@ -140,7 +140,7 @@ pub trait Layer: FileSystem {
                 Ok(v) => {
                     // xattr name exists and we get value.
                     if let GetxattrReply::Value(buf) = v {
-                        if buf.len() == 1 && buf[0].to_ascii_lowercase() == b'y' {
+                        if buf.len() == 1 && buf[0].eq_ignore_ascii_case(&b'y') {
                             return Ok(true);
                         }
                     }

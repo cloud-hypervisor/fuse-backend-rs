@@ -530,7 +530,7 @@ pub enum Writer<'a, S: BitmapSlice = ()> {
     Noop(PhantomData<&'a S>),
 }
 
-impl<'a, S: BitmapSlice> Writer<'a, S> {
+impl<S: BitmapSlice> Writer<'_, S> {
     /// Write data to the descriptor chain buffer from a File at offset `off`.
     ///
     /// Return the number of bytes written to the descriptor chain buffer.
@@ -601,7 +601,7 @@ impl<'a, S: BitmapSlice> Writer<'a, S> {
     }
 }
 
-impl<'a, S: BitmapSlice> io::Write for Writer<'a, S> {
+impl<S: BitmapSlice> io::Write for Writer<'_, S> {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         match self {
             #[cfg(feature = "fusedev")]
