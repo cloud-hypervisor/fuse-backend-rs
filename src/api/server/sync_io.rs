@@ -734,8 +734,8 @@ impl<F: FileSystem + Sync> Server<F> {
                     minor: KERNEL_MINOR_VERSION,
                     max_readahead: readahead,
                     flags: enabled_flags as u32,
-                    max_background: ::std::u16::MAX,
-                    congestion_threshold: (::std::u16::MAX / 4) * 3,
+                    max_background: u16::MAX,
+                    congestion_threshold: (u16::MAX / 4) * 3,
                     max_write: MIN_READ_BUFFER - BUFFER_HEADER_SIZE,
                     time_gran: 1, // nanoseconds
                     flags2: (enabled_flags >> 32) as u32,
@@ -1251,7 +1251,7 @@ impl<F: FileSystem + Sync> Server<F> {
     }
 }
 
-impl<'a, F: FileSystem, S: BitmapSlice> SrvContext<'a, F, S> {
+impl<F: FileSystem, S: BitmapSlice> SrvContext<'_, F, S> {
     fn reply_ok<T: ByteValued>(&mut self, out: Option<T>, data: Option<&[u8]>) -> Result<usize> {
         let data2 = out.as_ref().map(|v| v.as_slice()).unwrap_or(&[]);
         let data3 = data.unwrap_or(&[]);
@@ -1350,7 +1350,7 @@ fn add_dirent<S: BitmapSlice>(
     d: DirEntry,
     entry: Option<Entry>,
 ) -> io::Result<usize> {
-    if d.name.len() > ::std::u32::MAX as usize {
+    if d.name.len() > u32::MAX as usize {
         return Err(io::Error::from_raw_os_error(libc::EOVERFLOW));
     }
 

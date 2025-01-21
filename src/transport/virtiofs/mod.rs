@@ -273,7 +273,7 @@ impl<'a, S: BitmapSlice> VirtioFsWriter<'a, S> {
     }
 }
 
-impl<'a, S: BitmapSlice> io::Write for VirtioFsWriter<'a, S> {
+impl<S: BitmapSlice> io::Write for VirtioFsWriter<'_, S> {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         self.check_available_space(buf.len(), 0, 0)?;
 
@@ -388,6 +388,7 @@ mod async_io {
 
 /// Disabled since vm-virtio doesn't export any DescriptorChain constructors.
 /// Should re-enable once it does.
+#[allow(unexpected_cfgs)]
 #[cfg(testff)]
 mod tests {
     use super::*;

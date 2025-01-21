@@ -15,7 +15,7 @@ use std::os::unix::io::RawFd;
 
 use nix::sys::uio::writev;
 use nix::unistd::write;
-use vm_memory::{ByteValued, VolatileMemory, VolatileSlice};
+use vm_memory::{ByteValued, VolatileSlice};
 
 use super::{Error, FileReadWriteVolatile, IoBuffers, Reader, Result, Writer};
 use crate::file_buf::FileVolatileSlice;
@@ -63,7 +63,7 @@ impl<'a, S: BitmapSlice + Default> Reader<'a, S> {
         let mut buffers: VecDeque<VolatileSlice<'a, S>> = VecDeque::new();
         // Safe because Reader has the same lifetime with buf.
         buffers.push_back(unsafe {
-            VolatileSlice::with_bitmap(buf.mem.as_mut_ptr(), buf.mem.len(), S::default())
+            VolatileSlice::with_bitmap(buf.mem.as_mut_ptr(), buf.mem.len(), S::default(), None)
         });
 
         Ok(Reader {
@@ -288,7 +288,7 @@ impl<'a, S: BitmapSlice> FuseDevWriter<'a, S> {
     }
 }
 
-impl<'a, S: BitmapSlice> Write for FuseDevWriter<'a, S> {
+impl<S: BitmapSlice> Write for FuseDevWriter<'_, S> {
     fn write(&mut self, data: &[u8]) -> io::Result<usize> {
         self.check_available_space(data.len())?;
 
@@ -296,9 +296,8 @@ impl<'a, S: BitmapSlice> Write for FuseDevWriter<'a, S> {
             self.buf.extend_from_slice(data);
             Ok(data.len())
         } else {
-            Self::do_write(self.fd, data).map(|x| {
+            Self::do_write(self.fd, data).inspect(|&x| {
                 self.account_written(x);
-                x
             })
         }
     }
@@ -318,9 +317,8 @@ impl<'a, S: BitmapSlice> Write for FuseDevWriter<'a, S> {
                 return Ok(0);
             }
             writev(self.fd, bufs)
-                .map(|x| {
+                .inspect(|&x| {
                     self.account_written(x);
-                    x
                 })
                 .map_err(|e| {
                     error! {"fail to write to fuse device on commit: {}", e};

@@ -30,9 +30,9 @@ nix = "0.24"
 radix_trie = "0.2.1"
 tokio = { version = "1", optional = true }
 tokio-uring = { version = "0.4.0", optional = true }
-vmm-sys-util = { version = "0.11", optional = true }
-vm-memory = { version = "0.10", features = ["backend-mmap"] }
-virtio-queue = { version = "0.7", optional = true }
+vmm-sys-util = { version = "0.12.1", optional = true }
+vm-memory = { version = "0.16.1", features = ["backend-mmap"] }
+virtio-queue = { version = "0.14.0", optional = true }
 vhost = { version = "0.6", features = ["vhost-user-slave"], optional = true }
 versionize_derive = { version = "0.1.6", optional = true }
 versionize = { version = "0.1.10", optional = true }
@@ -46,8 +46,8 @@ tokio-uring = { version = "0.4.0", optional = true }
 
 [dev-dependencies]
 tokio-test = "0.4.2"
-vmm-sys-util = "0.11"
-vm-memory = { version = "0.10", features = ["backend-mmap", "backend-bitmap"] }
+vmm-sys-util = "0.12.0"
+vm-memory = { version = "0.16.1", features = ["backend-mmap", "backend-bitmap"] }
 
 [features]
 default = ["fusedev"]
@@ -66,6 +66,7 @@ virtiofs = ["virtio-queue", "caps", "vmm-sys-util"]
 vhost-user-fs = ["virtiofs", "vhost", "caps"]
 persist = ["dbs-snapshot", "versionize", "versionize_derive"]
 fuse-t = []
+async_io = []
 
 [package.metadata.docs.rs]
 all-features = true
@@ -74,3 +75,6 @@ targets = [
     "aarch64-unknown-linux-gnu",
     "aarch64-apple-darwin",
 ]
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(testff)'] }

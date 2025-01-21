@@ -244,10 +244,7 @@ impl RealInode {
         // Open the directory and load each entry.
         let opendir_res = self.layer.opendir(ctx, self.inode, libc::O_RDONLY as u32);
         let handle = match opendir_res {
-            Ok((handle, _)) => match handle {
-                Some(h) => h,
-                _ => 0,
-            },
+            Ok((handle, _)) => handle.unwrap_or_default(),
             // opendir may not be supported if no_opendir is set, so we can ignore this error.
             Err(e) => {
                 match e.raw_os_error() {
@@ -970,9 +967,9 @@ impl OverlayFs {
         }
 
         // Current file or dir.
-        if name.eq(".")  
+        if name.eq(".")
             // Root directory has no parent.
-            || (parent == FUSE_ROOT_ID && name.eq("..")) 
+            || (parent == FUSE_ROOT_ID && name.eq(".."))
             // Special convention: empty name indicates current dir.
             || name.is_empty()
         {
