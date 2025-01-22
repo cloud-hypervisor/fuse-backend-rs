@@ -416,7 +416,7 @@ fn fuse_kern_mount(
                 cmd.arg("-r");
             }
             cmd.arg(mountpoint);
-            cmd.exec();
+            let _ = cmd.exec();
             panic!("never arrive here")
         }
     }

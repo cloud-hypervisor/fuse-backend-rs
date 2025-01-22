@@ -180,7 +180,8 @@ impl<'a> FileVolatileSlice<'a> {
     }
 }
 
-impl Bytes<usize> for FileVolatileSlice<'_> {
+#[allow(clippy::needless_lifetimes)]
+impl<'a> Bytes<usize> for FileVolatileSlice<'a> {
     type E = VError;
 
     fn write(&self, buf: &[u8], addr: usize) -> Result<usize, Self::E> {
