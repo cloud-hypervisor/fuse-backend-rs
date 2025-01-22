@@ -16,10 +16,10 @@ mod virtiofs {
 
     #[cfg(feature = "vhost-user-fs")]
     use vhost::vhost_user::message::{
-        VhostUserFSSlaveMsg, VhostUserFSSlaveMsgFlags, VHOST_USER_FS_SLAVE_ENTRIES,
+        VhostUserFSBackendMsg, VhostUserFSBackendMsgFlags, VHOST_USER_FS_BACKEND_ENTRIES,
     };
     #[cfg(feature = "vhost-user-fs")]
-    use vhost::vhost_user::{SlaveFsCacheReq, VhostUserMasterReqHandler};
+    use vhost::vhost_user::{Backend, VhostUserFrontendReqHandler};
 
     use crate::abi::virtio_fs::RemovemappingOne;
     #[cfg(feature = "vhost-user-fs")]
@@ -54,7 +54,7 @@ mod virtiofs {
     }
 
     #[cfg(feature = "vhost-user-fs")]
-    impl FsCacheReqHandler for SlaveFsCacheReq {
+    impl FsCacheReqHandler for Backend {
         fn map(
             &mut self,
             foffset: u64,
@@ -63,31 +63,31 @@ mod virtiofs {
             flags: u64,
             fd: RawFd,
         ) -> io::Result<()> {
-            let mut msg: VhostUserFSSlaveMsg = Default::default();
+            let mut msg: VhostUserFSBackendMsg = Default::default();
             msg.fd_offset[0] = foffset;
             msg.cache_offset[0] = moffset;
             msg.len[0] = len;
             msg.flags[0] = if (flags & SetupmappingFlags::WRITE.bits()) != 0 {
-                VhostUserFSSlaveMsgFlags::MAP_W | VhostUserFSSlaveMsgFlags::MAP_R
+                VhostUserFSBackendMsgFlags::MAP_W | VhostUserFSBackendMsgFlags::MAP_R
             } else {
-                VhostUserFSSlaveMsgFlags::MAP_R
+                VhostUserFSBackendMsgFlags::MAP_R
             };
 
-            self.fs_slave_map(&msg, &fd)?;
+            self.fs_backend_map(&msg, &fd)?;
 
             Ok(())
         }
 
         fn unmap(&mut self, requests: Vec<RemovemappingOne>) -> io::Result<()> {
-            for chunk in requests.chunks(VHOST_USER_FS_SLAVE_ENTRIES) {
-                let mut msg: VhostUserFSSlaveMsg = Default::default();
+            for chunk in requests.chunks(VHOST_USER_FS_BACKEND_ENTRIES) {
+                let mut msg: VhostUserFSBackendMsg = Default::default();
 
                 for (ind, req) in chunk.iter().enumerate() {
                     msg.len[ind] = req.len;
                     msg.cache_offset[ind] = req.moffset;
                 }
 
-                self.fs_slave_unmap(&msg)?;
+                self.fs_backend_unmap(&msg)?;
             }
 
             Ok(())

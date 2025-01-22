@@ -388,7 +388,6 @@ mod async_io {
 
 /// Disabled since vm-virtio doesn't export any DescriptorChain constructors.
 /// Should re-enable once it does.
-#[allow(unexpected_cfgs)]
 #[cfg(testff)]
 mod tests {
     use super::*;

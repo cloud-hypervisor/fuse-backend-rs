@@ -395,8 +395,14 @@ fn create_disk(mountpoint: &Path, dasession: DASessionRef) -> DADiskRef {
         let url =
             CFURLCreateWithFileSystemPath(std::ptr::null(), url_str, kCFURLPOSIXPathStyle, 1u8);
         let disk = DADiskCreateFromVolumePath(std::ptr::null(), dasession, url);
-        CFRelease(std::mem::transmute(url_str));
-        CFRelease(std::mem::transmute(url));
+        CFRelease(std::mem::transmute::<
+            *const core_foundation_sys::string::__CFString,
+            *const libc::c_void,
+        >(url_str));
+        CFRelease(std::mem::transmute::<
+            *const core_foundation_sys::url::__CFURL,
+            *const libc::c_void,
+        >(url));
         disk
     }
 }
@@ -419,7 +425,7 @@ fn fuse_kern_umount(file: File, disk: Option<DADiskRef>) -> Result<()> {
                 None,
                 std::ptr::null_mut(),
             );
-            CFRelease(std::mem::transmute(disk));
+            CFRelease(std::mem::transmute::<DADiskRef, *const libc::c_void>(disk));
         }
     }
     Ok(())

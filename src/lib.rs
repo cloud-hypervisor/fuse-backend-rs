@@ -4,6 +4,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #![deny(missing_docs)]
+#![allow(unexpected_cfgs)]
 
 //! A rust library for Fuse(filesystem in userspace) servers and virtio-fs devices.
 //!

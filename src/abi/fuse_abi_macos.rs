@@ -1090,7 +1090,12 @@ mod tests {
         let buf = [
             0x1u8, 0x2u8, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x5u8, 0x6u8, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0,
         ];
-        let forget: &ForgetOne = ForgetOne::from_slice(&buf).unwrap();
+        let forget = match ForgetOne::from_slice(&buf) {
+            Some(f) => f,
+            None => {
+                panic!("Failed to parse ForgetOne from buffer: {:?}", buf)
+            }
+        };
 
         assert_eq!(forget.nodeid, 0x201u64);
         assert_eq!(forget.nlookup, 0x605u64);
