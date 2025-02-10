@@ -899,9 +899,7 @@ pub trait FileSystem {
     }
 
     /// Remap the external IDs in context to internal IDs.
-    fn id_remap(&self, ctx: &mut Context) -> io::Result<()> {
-        Ok(())
-    }
+    fn id_remap(&self, ctx: &mut Context) {}
 }
 
 impl<FS: FileSystem> FileSystem for Arc<FS> {
@@ -1349,7 +1347,7 @@ impl<FS: FileSystem> FileSystem for Arc<FS> {
     }
 
     #[inline]
-    fn id_remap(&self, ctx: &mut Context) -> io::Result<()> {
-        self.deref().id_remap(ctx)
+    fn id_remap(&self, ctx: &mut Context) {
+        self.deref().id_remap(ctx);
     }
 }
