@@ -717,7 +717,7 @@ impl<F: FileSystem + Sync> Server<F> {
         match self.fs.init(capable) {
             Ok(want) => {
                 let enabled = capable & want;
-                info!(
+                debug!(
                     "FUSE INIT major {} minor {}\n in_opts: {:?}\nout_opts: {:?}",
                     major, minor, capable, enabled
                 );
