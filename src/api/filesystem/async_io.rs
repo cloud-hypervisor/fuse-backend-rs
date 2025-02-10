@@ -618,7 +618,9 @@ pub trait AsyncFileSystem: FileSystem {
         /// the file system did not return a `Handle` from `opendir` then the contents of `handle` are
         /// undefined.
         ///
-        /// `size` indicates the maximum number of bytes that should be returned by this method.
+        /// `size` indicates the maximum number of bytes that should be returned by this method,
+        /// but can be ignored in practice. Instead, entries are returned by calling the
+        /// `add_entry` function until it returns zero (indicating that the buffer is full).
         ///
         /// If `offset` is non-zero then it corresponds to one of the `offset` values from a `DirEntry`
         /// that was previously returned by a call to `readdir` for the same handle. In this case the
@@ -659,7 +661,9 @@ pub trait AsyncFileSystem: FileSystem {
         /// the file system did not return a `Handle` from `opendir` then the contents of `handle` are
         /// undefined.
         ///
-        /// `size` indicates the maximum number of bytes that should be returned by this method.
+        /// `size` indicates the maximum number of bytes that should be returned by this method,
+        /// but can be ignored in practice. Instead, entries are returned by calling the
+        /// `add_entry` function until it returns zero (indicating that the buffer is full).
         ///
         /// Unlike `readdir`, the lookup count for `Inode`s associated with the returned directory
         /// entries **IS** affected by this method (since it returns an `Entry` for each `DirEntry`).
