@@ -195,8 +195,8 @@ pub(crate) fn is_chardev(st: stat64) -> bool {
 pub(crate) fn is_whiteout(st: stat64) -> bool {
     // A whiteout is created as a character device with 0/0 device number.
     // See ref: https://docs.kernel.org/filesystems/overlayfs.html#whiteouts-and-opaque-directories
-    let major = unsafe { libc::major(st.st_rdev) };
-    let minor = unsafe { libc::minor(st.st_rdev) };
+    let major = libc::major(st.st_rdev);
+    let minor = libc::minor(st.st_rdev);
     is_chardev(st) && major == 0 && minor == 0
 }
 

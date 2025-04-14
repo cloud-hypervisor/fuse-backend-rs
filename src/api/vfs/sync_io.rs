@@ -306,9 +306,7 @@ impl FileSystem for Vfs {
         }
         match self.get_real_rootfs(inode)? {
             (Left(fs), idata) => fs.open(ctx, idata.ino(), flags, fuse_flags),
-            (Right(fs), idata) => fs
-                .open(ctx, idata.ino(), flags, fuse_flags)
-                .map(|(h, opt, passthrough)| (h.map(Into::into), opt, passthrough)),
+            (Right(fs), idata) => fs.open(ctx, idata.ino(), flags, fuse_flags),
         }
     }
 
@@ -522,9 +520,7 @@ impl FileSystem for Vfs {
         }
         match self.get_real_rootfs(inode)? {
             (Left(fs), idata) => fs.opendir(ctx, idata.ino(), flags),
-            (Right(fs), idata) => fs
-                .opendir(ctx, idata.ino(), flags)
-                .map(|(h, opt)| (h.map(Into::into), opt)),
+            (Right(fs), idata) => fs.opendir(ctx, idata.ino(), flags),
         }
     }
 
