@@ -225,6 +225,22 @@ pub fn eperm() -> io::Error {
     io::Error::from_raw_os_error(libc::EPERM)
 }
 
+pub fn sync_fd(fd: &impl AsRawFd, datasync: bool) -> io::Result<()> {
+    // Safe because this doesn't modify any memory and we check the return value.
+    let res = unsafe {
+        if datasync {
+            libc::fdatasync(fd.as_raw_fd())
+        } else {
+            libc::fsync(fd.as_raw_fd())
+        }
+    };
+    if res == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
