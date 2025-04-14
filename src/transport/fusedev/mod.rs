@@ -265,7 +265,7 @@ impl<'a, S: BitmapSlice> FuseDevWriter<'a, S> {
     }
 
     fn check_available_space(&self, sz: usize) -> io::Result<()> {
-        assert!(self.buffered || self.buf.len() == 0);
+        assert!(self.buffered || self.buf.is_empty());
         if sz > self.available_bytes() {
             Err(io::Error::new(
                 io::ErrorKind::InvalidData,
