@@ -15,7 +15,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use super::os_compat::LinuxDirent64;
-use super::util::stat_fd;
+use super::util::{stat_fd, sync_fd};
 use super::*;
 use crate::abi::fuse_abi::{CreateIn, Opcode, FOPEN_IN_KILL_SUIDGID, WRITE_KILL_PRIV};
 #[cfg(any(feature = "vhost-user-fs", feature = "virtiofs"))]
@@ -1074,30 +1074,19 @@ impl<S: BitmapSlice + Send + Sync> FileSystem for PassthroughFs<S> {
     ) -> io::Result<()> {
         let data = self.get_data(handle, inode, libc::O_RDONLY)?;
         let fd = data.borrow_fd();
-
-        // Safe because this doesn't modify any memory and we check the return value.
-        let res = unsafe {
-            if datasync {
-                libc::fdatasync(fd.as_raw_fd())
-            } else {
-                libc::fsync(fd.as_raw_fd())
-            }
-        };
-        if res == 0 {
-            Ok(())
-        } else {
-            Err(io::Error::last_os_error())
-        }
+        sync_fd(&fd, datasync)
     }
 
     fn fsyncdir(
         &self,
-        ctx: &Context,
+        _ctx: &Context,
         inode: Inode,
         datasync: bool,
         handle: Handle,
     ) -> io::Result<()> {
-        self.fsync(ctx, inode, datasync, handle)
+        let data = self.get_dirdata(handle, inode, libc::O_RDONLY)?;
+        let fd = data.borrow_fd();
+        sync_fd(&fd, datasync)
     }
 
     fn access(&self, ctx: &Context, inode: Inode, mask: u32) -> io::Result<()> {
@@ -1629,5 +1618,14 @@ mod tests {
 
         let statfs = fs.statfs(&ctx, ROOT_ID).unwrap();
         assert_eq!(statfs.f_namemax, 255);
+    }
+
+    #[test]
+    fn test_fsync_dir() {
+        let (fs, _source) = prepare_fs_tmpdir();
+        let ctx = prepare_context();
+        fs.no_opendir.store(true, Ordering::Relaxed);
+
+        assert!(fs.fsyncdir(&ctx, ROOT_ID, false, 0).is_ok());
     }
 }
