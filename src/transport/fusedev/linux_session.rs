@@ -10,6 +10,7 @@
 
 use std::fs::{File, OpenOptions};
 use std::ops::Deref;
+use std::os::fd::AsFd;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::io::AsRawFd;
 use std::os::unix::net::UnixStream;
@@ -20,8 +21,8 @@ use mio::{Events, Poll, Token, Waker};
 use nix::errno::Errno;
 use nix::fcntl::{fcntl, FcntlArg, FdFlag, OFlag};
 use nix::mount::{mount, umount2, MntFlags, MsFlags};
-use nix::poll::{poll, PollFd, PollFlags};
-use nix::sys::epoll::{epoll_ctl, EpollEvent, EpollFlags, EpollOp};
+use nix::poll::{poll, PollFd, PollFlags, PollTimeout};
+use nix::sys::epoll::{Epoll, EpollCreateFlags, EpollEvent, EpollFlags};
 use nix::unistd::{getgid, getuid, read};
 
 use super::{
@@ -199,7 +200,7 @@ impl FuseSession {
             &self.fusermount,
         )?;
 
-        fcntl(file.as_raw_fd(), FcntlArg::F_SETFL(OFlag::O_NONBLOCK))
+        fcntl(file.as_fd(), FcntlArg::F_SETFL(OFlag::O_NONBLOCK))
             .map_err(|e| SessionFailure(format!("set fd nonblocking: {e}")))?;
         self.file = Some(file);
         self.keep_alive = socket;
@@ -244,7 +245,7 @@ impl FuseSession {
         F: FnOnce(FuseDevWriter),
     {
         if let Some(file) = &self.file {
-            let fd = file.as_raw_fd();
+            let fd = file.as_fd();
             let mut buf = vec![0x0u8; self.bufsize];
             let writer = FuseDevWriter::new(fd, &mut buf).unwrap();
             f(writer);
@@ -301,15 +302,11 @@ impl FuseChannel {
         // mio default add EPOLLET to event flags, so epoll will use edge-triggered mode.
         // It may let poll miss some event, so manually register the fd with only EPOLLIN flag
         // to use level-triggered mode.
-        let epoll = poll.as_raw_fd();
-        let mut event = EpollEvent::new(EpollFlags::EPOLLIN, usize::from(FUSE_DEV_EVENT) as u64);
-        epoll_ctl(
-            epoll,
-            EpollOp::EpollCtlAdd,
-            file.as_raw_fd(),
-            Some(&mut event),
-        )
-        .map_err(|e| SessionFailure(format!("epoll register channel fd: {e}")))?;
+        let epoll = Epoll::new(EpollCreateFlags::empty()).unwrap();
+        let event = EpollEvent::new(EpollFlags::EPOLLIN, usize::from(FUSE_DEV_EVENT) as u64);
+        epoll
+          .add(&file, event)
+          .map_err(|e| SessionFailure(format!("epoll register channel fd: {e}")))?;
 
         Ok(FuseChannel {
             file,
@@ -366,7 +363,7 @@ impl FuseChannel {
                 return Ok(None);
             }
             if fusereq_available {
-                let fd = self.file.as_raw_fd();
+                let fd = self.file.as_fd();
                 match read(fd, &mut self.buf) {
                     Ok(len) => {
                         // ###############################################
@@ -403,7 +400,7 @@ impl FuseChannel {
                             return Ok(None);
                         }
                         e => {
-                            warn! {"read fuse dev failed on fd {}: {}", fd, e};
+                            warn! {"read fuse dev failed on fd {}: {}", fd.as_raw_fd(), e};
                             return Err(SessionFailure(format!("read new request: {e:?}")));
                         }
                     },
@@ -562,7 +559,7 @@ fn fuse_fusermount_mount(
     // When its partner recv closes, fusermount will unmount.
     // Remove the close-on-exec flag from the socket, so we can pass it to
     // fusermount.
-    fcntl(send.as_raw_fd(), FcntlArg::F_SETFD(FdFlag::empty()))
+    fcntl(send.as_fd(), FcntlArg::F_SETFD(FdFlag::empty()))
         .map_err(|e| SessionFailure(format!("Failed to remove close-on-exec flag: {e}")))?;
 
     let mut cmd = match target_mntns {
@@ -619,9 +616,9 @@ fn fuse_fusermount_mount(
 
 /// Umount a fuse file system
 fn fuse_kern_umount(mountpoint: &str, file: File, fusermount: &str) -> Result<()> {
-    let mut fds = [PollFd::new(file.as_raw_fd(), PollFlags::empty())];
+    let mut fds = [PollFd::new(file.as_fd(), PollFlags::empty())];
 
-    if poll(&mut fds, 0).is_ok() {
+    if poll(&mut fds, PollTimeout::ZERO).is_ok() {
         // POLLERR means the file system is already umounted,
         // or the connection has been aborted via /sys/fs/fuse/connections/NNN/abort
         if let Some(event) = fds[0].revents() {
@@ -666,7 +663,6 @@ fn fuse_fusermount_umount(mountpoint: &str, fusermount: &str) -> Result<()> {
 mod tests {
     use super::*;
     use std::fs::File;
-    use std::os::unix::io::FromRawFd;
     use std::path::Path;
     use vmm_sys_util::tempdir::TempDir;
 
@@ -682,8 +678,8 @@ mod tests {
 
     #[test]
     fn test_new_channel() {
-        let fd = nix::unistd::dup(std::io::stdout().as_raw_fd()).unwrap();
-        let file = unsafe { File::from_raw_fd(fd) };
+        let fd = nix::unistd::dup(std::io::stdout().as_fd()).unwrap();
+        let file = File::from(fd);
         let _ = FuseChannel::new(file, 3).unwrap();
     }
 
