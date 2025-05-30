@@ -298,6 +298,9 @@ impl Default for VfsOptions {
         }
     }
 
+    #[cfg(target_os = "freebsd")]
+    fn default() -> Self { todo!() }
+
     #[cfg(target_os = "macos")]
     fn default() -> Self {
         let out_opts = FsOptions::ASYNC_READ | FsOptions::BIG_WRITES | FsOptions::ATOMIC_O_TRUNC;
@@ -1489,6 +1492,8 @@ mod tests {
         #[cfg(target_os = "linux")]
         let in_opts =
             FsOptions::ASYNC_READ | FsOptions::ZERO_MESSAGE_OPEN | FsOptions::ZERO_MESSAGE_OPENDIR;
+        #[cfg(target_os = "freebsd")]
+        let in_opts = FsOptions::ASYNC_READ;
         #[cfg(target_os = "macos")]
         let in_opts = FsOptions::ASYNC_READ;
         vfs.init(in_opts).unwrap();

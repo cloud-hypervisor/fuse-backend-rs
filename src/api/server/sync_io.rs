@@ -705,6 +705,8 @@ impl<F: FileSystem + Sync> Server<F> {
 
         #[cfg(target_os = "macos")]
         let flags_u64 = flags as u64;
+        #[cfg(target_os = "freebsd")]
+        let flags_u64 = flags as u64;
         #[cfg(target_os = "linux")]
         let mut flags_u64 = flags as u64;
         #[cfg(target_os = "linux")]

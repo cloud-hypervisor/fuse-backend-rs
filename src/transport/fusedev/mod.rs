@@ -26,6 +26,11 @@ mod linux_session;
 #[cfg(target_os = "linux")]
 pub use linux_session::*;
 
+#[cfg(target_os = "freebsd")]
+mod freebsd_session;
+#[cfg(target_os = "freebsd")]
+pub use freebsd_session::*;
+
 #[cfg(all(target_os = "macos", not(feature = "fuse-t")))]
 mod macos_session;
 #[cfg(all(target_os = "macos", not(feature = "fuse-t")))]
@@ -192,15 +197,15 @@ impl<'a, S: BitmapSlice> FuseDevWriter<'a, S> {
     ) -> io::Result<usize> {
         self.check_available_space(count)?;
 
-        let cnt = src.read_vectored_volatile(
+        let bufs = unsafe {
             // Safe because we have made sure buf has at least count capacity above
-            unsafe {
-                &[FileVolatileSlice::from_raw_ptr(
-                    self.buf.as_mut_ptr().add(self.buf.len()),
-                    count,
-                )]
-            },
-        )?;
+            [FileVolatileSlice::from_raw_ptr(
+                self.buf.as_mut_ptr().add(self.buf.len()),
+                count,
+            )]
+        };
+
+        let cnt = src.read_vectored_volatile(&bufs)?;
         self.account_written(cnt);
 
         if self.buffered {
@@ -220,16 +225,15 @@ impl<'a, S: BitmapSlice> FuseDevWriter<'a, S> {
     ) -> io::Result<usize> {
         self.check_available_space(count)?;
 
-        let cnt = src.read_vectored_at_volatile(
+        let bufs = unsafe {
             // Safe because we have made sure buf has at least count capacity above
-            unsafe {
-                &[FileVolatileSlice::from_raw_ptr(
-                    self.buf.as_mut_ptr().add(self.buf.len()),
-                    count,
-                )]
-            },
-            off,
-        )?;
+            [FileVolatileSlice::from_raw_ptr(
+                self.buf.as_mut_ptr().add(self.buf.len()),
+                count,
+            )]
+        };
+
+        let cnt = src.read_vectored_at_volatile(&bufs, off)?;
         self.account_written(cnt);
 
         if self.buffered {

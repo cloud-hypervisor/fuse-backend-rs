@@ -37,6 +37,11 @@ mod sync_io;
 /// Maximum buffer size of FUSE requests.
 #[cfg(target_os = "linux")]
 pub const MAX_BUFFER_SIZE: u32 = 1 << 20;
+
+/// Maximum buffer size of FUSE requests.
+#[cfg(target_os = "freebsd")]
+pub const MAX_BUFFER_SIZE: u32 = 1 << 20;
+
 /// Maximum buffer size of FUSE requests.
 #[cfg(target_os = "macos")]
 pub const MAX_BUFFER_SIZE: u32 = 1 << 25;
