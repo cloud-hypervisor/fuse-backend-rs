@@ -1,7 +1,3 @@
-// Copyright 2020-2022 Ant Group. All rights reserved.
-//
-// SPDX-License-Identifier: Apache-2.0
-
 //! FUSE session management.
 //!
 //! A FUSE channel is a FUSE request handling context that takes care of handling FUSE requests
@@ -9,7 +5,6 @@
 //! A FUSE session can have multiple FUSE channels so that FUSE requests are handled in parallel.
 
 use std::fs::{File, OpenOptions};
-use std::ops::Deref;
 use std::os::fd::AsFd;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::io::AsRawFd;
@@ -17,18 +12,18 @@ use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use mio::{Events, Poll, Token, Waker};
+use mio::unix::SourceFd;
+use mio::{Events, Interest, Poll, Token, Waker};
 use nix::errno::Errno;
-use nix::fcntl::{fcntl, FcntlArg, FdFlag, OFlag};
-use nix::mount::{mount, umount2, MntFlags, MsFlags};
-use nix::poll::{poll, PollFd, PollFlags, PollTimeout};
-use nix::sys::epoll::{Epoll, EpollCreateFlags, EpollEvent, EpollFlags};
+use nix::fcntl::{FcntlArg, FdFlag, fcntl};
+use nix::mount::{MntFlags, Nmount, unmount};
+use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
 use nix::unistd::{getgid, getuid, read};
 
 use super::{
     super::pagesize,
     Error::{IoError, SessionFailure},
-    FuseBuf, FuseDevWriter, Reader, Result, FUSE_HEADER_SIZE, FUSE_KERN_BUF_PAGES,
+    FUSE_HEADER_SIZE, FUSE_KERN_BUF_PAGES, FuseBuf, FuseDevWriter, Reader, Result,
 };
 
 // These follows definition from libfuse.
@@ -185,9 +180,9 @@ impl FuseSession {
 
     /// Mount the fuse mountpoint, building connection with the in kernel fuse driver.
     pub fn mount(&mut self) -> Result<()> {
-        let mut flags = MsFlags::MS_NOSUID | MsFlags::MS_NODEV | MsFlags::MS_NOATIME;
+        let mut flags = MntFlags::MNT_NOSUID | MntFlags::MNT_NOATIME;
         if self.readonly {
-            flags |= MsFlags::MS_RDONLY;
+            flags |= MntFlags::MNT_RDONLY;
         }
         let (file, socket) = fuse_kern_mount(
             &self.mountpoint,
@@ -200,8 +195,8 @@ impl FuseSession {
             &self.fusermount,
         )?;
 
-        fcntl(file.as_fd(), FcntlArg::F_SETFL(OFlag::O_NONBLOCK))
-            .map_err(|e| SessionFailure(format!("set fd nonblocking: {e}")))?;
+        //fcntl(file.as_fd(), FcntlArg::F_SETFL(OFlag::O_NONBLOCK))
+        //    .map_err(|e| SessionFailure(format!("set fd nonblocking: {e}")))?;
         self.file = Some(file);
         self.keep_alive = socket;
 
@@ -294,19 +289,20 @@ pub struct FuseChannel {
 
 impl FuseChannel {
     fn new(file: File, bufsize: usize) -> Result<Self> {
-        let poll = Poll::new().map_err(|e| SessionFailure(format!("epoll create: {e}")))?;
-        let waker = Waker::new(poll.registry(), EXIT_FUSE_EVENT)
-            .map_err(|e| SessionFailure(format!("epoll register session fd: {e}")))?;
+        let poll = Poll::new().map_err(|e| SessionFailure(format!("poll create: {e}")))?;
+        let registry = poll.registry();
+        registry
+            .register(
+                &mut SourceFd(&file.as_raw_fd()),
+                FUSE_DEV_EVENT,
+                Interest::READABLE,
+            )
+            .unwrap();
+        let waker = Waker::new(registry, EXIT_FUSE_EVENT)
+            .map_err(|e| SessionFailure(format!("poll register session fd: {e}")))?;
         let waker = Arc::new(waker);
 
-        // mio default add EPOLLET to event flags, so epoll will use edge-triggered mode.
-        // It may let poll miss some event, so manually register the fd with only EPOLLIN flag
-        // to use level-triggered mode.
-        let epoll = Epoll::new(EpollCreateFlags::empty()).unwrap();
-        let event = EpollEvent::new(EpollFlags::EPOLLIN, usize::from(FUSE_DEV_EVENT) as u64);
-        epoll
-          .add(&file, event)
-          .map_err(|e| SessionFailure(format!("epoll register channel fd: {e}")))?;
+        //let kq = Kqueue::new().unwrap();
 
         Ok(FuseChannel {
             file,
@@ -416,7 +412,7 @@ fn fuse_kern_mount(
     mountpoint: &Path,
     fsname: &str,
     subtype: &str,
-    flags: MsFlags,
+    flags: MntFlags,
     auto_unmount: bool,
     allow_other: bool,
     target_mntns: Option<libc::pid_t>,
@@ -446,7 +442,7 @@ fn fuse_kern_mount(
     let mut opts = format!(
         "default_permissions,fd={},rootmode={:o},user_id={},group_id={},max_read={}",
         file.as_raw_fd(),
-        meta.permissions().mode() & libc::S_IFMT,
+        meta.permissions().mode() & libc::S_IFMT as u32,
         getuid(),
         getgid(),
         max_read
@@ -486,7 +482,16 @@ fn fuse_kern_mount(
             fusermount,
         )
     } else {
-        match mount(
+        let fd = format!("{}", file.as_raw_fd());
+        Nmount::new()
+            .str_opt_owned("fstype", "fusefs")
+            .str_opt_owned("fspath", mountpoint)
+            .str_opt_owned("from", FUSE_DEVICE)
+            .str_opt_owned("fd", fd.as_str())
+            .nmount(MntFlags::empty())
+            .unwrap();
+        Ok((file, None))
+        /*match mount(
             Some(fsname),
             mountpoint,
             Some(fstype.deref()),
@@ -507,26 +512,21 @@ fn fuse_kern_mount(
             Err(e) => Err(SessionFailure(format!(
                 "failed to mount {mountpoint:?}: {e}"
             ))),
-        }
+        }*/
     }
 }
 
-fn msflags_to_string(flags: MsFlags) -> String {
+fn msflags_to_string(flags: MntFlags) -> String {
     [
-        (MsFlags::MS_RDONLY, ("rw", "ro")),
-        (MsFlags::MS_NOSUID, ("suid", "nosuid")),
-        (MsFlags::MS_NODEV, ("dev", "nodev")),
-        (MsFlags::MS_NOEXEC, ("exec", "noexec")),
-        (MsFlags::MS_SYNCHRONOUS, ("async", "sync")),
-        (MsFlags::MS_NOATIME, ("atime", "noatime")),
+        (MntFlags::MNT_RDONLY, ("rw", "ro")),
+        (MntFlags::MNT_NOSUID, ("suid", "nosuid")),
+        (MntFlags::MNT_NOEXEC, ("exec", "noexec")),
+        (MntFlags::MNT_SYNCHRONOUS, ("async", "sync")),
+        (MntFlags::MNT_NOATIME, ("atime", "noatime")),
     ]
     .map(
         |(flag, (neg, pos))| {
-            if flags.contains(flag) {
-                pos
-            } else {
-                neg
-            }
+            if flags.contains(flag) { pos } else { neg }
         },
     )
     .join(",")
@@ -539,7 +539,7 @@ fn fuse_fusermount_mount(
     fsname: &str,
     subtype: &str,
     opts: String,
-    flags: MsFlags,
+    flags: MntFlags,
     auto_unmount: bool,
     target_mntns: Option<libc::pid_t>,
     fusermount: &str,
@@ -553,7 +553,7 @@ fn fuse_fusermount_mount(
     }
     let opts = opts.join(",");
 
-    let (send, recv) = UnixStream::pair().unwrap();
+    let (send, _recv) = UnixStream::pair().unwrap();
 
     // Keep the sending socket around after exec to pass to fusermount.
     // When its partner recv closes, fusermount will unmount.
@@ -593,13 +593,14 @@ fn fuse_fusermount_mount(
             exit_code => {
                 return Err(SessionFailure(format!(
                     "Unexpected exit code when running fusermount: {exit_code:?}"
-                )))
+                )));
             }
         }
     }
     drop(send);
+    todo!();
 
-    match vmm_sys_util::sock_ctrl_msg::ScmSocket::recv_with_fd(&recv, &mut [0u8; 8]).map_err(
+    /*match vmm_sys_util::sock_ctrl_msg::ScmSocket::recv_with_fd(&recv, &mut [0u8; 8]).map_err(
         |e| {
             SessionFailure(format!(
                 "Unexpected error when receiving fuse file descriptor from fusermount: {}",
@@ -611,7 +612,7 @@ fn fuse_fusermount_mount(
         (recv_bytes, None) => Err(SessionFailure(format!(
             "fusermount did not send a file descriptor.  We received {recv_bytes} bytes."
         ))),
-    }
+    }*/
 }
 
 /// Umount a fuse file system
@@ -631,7 +632,7 @@ fn fuse_kern_umount(mountpoint: &str, file: File, fusermount: &str) -> Result<()
     // Drop to close fuse session fd, otherwise synchronous umount can recurse into filesystem and
     // cause deadlock.
     drop(file);
-    match umount2(mountpoint, MntFlags::MNT_DETACH) {
+    match unmount(mountpoint, MntFlags::empty()) {
         Ok(()) => Ok(()),
         Err(Errno::EPERM) => fuse_fusermount_umount(mountpoint, fusermount),
         Err(e) => Err(SessionFailure(format!(
@@ -678,7 +679,7 @@ mod tests {
 
     #[test]
     fn test_new_channel() {
-        let fd = nix::unistd::dup(std::io::stdout().as_fd()).unwrap();
+        let fd = nix::unistd::dup(std::io::stdout()).unwrap();
         let file = File::from(fd);
         let _ = FuseChannel::new(file, 3).unwrap();
     }

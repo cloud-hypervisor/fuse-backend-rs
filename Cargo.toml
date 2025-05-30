@@ -11,44 +11,44 @@ authors = [
 ]
 readme = "README.md"
 license = "Apache-2.0 AND BSD-3-Clause"
-edition = "2018"
+edition = "2024"
 repository = "https://github.com/cloud-hypervisor/fuse-backend-rs"
 homepage = "https://github.com/cloud-hypervisor/"
 build = "build.rs"
 
 [dependencies]
-arc-swap = "1.5"
-async-trait = { version = "0.1.42", optional = true }
-bitflags = "1.1"
-dbs-snapshot = { version = "1.5.2", optional = true }
-io-uring = { version = "0.5.8", optional = true }
-lazy_static = "1.4"
-libc = "0.2.68"
-log = "0.4.6"
-mio = { version = "0.8", features = ["os-poll", "os-ext"] }
-nix = "0.24"
-radix_trie = "0.2.1"
+arc-swap = "1.7"
+async-trait = { version = "0.1.88", optional = true }
+bitflags = "2.9"
+dbs-snapshot = { version = "1.5", optional = true }
+io-uring = { version = "0.7", optional = true }
+lazy_static = "1.5"
+libc = "0.2.172"
+log = "0.4"
+mio = { version = "1.0", features = ["os-poll", "os-ext"] }
+nix = { version = "0.30", features = ["event", "fs", "ioctl", "mount", "poll", "uio", "user"] }
+radix_trie = "0.2"
 tokio = { version = "1", optional = true }
-tokio-uring = { version = "0.4.0", optional = true }
-vmm-sys-util = { version = "0.12.1", optional = true }
-vm-memory = { version = "0.14.1", features = ["backend-mmap"] }
+tokio-uring = { version = "0.5", optional = true }
+vmm-sys-util = { version = "0.14", optional = true }
+vm-memory = { version = "0.16", features = ["backend-mmap"] }
 virtio-bindings = { version = "=0.2.4", optional = true }
-virtio-queue = { version = "0.12.0", optional = true }
-vhost = { version = "0.11.0", features = ["vhost-user","vhost-user-backend"], optional = true }
-versionize_derive = { version = "0.1.6", optional = true }
-versionize = { version = "0.2.0", optional = true }
+virtio-queue = { version = "0.14", optional = true }
+vhost = { version = "0.13", features = ["vhost-user","vhost-user-backend"], optional = true }
+versionize_derive = { version = "0.1", optional = true }
+versionize = { version = "0.2", optional = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 core-foundation-sys = { version = ">=0.8", optional = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 caps = { version = "0.5", optional = true }
-tokio-uring = { version = "0.4.0", optional = true }
+tokio-uring = { version = "0.4", optional = true }
 
 [dev-dependencies]
-tokio-test = "0.4.2"
-vmm-sys-util = "0.12.1"
-vm-memory = { version = "0.14.1", features = ["backend-mmap", "backend-bitmap"] }
+tokio-test = "0.4"
+vmm-sys-util = "0.14"
+vm-memory = { version = "0.16", features = ["backend-mmap", "backend-bitmap"] }
 
 [features]
 default = ["fusedev"]

@@ -11,7 +11,7 @@ use std::collections::VecDeque;
 use std::io::{self, IoSlice, Write};
 use std::marker::PhantomData;
 use std::mem::ManuallyDrop;
-use std::os::unix::io::RawFd;
+use std::os::fd::{BorrowedFd, AsFd};
 
 use nix::sys::uio::writev;
 use nix::unistd::write;
@@ -25,6 +25,11 @@ use crate::BitmapSlice;
 mod linux_session;
 #[cfg(target_os = "linux")]
 pub use linux_session::*;
+
+#[cfg(target_os = "freebsd")]
+mod freebsd_session;
+#[cfg(target_os = "freebsd")]
+pub use freebsd_session::*;
 
 #[cfg(all(target_os = "macos", not(feature = "fuse-t")))]
 mod macos_session;
@@ -82,9 +87,9 @@ impl<'a, S: BitmapSlice + Default> Reader<'a, S> {
 /// 2. If the writer is split, a final commit() MUST be called to issue the
 ///    device write operation.
 /// 3. Concurrency, caller should not write to the writer concurrently.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug)]
 pub struct FuseDevWriter<'a, S: BitmapSlice = ()> {
-    fd: RawFd,
+    fd: BorrowedFd<'a>,
     buffered: bool,
     buf: ManuallyDrop<Vec<u8>>,
     bitmapslice: S,
@@ -93,7 +98,7 @@ pub struct FuseDevWriter<'a, S: BitmapSlice = ()> {
 
 impl<'a, S: BitmapSlice + Default> FuseDevWriter<'a, S> {
     /// Construct a new [Writer].
-    pub fn new(fd: RawFd, data_buf: &'a mut [u8]) -> Result<FuseDevWriter<'a, S>> {
+    pub fn new(fd: BorrowedFd<'a>, data_buf: &'a mut [u8]) -> Result<FuseDevWriter<'a, S>> {
         let buf = unsafe { Vec::from_raw_parts(data_buf.as_mut_ptr(), 0, data_buf.len()) };
         Ok(FuseDevWriter {
             fd,
@@ -192,15 +197,15 @@ impl<'a, S: BitmapSlice> FuseDevWriter<'a, S> {
     ) -> io::Result<usize> {
         self.check_available_space(count)?;
 
-        let cnt = src.read_vectored_volatile(
+        let bufs = unsafe {
             // Safe because we have made sure buf has at least count capacity above
-            unsafe {
-                &[FileVolatileSlice::from_raw_ptr(
-                    self.buf.as_mut_ptr().add(self.buf.len()),
-                    count,
-                )]
-            },
-        )?;
+            [FileVolatileSlice::from_raw_ptr(
+                self.buf.as_mut_ptr().add(self.buf.len()),
+                count,
+            )]
+        };
+
+        let cnt = src.read_vectored_volatile(&bufs)?;
         self.account_written(cnt);
 
         if self.buffered {
@@ -220,16 +225,15 @@ impl<'a, S: BitmapSlice> FuseDevWriter<'a, S> {
     ) -> io::Result<usize> {
         self.check_available_space(count)?;
 
-        let cnt = src.read_vectored_at_volatile(
+        let bufs = unsafe {
             // Safe because we have made sure buf has at least count capacity above
-            unsafe {
-                &[FileVolatileSlice::from_raw_ptr(
-                    self.buf.as_mut_ptr().add(self.buf.len()),
-                    count,
-                )]
-            },
-            off,
-        )?;
+            [FileVolatileSlice::from_raw_ptr(
+                self.buf.as_mut_ptr().add(self.buf.len()),
+                count,
+            )]
+        };
+
+        let cnt = src.read_vectored_at_volatile(&bufs, off)?;
         self.account_written(cnt);
 
         if self.buffered {
@@ -280,9 +284,9 @@ impl<'a, S: BitmapSlice> FuseDevWriter<'a, S> {
         }
     }
 
-    fn do_write(fd: RawFd, data: &[u8]) -> io::Result<usize> {
-        write(fd, data).map_err(|e| {
-            error! {"fail to write to fuse device fd {}: {}, {:?}", fd, e, data};
+    fn do_write<Fd: AsFd>(fd: Fd, data: &[u8]) -> io::Result<usize> {
+        write(fd.as_fd(), data).map_err(|e| {
+            error! {"fail to write to fuse device fd {:?}: {}, {:?}", fd.as_fd(), e, data};
             io::Error::new(io::ErrorKind::Other, format!("{e}"))
         })
     }
@@ -514,7 +518,6 @@ mod async_io {
 mod tests {
     use super::*;
     use std::io::{Read, Seek, SeekFrom, Write};
-    use std::os::unix::io::AsRawFd;
     use vmm_sys_util::tempfile::TempFile;
 
     #[test]
@@ -546,7 +549,7 @@ mod tests {
     fn writer_test_simple_chain() {
         let file = TempFile::new().unwrap().into_file();
         let mut buf = vec![0x0u8; 106];
-        let mut writer = FuseDevWriter::<()>::new(file.as_raw_fd(), &mut buf).unwrap();
+        let mut writer = FuseDevWriter::<()>::new(file.as_fd(), &mut buf).unwrap();
 
         writer.buffered = true;
         assert_eq!(writer.available_bytes(), 106);
@@ -574,7 +577,7 @@ mod tests {
     fn writer_test_split_chain() {
         let file = TempFile::new().unwrap().into_file();
         let mut buf = vec![0x0u8; 108];
-        let mut writer = FuseDevWriter::<()>::new(file.as_raw_fd(), &mut buf).unwrap();
+        let mut writer = FuseDevWriter::<()>::new(file.as_fd(), &mut buf).unwrap();
         let writer2 = writer.split_at(106).unwrap();
 
         assert_eq!(writer.available_bytes(), 106);
@@ -641,7 +644,7 @@ mod tests {
     fn writer_simple_commit_header() {
         let file = TempFile::new().unwrap().into_file();
         let mut buf = vec![0x0u8; 106];
-        let mut writer = FuseDevWriter::<()>::new(file.as_raw_fd(), &mut buf).unwrap();
+        let mut writer = FuseDevWriter::<()>::new(file.as_fd(), &mut buf).unwrap();
 
         writer.buffered = true;
         assert_eq!(writer.available_bytes(), 106);
@@ -671,7 +674,7 @@ mod tests {
     fn writer_split_commit_header() {
         let file = TempFile::new().unwrap().into_file();
         let mut buf = vec![0x0u8; 106];
-        let mut writer = FuseDevWriter::<()>::new(file.as_raw_fd(), &mut buf).unwrap();
+        let mut writer = FuseDevWriter::<()>::new(file.as_fd(), &mut buf).unwrap();
         let mut other = writer.split_at(4).expect("failed to split Writer");
 
         assert_eq!(writer.available_bytes(), 4);
@@ -702,7 +705,7 @@ mod tests {
     fn writer_split_commit_all() {
         let file = TempFile::new().unwrap().into_file();
         let mut buf = vec![0x0u8; 106];
-        let mut writer = FuseDevWriter::<()>::new(file.as_raw_fd(), &mut buf).unwrap();
+        let mut writer = FuseDevWriter::<()>::new(file.as_fd(), &mut buf).unwrap();
         let mut other = writer.split_at(4).expect("failed to split Writer");
 
         assert_eq!(writer.available_bytes(), 4);
@@ -744,7 +747,7 @@ mod tests {
     fn write_full() {
         let file = TempFile::new().unwrap().into_file();
         let mut buf = vec![0x0u8; 48];
-        let mut writer = FuseDevWriter::<()>::new(file.as_raw_fd(), &mut buf).unwrap();
+        let mut writer = FuseDevWriter::<()>::new(file.as_fd(), &mut buf).unwrap();
 
         let buf = vec![0xdeu8; 64];
         writer.write(&buf[..]).unwrap_err();
@@ -760,7 +763,7 @@ mod tests {
     fn write_vectored() {
         let file = TempFile::new().unwrap().into_file();
         let mut buf = vec![0x0u8; 48];
-        let mut writer = FuseDevWriter::<()>::new(file.as_raw_fd(), &mut buf).unwrap();
+        let mut writer = FuseDevWriter::<()>::new(file.as_fd(), &mut buf).unwrap();
 
         let buf = vec![0xdeu8; 48];
         let slices = [
@@ -822,7 +825,7 @@ mod tests {
     fn write_obj() {
         let file1 = TempFile::new().unwrap().into_file();
         let mut buf = vec![0x0u8; 48];
-        let mut writer = FuseDevWriter::<()>::new(file1.as_raw_fd(), &mut buf).unwrap();
+        let mut writer = FuseDevWriter::<()>::new(file1.as_fd(), &mut buf).unwrap();
         let _writer2 = writer.split_at(40).unwrap();
         let val = 0x1u64;
 
@@ -834,7 +837,7 @@ mod tests {
     fn write_all_from() {
         let file1 = TempFile::new().unwrap().into_file();
         let mut buf = vec![0x0u8; 48];
-        let mut writer = FuseDevWriter::<()>::new(file1.as_raw_fd(), &mut buf).unwrap();
+        let mut writer = FuseDevWriter::<()>::new(file1.as_fd(), &mut buf).unwrap();
         let mut file = TempFile::new().unwrap().into_file();
         let buf = vec![0xdeu8; 64];
 
@@ -858,7 +861,7 @@ mod tests {
     fn write_all_from_split() {
         let file1 = TempFile::new().unwrap().into_file();
         let mut buf = vec![0x0u8; 58];
-        let mut writer = FuseDevWriter::<()>::new(file1.as_raw_fd(), &mut buf).unwrap();
+        let mut writer = FuseDevWriter::<()>::new(file1.as_fd(), &mut buf).unwrap();
         let _other = writer.split_at(48).unwrap();
         let mut file = TempFile::new().unwrap().into_file();
         let buf = vec![0xdeu8; 64];
@@ -881,7 +884,7 @@ mod tests {
     fn write_from_at() {
         let file1 = TempFile::new().unwrap().into_file();
         let mut buf = vec![0x0u8; 48];
-        let mut writer = FuseDevWriter::<()>::new(file1.as_raw_fd(), &mut buf).unwrap();
+        let mut writer = FuseDevWriter::<()>::new(file1.as_fd(), &mut buf).unwrap();
         let mut file = TempFile::new().unwrap().into_file();
         let buf = vec![0xdeu8; 64];
 
@@ -908,7 +911,7 @@ mod tests {
     fn write_from_at_split() {
         let file1 = TempFile::new().unwrap().into_file();
         let mut buf = vec![0x0u8; 58];
-        let mut writer = FuseDevWriter::<()>::new(file1.as_raw_fd(), &mut buf).unwrap();
+        let mut writer = FuseDevWriter::<()>::new(file1.as_fd(), &mut buf).unwrap();
         let _other = writer.split_at(48).unwrap();
         let mut file = TempFile::new().unwrap().into_file();
         let buf = vec![0xdeu8; 64];
