@@ -15,6 +15,7 @@ mod fusedev_tests {
     use std::path::Path;
     use std::process::Command;
 
+    use nix::mount::MsFlags;
     use vmm_sys_util::tempdir::TempDir;
 
     use crate::example::passthroughfs;
@@ -79,6 +80,55 @@ mod fusedev_tests {
         return Ok(stdout.to_string());
     }
 
+    /// Validates that the mounted filesystem has the expected mount flags
+    fn validate_mount_flags(mountpoint: &str, expected_flags: MsFlags) -> bool {
+        // Use findmnt to get the mount flags
+        let cmd = format!("findmnt -no OPTIONS {}", mountpoint);
+        let output = match exec(&cmd) {
+            Ok(out) => out,
+            Err(_) => return false,
+        };
+
+        // Convert the expected flags to a string representation
+        let expected_flags_str = msflags_to_string_set(expected_flags);
+
+        // Check if all expected flags are present in the output
+        for flag in expected_flags_str {
+            if !output.contains(&flag) {
+                error!("Expected flag '{}' not found in mount options: {}", flag, output);
+                return false;
+            }
+        }
+
+        true
+    }
+
+    /// Converts MsFlags to a set of string representations
+    fn msflags_to_string_set(flags: MsFlags) -> Vec<String> {
+        let mut result = Vec::new();
+
+        if flags.contains(MsFlags::MS_RDONLY) {
+            result.push("ro".to_string());
+        }
+        if flags.contains(MsFlags::MS_NOSUID) {
+            result.push("nosuid".to_string());
+        }
+        if flags.contains(MsFlags::MS_NODEV) {
+            result.push("nodev".to_string());
+        }
+        if flags.contains(MsFlags::MS_NOEXEC) {
+            result.push("noexec".to_string());
+        }
+        if flags.contains(MsFlags::MS_SYNCHRONOUS) {
+            result.push("sync".to_string());
+        }
+        if flags.contains(MsFlags::MS_NOATIME) {
+            result.push("noatime".to_string());
+        }
+
+        result
+    }
+
     #[test]
     #[ignore] // it depends on privileged mode to pass through /dev/fuse
     fn integration_test_tree_gitrepo() -> Result<()> {
@@ -97,6 +147,42 @@ mod fusedev_tests {
         std::thread::sleep(std::time::Duration::from_secs(1));
         assert!(validate_two_git_directory(src_dir, mnt_dir));
         daemon.umount().unwrap();
+        Ok(())
+    }
+
+    #[test]
+    #[ignore]
+    fn integration_test_mount_flags() -> Result<()> {
+        // Test custom mount flags
+        let src = Path::new(".").canonicalize().unwrap();
+        let src_dir = src.to_str().unwrap();
+        let tmp_dir = TempDir::new().unwrap();
+        let mnt_dir = tmp_dir.as_path().to_str().unwrap();
+        info!(
+            "test mount flags src {:?} mountpoint {}",
+            src_dir, mnt_dir
+        );
+
+        // Create a set of custom mount flags
+        let custom_flags = MsFlags::MS_NODEV | MsFlags::MS_NOSUID | MsFlags::MS_NOEXEC;
+
+        let mut daemon = passthroughfs::Daemon::new(src_dir, mnt_dir, 2).unwrap();
+
+        // Set the custom mount flags
+        daemon.set_mount_flags(custom_flags);
+
+        // Mount the filesystem
+        daemon.mount().unwrap();
+
+        // Wait for the mount to complete
+        std::thread::sleep(std::time::Duration::from_millis(100));
+
+        // Validate that the mounted filesystem has the expected flags
+        assert!(validate_mount_flags(mnt_dir, custom_flags));
+
+        // Unmount the filesystem
+        daemon.umount().unwrap();
+
         Ok(())
     }
 }
