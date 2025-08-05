@@ -496,8 +496,8 @@ impl Vfs {
         Ok((inode, parent))
     }
 
-    /// Get the mounted backend file system alongside the path if there's one.
-    pub fn get_rootfs(&self, path: &str) -> VfsResult<Option<Arc<BackFileSystem>>> {
+    /// Get the mounted backend file system and its fs_idx alongside the path if there's one.
+    pub fn get_rootfs(&self, path: &str) -> VfsResult<Option<(Arc<BackFileSystem>, u8)>> {
         // Serialize mount operations. Do not expect poisoned lock here.
         let _guard = self.lock.lock().unwrap();
         let inode = match self.root.path_walk(path).map_err(VfsError::PathWalk)? {
@@ -506,9 +506,10 @@ impl Vfs {
         };
 
         if let Some(mnt) = self.mountpoints.load().get(&inode) {
-            Ok(Some(self.get_fs_by_idx(mnt.fs_idx).map_err(|e| {
-                VfsError::NotFound(format!("fs index {}, {:?}", mnt.fs_idx, e))
-            })?))
+            let fs = self
+                .get_fs_by_idx(mnt.fs_idx)
+                .map_err(|e| VfsError::NotFound(format!("fs index {}, {:?}", mnt.fs_idx, e)))?;
+            Ok(Some((fs, mnt.fs_idx)))
         } else {
             // Pseudo fs dir inode exists, but that no backend is ever mounted
             // is a normal case.
@@ -1582,9 +1583,9 @@ mod tests {
         assert!(vfs.mount(Box::new(fs1), "/x/y/z").is_ok());
         assert!(vfs.mount(Box::new(fs2), "/x/y").is_ok());
 
-        let m1 = vfs.get_rootfs("/x/y/z").unwrap().unwrap();
+        let (m1, _) = vfs.get_rootfs("/x/y/z").unwrap().unwrap();
         assert!(m1.as_any().is::<FakeFileSystemOne>());
-        let m2 = vfs.get_rootfs("/x/y").unwrap().unwrap();
+        let (m2, _) = vfs.get_rootfs("/x/y").unwrap().unwrap();
         assert!(m2.as_any().is::<FakeFileSystemTwo>());
 
         assert!(vfs.umount("/x/y/z").is_ok());
@@ -1605,7 +1606,7 @@ mod tests {
         assert!(vfs.mount(Box::new(fs1), "/x/y").is_ok());
         assert!(vfs.mount(Box::new(fs2), "/x/y").is_ok());
 
-        let m1 = vfs.get_rootfs("/x/y").unwrap().unwrap();
+        let (m1, _) = vfs.get_rootfs("/x/y").unwrap().unwrap();
         assert!(m1.as_any().is::<FakeFileSystemTwo>());
 
         assert!(vfs.umount("/x/y").is_ok());
