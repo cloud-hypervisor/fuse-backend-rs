@@ -57,7 +57,36 @@ impl<F: FileSystem + Sync> Server<F> {
             .map_err(Error::FailedToWrite)?;
         buffer_writer.commit(None).map_err(Error::InvalidMessage)
     }
+    /// Notify the kernel that an inode's data has been invalidated.
+    #[cfg(feature = "fusedev")]
+    pub fn notify_inval_inode<S: BitmapSlice>(
+        &self,
+        mut w: FuseDevWriter<'_, S>,
+        ino: u64,
+        off: u64,
+        len: u64,
+    ) -> Result<usize> {
+        let mut buffer_writer = w.split_at(0).map_err(Error::FailedToSplitWriter)?;
+        let mut header = OutHeader::default();
+        let mut inode = NotifyInvalInodeOut::default();
 
+        header.unique = 0;
+        header.error = NotifyOpcode::InvalInode as i32;
+        header.len = std::mem::size_of::<OutHeader>() as u32
+            + std::mem::size_of::<NotifyInvalInodeOut>() as u32;
+
+        inode.ino = ino;
+        inode.off = off as i64;
+        inode.len = len as i64;
+
+        buffer_writer
+            .write_obj(header)
+            .map_err(Error::FailedToWrite)?;
+        buffer_writer
+            .write_obj(inode)
+            .map_err(Error::FailedToWrite)?;
+        buffer_writer.commit(None).map_err(Error::InvalidMessage)
+    }
     #[cfg(feature = "fusedev")]
     /// Send a resend notification message to the kernel via FUSE. This function should be invoked as part of
     /// the crash recovery routine. Given that FUSE initialization does not occur again during recovery,

@@ -1032,7 +1032,7 @@ mod tests {
         fs.import().unwrap();
         vfs.mount(Box::new(fs), "/submnt/A").unwrap();
 
-        let p_fs = vfs.get_rootfs("/submnt/A").unwrap().unwrap();
+        let (p_fs, _) = vfs.get_rootfs("/submnt/A").unwrap().unwrap();
         let any_fs = p_fs.deref().as_any();
         any_fs
             .downcast_ref::<PassthroughFs>()
