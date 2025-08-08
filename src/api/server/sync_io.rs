@@ -96,9 +96,9 @@ impl<F: FileSystem + Sync> Server<F> {
         let mut buffer_writer = w.split_at(0).map_err(Error::FailedToSplitWriter)?;
         let header = {
             OutHeader {
+                len: std::mem::size_of::<OutHeader>() as u32,
                 unique: 0,
                 error: NotifyOpcode::Resend as i32,
-                ..Default::default()
             }
         };
         buffer_writer
