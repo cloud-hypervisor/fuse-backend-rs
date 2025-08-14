@@ -283,7 +283,7 @@ impl<'a, S: BitmapSlice> FuseDevWriter<'a, S> {
     fn do_write(fd: RawFd, data: &[u8]) -> io::Result<usize> {
         write(fd, data).map_err(|e| {
             error! {"fail to write to fuse device fd {}: {}, {:?}", fd, e, data};
-            io::Error::new(io::ErrorKind::Other, format!("{e}"))
+            io::Error::other(format!("{e}"))
         })
     }
 }
@@ -322,7 +322,7 @@ impl<S: BitmapSlice> Write for FuseDevWriter<'_, S> {
                 })
                 .map_err(|e| {
                     error! {"fail to write to fuse device on commit: {}", e};
-                    io::Error::new(io::ErrorKind::Other, format!("{e}"))
+                    io::Error::other(format!("{e}"))
                 })
         }
     }
@@ -330,10 +330,7 @@ impl<S: BitmapSlice> Write for FuseDevWriter<'_, S> {
     /// As this writer can associate multiple writers by splitting, `flush()` can't
     /// flush them all. Disable it!
     fn flush(&mut self) -> io::Result<()> {
-        Err(io::Error::new(
-            io::ErrorKind::Other,
-            "Writer does not support flush buffer.",
-        ))
+        Err(io::Error::other("Writer does not support flush buffer."))
     }
 }
 
@@ -362,7 +359,7 @@ mod async_io {
                     })
                     .map_err(|e| {
                         error! {"fail to write to fuse device fd {}: {}", self.fd, e};
-                        io::Error::new(io::ErrorKind::Other, format!("{}", e))
+                        io::Error::other(format!("{}", e))
                     })
             }
         }
@@ -388,7 +385,7 @@ mod async_io {
                     })
                     .map_err(|e| {
                         error! {"fail to write to fuse device fd {}: {}", self.fd, e};
-                        io::Error::new(io::ErrorKind::Other, format!("{}", e))
+                        io::Error::other(format!("{}", e))
                     })
             }
         }
@@ -420,7 +417,7 @@ mod async_io {
                     })
                     .map_err(|e| {
                         error! {"fail to write to fuse device fd {}: {}", self.fd, e};
-                        io::Error::new(io::ErrorKind::Other, format!("{}", e))
+                        io::Error::other(format!("{}", e))
                     })
             }
         }
@@ -466,7 +463,7 @@ mod async_io {
                         // write to fd, can only happen once per instance
                         nix::sys::uio::pwrite(self.fd, &self.buf[..cnt], 0).map_err(|e| {
                             error! {"fail to write to fuse device fd {}: {}", self.fd, e};
-                            io::Error::new(io::ErrorKind::Other, format!("{}", e))
+                            io::Error::other(format!("{}", e))
                         })
                     }
                 }
@@ -487,17 +484,17 @@ mod async_io {
                 (0, 0) => Ok(0),
                 (0, _) => nix::sys::uio::pwrite(self.fd, o, 0).map_err(|e| {
                     error! {"fail to write to fuse device fd {}: {}", self.fd, e};
-                    io::Error::new(io::ErrorKind::Other, format!("{}", e))
+                    io::Error::other(format!("{}", e))
                 }),
                 (_, 0) => nix::sys::uio::pwrite(self.fd, self.buf.as_slice(), 0).map_err(|e| {
                     error! {"fail to write to fuse device fd {}: {}", self.fd, e};
-                    io::Error::new(io::ErrorKind::Other, format!("{}", e))
+                    io::Error::other(format!("{}", e))
                 }),
                 (_, _) => {
                     let bufs = [IoSlice::new(self.buf.as_slice()), IoSlice::new(o)];
                     writev(self.fd, &bufs).map_err(|e| {
                         error! {"fail to write to fuse device fd {}: {}", self.fd, e};
-                        io::Error::new(io::ErrorKind::Other, format!("{}", e))
+                        io::Error::other(format!("{}", e))
                     })
                 }
             };

@@ -20,7 +20,7 @@ use std::collections::HashMap;
 use std::ffi::CStr;
 use std::fmt;
 use std::io;
-use std::io::{Error, ErrorKind, Result};
+use std::io::{Error, Result};
 use std::ops::Deref;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
@@ -434,13 +434,10 @@ impl Vfs {
     pub fn restore_mount(&self, fs: BackFileSystem, fs_idx: VfsIndex, path: &str) -> Result<()> {
         let (entry, ino) = fs.mount()?;
         if ino > VFS_MAX_INO {
-            return Err(Error::new(
-                ErrorKind::Other,
-                format!(
-                    "Unsupported max inode number, requested {} supported {}",
-                    ino, VFS_MAX_INO
-                ),
-            ));
+            return Err(Error::other(format!(
+                "Unsupported max inode number, requested {} supported {}",
+                ino, VFS_MAX_INO
+            )));
         }
 
         let _guard = self.lock.lock().unwrap();
@@ -535,10 +532,9 @@ impl Vfs {
             return Ok(inode);
         }
         if inode > VFS_MAX_INO {
-            return Err(Error::new(
-                ErrorKind::Other,
-                format!("Inode number {inode} too large, max supported {VFS_MAX_INO}"),
-            ));
+            return Err(Error::other(format!(
+                "Inode number {inode} too large, max supported {VFS_MAX_INO}"
+            )));
         }
         let ino: u64 = ((fs_idx as u64) << VFS_INDEX_SHIFT) | inode;
         trace!(
@@ -630,10 +626,7 @@ impl Vfs {
             }
         }
 
-        Err(Error::new(
-            ErrorKind::Other,
-            "vfs maximum mountpoints reached",
-        ))
+        Err(Error::other("vfs maximum mountpoints reached"))
     }
 
     fn get_fs_by_idx(&self, fs_idx: VfsIndex) -> Result<Arc<BackFileSystem>> {

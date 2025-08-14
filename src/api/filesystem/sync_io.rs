@@ -863,7 +863,7 @@ pub trait FileSystem {
         cmd: u32,
         data: IoctlData,
         out_size: u32,
-    ) -> io::Result<IoctlData> {
+    ) -> io::Result<IoctlData<'_>> {
         // Rather than ENOSYS, let's return ENOTTY so simulate that the ioctl call is implemented
         // but no ioctl number is supported.
         Err(io::Error::from_raw_os_error(libc::ENOTTY))
@@ -1313,7 +1313,7 @@ impl<FS: FileSystem> FileSystem for Arc<FS> {
         cmd: u32,
         data: IoctlData,
         out_size: u32,
-    ) -> io::Result<IoctlData> {
+    ) -> io::Result<IoctlData<'_>> {
         self.deref()
             .ioctl(ctx, inode, handle, flags, cmd, data, out_size)
     }

@@ -238,7 +238,7 @@ impl InodeMap {
             .cloned()
     }
 
-    fn get_map_mut(&self) -> RwLockWriteGuard<InodeStore> {
+    fn get_map_mut(&self) -> RwLockWriteGuard<'_, InodeStore> {
         // Do not expect poisoned lock here, so safe to unwrap().
         self.inodes.write().unwrap()
     }
@@ -275,11 +275,11 @@ impl HandleData {
         &self.file
     }
 
-    fn get_file_mut(&self) -> (MutexGuard<()>, &File) {
+    fn get_file_mut(&self) -> (MutexGuard<'_, ()>, &File) {
         (self.lock.lock().unwrap(), &self.file)
     }
 
-    fn borrow_fd(&self) -> BorrowedFd {
+    fn borrow_fd(&self) -> BorrowedFd<'_> {
         self.file.as_fd()
     }
 
@@ -706,10 +706,9 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
 
                     if inode > VFS_MAX_INO {
                         error!("fuse: max inode number reached: {}", VFS_MAX_INO);
-                        return Err(io::Error::new(
-                            io::ErrorKind::Other,
-                            format!("max inode number reached: {VFS_MAX_INO}"),
-                        ));
+                        return Err(io::Error::other(format!(
+                            "max inode number reached: {VFS_MAX_INO}"
+                        )));
                     }
 
                     InodeMap::insert_locked(

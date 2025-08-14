@@ -315,13 +315,13 @@ impl FileVolatileBuf {
     }
 
     /// Generate an `IoSlice` object to read data from the buffer.
-    pub fn io_slice(&self) -> IoSlice {
+    pub fn io_slice(&self) -> IoSlice<'_> {
         let buf = unsafe { slice::from_raw_parts(self.addr as *const u8, self.size) };
         IoSlice::new(buf)
     }
 
     /// Generate an `IoSliceMut` object to write data into the buffer.
-    pub fn io_slice_mut(&self) -> IoSliceMut {
+    pub fn io_slice_mut(&self) -> IoSliceMut<'_> {
         let buf = unsafe {
             let ptr = (self.addr as *mut u8).add(self.size);
             let sz = self.cap - self.size;
