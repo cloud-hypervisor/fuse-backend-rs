@@ -1,7 +1,7 @@
 // Copyright (C) 2023 Ant Group. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use std::io::{Error, ErrorKind, Result};
+use std::io::{Error, Result};
 use std::{
     collections::HashMap,
     sync::{atomic::Ordering, Arc},
@@ -45,10 +45,10 @@ impl InodeStore {
             ino += 1;
         }
         error!("reached maximum inode number: {}", VFS_MAX_INO);
-        Err(Error::new(
-            ErrorKind::Other,
-            format!("maximum inode number {} reached", VFS_MAX_INO),
-        ))
+        Err(Error::other(format!(
+            "maximum inode number {} reached",
+            VFS_MAX_INO
+        )))
     }
 
     pub(crate) fn alloc_inode(&mut self, path: &String) -> Result<Inode> {

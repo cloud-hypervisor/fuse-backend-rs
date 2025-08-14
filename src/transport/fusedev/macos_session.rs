@@ -223,7 +223,7 @@ impl FuseChannel {
     /// - Ok(None): signal has pending on the exiting event channel
     /// - Ok(Some((reader, writer))): reader to receive request and writer to send reply
     /// - Err(e): error message
-    pub fn get_request(&mut self) -> Result<Option<(Reader, FuseDevWriter)>> {
+    pub fn get_request(&mut self) -> Result<Option<(Reader<'_>, FuseDevWriter<'_>)>> {
         let fd = self.file.as_raw_fd();
         loop {
             match read(fd, &mut self.buf) {

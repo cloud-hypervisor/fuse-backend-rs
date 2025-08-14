@@ -701,7 +701,7 @@ impl OverlayInode {
         let pnode = if let Some(n) = self.parent.lock().unwrap().upgrade() {
             Arc::clone(&n)
         } else {
-            return Err(Error::new(ErrorKind::Other, "no parent?"));
+            return Err(Error::other("no parent?"));
         };
 
         if !pnode.in_upper_layer() {
@@ -818,13 +818,10 @@ impl OverlayInode {
                     f(None)
                 }
             }
-            None => Err(Error::new(
-                ErrorKind::Other,
-                format!(
-                    "BUG: dangling OverlayInode {} without any backend inode",
-                    self.inode
-                ),
-            )),
+            None => Err(Error::other(format!(
+                "BUG: dangling OverlayInode {} without any backend inode",
+                self.inode
+            ))),
         }
     }
 }
@@ -1119,7 +1116,7 @@ impl OverlayFs {
                 let all_inodes = ovi.real_inodes.lock().unwrap();
                 let real_inode = all_inodes
                     .first()
-                    .ok_or(Error::new(ErrorKind::Other, "backend inode not found"))?;
+                    .ok_or(Error::other("backend inode not found"))?;
                 real_inode.layer.statfs(ctx, real_inode.inode)
             }
             None => Err(Error::from_raw_os_error(libc::ENOENT)),
@@ -1694,7 +1691,7 @@ impl OverlayFs {
         let parent_node = if let Some(ref n) = node.parent.lock().unwrap().upgrade() {
             Arc::clone(n)
         } else {
-            return Err(Error::new(ErrorKind::Other, "no parent?"));
+            return Err(Error::other("no parent?"));
         };
 
         let (self_layer, _, self_inode) = node.first_layer_inode();
@@ -1736,7 +1733,7 @@ impl OverlayFs {
         let parent_node = if let Some(ref n) = node.parent.lock().unwrap().upgrade() {
             Arc::clone(n)
         } else {
-            return Err(Error::new(ErrorKind::Other, "no parent?"));
+            return Err(Error::other("no parent?"));
         };
 
         let st = node.stat64(ctx)?;
@@ -2027,8 +2024,8 @@ impl OverlayFs {
             .childrens
             .lock()
             .unwrap()
-            .iter()
-            .map(|(_, v)| v.clone())
+            .values()
+            .cloned()
             .collect::<Vec<_>>();
 
         for child in iter {

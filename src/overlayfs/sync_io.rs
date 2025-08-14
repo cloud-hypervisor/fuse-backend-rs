@@ -16,7 +16,7 @@ use crate::api::filesystem::{
 };
 
 use libc;
-use std::io::{Error, ErrorKind};
+use std::io::Error;
 
 impl FileSystem for OverlayFs {
     type Inode = Inode;
@@ -350,7 +350,7 @@ impl FileSystem for OverlayFs {
             let rh = if let Some(ref h) = hd.real_handle {
                 h
             } else {
-                return Err(Error::new(ErrorKind::Other, "no handle"));
+                return Err(Error::other("no handle"));
             };
             let real_handle = rh.handle.load(Ordering::Relaxed);
             let real_inode = rh.inode;

@@ -142,7 +142,7 @@ impl<S: BitmapSlice> IoBuffers<'_, S> {
         self.bytes_consumed
     }
 
-    fn allocate_file_volatile_slice(&self, count: usize) -> Vec<FileVolatileSlice> {
+    fn allocate_file_volatile_slice(&self, count: usize) -> Vec<FileVolatileSlice<'_>> {
         let mut rem = count;
         let mut bufs: Vec<FileVolatileSlice> = Vec::with_capacity(self.buffers.len());
 
