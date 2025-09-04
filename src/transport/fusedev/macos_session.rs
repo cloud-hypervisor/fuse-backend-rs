@@ -189,6 +189,19 @@ impl FuseSession {
         }
     }
 
+    /// Create a new fuse message writer and pass it to the given closure.
+    pub fn with_writer<F>(&mut self, f: F)
+    where
+        F: FnOnce(FuseDevWriter),
+    {
+        if let Some(file) = &self.file {
+            let fd = file.as_raw_fd();
+            let mut buf = vec![0x0u8; self.bufsize];
+            let writer = FuseDevWriter::new(fd, &mut buf).unwrap();
+            f(writer);
+        }
+    }
+
     /// Wake channel loop
     /// After macfuse unmount, read will throw ENODEV
     /// So wakers is no need for macfuse to interrupt channel
