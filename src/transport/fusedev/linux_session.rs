@@ -238,7 +238,7 @@ impl FuseSession {
         }
     }
 
-    /// Create a new fuse message channel with a specific buffer size.
+    /// Create a new fuse message writer and pass it to the given closure.
     pub fn with_writer<F>(&mut self, f: F)
     where
         F: FnOnce(FuseDevWriter),
@@ -248,6 +248,22 @@ impl FuseSession {
             let mut buf = vec![0x0u8; self.bufsize];
             let writer = FuseDevWriter::new(fd, &mut buf).unwrap();
             f(writer);
+        }
+    }
+
+    /// Create a new fuse message writer and pass it to the given closure. and return the result from the closure.
+    pub fn try_with_writer<F, R, E>(&mut self, f: F) -> std::result::Result<R, E>
+    where
+        F: FnOnce(FuseDevWriter) -> std::result::Result<R, E>,
+        E: From<super::Error>,
+    {
+        if let Some(file) = &self.file {
+            let fd = file.as_raw_fd();
+            let mut buf = vec![0x0u8; self.bufsize];
+            let writer = FuseDevWriter::new(fd, &mut buf)?;
+            f(writer)
+        } else {
+            Err(SessionFailure("invalid fuse session".into()).into())
         }
     }
 
