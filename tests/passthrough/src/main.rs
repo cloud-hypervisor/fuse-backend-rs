@@ -23,6 +23,17 @@ pub struct Daemon {
     session: Option<FuseSession>,
 }
 
+pub enum PassthroughFsError {
+    FuseError(fuse_backend_rs::Error),
+    TransportError(fuse_backend_rs::transport::Error),
+}
+
+impl From<fuse_backend_rs::transport::Error> for PassthroughFsError {
+    fn from(e: fuse_backend_rs::transport::Error) -> Self {
+        PassthroughFsError::TransportError(e)
+    }
+}
+
 #[allow(dead_code)]
 impl Daemon {
     /// Creates a fusedev daemon instance
@@ -59,11 +70,10 @@ impl Daemon {
             FuseSession::new(Path::new(&self.mountpoint), "testpassthrough", "", false).unwrap();
         se.mount().unwrap();
         
-        se.with_writer(|writer| {
+        se.try_with_writer(|writer| {
             self.server
-                .notify_resend(writer)
-                .unwrap_or_else(|e| println!("failed to send resend notification {}", e));
-        });
+                .notify_resend(writer).map_err(PassthroughFsError::FuseError)
+        }).map_err(|_| Error::from_raw_os_error(libc::EINVAL))?;
 
         for _ in 0..self.thread_cnt {
             let mut server = FuseServer {
