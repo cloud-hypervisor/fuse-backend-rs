@@ -1,3 +1,4 @@
+use fuse_backend_rs::transport::FuseSessionExt as _;
 use log::{error, info, warn, LevelFilter};
 use std::env;
 use std::fs;

@@ -11,6 +11,7 @@ use std::collections::VecDeque;
 use std::io::{self, IoSlice, Write};
 use std::marker::PhantomData;
 use std::mem::ManuallyDrop;
+use std::os::fd::AsRawFd;
 use std::os::unix::io::RawFd;
 
 use nix::sys::uio::writev;
@@ -331,6 +332,45 @@ impl<S: BitmapSlice> Write for FuseDevWriter<'_, S> {
     /// flush them all. Disable it!
     fn flush(&mut self) -> io::Result<()> {
         Err(io::Error::other("Writer does not support flush buffer."))
+    }
+}
+
+/// Extension trait for FuseSession to provide helper methods.
+pub trait FuseSessionExt {
+
+    /// Get the underlying file of the fuse session.
+    fn file(&self) -> Option<&std::fs::File>;
+
+    /// Get the buffer size of the fuse session.
+    fn bufsize(&self) -> usize;
+
+    /// Create a new fuse message writer and pass it to the given closure.
+    fn with_writer<F>(&mut self, f: F)
+    where
+        F: FnOnce(FuseDevWriter),
+    {
+        if let Some(file) = self.file() {
+            let fd = file.as_raw_fd();
+            let mut buf = vec![0x0u8; self.bufsize()];
+            let writer = FuseDevWriter::new(fd, &mut buf).unwrap();
+            f(writer);
+        }
+    }
+
+    /// Create a new fuse message writer and pass it to the given closure. and return the result from the closure.
+    fn try_with_writer<F, R, E>(&mut self, f: F) -> std::result::Result<R, E>
+    where
+        F: FnOnce(FuseDevWriter) -> std::result::Result<R, E>,
+        E: From<Error>,
+    {
+        if let Some(file) = self.file() {
+            let fd = file.as_raw_fd();
+            let mut buf = vec![0x0u8; self.bufsize()];
+            let writer = FuseDevWriter::new(fd, &mut buf)?;
+            f(writer)
+        } else {
+            Err(Error::SessionFailure("invalid fuse session".into()).into())
+        }
     }
 }
 
