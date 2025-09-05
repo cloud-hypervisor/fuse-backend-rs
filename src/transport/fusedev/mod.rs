@@ -337,7 +337,6 @@ impl<S: BitmapSlice> Write for FuseDevWriter<'_, S> {
 
 /// Extension trait for FuseSession to provide helper methods.
 pub trait FuseSessionExt {
-
     /// Get the underlying file of the fuse session.
     fn file(&self) -> Option<&std::fs::File>;
 
