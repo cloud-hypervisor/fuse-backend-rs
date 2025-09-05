@@ -42,7 +42,7 @@ mod virtiofs;
 
 pub use self::fs_cache_req_handler::FsCacheReqHandler;
 #[cfg(feature = "fusedev")]
-pub use self::fusedev::{FuseBuf, FuseChannel, FuseDevWriter, FuseSession};
+pub use self::fusedev::{FuseBuf, FuseChannel, FuseDevWriter, FuseSession, FuseSessionExt};
 #[cfg(feature = "virtiofs")]
 pub use self::virtiofs::VirtioFsWriter;
 

@@ -203,6 +203,16 @@ impl Drop for FuseSession {
     }
 }
 
+impl FuseSessionExt for FuseSession {
+    fn file(&self) -> Option<&File> {
+        self.file.as_ref()
+    }
+
+    fn bufsize(&self) -> usize {
+        self.bufsize
+    }
+}
+
 /// A fuse channel abstruction. Each session can hold multiple channels.
 pub struct FuseChannel {
     file: File,
