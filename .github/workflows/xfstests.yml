@@ -24,8 +24,7 @@ jobs:
         override: true
     - name: Build passthrough binary
       run: |
-        cd tests/passthrough
-        cargo build --release
+        cargo build --release -p passthrough
         sudo install -t /usr/sbin/ -m 700 ./target/release/passthrough
     - name: Setup and run xfstest
       run: |
@@ -45,8 +44,7 @@ jobs:
         override: true
     - name: Build overlay binary
       run: |
-        cd tests/overlay
-        cargo build --release
+        cargo build --release -p overlay
         sudo install -t /usr/sbin/ -m 700 ./target/release/overlay
     - name: Setup and run xfstest
       run: |
@@ -66,8 +64,7 @@ jobs:
         override: true
     - name: Build overlay binary
       run: |
-        cd tests/overlay
-        cargo build --release
+        cargo build --release -p overlay
         sudo install -t /usr/sbin/ -m 700 ./target/release/overlay
     - name: Setup and run unionmount testsuite
       run: |
