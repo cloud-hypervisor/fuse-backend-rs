@@ -70,11 +70,13 @@ impl Daemon {
         let mut se =
             FuseSession::new(Path::new(&self.mountpoint), "testpassthrough", "", false).unwrap();
         se.mount().unwrap();
-        
+
         se.try_with_writer(|writer| {
             self.server
-                .notify_resend(writer).map_err(PassthroughFsError::FuseError)
-        }).map_err(|_| Error::from_raw_os_error(libc::EINVAL))?;
+                .notify_resend(writer)
+                .map_err(PassthroughFsError::FuseError)
+        })
+        .map_err(|_| Error::from_raw_os_error(libc::EINVAL))?;
 
         for _ in 0..self.thread_cnt {
             let mut server = FuseServer {
