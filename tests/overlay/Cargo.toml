@@ -8,7 +8,7 @@ edition = "2021"
 [dependencies]
 fuse-backend-rs = { path = "../../", features = ["fusedev"] }
 log = ">=0.4.6"
-vmm-sys-util = ">=0.4"
+vmm-sys-util = { workspace = true }
 libc = ">=0.2.68"
 simple_logger = ">=1.13.0"
 signal-hook = ">=0.3.10"
