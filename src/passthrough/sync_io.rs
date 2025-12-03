@@ -429,13 +429,9 @@ impl<S: BitmapSlice + Send + Sync> FileSystem for PassthroughFs<S> {
 
         let data = self.inode_map.get(parent)?;
 
-        let res = {
-            let (_uid, _gid) = set_creds(ctx.uid, ctx.gid)?;
-
-            let file = data.get_file()?;
-            // Safe because this doesn't modify any memory and we check the return value.
-            unsafe { libc::mkdirat(file.as_raw_fd(), name.as_ptr(), mode & !umask) }
-        };
+        let file = data.get_file()?;
+        // Safe because this doesn't modify any memory and we check the return value.
+        let res = unsafe { libc::mkdirat(file.as_raw_fd(), name.as_ptr(), mode & !umask) };
         if res < 0 {
             return Err(io::Error::last_os_error());
         }
@@ -561,12 +557,9 @@ impl<S: BitmapSlice + Send + Sync> FileSystem for PassthroughFs<S> {
         let dir = self.inode_map.get(parent)?;
         let dir_file = dir.get_file()?;
 
-        let new_file = {
-            let (_uid, _gid) = set_creds(ctx.uid, ctx.gid)?;
-
-            let flags = self.get_writeback_open_flags(args.flags as i32);
-            Self::create_file_excl(&dir_file, name, flags, args.mode & !(args.umask & 0o777))?
-        };
+        let flags = self.get_writeback_open_flags(args.flags as i32);
+        let new_file =
+            Self::create_file_excl(&dir_file, name, flags, args.mode & !(args.umask & 0o777))?;
 
         let entry = self.do_lookup(parent, name)?;
         let file = match new_file {
@@ -584,7 +577,6 @@ impl<S: BitmapSlice + Send + Sync> FileSystem for PassthroughFs<S> {
                     None
                 };
 
-                let (_uid, _gid) = set_creds(ctx.uid, ctx.gid)?;
                 self.open_inode(entry.inode, args.flags as i32)?
             }
         };
@@ -930,18 +922,14 @@ impl<S: BitmapSlice + Send + Sync> FileSystem for PassthroughFs<S> {
         let data = self.inode_map.get(parent)?;
         let file = data.get_file()?;
 
-        let res = {
-            let (_uid, _gid) = set_creds(ctx.uid, ctx.gid)?;
-
-            // Safe because this doesn't modify any memory and we check the return value.
-            unsafe {
-                libc::mknodat(
-                    file.as_raw_fd(),
-                    name.as_ptr(),
-                    (mode & !umask) as libc::mode_t,
-                    u64::from(rdev),
-                )
-            }
+        // Safe because this doesn't modify any memory and we check the return value.
+        let res = unsafe {
+            libc::mknodat(
+                file.as_raw_fd(),
+                name.as_ptr(),
+                (mode & !umask) as libc::mode_t,
+                u64::from(rdev),
+            )
         };
         if res < 0 {
             Err(io::Error::last_os_error())
@@ -994,14 +982,10 @@ impl<S: BitmapSlice + Send + Sync> FileSystem for PassthroughFs<S> {
         self.validate_path_component(name)?;
 
         let data = self.inode_map.get(parent)?;
+        let file = data.get_file()?;
 
-        let res = {
-            let (_uid, _gid) = set_creds(ctx.uid, ctx.gid)?;
-
-            let file = data.get_file()?;
-            // Safe because this doesn't modify any memory and we check the return value.
-            unsafe { libc::symlinkat(linkname.as_ptr(), file.as_raw_fd(), name.as_ptr()) }
-        };
+        // Safe because this doesn't modify any memory and we check the return value.
+        let res = unsafe { libc::symlinkat(linkname.as_ptr(), file.as_raw_fd(), name.as_ptr()) };
         if res == 0 {
             self.do_lookup(parent, name)
         } else {
