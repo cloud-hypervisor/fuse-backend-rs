@@ -725,7 +725,7 @@ impl<S: BitmapSlice + Send + Sync> FileSystem for PassthroughFs<S> {
 
     fn setattr(
         &self,
-        _ctx: &Context,
+        ctx: &Context,
         inode: Inode,
         attr: libc::stat64,
         handle: Option<Handle>,
@@ -816,6 +816,10 @@ impl<S: BitmapSlice + Send + Sync> FileSystem for PassthroughFs<S> {
                 None
             };
 
+            // Switch to caller's credentials for permission check
+            // (truncate requires write permission)
+            let _creds = set_creds(ctx.uid, ctx.gid)?;
+
             // Safe because this doesn't modify any memory and we check the return value.
             let res = match data {
                 Data::Handle(ref h) => unsafe {
@@ -857,6 +861,10 @@ impl<S: BitmapSlice + Send + Sync> FileSystem for PassthroughFs<S> {
                 tvs[1].tv_sec = attr.st_mtime;
                 tvs[1].tv_nsec = attr.st_mtime_nsec;
             }
+
+            // Switch to caller's credentials for permission check
+            // (utimensat requires write permission or ownership)
+            let _creds = set_creds(ctx.uid, ctx.gid)?;
 
             // Safe because this doesn't modify any memory and we check the return value.
             let res = match data {
