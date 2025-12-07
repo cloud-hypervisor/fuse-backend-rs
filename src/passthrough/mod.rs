@@ -907,21 +907,137 @@ impl<S: BitmapSlice + Send + Sync + 'static> BackendFileSystem for PassthroughFs
 ///
 /// See: https://man7.org/linux/man-pages/man2/setfsuid.2.html
 /// See: https://stackoverflow.com/questions/1223600/change-uid-gid-only-of-one-thread-in-linux
+///
+/// # Supplementary Groups
+///
+/// FUSE protocol only passes uid and primary gid in requests, not supplementary groups.
+/// With `default_permissions` mount option, the kernel checks permissions before the
+/// request reaches the FUSE server, but these checks don't consider the caller's
+/// supplementary groups because the kernel doesn't know them for FUSE operations.
+///
+/// To fix this, we read the caller's supplementary groups from /proc/<pid>/status
+/// and adopt them using setgroups(). This is the "gocryptfs workaround" approach.
+/// See: https://github.com/rfjakob/gocryptfs/commit/e74f48b
 #[derive(Debug)]
 pub(crate) struct ScopedCreds {
     original_fsuid: libc::uid_t,
     original_fsgid: libc::gid_t,
+    original_groups: Vec<libc::gid_t>,
+}
+
+/// Parse supplementary groups from /proc/<pid>/status
+///
+/// Returns empty Vec if the file cannot be read (e.g., process exited).
+fn parse_proc_groups(pid: libc::pid_t) -> Vec<libc::gid_t> {
+    // Try /proc/<pid>/task/<pid>/status first (more accurate for threads)
+    // Fall back to /proc/<pid>/status
+    let status_path = format!("/proc/{}/task/{}/status", pid, pid);
+    let content = match std::fs::read_to_string(&status_path) {
+        Ok(c) => c,
+        Err(_) => {
+            let fallback_path = format!("/proc/{}/status", pid);
+            match std::fs::read_to_string(&fallback_path) {
+                Ok(c) => c,
+                Err(e) => {
+                    debug!("parse_proc_groups: failed to read /proc/{}/status: {}", pid, e);
+                    return Vec::new();
+                }
+            }
+        }
+    };
+
+    // Look for line: "Groups:\t1000 1001 1002"
+    for line in content.lines() {
+        if let Some(groups_str) = line.strip_prefix("Groups:") {
+            let groups: Vec<libc::gid_t> = groups_str
+                .split_whitespace()
+                .filter_map(|s| s.parse().ok())
+                .collect();
+            debug!("parse_proc_groups: pid={} groups={:?}", pid, groups);
+            return groups;
+        }
+    }
+
+    debug!("parse_proc_groups: pid={} no Groups line found", pid);
+    Vec::new()
+}
+
+/// Thread-local setgroups using raw syscall.
+///
+/// IMPORTANT: We use the raw SYS_setgroups syscall instead of libc::setgroups()
+/// because glibc's NPTL wrapper signals ALL threads to change credentials for
+/// POSIX compliance. The raw kernel syscall is per-thread, which is what we need
+/// for a multi-threaded FUSE server where each thread handles different users.
+///
+/// See: https://man7.org/linux/man-pages/man7/nptl.7.html
+/// See: https://github.com/rfjakob/gocryptfs (uses same approach)
+unsafe fn setgroups_thread(groups: &[libc::gid_t]) -> libc::c_long {
+    libc::syscall(
+        libc::SYS_setgroups,
+        groups.len() as libc::size_t,
+        groups.as_ptr(),
+    )
+}
+
+/// Thread-local getgroups using raw syscall.
+///
+/// Like setgroups_thread, this uses the raw syscall to get per-thread groups.
+unsafe fn getgroups_thread(size: libc::c_int, list: *mut libc::gid_t) -> libc::c_long {
+    libc::syscall(libc::SYS_getgroups, size, list)
+}
+
+/// Get current supplementary groups for this thread
+fn get_current_groups() -> io::Result<Vec<libc::gid_t>> {
+    // First call with size 0 to get the actual count
+    let count = unsafe { getgroups_thread(0, std::ptr::null_mut()) };
+    if count < 0 {
+        return Err(io::Error::last_os_error());
+    }
+
+    if count == 0 {
+        return Ok(Vec::new());
+    }
+
+    let mut groups = vec![0 as libc::gid_t; count as usize];
+    let actual = unsafe { getgroups_thread(count as libc::c_int, groups.as_mut_ptr()) };
+    if actual < 0 {
+        return Err(io::Error::last_os_error());
+    }
+
+    groups.truncate(actual as usize);
+    Ok(groups)
 }
 
 impl ScopedCreds {
-    /// Switch filesystem credentials to the given uid/gid.
+    /// Switch filesystem credentials to the given uid/gid/groups.
     /// Returns None if both uid and gid are 0 (already root).
-    fn new(uid: libc::uid_t, gid: libc::gid_t) -> io::Result<Option<ScopedCreds>> {
-        debug!("set_creds: switching to uid={} gid={}", uid, gid);
+    fn new(uid: libc::uid_t, gid: libc::gid_t, pid: libc::pid_t) -> io::Result<Option<ScopedCreds>> {
+        debug!("set_creds: switching to uid={} gid={} pid={}", uid, gid, pid);
         if uid == 0 && gid == 0 {
             // Nothing to do since we are already uid/gid 0.
             debug!("set_creds: uid=0 gid=0, nothing to do");
             return Ok(None);
+        }
+
+        // Get current groups before we change anything
+        let original_groups = get_current_groups().unwrap_or_default();
+        debug!("set_creds: original_groups={:?}", original_groups);
+
+        // Parse caller's supplementary groups from /proc
+        let caller_groups = parse_proc_groups(pid);
+
+        // Set supplementary groups first (before dropping privileges)
+        // Use raw syscall for per-thread behavior (not glibc's process-wide wrapper)
+        if !caller_groups.is_empty() {
+            let ret = unsafe { setgroups_thread(&caller_groups) };
+            if ret < 0 {
+                let err = io::Error::last_os_error();
+                debug!("set_creds: setgroups({:?}) failed: {}", caller_groups, err);
+                // Don't fail - continue without supplementary groups
+                // This can happen if we don't have CAP_SETGID
+            } else {
+                debug!("set_creds: setgroups({:?}) succeeded", caller_groups);
+            }
         }
 
         // setfsuid/setfsgid return the PREVIOUS value, not an error code.
@@ -933,7 +1049,10 @@ impl ScopedCreds {
         let verify_gid = unsafe { libc::setfsgid(gid) } as libc::gid_t;
         debug!("set_creds: setfsgid({}) returned original={} verify={}", gid, original_fsgid, verify_gid);
         if verify_gid != gid {
-            // Restore and return error
+            // Restore groups and return error
+            if !original_groups.is_empty() {
+                unsafe { setgroups_thread(&original_groups) };
+            }
             unsafe { libc::setfsgid(original_fsgid) };
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
@@ -947,7 +1066,10 @@ impl ScopedCreds {
         let verify_uid = unsafe { libc::setfsuid(uid) } as libc::uid_t;
         debug!("set_creds: setfsuid({}) returned original={} verify={}", uid, original_fsuid, verify_uid);
         if verify_uid != uid {
-            // Restore both and return error
+            // Restore all and return error
+            if !original_groups.is_empty() {
+                unsafe { setgroups_thread(&original_groups) };
+            }
             unsafe { libc::setfsgid(original_fsgid) };
             unsafe { libc::setfsuid(original_fsuid) };
             return Err(io::Error::new(
@@ -960,20 +1082,29 @@ impl ScopedCreds {
         Ok(Some(ScopedCreds {
             original_fsuid,
             original_fsgid,
+            original_groups,
         }))
     }
 }
 
 impl Drop for ScopedCreds {
     fn drop(&mut self) {
-        // Restore original credentials (order doesn't matter for restore)
+        // Restore original credentials (order: uid first, then gid, then groups)
+        // Restore uid first so we have privileges to restore groups
         unsafe { libc::setfsuid(self.original_fsuid) };
         unsafe { libc::setfsgid(self.original_fsgid) };
+        // Restore supplementary groups using raw syscall for per-thread behavior
+        if !self.original_groups.is_empty() {
+            unsafe { setgroups_thread(&self.original_groups) };
+        } else {
+            // If we had no groups originally, clear them
+            unsafe { setgroups_thread(&[]) };
+        }
     }
 }
 
-fn set_creds(uid: libc::uid_t, gid: libc::gid_t) -> io::Result<Option<ScopedCreds>> {
-    ScopedCreds::new(uid, gid)
+fn set_creds(uid: libc::uid_t, gid: libc::gid_t, pid: libc::pid_t) -> io::Result<Option<ScopedCreds>> {
+    ScopedCreds::new(uid, gid, pid)
 }
 
 struct CapFsetid {}
