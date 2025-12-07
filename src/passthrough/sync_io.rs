@@ -365,11 +365,13 @@ impl<S: BitmapSlice + Send + Sync> FileSystem for PassthroughFs<S> {
         }
     }
 
-    fn lookup(&self, _ctx: &Context, parent: Inode, name: &CStr) -> io::Result<Entry> {
+    fn lookup(&self, ctx: &Context, parent: Inode, name: &CStr) -> io::Result<Entry> {
         // Don't use is_safe_path_component(), allow "." and ".." for NFS export support
         if name.to_bytes_with_nul().contains(&SLASH_ASCII) {
             return Err(einval());
         }
+        // Switch to caller's credentials for directory search permission check
+        let _creds = set_creds(ctx.uid, ctx.gid)?;
         self.do_lookup(parent, name)
     }
 
