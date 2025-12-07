@@ -389,7 +389,7 @@ impl<S: BitmapSlice + Send + Sync> FileSystem for PassthroughFs<S> {
 
     fn opendir(
         &self,
-        _ctx: &Context,
+        ctx: &Context,
         inode: Inode,
         flags: u32,
     ) -> io::Result<(Option<Handle>, OpenOptions)> {
@@ -397,6 +397,8 @@ impl<S: BitmapSlice + Send + Sync> FileSystem for PassthroughFs<S> {
             info!("fuse: opendir is not supported.");
             Err(enosys())
         } else {
+            // Switch to caller's credentials for permission check
+            let _creds = set_creds(ctx.uid, ctx.gid)?;
             self.do_open(inode, flags | (libc::O_DIRECTORY as u32), 0)
                 .map(|(a, b, _)| (a, b))
         }
@@ -441,8 +443,10 @@ impl<S: BitmapSlice + Send + Sync> FileSystem for PassthroughFs<S> {
         self.do_lookup(parent, name)
     }
 
-    fn rmdir(&self, _ctx: &Context, parent: Inode, name: &CStr) -> io::Result<()> {
+    fn rmdir(&self, ctx: &Context, parent: Inode, name: &CStr) -> io::Result<()> {
         self.validate_path_component(name)?;
+        // Switch to caller's credentials for permission check
+        let _creds = set_creds(ctx.uid, ctx.gid)?;
         self.do_unlink(parent, name, libc::AT_REMOVEDIR)
     }
 
@@ -517,7 +521,7 @@ impl<S: BitmapSlice + Send + Sync> FileSystem for PassthroughFs<S> {
 
     fn open(
         &self,
-        _ctx: &Context,
+        ctx: &Context,
         inode: Inode,
         flags: u32,
         fuse_flags: u32,
@@ -526,6 +530,8 @@ impl<S: BitmapSlice + Send + Sync> FileSystem for PassthroughFs<S> {
             info!("fuse: open is not supported.");
             Err(enosys())
         } else {
+            // Switch to caller's credentials for permission check
+            let _creds = set_creds(ctx.uid, ctx.gid)?;
             self.do_open(inode, flags, fuse_flags)
         }
     }
@@ -606,8 +612,10 @@ impl<S: BitmapSlice + Send + Sync> FileSystem for PassthroughFs<S> {
         Ok((entry, ret_handle, opts, None))
     }
 
-    fn unlink(&self, _ctx: &Context, parent: Inode, name: &CStr) -> io::Result<()> {
+    fn unlink(&self, ctx: &Context, parent: Inode, name: &CStr) -> io::Result<()> {
         self.validate_path_component(name)?;
+        // Switch to caller's credentials for permission check
+        let _creds = set_creds(ctx.uid, ctx.gid)?;
         self.do_unlink(parent, name, 0)
     }
 
@@ -885,7 +893,7 @@ impl<S: BitmapSlice + Send + Sync> FileSystem for PassthroughFs<S> {
 
     fn rename(
         &self,
-        _ctx: &Context,
+        ctx: &Context,
         olddir: Inode,
         oldname: &CStr,
         newdir: Inode,
@@ -899,6 +907,9 @@ impl<S: BitmapSlice + Send + Sync> FileSystem for PassthroughFs<S> {
         let new_inode = self.inode_map.get(newdir)?;
         let old_file = old_inode.get_file()?;
         let new_file = new_inode.get_file()?;
+
+        // Switch to caller's credentials for permission check
+        let _creds = set_creds(ctx.uid, ctx.gid)?;
 
         // Safe because this doesn't modify any memory and we check the return value.
         // TODO: Switch to libc::renameat2 once https://github.com/rust-lang/libc/pull/1508 lands
@@ -954,7 +965,7 @@ impl<S: BitmapSlice + Send + Sync> FileSystem for PassthroughFs<S> {
 
     fn link(
         &self,
-        _ctx: &Context,
+        ctx: &Context,
         inode: Inode,
         newparent: Inode,
         newname: &CStr,
@@ -968,6 +979,9 @@ impl<S: BitmapSlice + Send + Sync> FileSystem for PassthroughFs<S> {
 
         // Safe because this is a constant value and a valid C string.
         let empty = unsafe { CStr::from_bytes_with_nul_unchecked(EMPTY_CSTR) };
+
+        // Switch to caller's credentials for permission check
+        let _creds = set_creds(ctx.uid, ctx.gid)?;
 
         // Safe because this doesn't modify any memory and we check the return value.
         let res = unsafe {
