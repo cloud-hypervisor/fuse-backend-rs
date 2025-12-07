@@ -430,6 +430,8 @@ impl<S: BitmapSlice + Send + Sync> FileSystem for PassthroughFs<S> {
         let data = self.inode_map.get(parent)?;
 
         let file = data.get_file()?;
+        // Switch to caller's credentials so the directory is owned by them
+        let _creds = set_creds(ctx.uid, ctx.gid)?;
         // Safe because this doesn't modify any memory and we check the return value.
         let res = unsafe { libc::mkdirat(file.as_raw_fd(), name.as_ptr(), mode & !umask) };
         if res < 0 {
@@ -558,6 +560,8 @@ impl<S: BitmapSlice + Send + Sync> FileSystem for PassthroughFs<S> {
         let dir_file = dir.get_file()?;
 
         let flags = self.get_writeback_open_flags(args.flags as i32);
+        // Switch to caller's credentials so the file is owned by them
+        let _creds = set_creds(ctx.uid, ctx.gid)?;
         let new_file =
             Self::create_file_excl(&dir_file, name, flags, args.mode & !(args.umask & 0o777))?;
 
@@ -922,6 +926,8 @@ impl<S: BitmapSlice + Send + Sync> FileSystem for PassthroughFs<S> {
         let data = self.inode_map.get(parent)?;
         let file = data.get_file()?;
 
+        // Switch to caller's credentials so the node is owned by them
+        let _creds = set_creds(ctx.uid, ctx.gid)?;
         // Safe because this doesn't modify any memory and we check the return value.
         let res = unsafe {
             libc::mknodat(
@@ -984,6 +990,8 @@ impl<S: BitmapSlice + Send + Sync> FileSystem for PassthroughFs<S> {
         let data = self.inode_map.get(parent)?;
         let file = data.get_file()?;
 
+        // Switch to caller's credentials so the symlink is owned by them
+        let _creds = set_creds(ctx.uid, ctx.gid)?;
         // Safe because this doesn't modify any memory and we check the return value.
         let res = unsafe { libc::symlinkat(linkname.as_ptr(), file.as_raw_fd(), name.as_ptr()) };
         if res == 0 {
