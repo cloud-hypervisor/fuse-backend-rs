@@ -803,6 +803,10 @@ impl<S: BitmapSlice + Send + Sync> FileSystem for PassthroughFs<S> {
             // Safe because this is a constant value and a valid C string.
             let empty = unsafe { CStr::from_bytes_with_nul_unchecked(EMPTY_CSTR) };
 
+            // Switch to caller's credentials for permission check
+            // (only root can change owner, owner can change group)
+            let _creds = set_creds(ctx.uid, ctx.gid)?;
+
             // Safe because this doesn't modify any memory and we check the return value.
             let res = unsafe {
                 libc::fchownat(
