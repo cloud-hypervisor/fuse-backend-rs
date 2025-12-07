@@ -768,6 +768,10 @@ impl<S: BitmapSlice + Send + Sync> FileSystem for PassthroughFs<S> {
         }
 
         if valid.contains(SetattrValid::MODE) {
+            // Switch to caller's credentials for permission check
+            // (only file owner or root can chmod)
+            let _creds = set_creds(ctx.uid, ctx.gid)?;
+
             // Safe because this doesn't modify any memory and we check the return value.
             let res = unsafe {
                 match data {
