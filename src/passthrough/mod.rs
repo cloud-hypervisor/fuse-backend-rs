@@ -917,8 +917,10 @@ impl ScopedCreds {
     /// Switch filesystem credentials to the given uid/gid.
     /// Returns None if both uid and gid are 0 (already root).
     fn new(uid: libc::uid_t, gid: libc::gid_t) -> io::Result<Option<ScopedCreds>> {
+        debug!("set_creds: switching to uid={} gid={}", uid, gid);
         if uid == 0 && gid == 0 {
             // Nothing to do since we are already uid/gid 0.
+            debug!("set_creds: uid=0 gid=0, nothing to do");
             return Ok(None);
         }
 
@@ -929,6 +931,7 @@ impl ScopedCreds {
         let original_fsgid = unsafe { libc::setfsgid(gid) } as libc::gid_t;
         // Verify the change took effect
         let verify_gid = unsafe { libc::setfsgid(gid) } as libc::gid_t;
+        debug!("set_creds: setfsgid({}) returned original={} verify={}", gid, original_fsgid, verify_gid);
         if verify_gid != gid {
             // Restore and return error
             unsafe { libc::setfsgid(original_fsgid) };
@@ -942,6 +945,7 @@ impl ScopedCreds {
         let original_fsuid = unsafe { libc::setfsuid(uid) } as libc::uid_t;
         // Verify the change took effect
         let verify_uid = unsafe { libc::setfsuid(uid) } as libc::uid_t;
+        debug!("set_creds: setfsuid({}) returned original={} verify={}", uid, original_fsuid, verify_uid);
         if verify_uid != uid {
             // Restore both and return error
             unsafe { libc::setfsgid(original_fsgid) };
@@ -952,6 +956,7 @@ impl ScopedCreds {
             ));
         }
 
+        debug!("set_creds: success, original_fsuid={} original_fsgid={}", original_fsuid, original_fsgid);
         Ok(Some(ScopedCreds {
             original_fsuid,
             original_fsgid,
@@ -982,9 +987,11 @@ impl Drop for CapFsetid {
 }
 
 fn drop_cap_fsetid() -> io::Result<Option<CapFsetid>> {
-    if !caps::has_cap(None, caps::CapSet::Effective, caps::Capability::CAP_FSETID)
-        .map_err(|_e| io::Error::new(io::ErrorKind::PermissionDenied, "no CAP_FSETID capability"))?
-    {
+    // Use unwrap_or(false) instead of propagating error - if we can't check
+    // capabilities, assume we don't have them and continue without error
+    let has_cap = caps::has_cap(None, caps::CapSet::Effective, caps::Capability::CAP_FSETID)
+        .unwrap_or(false);
+    if !has_cap {
         return Ok(None);
     }
     caps::drop(None, caps::CapSet::Effective, caps::Capability::CAP_FSETID).map_err(|_e| {

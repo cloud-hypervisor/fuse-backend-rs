@@ -686,7 +686,7 @@ impl<S: BitmapSlice + Send + Sync> FileSystem for PassthroughFs<S> {
 
     fn write(
         &self,
-        _ctx: &Context,
+        ctx: &Context,
         inode: Inode,
         handle: Handle,
         r: &mut dyn ZeroCopyReader,
@@ -697,6 +697,20 @@ impl<S: BitmapSlice + Send + Sync> FileSystem for PassthroughFs<S> {
         flags: u32,
         fuse_flags: u32,
     ) -> io::Result<usize> {
+        debug!("write: inode={} handle={} size={} uid={} gid={}", inode, handle, size, ctx.uid, ctx.gid);
+        // Switch to caller's credentials for the write operation.
+        // This is needed for proper SUID/SGID bit handling when a non-owner writes.
+        let _creds = match set_creds(ctx.uid, ctx.gid) {
+            Ok(c) => {
+                debug!("write: set_creds succeeded");
+                c
+            }
+            Err(e) => {
+                debug!("write: set_creds FAILED: {:?}", e);
+                return Err(e);
+            }
+        };
+
         let data = self.get_data(handle, inode, libc::O_RDWR)?;
 
         // Manually implement File::try_clone() by borrowing fd of data.file instead of dup().
@@ -741,6 +755,8 @@ impl<S: BitmapSlice + Send + Sync> FileSystem for PassthroughFs<S> {
         handle: Option<Handle>,
         valid: SetattrValid,
     ) -> io::Result<(libc::stat64, Duration)> {
+        let no_open_val = self.no_open.load(Ordering::Relaxed);
+        debug!(target: "passthrough", "setattr inode={} handle={:?} valid={:?} no_open={}", inode, handle, valid, no_open_val);
         let inode_data = self.inode_map.get(inode)?;
 
         enum Data {
@@ -770,9 +786,45 @@ impl<S: BitmapSlice + Send + Sync> FileSystem for PassthroughFs<S> {
         }
 
         if valid.contains(SetattrValid::MODE) {
-            // Switch to caller's credentials for permission check
-            // (only file owner or root can chmod)
-            let _creds = set_creds(ctx.uid, ctx.gid)?;
+            // Get current mode to detect SUID/SGID clearing
+            let current_mode = {
+                let mut st: libc::stat64 = unsafe { std::mem::zeroed() };
+                let res = unsafe {
+                    match &data {
+                        Data::Handle(h) => libc::fstat64(h.borrow_fd().as_raw_fd(), &mut st),
+                        Data::ProcPath(p) => libc::fstatat64(
+                            self.proc_self_fd.as_raw_fd(),
+                            p.as_ptr(),
+                            &mut st,
+                            0,
+                        ),
+                    }
+                };
+                if res < 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                st.st_mode
+            };
+
+            // Check if this is SUID/SGID clearing by the kernel (happens on write by non-owner)
+            // The kernel sends SETATTR with the new mode = old mode with S_ISUID/S_ISGID cleared.
+            // In this case, we should NOT switch credentials because:
+            // 1. The operation is kernel-initiated, not user-initiated
+            // 2. The writing user doesn't have permission to chmod (they're not the owner)
+            // 3. The SUID/SGID clearing must succeed for POSIX compliance
+            let old_special_bits = current_mode & (libc::S_ISUID | libc::S_ISGID);
+            let new_special_bits = attr.st_mode & (libc::S_ISUID | libc::S_ISGID);
+            let is_suid_sgid_clearing =
+                old_special_bits != 0 && new_special_bits == 0 && (current_mode & 0o777) == (attr.st_mode & 0o777);
+
+            let _creds = if is_suid_sgid_clearing {
+                // Kernel clearing SUID/SGID - do as root
+                None
+            } else {
+                // User-initiated chmod - switch to caller's credentials for permission check
+                // (only file owner or root can chmod)
+                Some(set_creds(ctx.uid, ctx.gid)?)
+            };
 
             // Safe because this doesn't modify any memory and we check the return value.
             let res = unsafe {
@@ -834,16 +886,19 @@ impl<S: BitmapSlice + Send + Sync> FileSystem for PassthroughFs<S> {
                 None
             };
 
-            // Switch to caller's credentials for permission check
-            // (truncate requires write permission)
-            let _creds = set_creds(ctx.uid, ctx.gid)?;
-
             // Safe because this doesn't modify any memory and we check the return value.
             let res = match data {
-                Data::Handle(ref h) => unsafe {
-                    libc::ftruncate(h.borrow_fd().as_raw_fd(), attr.st_size)
-                },
+                Data::Handle(ref h) => {
+                    // ftruncate on an already-opened fd doesn't re-check file permissions.
+                    // The permission was validated when the fd was opened, so we don't
+                    // switch credentials here - ftruncate should succeed if the fd has
+                    // write access, regardless of current file mode.
+                    unsafe { libc::ftruncate(h.borrow_fd().as_raw_fd(), attr.st_size) }
+                }
                 _ => {
+                    // No file handle - need to open the file, which requires permission check.
+                    // Switch to caller's credentials for this case.
+                    let _creds = set_creds(ctx.uid, ctx.gid)?;
                     // There is no `ftruncateat` so we need to get a new fd and truncate it.
                     let f = self.open_inode(inode, libc::O_NONBLOCK | libc::O_RDWR)?;
                     unsafe { libc::ftruncate(f.as_raw_fd(), attr.st_size) }
@@ -975,7 +1030,7 @@ impl<S: BitmapSlice + Send + Sync> FileSystem for PassthroughFs<S> {
 
     fn link(
         &self,
-        ctx: &Context,
+        _ctx: &Context,
         inode: Inode,
         newparent: Inode,
         newname: &CStr,
@@ -990,8 +1045,11 @@ impl<S: BitmapSlice + Send + Sync> FileSystem for PassthroughFs<S> {
         // Safe because this is a constant value and a valid C string.
         let empty = unsafe { CStr::from_bytes_with_nul_unchecked(EMPTY_CSTR) };
 
-        // Switch to caller's credentials for permission check
-        let _creds = set_creds(ctx.uid, ctx.gid)?;
+        // NOTE: We do NOT call set_creds() here because:
+        // 1. linkat with AT_EMPTY_PATH requires CAP_DAC_READ_SEARCH capability
+        // 2. set_creds() drops to non-root uid which loses CAP_DAC_READ_SEARCH
+        // 3. Permission checks should be done by the kernel via default_permissions
+        //    mount option before the LINK request reaches the FUSE server
 
         // Safe because this doesn't modify any memory and we check the return value.
         let res = unsafe {
