@@ -913,55 +913,13 @@ impl<S: BitmapSlice + Send + Sync + 'static> BackendFileSystem for PassthroughFs
 /// # Supplementary Groups
 ///
 /// FUSE protocol only passes uid and primary gid in requests, not supplementary groups.
-/// With `default_permissions` mount option, the kernel checks permissions before the
-/// request reaches the FUSE server, but these checks don't consider the caller's
-/// supplementary groups because the kernel doesn't know them for FUSE operations.
-///
-/// To fix this, we read the caller's supplementary groups from /proc/<pid>/status
-/// and adopt them using setgroups(). This is the "gocryptfs workaround" approach.
-/// See: https://github.com/rfjakob/gocryptfs/commit/e74f48b
+/// The caller must forward supplementary groups via the Context struct. We adopt them
+/// using setgroups() raw syscall for per-thread credential switching.
 #[derive(Debug)]
 pub(crate) struct ScopedCreds {
     original_fsuid: libc::uid_t,
     original_fsgid: libc::gid_t,
     original_groups: Vec<libc::gid_t>,
-}
-
-/// Parse supplementary groups from /proc/<pid>/status
-///
-/// Returns empty Vec if the file cannot be read (e.g., process exited).
-fn parse_proc_groups(pid: libc::pid_t) -> Vec<libc::gid_t> {
-    // Try /proc/<pid>/task/<pid>/status first (more accurate for threads)
-    // Fall back to /proc/<pid>/status
-    let status_path = format!("/proc/{}/task/{}/status", pid, pid);
-    let content = match std::fs::read_to_string(&status_path) {
-        Ok(c) => c,
-        Err(_) => {
-            let fallback_path = format!("/proc/{}/status", pid);
-            match std::fs::read_to_string(&fallback_path) {
-                Ok(c) => c,
-                Err(e) => {
-                    debug!("parse_proc_groups: failed to read /proc/{}/status: {}", pid, e);
-                    return Vec::new();
-                }
-            }
-        }
-    };
-
-    // Look for line: "Groups:\t1000 1001 1002"
-    for line in content.lines() {
-        if let Some(groups_str) = line.strip_prefix("Groups:") {
-            let groups: Vec<libc::gid_t> = groups_str
-                .split_whitespace()
-                .filter_map(|s| s.parse().ok())
-                .collect();
-            debug!("parse_proc_groups: pid={} groups={:?}", pid, groups);
-            return groups;
-        }
-    }
-
-    debug!("parse_proc_groups: pid={} no Groups line found", pid);
-    Vec::new()
 }
 
 /// Thread-local setgroups using raw syscall.
@@ -1014,16 +972,14 @@ impl ScopedCreds {
     /// Switch filesystem credentials to the given uid/gid/groups.
     /// Returns None if both uid and gid are 0 (already root).
     ///
-    /// The `supplementary_groups` parameter allows passing pre-read supplementary groups
-    /// instead of reading from /proc/<pid>/status. This is essential for remote filesystems
-    /// (like fuse-pipe over vsock) where the PID doesn't exist on the server.
+    /// The `supplementary_groups` parameter allows passing supplementary groups
+    /// to adopt for the duration of the filesystem operation.
     fn new(
         uid: libc::uid_t,
         gid: libc::gid_t,
-        pid: libc::pid_t,
         supplementary_groups: Option<&[libc::gid_t]>,
     ) -> io::Result<Option<ScopedCreds>> {
-        debug!("set_creds: switching to uid={} gid={} pid={}", uid, gid, pid);
+        debug!("set_creds: switching to uid={} gid={}", uid, gid);
         if uid == 0 && gid == 0 {
             // Nothing to do since we are already uid/gid 0.
             debug!("set_creds: uid=0 gid=0, nothing to do");
@@ -1034,14 +990,9 @@ impl ScopedCreds {
         let original_groups = get_current_groups().unwrap_or_default();
         debug!("set_creds: original_groups={:?}", original_groups);
 
-        // Use provided supplementary groups if available, otherwise parse from /proc
-        let caller_groups = match supplementary_groups {
-            Some(groups) => {
-                debug!("set_creds: using provided supplementary_groups={:?}", groups);
-                groups.to_vec()
-            }
-            None => parse_proc_groups(pid),
-        };
+        // Use provided supplementary groups (required - caller must forward them)
+        let caller_groups = supplementary_groups.unwrap_or(&[]).to_vec();
+        debug!("set_creds: supplementary_groups={:?}", caller_groups);
 
         // Set supplementary groups first (before dropping privileges)
         // Use raw syscall for per-thread behavior (not glibc's process-wide wrapper)
@@ -1120,24 +1071,17 @@ impl Drop for ScopedCreds {
     }
 }
 
-fn set_creds(
-    uid: libc::uid_t,
-    gid: libc::gid_t,
-    pid: libc::pid_t,
-    supplementary_groups: Option<&[libc::gid_t]>,
-) -> io::Result<Option<ScopedCreds>> {
-    ScopedCreds::new(uid, gid, pid, supplementary_groups)
+/// Switch filesystem credentials to the given uid/gid.
+/// This is the upstream-compatible API that doesn't handle supplementary groups.
+#[allow(dead_code)]
+fn set_creds(uid: libc::uid_t, gid: libc::gid_t) -> io::Result<Option<ScopedCreds>> {
+    ScopedCreds::new(uid, gid, None)
 }
 
-/// Convenience function for set_creds that takes a Context reference.
-/// Automatically extracts uid, gid, pid, and supplementary_groups.
+/// Switch filesystem credentials from Context.
+/// Uses supplementary_groups from Context if available.
 fn set_creds_from_context(ctx: &Context) -> io::Result<Option<ScopedCreds>> {
-    set_creds(
-        ctx.uid,
-        ctx.gid,
-        ctx.pid,
-        ctx.supplementary_groups.as_deref(),
-    )
+    ScopedCreds::new(ctx.uid, ctx.gid, ctx.supplementary_groups.as_deref())
 }
 
 struct CapFsetid {}
