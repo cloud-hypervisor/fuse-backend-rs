@@ -371,7 +371,7 @@ impl<S: BitmapSlice + Send + Sync> FileSystem for PassthroughFs<S> {
             return Err(einval());
         }
         // Switch to caller's credentials for directory search permission check
-        let _creds = set_creds(ctx.uid, ctx.gid, ctx.pid)?;
+        let _creds = set_creds_from_context(ctx)?;
         self.do_lookup(parent, name)
     }
 
@@ -400,7 +400,7 @@ impl<S: BitmapSlice + Send + Sync> FileSystem for PassthroughFs<S> {
             Err(enosys())
         } else {
             // Switch to caller's credentials for permission check
-            let _creds = set_creds(ctx.uid, ctx.gid, ctx.pid)?;
+            let _creds = set_creds_from_context(ctx)?;
             self.do_open(inode, flags | (libc::O_DIRECTORY as u32), 0)
                 .map(|(a, b, _)| (a, b))
         }
@@ -435,7 +435,7 @@ impl<S: BitmapSlice + Send + Sync> FileSystem for PassthroughFs<S> {
 
         let file = data.get_file()?;
         // Switch to caller's credentials so the directory is owned by them
-        let _creds = set_creds(ctx.uid, ctx.gid, ctx.pid)?;
+        let _creds = set_creds_from_context(ctx)?;
         // Safe because this doesn't modify any memory and we check the return value.
         let res = unsafe { libc::mkdirat(file.as_raw_fd(), name.as_ptr(), mode & !umask) };
         if res < 0 {
@@ -448,7 +448,7 @@ impl<S: BitmapSlice + Send + Sync> FileSystem for PassthroughFs<S> {
     fn rmdir(&self, ctx: &Context, parent: Inode, name: &CStr) -> io::Result<()> {
         self.validate_path_component(name)?;
         // Switch to caller's credentials for permission check
-        let _creds = set_creds(ctx.uid, ctx.gid, ctx.pid)?;
+        let _creds = set_creds_from_context(ctx)?;
         self.do_unlink(parent, name, libc::AT_REMOVEDIR)
     }
 
@@ -533,7 +533,7 @@ impl<S: BitmapSlice + Send + Sync> FileSystem for PassthroughFs<S> {
             Err(enosys())
         } else {
             // Switch to caller's credentials for permission check
-            let _creds = set_creds(ctx.uid, ctx.gid, ctx.pid)?;
+            let _creds = set_creds_from_context(ctx)?;
             self.do_open(inode, flags, fuse_flags)
         }
     }
@@ -569,7 +569,7 @@ impl<S: BitmapSlice + Send + Sync> FileSystem for PassthroughFs<S> {
 
         let flags = self.get_writeback_open_flags(args.flags as i32);
         // Switch to caller's credentials so the file is owned by them
-        let _creds = set_creds(ctx.uid, ctx.gid, ctx.pid)?;
+        let _creds = set_creds_from_context(ctx)?;
         let new_file =
             Self::create_file_excl(&dir_file, name, flags, args.mode & !(args.umask & 0o777))?;
 
@@ -617,7 +617,7 @@ impl<S: BitmapSlice + Send + Sync> FileSystem for PassthroughFs<S> {
     fn unlink(&self, ctx: &Context, parent: Inode, name: &CStr) -> io::Result<()> {
         self.validate_path_component(name)?;
         // Switch to caller's credentials for permission check
-        let _creds = set_creds(ctx.uid, ctx.gid, ctx.pid)?;
+        let _creds = set_creds_from_context(ctx)?;
         self.do_unlink(parent, name, 0)
     }
 
@@ -700,7 +700,7 @@ impl<S: BitmapSlice + Send + Sync> FileSystem for PassthroughFs<S> {
         debug!("write: inode={} handle={} size={} uid={} gid={}", inode, handle, size, ctx.uid, ctx.gid);
         // Switch to caller's credentials for the write operation.
         // This is needed for proper SUID/SGID bit handling when a non-owner writes.
-        let _creds = match set_creds(ctx.uid, ctx.gid, ctx.pid) {
+        let _creds = match set_creds_from_context(ctx) {
             Ok(c) => {
                 debug!("write: set_creds succeeded");
                 c
@@ -823,7 +823,7 @@ impl<S: BitmapSlice + Send + Sync> FileSystem for PassthroughFs<S> {
             } else {
                 // User-initiated chmod - switch to caller's credentials for permission check
                 // (only file owner or root can chmod)
-                Some(set_creds(ctx.uid, ctx.gid, ctx.pid)?)
+                Some(set_creds_from_context(ctx)?)
             };
 
             // Safe because this doesn't modify any memory and we check the return value.
@@ -859,7 +859,7 @@ impl<S: BitmapSlice + Send + Sync> FileSystem for PassthroughFs<S> {
 
             // Switch to caller's credentials for permission check
             // (only root can change owner, owner can change group)
-            let _creds = set_creds(ctx.uid, ctx.gid, ctx.pid)?;
+            let _creds = set_creds_from_context(ctx)?;
 
             // Safe because this doesn't modify any memory and we check the return value.
             let res = unsafe {
@@ -898,7 +898,7 @@ impl<S: BitmapSlice + Send + Sync> FileSystem for PassthroughFs<S> {
                 _ => {
                     // No file handle - need to open the file, which requires permission check.
                     // Switch to caller's credentials for this case.
-                    let _creds = set_creds(ctx.uid, ctx.gid, ctx.pid)?;
+                    let _creds = set_creds_from_context(ctx)?;
                     // There is no `ftruncateat` so we need to get a new fd and truncate it.
                     let f = self.open_inode(inode, libc::O_NONBLOCK | libc::O_RDWR)?;
                     unsafe { libc::ftruncate(f.as_raw_fd(), attr.st_size) }
@@ -937,7 +937,7 @@ impl<S: BitmapSlice + Send + Sync> FileSystem for PassthroughFs<S> {
 
             // Switch to caller's credentials for permission check
             // (utimensat requires write permission or ownership)
-            let _creds = set_creds(ctx.uid, ctx.gid, ctx.pid)?;
+            let _creds = set_creds_from_context(ctx)?;
 
             // Safe because this doesn't modify any memory and we check the return value.
             let res = match data {
@@ -974,7 +974,7 @@ impl<S: BitmapSlice + Send + Sync> FileSystem for PassthroughFs<S> {
         let new_file = new_inode.get_file()?;
 
         // Switch to caller's credentials for permission check
-        let _creds = set_creds(ctx.uid, ctx.gid, ctx.pid)?;
+        let _creds = set_creds_from_context(ctx)?;
 
         // Safe because this doesn't modify any memory and we check the return value.
         // TODO: Switch to libc::renameat2 once https://github.com/rust-lang/libc/pull/1508 lands
@@ -1011,7 +1011,7 @@ impl<S: BitmapSlice + Send + Sync> FileSystem for PassthroughFs<S> {
         let file = data.get_file()?;
 
         // Switch to caller's credentials so the node is owned by them
-        let _creds = set_creds(ctx.uid, ctx.gid, ctx.pid)?;
+        let _creds = set_creds_from_context(ctx)?;
         // Safe because this doesn't modify any memory and we check the return value.
         let res = unsafe {
             libc::mknodat(
@@ -1081,7 +1081,7 @@ impl<S: BitmapSlice + Send + Sync> FileSystem for PassthroughFs<S> {
         let file = data.get_file()?;
 
         // Switch to caller's credentials so the symlink is owned by them
-        let _creds = set_creds(ctx.uid, ctx.gid, ctx.pid)?;
+        let _creds = set_creds_from_context(ctx)?;
         // Safe because this doesn't modify any memory and we check the return value.
         let res = unsafe { libc::symlinkat(linkname.as_ptr(), file.as_raw_fd(), name.as_ptr()) };
         if res == 0 {

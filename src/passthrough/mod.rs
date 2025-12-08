@@ -28,6 +28,8 @@ use std::time::Duration;
 
 use vm_memory::{bitmap::BitmapSlice, ByteValued};
 
+use crate::api::filesystem::Context;
+
 pub use self::config::{CachePolicy, Config};
 use self::file_handle::{FileHandle, OpenableFileHandle};
 use self::inode_store::{InodeId, InodeStore};
@@ -1011,7 +1013,16 @@ fn get_current_groups() -> io::Result<Vec<libc::gid_t>> {
 impl ScopedCreds {
     /// Switch filesystem credentials to the given uid/gid/groups.
     /// Returns None if both uid and gid are 0 (already root).
-    fn new(uid: libc::uid_t, gid: libc::gid_t, pid: libc::pid_t) -> io::Result<Option<ScopedCreds>> {
+    ///
+    /// The `supplementary_groups` parameter allows passing pre-read supplementary groups
+    /// instead of reading from /proc/<pid>/status. This is essential for remote filesystems
+    /// (like fuse-pipe over vsock) where the PID doesn't exist on the server.
+    fn new(
+        uid: libc::uid_t,
+        gid: libc::gid_t,
+        pid: libc::pid_t,
+        supplementary_groups: Option<&[libc::gid_t]>,
+    ) -> io::Result<Option<ScopedCreds>> {
         debug!("set_creds: switching to uid={} gid={} pid={}", uid, gid, pid);
         if uid == 0 && gid == 0 {
             // Nothing to do since we are already uid/gid 0.
@@ -1023,8 +1034,14 @@ impl ScopedCreds {
         let original_groups = get_current_groups().unwrap_or_default();
         debug!("set_creds: original_groups={:?}", original_groups);
 
-        // Parse caller's supplementary groups from /proc
-        let caller_groups = parse_proc_groups(pid);
+        // Use provided supplementary groups if available, otherwise parse from /proc
+        let caller_groups = match supplementary_groups {
+            Some(groups) => {
+                debug!("set_creds: using provided supplementary_groups={:?}", groups);
+                groups.to_vec()
+            }
+            None => parse_proc_groups(pid),
+        };
 
         // Set supplementary groups first (before dropping privileges)
         // Use raw syscall for per-thread behavior (not glibc's process-wide wrapper)
@@ -1103,8 +1120,24 @@ impl Drop for ScopedCreds {
     }
 }
 
-fn set_creds(uid: libc::uid_t, gid: libc::gid_t, pid: libc::pid_t) -> io::Result<Option<ScopedCreds>> {
-    ScopedCreds::new(uid, gid, pid)
+fn set_creds(
+    uid: libc::uid_t,
+    gid: libc::gid_t,
+    pid: libc::pid_t,
+    supplementary_groups: Option<&[libc::gid_t]>,
+) -> io::Result<Option<ScopedCreds>> {
+    ScopedCreds::new(uid, gid, pid, supplementary_groups)
+}
+
+/// Convenience function for set_creds that takes a Context reference.
+/// Automatically extracts uid, gid, pid, and supplementary_groups.
+fn set_creds_from_context(ctx: &Context) -> io::Result<Option<ScopedCreds>> {
+    set_creds(
+        ctx.uid,
+        ctx.gid,
+        ctx.pid,
+        ctx.supplementary_groups.as_deref(),
+    )
 }
 
 struct CapFsetid {}
