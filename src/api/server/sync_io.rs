@@ -1193,11 +1193,15 @@ impl<F: FileSystem + Sync> Server<F> {
         let LseekIn {
             fh, offset, whence, ..
         } = ctx.r.read_obj().map_err(Error::DecodeMessage)?;
+        let offset_signed = offset as i64;
 
-        match self
-            .fs
-            .lseek(ctx.context(), ctx.nodeid(), fh.into(), offset, whence)
-        {
+        match self.fs.lseek_signed(
+            ctx.context(),
+            ctx.nodeid(),
+            fh.into(),
+            offset_signed,
+            whence,
+        ) {
             Ok(offset) => {
                 let out = LseekOut { offset };
 

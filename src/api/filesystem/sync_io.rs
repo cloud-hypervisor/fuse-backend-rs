@@ -813,6 +813,22 @@ pub trait FileSystem {
         Err(io::Error::from_raw_os_error(libc::ENOSYS))
     }
 
+    /// Reposition read/write file offset with a signed offset.
+    ///
+    /// Default implementation forwards to [`lseek`] for backward compatibility.
+    /// Filesystems that need negative offsets (e.g. SEEK_END) can override this
+    /// to receive the signed value directly.
+    fn lseek_signed(
+        &self,
+        ctx: &Context,
+        inode: Self::Inode,
+        handle: Self::Handle,
+        offset: i64,
+        whence: u32,
+    ) -> io::Result<u64> {
+        self.lseek(ctx, inode, handle, offset as u64, whence)
+    }
+
     /// Query file lock status
     fn getlk(
         &self,
@@ -1261,6 +1277,18 @@ impl<FS: FileSystem> FileSystem for Arc<FS> {
         whence: u32,
     ) -> io::Result<u64> {
         self.deref().lseek(ctx, inode, handle, offset, whence)
+    }
+
+    fn lseek_signed(
+        &self,
+        ctx: &Context,
+        inode: Self::Inode,
+        handle: Self::Handle,
+        offset: i64,
+        whence: u32,
+    ) -> io::Result<u64> {
+        self.deref()
+            .lseek_signed(ctx, inode, handle, offset, whence)
     }
 
     /// Query file lock status

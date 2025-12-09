@@ -697,7 +697,10 @@ impl<S: BitmapSlice + Send + Sync> FileSystem for PassthroughFs<S> {
         flags: u32,
         fuse_flags: u32,
     ) -> io::Result<usize> {
-        debug!("write: inode={} handle={} size={} uid={} gid={}", inode, handle, size, ctx.uid, ctx.gid);
+        debug!(
+            "write: inode={} handle={} size={} uid={} gid={}",
+            inode, handle, size, ctx.uid, ctx.gid
+        );
         // Switch to caller's credentials for the write operation.
         // This is needed for proper SUID/SGID bit handling when a non-owner writes.
         let _creds = match set_creds_from_context(ctx) {
@@ -792,12 +795,9 @@ impl<S: BitmapSlice + Send + Sync> FileSystem for PassthroughFs<S> {
                 let res = unsafe {
                     match &data {
                         Data::Handle(h) => libc::fstat64(h.borrow_fd().as_raw_fd(), &mut st),
-                        Data::ProcPath(p) => libc::fstatat64(
-                            self.proc_self_fd.as_raw_fd(),
-                            p.as_ptr(),
-                            &mut st,
-                            0,
-                        ),
+                        Data::ProcPath(p) => {
+                            libc::fstatat64(self.proc_self_fd.as_raw_fd(), p.as_ptr(), &mut st, 0)
+                        }
                     }
                 };
                 if res < 0 {
@@ -814,8 +814,9 @@ impl<S: BitmapSlice + Send + Sync> FileSystem for PassthroughFs<S> {
             // 3. The SUID/SGID clearing must succeed for POSIX compliance
             let old_special_bits = current_mode & (libc::S_ISUID | libc::S_ISGID);
             let new_special_bits = attr.st_mode & (libc::S_ISUID | libc::S_ISGID);
-            let is_suid_sgid_clearing =
-                old_special_bits != 0 && new_special_bits == 0 && (current_mode & 0o777) == (attr.st_mode & 0o777);
+            let is_suid_sgid_clearing = old_special_bits != 0
+                && new_special_bits == 0
+                && (current_mode & 0o777) == (attr.st_mode & 0o777);
 
             let _creds = if is_suid_sgid_clearing {
                 // Kernel clearing SUID/SGID - do as root
@@ -1393,6 +1394,17 @@ impl<S: BitmapSlice + Send + Sync> FileSystem for PassthroughFs<S> {
         offset: u64,
         whence: u32,
     ) -> io::Result<u64> {
+        self.lseek_signed(_ctx, inode, handle, offset as i64, whence)
+    }
+
+    fn lseek_signed(
+        &self,
+        _ctx: &Context,
+        inode: Inode,
+        handle: Handle,
+        offset: i64,
+        whence: u32,
+    ) -> io::Result<u64> {
         // Let the Arc<HandleData> in scope, otherwise fd may get invalid.
         let data = self.handle_map.get(handle, inode)?;
 
@@ -1700,6 +1712,27 @@ mod tests {
 
         let statfs = fs.statfs(&ctx, ROOT_ID).unwrap();
         assert_eq!(statfs.f_namemax, 255);
+    }
+
+    #[test]
+    fn test_lseek_signed_negative_offset() {
+        let (fs, source) = prepare_fs_tmpdir();
+        let ctx = prepare_context();
+
+        let path = source.as_path().join("seek.txt");
+        std::fs::write(&path, b"abcdef").unwrap();
+
+        let name = CString::new("seek.txt").unwrap();
+        let entry = fs.lookup(&ctx, ROOT_ID, &name).unwrap();
+        let (handle, _, _) = fs
+            .open(&ctx, entry.inode, libc::O_RDONLY as u32, 0)
+            .unwrap();
+        let handle = handle.expect("expected handle");
+
+        let offset = fs
+            .lseek_signed(&ctx, entry.inode, handle, -2, libc::SEEK_END as u32)
+            .unwrap();
+        assert_eq!(offset, 4);
     }
 
     #[test]
