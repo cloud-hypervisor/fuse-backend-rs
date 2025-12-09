@@ -1015,7 +1015,10 @@ impl ScopedCreds {
         let original_fsgid = unsafe { libc::setfsgid(gid) } as libc::gid_t;
         // Verify the change took effect
         let verify_gid = unsafe { libc::setfsgid(gid) } as libc::gid_t;
-        debug!("set_creds: setfsgid({}) returned original={} verify={}", gid, original_fsgid, verify_gid);
+        debug!(
+            "set_creds: setfsgid({}) returned original={} verify={}",
+            gid, original_fsgid, verify_gid
+        );
         if verify_gid != gid {
             // Restore groups and return error
             if !original_groups.is_empty() {
@@ -1032,7 +1035,10 @@ impl ScopedCreds {
         let original_fsuid = unsafe { libc::setfsuid(uid) } as libc::uid_t;
         // Verify the change took effect
         let verify_uid = unsafe { libc::setfsuid(uid) } as libc::uid_t;
-        debug!("set_creds: setfsuid({}) returned original={} verify={}", uid, original_fsuid, verify_uid);
+        debug!(
+            "set_creds: setfsuid({}) returned original={} verify={}",
+            uid, original_fsuid, verify_uid
+        );
         if verify_uid != uid {
             // Restore all and return error
             if !original_groups.is_empty() {
@@ -1046,7 +1052,10 @@ impl ScopedCreds {
             ));
         }
 
-        debug!("set_creds: success, original_fsuid={} original_fsgid={}", original_fsuid, original_fsgid);
+        debug!(
+            "set_creds: success, original_fsuid={} original_fsgid={}",
+            original_fsuid, original_fsgid
+        );
         Ok(Some(ScopedCreds {
             original_fsuid,
             original_fsgid,
@@ -1097,8 +1106,8 @@ impl Drop for CapFsetid {
 fn drop_cap_fsetid() -> io::Result<Option<CapFsetid>> {
     // Use unwrap_or(false) instead of propagating error - if we can't check
     // capabilities, assume we don't have them and continue without error
-    let has_cap = caps::has_cap(None, caps::CapSet::Effective, caps::Capability::CAP_FSETID)
-        .unwrap_or(false);
+    let has_cap =
+        caps::has_cap(None, caps::CapSet::Effective, caps::Capability::CAP_FSETID).unwrap_or(false);
     if !has_cap {
         return Ok(None);
     }
