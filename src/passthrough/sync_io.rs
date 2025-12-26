@@ -1466,6 +1466,85 @@ impl<S: BitmapSlice + Send + Sync> FileSystem for PassthroughFs<S> {
             Ok(result as usize)
         }
     }
+
+    fn remap_file_range(
+        &self,
+        _ctx: &Context,
+        inode_in: Inode,
+        handle_in: Handle,
+        offset_in: u64,
+        inode_out: Inode,
+        handle_out: Handle,
+        offset_out: u64,
+        len: u64,
+        flags: u32,
+    ) -> io::Result<usize> {
+        debug!(
+            "remap_file_range: ino_in={} fh_in={} ino_out={} fh_out={} len={} flags={}",
+            inode_in, handle_in, inode_out, handle_out, len, flags
+        );
+
+        // Get file descriptors from handles
+        let data_in = match self.handle_map.get(handle_in, inode_in) {
+            Ok(d) => d,
+            Err(e) => {
+                debug!("remap_file_range: handle_map.get(in) failed: {:?}", e);
+                return Err(e);
+            }
+        };
+        let data_out = match self.handle_map.get(handle_out, inode_out) {
+            Ok(d) => d,
+            Err(e) => {
+                debug!("remap_file_range: handle_map.get(out) failed: {:?}", e);
+                return Err(e);
+            }
+        };
+
+        let (_guard_in, file_in) = data_in.get_file_mut();
+        let (_guard_out, file_out) = data_out.get_file_mut();
+
+        let fd_in = file_in.as_raw_fd();
+        let fd_out = file_out.as_raw_fd();
+
+        debug!("remap_file_range: fd_in={} fd_out={}", fd_in, fd_out);
+
+        // struct file_clone_range from <linux/fs.h>
+        #[repr(C)]
+        struct FileCloneRange {
+            src_fd: i64,
+            src_offset: u64,
+            src_length: u64,
+            dest_offset: u64,
+        }
+
+        // FICLONE = _IOW('9', 1, int) = 0x40049409
+        // FICLONERANGE = _IOW('9', 13, struct file_clone_range) = 0x4020940d
+        let result = if len == 0 && offset_in == 0 && offset_out == 0 && flags == 0 {
+            // Whole-file clone (FICLONE)
+            debug!("remap_file_range: using FICLONE ioctl");
+            unsafe { libc::ioctl(fd_out, 0x40049409, fd_in) }
+        } else {
+            // Partial clone (FICLONERANGE)
+            let range = FileCloneRange {
+                src_fd: fd_in as i64,
+                src_offset: offset_in,
+                src_length: len,
+                dest_offset: offset_out,
+            };
+            debug!("remap_file_range: using FICLONERANGE ioctl");
+            unsafe { libc::ioctl(fd_out, 0x4020940d, &range as *const FileCloneRange) }
+        };
+
+        if result < 0 {
+            let err = io::Error::last_os_error();
+            debug!("remap_file_range: ioctl failed: {:?}", err);
+            Err(err)
+        } else {
+            debug!("remap_file_range: success, result={}", result);
+            // Return the length that was cloned (0 for whole-file means success)
+            Ok(if len == 0 { 0 } else { len as usize })
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1857,5 +1936,95 @@ mod tests {
         assert_eq!(result.len(), test_data.len() + partial_len);
         assert_eq!(&result[..test_data.len()], test_data);
         assert_eq!(&result[test_data.len()..], &test_data[offset..]);
+    }
+
+    /// Test that Arc<PassthroughFs> properly delegates all FileSystem methods.
+    ///
+    /// This catches a subtle bug where the `impl<FS: FileSystem> FileSystem for Arc<FS>`
+    /// blanket implementation might forget to delegate a method, causing it to use
+    /// the default trait implementation (which returns ENOSYS) instead.
+    #[test]
+    fn test_arc_delegates_filesystem_methods() {
+        let (fs, source) = prepare_fs_tmpdir();
+        let arc_fs = Arc::new(fs);
+        let ctx = prepare_context();
+
+        // Create test files for copy/remap operations
+        let src_name = CString::new("arc_test_src.txt").unwrap();
+        let dst_name = CString::new("arc_test_dst.txt").unwrap();
+        let test_data = b"Arc delegation test data";
+
+        let args = CreateIn {
+            flags: libc::O_RDWR as u32,
+            mode: 0o644,
+            umask: 0,
+            fuse_flags: 0,
+        };
+
+        // Test basic operations through Arc - these should work, not return ENOSYS
+        let (src_entry, src_handle, _, _) = arc_fs.create(&ctx, ROOT_ID, &src_name, args).unwrap();
+        let src_handle = src_handle.unwrap();
+
+        // Write test data
+        let src_path = source.as_path().join("arc_test_src.txt");
+        std::fs::write(&src_path, test_data).unwrap();
+
+        let (dst_entry, dst_handle, _, _) = arc_fs.create(&ctx, ROOT_ID, &dst_name, args).unwrap();
+        let dst_handle = dst_handle.unwrap();
+
+        // Test copy_file_range through Arc - should NOT return ENOSYS
+        let result = arc_fs.copy_file_range(
+            &ctx,
+            src_entry.inode,
+            src_handle,
+            0,
+            dst_entry.inode,
+            dst_handle,
+            0,
+            test_data.len() as u64,
+            0,
+        );
+        // copy_file_range should succeed or fail with a real error, never ENOSYS
+        match &result {
+            Ok(_) => {} // Success
+            Err(e) => {
+                assert_ne!(
+                    e.raw_os_error(),
+                    Some(libc::ENOSYS),
+                    "Arc<FS> must delegate copy_file_range, not use default ENOSYS impl"
+                );
+            }
+        }
+
+        // Test remap_file_range through Arc - should NOT return ENOSYS
+        // On tmpfs this will return EOPNOTSUPP or EINVAL (no reflink support),
+        // but it should NEVER return ENOSYS (which would mean missing delegation)
+        let result = arc_fs.remap_file_range(
+            &ctx,
+            src_entry.inode,
+            src_handle,
+            0,
+            dst_entry.inode,
+            dst_handle,
+            0,
+            0, // len=0 means whole file
+            0,
+        );
+        match &result {
+            Ok(_) => {} // Success (would require btrfs/xfs with reflink)
+            Err(e) => {
+                assert_ne!(
+                    e.raw_os_error(),
+                    Some(libc::ENOSYS),
+                    "Arc<FS> must delegate remap_file_range, not use default ENOSYS impl. \
+                     Got ENOSYS which means the Arc<FS> blanket impl is missing this method."
+                );
+                // Expected: EOPNOTSUPP (95) or EINVAL (22) on tmpfs
+            }
+        }
+
+        // Cleanup
+        arc_fs.release(&ctx, src_entry.inode, 0, src_handle, true, true, None).unwrap();
+        arc_fs.release(&ctx, dst_entry.inode, 0, dst_handle, true, true, None).unwrap();
     }
 }
