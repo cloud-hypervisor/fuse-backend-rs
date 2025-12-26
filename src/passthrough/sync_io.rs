@@ -1508,6 +1508,11 @@ impl<S: BitmapSlice + Send + Sync> FileSystem for PassthroughFs<S> {
 
         debug!("remap_file_range: fd_in={} fd_out={}", fd_in, fd_out);
 
+        // FICLONE = _IOW('9', 1, int) = 0x40049409
+        // FICLONERANGE = _IOW('9', 13, struct file_clone_range) = 0x4020940d
+        const FICLONE: libc::c_ulong = 0x40049409;
+        const FICLONERANGE: libc::c_ulong = 0x4020940d;
+
         // struct file_clone_range from <linux/fs.h>
         #[repr(C)]
         struct FileCloneRange {
@@ -1517,12 +1522,10 @@ impl<S: BitmapSlice + Send + Sync> FileSystem for PassthroughFs<S> {
             dest_offset: u64,
         }
 
-        // FICLONE = _IOW('9', 1, int) = 0x40049409
-        // FICLONERANGE = _IOW('9', 13, struct file_clone_range) = 0x4020940d
         let result = if len == 0 && offset_in == 0 && offset_out == 0 && flags == 0 {
             // Whole-file clone (FICLONE)
             debug!("remap_file_range: using FICLONE ioctl");
-            unsafe { libc::ioctl(fd_out, 0x40049409, fd_in) }
+            unsafe { libc::ioctl(fd_out, FICLONE, fd_in) }
         } else {
             // Partial clone (FICLONERANGE)
             let range = FileCloneRange {
@@ -1532,7 +1535,7 @@ impl<S: BitmapSlice + Send + Sync> FileSystem for PassthroughFs<S> {
                 dest_offset: offset_out,
             };
             debug!("remap_file_range: using FICLONERANGE ioctl");
-            unsafe { libc::ioctl(fd_out, 0x4020940d, &range as *const FileCloneRange) }
+            unsafe { libc::ioctl(fd_out, FICLONERANGE, &range as *const FileCloneRange) }
         };
 
         if result < 0 {
@@ -1540,9 +1543,19 @@ impl<S: BitmapSlice + Send + Sync> FileSystem for PassthroughFs<S> {
             debug!("remap_file_range: ioctl failed: {:?}", err);
             Err(err)
         } else {
-            debug!("remap_file_range: success, result={}", result);
-            // Return the length that was cloned (0 for whole-file means success)
-            Ok(if len == 0 { 0 } else { len as usize })
+            // For whole-file clone (len=0), get actual size from source file
+            let cloned_len = if len == 0 {
+                let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+                if unsafe { libc::fstat(fd_in, &mut stat) } == 0 {
+                    stat.st_size as usize
+                } else {
+                    0
+                }
+            } else {
+                len as usize
+            };
+            debug!("remap_file_range: success, cloned {} bytes", cloned_len);
+            Ok(cloned_len)
         }
     }
 }
