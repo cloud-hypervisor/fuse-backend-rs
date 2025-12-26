@@ -868,6 +868,29 @@ pub trait FileSystem {
         Err(io::Error::from_raw_os_error(libc::ENOSYS))
     }
 
+    /// Copy a range of data from one file to another.
+    ///
+    /// Performs an optimized copy between two file descriptors. On filesystems
+    /// that support it (like btrfs), this creates a reflink (copy-on-write clone)
+    /// which is nearly instantaneous regardless of file size.
+    ///
+    /// Returns the number of bytes copied.
+    #[allow(clippy::too_many_arguments)]
+    fn copy_file_range(
+        &self,
+        ctx: &Context,
+        inode_in: Self::Inode,
+        handle_in: Self::Handle,
+        offset_in: u64,
+        inode_out: Self::Inode,
+        handle_out: Self::Handle,
+        offset_out: u64,
+        len: u64,
+        flags: u64,
+    ) -> io::Result<usize> {
+        Err(io::Error::from_raw_os_error(libc::ENOSYS))
+    }
+
     /// send ioctl to the file
     #[allow(clippy::too_many_arguments)]
     fn ioctl(

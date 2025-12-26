@@ -1425,6 +1425,47 @@ impl<S: BitmapSlice + Send + Sync> FileSystem for PassthroughFs<S> {
             Ok(res as u64)
         }
     }
+
+    fn copy_file_range(
+        &self,
+        _ctx: &Context,
+        inode_in: Inode,
+        handle_in: Handle,
+        offset_in: u64,
+        inode_out: Inode,
+        handle_out: Handle,
+        offset_out: u64,
+        len: u64,
+        flags: u64,
+    ) -> io::Result<usize> {
+        // Get file descriptors from handles
+        let data_in = self.handle_map.get(handle_in, inode_in)?;
+        let data_out = self.handle_map.get(handle_out, inode_out)?;
+
+        let (_guard_in, file_in) = data_in.get_file_mut();
+        let (_guard_out, file_out) = data_out.get_file_mut();
+
+        let mut off_in = offset_in as libc::off64_t;
+        let mut off_out = offset_out as libc::off64_t;
+
+        // Safe because we check the return value and the fds are valid
+        let result = unsafe {
+            libc::copy_file_range(
+                file_in.as_raw_fd(),
+                &mut off_in,
+                file_out.as_raw_fd(),
+                &mut off_out,
+                len as libc::size_t,
+                flags as libc::c_uint,
+            )
+        };
+
+        if result < 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(result as usize)
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1742,5 +1783,79 @@ mod tests {
         fs.no_opendir.store(true, Ordering::Relaxed);
 
         assert!(fs.fsyncdir(&ctx, ROOT_ID, false, 0).is_ok());
+    }
+
+    #[test]
+    fn test_copy_file_range() {
+        let (fs, source) = prepare_fs_tmpdir();
+        let ctx = prepare_context();
+
+        // Create source file with data (using std::fs for simplicity)
+        let test_data = b"Hello, copy_file_range!";
+        let src_path = source.as_path().join("source.txt");
+        let dst_path = source.as_path().join("dest.txt");
+        std::fs::write(&src_path, test_data).unwrap();
+        std::fs::write(&dst_path, b"").unwrap(); // Create empty destination
+
+        // Look up and open both files through the passthrough fs
+        let src_name = CString::new("source.txt").unwrap();
+        let src_entry = fs.lookup(&ctx, ROOT_ID, &src_name).unwrap();
+        let (src_handle, _, _) = fs
+            .open(&ctx, src_entry.inode, libc::O_RDWR as u32, 0)
+            .unwrap();
+        let src_handle = src_handle.expect("expected src handle");
+
+        let dst_name = CString::new("dest.txt").unwrap();
+        let dst_entry = fs.lookup(&ctx, ROOT_ID, &dst_name).unwrap();
+        let (dst_handle, _, _) = fs
+            .open(&ctx, dst_entry.inode, libc::O_RDWR as u32, 0)
+            .unwrap();
+        let dst_handle = dst_handle.expect("expected dst handle");
+
+        // Copy data from source to destination using copy_file_range
+        let copied = fs
+            .copy_file_range(
+                &ctx,
+                src_entry.inode,
+                src_handle,
+                0, // offset_in
+                dst_entry.inode,
+                dst_handle,
+                0, // offset_out
+                test_data.len() as u64,
+                0, // flags
+            )
+            .unwrap();
+        assert_eq!(copied, test_data.len());
+
+        // Sync and verify by reading directly from disk
+        fs.fsync(&ctx, dst_entry.inode, false, dst_handle).unwrap();
+        let result = std::fs::read(&dst_path).unwrap();
+        assert_eq!(&result, test_data);
+
+        // Test partial copy with offset
+        let offset = 7; // "Hello, " is 7 bytes
+        let partial_len = test_data.len() - offset;
+        let copied = fs
+            .copy_file_range(
+                &ctx,
+                src_entry.inode,
+                src_handle,
+                offset as u64,
+                dst_entry.inode,
+                dst_handle,
+                test_data.len() as u64, // append after existing data
+                partial_len as u64,
+                0,
+            )
+            .unwrap();
+        assert_eq!(copied, partial_len);
+
+        // Verify the appended data
+        fs.fsync(&ctx, dst_entry.inode, false, dst_handle).unwrap();
+        let result = std::fs::read(&dst_path).unwrap();
+        assert_eq!(result.len(), test_data.len() + partial_len);
+        assert_eq!(&result[..test_data.len()], test_data);
+        assert_eq!(&result[test_data.len()..], &test_data[offset..]);
     }
 }
