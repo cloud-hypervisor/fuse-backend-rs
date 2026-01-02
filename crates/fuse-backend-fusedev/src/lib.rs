@@ -121,7 +121,7 @@ impl<'a, S: BitmapSlice + Default> FuseDevReaderExt<'a, S> for Reader<'a, S> {
 /// 2. If the writer is split, a final commit() MUST be called to issue the
 ///    device write operation.
 /// 3. Concurrency, caller should not write to the writer concurrently.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug)]
 pub struct FuseDevWriter<'a, S: BitmapSlice = ()> {
     fd: RawFd,
     buffered: bool,
