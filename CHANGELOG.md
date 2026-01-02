@@ -46,6 +46,9 @@
   (guarded by `tests/legacy_paths.rs`), so existing imports and the
   `persist`/`async-io` feature names are unchanged, and snapshots stay
   byte-compatible.
+- [#221](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/221): `FuseDevWriter` no longer derives `PartialEq`/`Eq`; comparing two
+  writers for equality was never meaningful (they wrap a mutable reply buffer)
+  and no code in the workspace relied on it.
 
 ### Removed
 - [254](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/254): Drop the vestigial `vhost` and `virtio-bindings` dependencies that the
