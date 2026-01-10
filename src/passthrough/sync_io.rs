@@ -38,7 +38,20 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
             if !self.cfg.allow_direct_io && flags & libc::O_DIRECT != 0 {
                 new_flags &= !libc::O_DIRECT;
             }
-            data.open_file(new_flags | libc::O_CLOEXEC, &self.proc_self_fd)
+            // Try with promoted flags first. If that fails with EACCES (e.g., O_WRONLY
+            // promoted to O_RDWR but file has no read permission), fall back to original.
+            match data.open_file(new_flags | libc::O_CLOEXEC, &self.proc_self_fd) {
+                Ok(file) => Ok(file),
+                Err(e) if e.raw_os_error() == Some(libc::EACCES) && new_flags != flags => {
+                    // Promotion failed due to permissions, try original flags
+                    let mut orig_flags = flags;
+                    if !self.cfg.allow_direct_io && flags & libc::O_DIRECT != 0 {
+                        orig_flags &= !libc::O_DIRECT;
+                    }
+                    data.open_file(orig_flags | libc::O_CLOEXEC, &self.proc_self_fd)
+                }
+                Err(e) => Err(e),
+            }
         }
     }
 
