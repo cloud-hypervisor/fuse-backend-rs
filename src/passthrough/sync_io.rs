@@ -1510,8 +1510,8 @@ impl<S: BitmapSlice + Send + Sync> FileSystem for PassthroughFs<S> {
 
         // FICLONE = _IOW('9', 1, int) = 0x40049409
         // FICLONERANGE = _IOW('9', 13, struct file_clone_range) = 0x4020940d
-        const FICLONE: libc::c_ulong = 0x40049409;
-        const FICLONERANGE: libc::c_ulong = 0x4020940d;
+        const FICLONE: libc::Ioctl = 0x40049409;
+        const FICLONERANGE: libc::Ioctl = 0x4020940d;
 
         // struct file_clone_range from <linux/fs.h>
         #[repr(C)]
