@@ -188,7 +188,7 @@ impl<S: BitmapSlice> IoBuffers<'_, S> {
             };
             // Safe because we just change the interface to access underlying buffers.
             bufs.push(FileVolatileBuf::from_raw_ptr(
-                local_buf.as_ptr(),
+                local_buf.ptr_guard_mut().as_ptr(),
                 local_buf.len(),
                 local_buf.len(),
             ));
@@ -219,7 +219,7 @@ impl<S: BitmapSlice> IoBuffers<'_, S> {
                 buf.clone()
             };
             bufs.push(FileVolatileBuf::from_raw_ptr(
-                local_buf.as_ptr(),
+                local_buf.ptr_guard_mut().as_ptr(),
                 0,
                 local_buf.len(),
             ));

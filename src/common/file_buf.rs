@@ -17,13 +17,14 @@
 //! [tokio]: https://tokio.rs/
 //! [tokio-uring]: https://github.com/tokio-rs/tokio-uring
 
-use std::io::{IoSlice, IoSliceMut, Read, Write};
+use std::io::{IoSlice, IoSliceMut};
 use std::marker::PhantomData;
 use std::sync::atomic::Ordering;
 use std::{error, fmt, slice};
 
 use vm_memory::{
-    bitmap::BitmapSlice, volatile_memory::Error as VError, AtomicAccess, Bytes, VolatileSlice,
+    bitmap::BitmapSlice, volatile_memory::Error as VError, AtomicAccess, Bytes, ReadVolatile,
+    VolatileSlice, WriteVolatile,
 };
 
 /// Error codes related to buffer management.
@@ -125,8 +126,7 @@ impl<'a> FileVolatileSlice<'a> {
     /// [`vm_memory::BitmapSlice`]: https://docs.rs/vm-memory/latest/vm_memory/bitmap/trait.BitmapSlice.html
     /// [`vm_memory::VolatileSlice`]: https://docs.rs/vm-memory/latest/vm_memory/volatile_memory/struct.VolatileSlice.html
     pub fn from_volatile_slice<S: BitmapSlice>(s: &VolatileSlice<'a, S>) -> Self {
-        #[allow(deprecated)]
-        Self::new(s.as_ptr(), s.len())
+        Self::new(s.ptr_guard_mut().as_ptr(), s.len())
     }
 
     /// Create a [`vm_memory::VolatileSlice`] from [FileVolatileSlice] without dirty page tracking.
@@ -200,36 +200,47 @@ impl<'a> Bytes<usize> for FileVolatileSlice<'a> {
         VolatileSlice::write_slice(&self.as_volatile_slice(), buf, addr)
     }
 
-    fn read_from<F>(&self, addr: usize, src: &mut F, count: usize) -> Result<usize, Self::E>
+    fn read_volatile_from<F>(
+        &self,
+        addr: usize,
+        src: &mut F,
+        count: usize,
+    ) -> Result<usize, Self::E>
     where
-        F: Read,
+        F: ReadVolatile,
     {
-        #[allow(deprecated)]
-        VolatileSlice::read_from(&self.as_volatile_slice(), addr, src, count)
+        VolatileSlice::read_volatile_from(&self.as_volatile_slice(), addr, src, count)
     }
 
-    fn read_exact_from<F>(&self, addr: usize, src: &mut F, count: usize) -> Result<(), Self::E>
+    fn read_exact_volatile_from<F>(
+        &self,
+        addr: usize,
+        src: &mut F,
+        count: usize,
+    ) -> Result<(), Self::E>
     where
-        F: Read,
+        F: ReadVolatile,
     {
-        #[allow(deprecated)]
-        VolatileSlice::read_exact_from(&self.as_volatile_slice(), addr, src, count)
+        VolatileSlice::read_exact_volatile_from(&self.as_volatile_slice(), addr, src, count)
     }
 
-    fn write_to<F>(&self, addr: usize, dst: &mut F, count: usize) -> Result<usize, Self::E>
+    fn write_volatile_to<F>(&self, addr: usize, dst: &mut F, count: usize) -> Result<usize, Self::E>
     where
-        F: Write,
+        F: WriteVolatile,
     {
-        #[allow(deprecated)]
-        VolatileSlice::write_to(&self.as_volatile_slice(), addr, dst, count)
+        VolatileSlice::write_volatile_to(&self.as_volatile_slice(), addr, dst, count)
     }
 
-    fn write_all_to<F>(&self, addr: usize, dst: &mut F, count: usize) -> Result<(), Self::E>
+    fn write_all_volatile_to<F>(
+        &self,
+        addr: usize,
+        dst: &mut F,
+        count: usize,
+    ) -> Result<(), Self::E>
     where
-        F: Write,
+        F: WriteVolatile,
     {
-        #[allow(deprecated)]
-        VolatileSlice::write_all_to(&self.as_volatile_slice(), addr, dst, count)
+        VolatileSlice::write_all_volatile_to(&self.as_volatile_slice(), addr, dst, count)
     }
 
     fn store<T: AtomicAccess>(&self, val: T, addr: usize, order: Ordering) -> Result<(), Self::E> {
