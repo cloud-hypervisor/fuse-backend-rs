@@ -237,12 +237,12 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
 
         // kernel sends 0 as handle in case of no_open, and it depends on fuse server to handle
         // this case correctly.
-        let st = if !self.no_open.load(Ordering::Relaxed) && handle.is_some() {
-            // Safe as we just checked handle
-            let hd = self.handle_map.get(handle.unwrap(), inode)?;
-            stat_fd(hd.get_file(), None)
-        } else {
-            data.handle.stat()
+        let st = match (!self.no_open.load(Ordering::Relaxed), handle) {
+            (true, Some(h)) => {
+                let hd = self.handle_map.get(h, inode)?;
+                stat_fd(hd.get_file(), None)
+            }
+            _ => data.handle.stat(),
         };
 
         let st = st.map_err(|e| {
