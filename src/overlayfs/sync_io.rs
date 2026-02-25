@@ -80,7 +80,7 @@ impl FileSystem for OverlayFs {
         trace!("LOOKUP: parent: {}, name: {}\n", parent, tmp);
         let result = self.do_lookup(ctx, parent, tmp.as_str());
         if result.is_ok() {
-            trace!("LOOKUP result: {:?}", result.as_ref().unwrap());
+            trace!("LOOKUP result: {:?}", result.as_ref());
         }
         //self.debug_print_all_inodes();
         result
