@@ -797,6 +797,20 @@ pub trait AsyncFileSystem: FileSystem {
         Err(io::Error::from_raw_os_error(libc::ENOSYS))
     }
 
+    /// Reposition read/write file offset with a signed offset.
+    ///
+    /// Default implementation forwards to [`lseek`] for backward compatibility.
+    fn lseek_signed(
+        &self,
+        ctx: Context,
+        inode: Self::Inode,
+        handle: Self::Handle,
+        offset: i64,
+        whence: u32,
+    ) -> io::Result<u64> {
+        self.lseek(ctx, inode, handle, offset as u64, whence)
+    }
+
     /// TODO: support this
     fn getlk(&self) -> io::Result<()> {
         Err(io::Error::from_raw_os_error(libc::ENOSYS))

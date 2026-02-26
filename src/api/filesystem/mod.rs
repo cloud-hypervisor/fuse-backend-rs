@@ -383,7 +383,7 @@ pub trait ZeroCopyWriter: io::Write {
 }
 
 /// Additional context associated with requests.
-#[derive(Default, Clone, Copy, Debug)]
+#[derive(Default, Clone, Debug)]
 pub struct Context {
     /// The user ID of the calling process.
     pub uid: libc::uid_t,
@@ -393,6 +393,12 @@ pub struct Context {
 
     /// The thread group ID of the calling process.
     pub pid: libc::pid_t,
+
+    /// Supplementary groups of the calling process.
+    ///
+    /// When set, these groups are used directly instead of reading from /proc/<pid>/status.
+    /// This is essential for remote filesystems where the PID doesn't exist on the server.
+    pub supplementary_groups: Option<Vec<libc::gid_t>>,
 }
 
 impl Context {
@@ -408,6 +414,7 @@ impl From<&fuse::InHeader> for Context {
             uid: source.uid,
             gid: source.gid,
             pid: source.pid as i32,
+            supplementary_groups: None,
         }
     }
 }

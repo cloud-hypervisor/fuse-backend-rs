@@ -28,6 +28,8 @@ use std::time::Duration;
 
 use vm_memory::{bitmap::BitmapSlice, ByteValued};
 
+use crate::api::filesystem::Context;
+
 pub use self::config::{CachePolicy, Config};
 use self::file_handle::{FileHandle, OpenableFileHandle};
 use self::inode_store::{InodeId, InodeStore};
@@ -888,66 +890,207 @@ impl<S: BitmapSlice + Send + Sync + 'static> BackendFileSystem for PassthroughFs
     }
 }
 
-macro_rules! scoped_cred {
-    ($name:ident, $ty:ty, $syscall_nr:expr) => {
-        #[derive(Debug)]
-        pub(crate) struct $name;
-
-        impl $name {
-            // Changes the effective uid/gid of the current thread to `val`.  Changes
-            // the thread's credentials back to root when the returned struct is dropped.
-            fn new(val: $ty) -> io::Result<Option<$name>> {
-                if val == 0 {
-                    // Nothing to do since we are already uid 0.
-                    return Ok(None);
-                }
-
-                // We want credential changes to be per-thread because otherwise
-                // we might interfere with operations being carried out on other
-                // threads with different uids/gids.  However, posix requires that
-                // all threads in a process share the same credentials.  To do this
-                // libc uses signals to ensure that when one thread changes its
-                // credentials the other threads do the same thing.
-                //
-                // So instead we invoke the syscall directly in order to get around
-                // this limitation.  Another option is to use the setfsuid and
-                // setfsgid systems calls.   However since those calls have no way to
-                // return an error, it's preferable to do this instead.
-
-                // This call is safe because it doesn't modify any memory and we
-                // check the return value.
-                let res = unsafe { libc::syscall($syscall_nr, -1, val, -1) };
-                if res == 0 {
-                    Ok(Some($name))
-                } else {
-                    Err(io::Error::last_os_error())
-                }
-            }
-        }
-
-        impl Drop for $name {
-            fn drop(&mut self) {
-                let res = unsafe { libc::syscall($syscall_nr, -1, 0, -1) };
-                if res < 0 {
-                    error!(
-                        "fuse: failed to change credentials back to root: {}",
-                        io::Error::last_os_error(),
-                    );
-                }
-            }
-        }
-    };
+/// RAII guard for temporarily switching filesystem uid/gid credentials.
+///
+/// Uses setfsuid()/setfsgid() syscalls which ONLY affect filesystem access
+/// checks for the calling thread. Unlike setresuid/setresgid, these do NOT
+/// change the real/effective uid, so the process retains access to /proc/self/fd/.
+///
+/// This is critical because fuse-backend-rs internally uses readlinkat on
+/// /proc/self/fd/ to resolve inode paths - if we changed euid to non-root,
+/// those operations would fail with EACCES.
+///
+/// # Thread Safety
+///
+/// setfsuid() and setfsgid() are inherently per-thread on Linux - they do not
+/// use glibc's signal-based synchronization that setresuid/setresgid use to
+/// comply with POSIX. This makes them ideal for multi-threaded file servers
+/// that need to serve multiple users concurrently in different threads.
+///
+/// See: https://man7.org/linux/man-pages/man2/setfsuid.2.html
+/// See: https://stackoverflow.com/questions/1223600/change-uid-gid-only-of-one-thread-in-linux
+///
+/// # Supplementary Groups
+///
+/// FUSE protocol only passes uid and primary gid in requests, not supplementary groups.
+/// The caller must forward supplementary groups via the Context struct. We adopt them
+/// using setgroups() raw syscall for per-thread credential switching.
+#[derive(Debug)]
+pub(crate) struct ScopedCreds {
+    original_fsuid: libc::uid_t,
+    original_fsgid: libc::gid_t,
+    original_groups: Vec<libc::gid_t>,
 }
-scoped_cred!(ScopedUid, libc::uid_t, libc::SYS_setresuid);
-scoped_cred!(ScopedGid, libc::gid_t, libc::SYS_setresgid);
 
-fn set_creds(
-    uid: libc::uid_t,
-    gid: libc::gid_t,
-) -> io::Result<(Option<ScopedUid>, Option<ScopedGid>)> {
-    // We have to change the gid before we change the uid because if we change the uid first then we
-    // lose the capability to change the gid.  However changing back can happen in any order.
-    ScopedGid::new(gid).and_then(|gid| Ok((ScopedUid::new(uid)?, gid)))
+/// Thread-local setgroups using raw syscall.
+///
+/// IMPORTANT: We use the raw SYS_setgroups syscall instead of libc::setgroups()
+/// because glibc's NPTL wrapper signals ALL threads to change credentials for
+/// POSIX compliance. The raw kernel syscall is per-thread, which is what we need
+/// for a multi-threaded FUSE server where each thread handles different users.
+///
+/// See: https://man7.org/linux/man-pages/man7/nptl.7.html
+/// See: https://github.com/rfjakob/gocryptfs (uses same approach)
+unsafe fn setgroups_thread(groups: &[libc::gid_t]) -> libc::c_long {
+    libc::syscall(
+        libc::SYS_setgroups,
+        groups.len() as libc::size_t,
+        groups.as_ptr(),
+    )
+}
+
+/// Thread-local getgroups using raw syscall.
+///
+/// Like setgroups_thread, this uses the raw syscall to get per-thread groups.
+unsafe fn getgroups_thread(size: libc::c_int, list: *mut libc::gid_t) -> libc::c_long {
+    libc::syscall(libc::SYS_getgroups, size, list)
+}
+
+/// Get current supplementary groups for this thread
+fn get_current_groups() -> io::Result<Vec<libc::gid_t>> {
+    // First call with size 0 to get the actual count
+    let count = unsafe { getgroups_thread(0, std::ptr::null_mut()) };
+    if count < 0 {
+        return Err(io::Error::last_os_error());
+    }
+
+    if count == 0 {
+        return Ok(Vec::new());
+    }
+
+    let mut groups = vec![0 as libc::gid_t; count as usize];
+    let actual = unsafe { getgroups_thread(count as libc::c_int, groups.as_mut_ptr()) };
+    if actual < 0 {
+        return Err(io::Error::last_os_error());
+    }
+
+    groups.truncate(actual as usize);
+    Ok(groups)
+}
+
+impl ScopedCreds {
+    /// Switch filesystem credentials to the given uid/gid/groups.
+    /// Returns None if both uid and gid are 0 (already root).
+    ///
+    /// The `supplementary_groups` parameter allows passing supplementary groups
+    /// to adopt for the duration of the filesystem operation.
+    fn new(
+        uid: libc::uid_t,
+        gid: libc::gid_t,
+        supplementary_groups: Option<&[libc::gid_t]>,
+    ) -> io::Result<Option<ScopedCreds>> {
+        debug!("set_creds: switching to uid={} gid={}", uid, gid);
+        if uid == 0 && gid == 0 {
+            // Nothing to do since we are already uid/gid 0.
+            debug!("set_creds: uid=0 gid=0, nothing to do");
+            return Ok(None);
+        }
+
+        // Get current groups before we change anything
+        let original_groups = get_current_groups().unwrap_or_default();
+        debug!("set_creds: original_groups={:?}", original_groups);
+
+        // Use provided supplementary groups (required - caller must forward them)
+        let caller_groups = supplementary_groups.unwrap_or(&[]).to_vec();
+        debug!("set_creds: supplementary_groups={:?}", caller_groups);
+
+        // Set supplementary groups first (before dropping privileges)
+        // Use raw syscall for per-thread behavior (not glibc's process-wide wrapper)
+        if !caller_groups.is_empty() {
+            let ret = unsafe { setgroups_thread(&caller_groups) };
+            if ret < 0 {
+                let err = io::Error::last_os_error();
+                debug!("set_creds: setgroups({:?}) failed: {}", caller_groups, err);
+                // Don't fail - continue without supplementary groups
+                // This can happen if we don't have CAP_SETGID
+            } else {
+                debug!("set_creds: setgroups({:?}) succeeded", caller_groups);
+            }
+        }
+
+        // setfsuid/setfsgid return the PREVIOUS value, not an error code.
+        // To detect errors, we call twice: first to set, then to verify.
+
+        // Change gid first (same reason as before - changing uid might drop privileges)
+        let original_fsgid = unsafe { libc::setfsgid(gid) } as libc::gid_t;
+        // Verify the change took effect
+        let verify_gid = unsafe { libc::setfsgid(gid) } as libc::gid_t;
+        debug!(
+            "set_creds: setfsgid({}) returned original={} verify={}",
+            gid, original_fsgid, verify_gid
+        );
+        if verify_gid != gid {
+            // Restore groups and return error
+            if !original_groups.is_empty() {
+                unsafe { setgroups_thread(&original_groups) };
+            }
+            unsafe { libc::setfsgid(original_fsgid) };
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!("setfsgid({}) failed, got {}", gid, verify_gid),
+            ));
+        }
+
+        // Now change uid
+        let original_fsuid = unsafe { libc::setfsuid(uid) } as libc::uid_t;
+        // Verify the change took effect
+        let verify_uid = unsafe { libc::setfsuid(uid) } as libc::uid_t;
+        debug!(
+            "set_creds: setfsuid({}) returned original={} verify={}",
+            uid, original_fsuid, verify_uid
+        );
+        if verify_uid != uid {
+            // Restore all and return error
+            if !original_groups.is_empty() {
+                unsafe { setgroups_thread(&original_groups) };
+            }
+            unsafe { libc::setfsgid(original_fsgid) };
+            unsafe { libc::setfsuid(original_fsuid) };
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!("setfsuid({}) failed, got {}", uid, verify_uid),
+            ));
+        }
+
+        debug!(
+            "set_creds: success, original_fsuid={} original_fsgid={}",
+            original_fsuid, original_fsgid
+        );
+        Ok(Some(ScopedCreds {
+            original_fsuid,
+            original_fsgid,
+            original_groups,
+        }))
+    }
+}
+
+impl Drop for ScopedCreds {
+    fn drop(&mut self) {
+        // Restore original credentials (order: uid first, then gid, then groups)
+        // Restore uid first so we have privileges to restore groups
+        unsafe { libc::setfsuid(self.original_fsuid) };
+        unsafe { libc::setfsgid(self.original_fsgid) };
+        // Restore supplementary groups using raw syscall for per-thread behavior
+        if !self.original_groups.is_empty() {
+            unsafe { setgroups_thread(&self.original_groups) };
+        } else {
+            // If we had no groups originally, clear them
+            unsafe { setgroups_thread(&[]) };
+        }
+    }
+}
+
+/// Switch filesystem credentials to the given uid/gid.
+/// This is the upstream-compatible API that doesn't handle supplementary groups.
+#[allow(dead_code)]
+fn set_creds(uid: libc::uid_t, gid: libc::gid_t) -> io::Result<Option<ScopedCreds>> {
+    ScopedCreds::new(uid, gid, None)
+}
+
+/// Switch filesystem credentials from Context.
+/// Uses supplementary_groups from Context if available.
+fn set_creds_from_context(ctx: &Context) -> io::Result<Option<ScopedCreds>> {
+    ScopedCreds::new(ctx.uid, ctx.gid, ctx.supplementary_groups.as_deref())
 }
 
 struct CapFsetid {}
@@ -961,9 +1104,11 @@ impl Drop for CapFsetid {
 }
 
 fn drop_cap_fsetid() -> io::Result<Option<CapFsetid>> {
-    if !caps::has_cap(None, caps::CapSet::Effective, caps::Capability::CAP_FSETID)
-        .map_err(|_e| io::Error::new(io::ErrorKind::PermissionDenied, "no CAP_FSETID capability"))?
-    {
+    // Use unwrap_or(false) instead of propagating error - if we can't check
+    // capabilities, assume we don't have them and continue without error
+    let has_cap =
+        caps::has_cap(None, caps::CapSet::Effective, caps::Capability::CAP_FSETID).unwrap_or(false);
+    if !has_cap {
         return Ok(None);
     }
     caps::drop(None, caps::CapSet::Effective, caps::Capability::CAP_FSETID).map_err(|_e| {

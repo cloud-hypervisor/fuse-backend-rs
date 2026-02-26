@@ -813,6 +813,22 @@ pub trait FileSystem {
         Err(io::Error::from_raw_os_error(libc::ENOSYS))
     }
 
+    /// Reposition read/write file offset with a signed offset.
+    ///
+    /// Default implementation forwards to [`lseek`] for backward compatibility.
+    /// Filesystems that need negative offsets (e.g. SEEK_END) can override this
+    /// to receive the signed value directly.
+    fn lseek_signed(
+        &self,
+        ctx: &Context,
+        inode: Self::Inode,
+        handle: Self::Handle,
+        offset: i64,
+        whence: u32,
+    ) -> io::Result<u64> {
+        self.lseek(ctx, inode, handle, offset as u64, whence)
+    }
+
     /// Query file lock status
     fn getlk(
         &self,
@@ -849,6 +865,53 @@ pub trait FileSystem {
         lock: FileLock,
         flags: u32,
     ) -> io::Result<()> {
+        Err(io::Error::from_raw_os_error(libc::ENOSYS))
+    }
+
+    /// Copy a range of data from one file to another.
+    ///
+    /// Performs an optimized copy between two file descriptors. On filesystems
+    /// that support it (like btrfs), this creates a reflink (copy-on-write clone)
+    /// which is nearly instantaneous regardless of file size.
+    ///
+    /// Returns the number of bytes copied.
+    #[allow(clippy::too_many_arguments)]
+    fn copy_file_range(
+        &self,
+        ctx: &Context,
+        inode_in: Self::Inode,
+        handle_in: Self::Handle,
+        offset_in: u64,
+        inode_out: Self::Inode,
+        handle_out: Self::Handle,
+        offset_out: u64,
+        len: u64,
+        flags: u64,
+    ) -> io::Result<usize> {
+        Err(io::Error::from_raw_os_error(libc::ENOSYS))
+    }
+
+    /// Remap file ranges (FICLONE/FICLONERANGE) for copy-on-write filesystems.
+    ///
+    /// This is the server-side implementation of the FUSE_REMAP_FILE_RANGE opcode,
+    /// which enables FICLONE and FICLONERANGE ioctls through FUSE. On btrfs and
+    /// other CoW filesystems, this creates reflinks - instant copies that share
+    /// the same physical storage until modified.
+    ///
+    /// Returns the number of bytes remapped.
+    #[allow(clippy::too_many_arguments)]
+    fn remap_file_range(
+        &self,
+        ctx: &Context,
+        inode_in: Self::Inode,
+        handle_in: Self::Handle,
+        offset_in: u64,
+        inode_out: Self::Inode,
+        handle_out: Self::Handle,
+        offset_out: u64,
+        len: u64,
+        flags: u32,
+    ) -> io::Result<usize> {
         Err(io::Error::from_raw_os_error(libc::ENOSYS))
     }
 
@@ -1263,6 +1326,18 @@ impl<FS: FileSystem> FileSystem for Arc<FS> {
         self.deref().lseek(ctx, inode, handle, offset, whence)
     }
 
+    fn lseek_signed(
+        &self,
+        ctx: &Context,
+        inode: Self::Inode,
+        handle: Self::Handle,
+        offset: i64,
+        whence: u32,
+    ) -> io::Result<u64> {
+        self.deref()
+            .lseek_signed(ctx, inode, handle, offset, whence)
+    }
+
     /// Query file lock status
     fn getlk(
         &self,
@@ -1351,5 +1426,41 @@ impl<FS: FileSystem> FileSystem for Arc<FS> {
     #[inline]
     fn id_remap(&self, ctx: &mut Context) -> io::Result<()> {
         self.deref().id_remap(ctx)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn copy_file_range(
+        &self,
+        ctx: &Context,
+        inode_in: Self::Inode,
+        handle_in: Self::Handle,
+        offset_in: u64,
+        inode_out: Self::Inode,
+        handle_out: Self::Handle,
+        offset_out: u64,
+        len: u64,
+        flags: u64,
+    ) -> io::Result<usize> {
+        self.deref().copy_file_range(
+            ctx, inode_in, handle_in, offset_in, inode_out, handle_out, offset_out, len, flags,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn remap_file_range(
+        &self,
+        ctx: &Context,
+        inode_in: Self::Inode,
+        handle_in: Self::Handle,
+        offset_in: u64,
+        inode_out: Self::Inode,
+        handle_out: Self::Handle,
+        offset_out: u64,
+        len: u64,
+        flags: u32,
+    ) -> io::Result<usize> {
+        self.deref().remap_file_range(
+            ctx, inode_in, handle_in, offset_in, inode_out, handle_out, offset_out, len, flags,
+        )
     }
 }
