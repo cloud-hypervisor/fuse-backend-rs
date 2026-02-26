@@ -1,6 +1,15 @@
 # Changelog
 ## [Unreleased]
 
+## [0.14.0]
+### Added
+- [261](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/216): feat(fusedev): add try_with_writer on FuseSession
+
+### Fixed
+
+### Removed
+- [222](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/222): Drop virtiofs DAX support as it never made it to the spec
+
 ## [0.13.0]
 ### Added
 - [187](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/187): Feat/support fuse resend notify
