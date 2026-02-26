@@ -1,6 +1,17 @@
 # Changelog
 ## [Unreleased]
 
+## [0.13.0]
+### Added
+- [187](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/187): Feat/support fuse resend notify
+- [211](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/211): Add notify_inval_inode and extend get_rootfs to return fs_idx for umount
+
+### Fixed
+- [189](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/189): fix by_id not free when use_host_ino=true
+- [191](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/191): fix request size too large when use direct io
+- [205](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/205): Fix: unable to perform sync on directory
+- [212](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/212): Fix fuse out header len in notify_resend
+
 ## [0.12.0]
 ### Added
 - [156](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/156): Fuse OverlayFs implementation.
