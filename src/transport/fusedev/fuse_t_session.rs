@@ -285,7 +285,7 @@ impl FuseChannel {
                         return Err(IoError(e.into()));
                     }
                     Errno::ENODEV => {
-                        info!("fuse filesystem umounted");
+                        debug!("got ENODEV when reading fuse fd, assuming fuse filesystem was umounted.");
                         return Ok(());
                     }
                     e => {
