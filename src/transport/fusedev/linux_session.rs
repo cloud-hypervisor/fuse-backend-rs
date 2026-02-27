@@ -349,7 +349,7 @@ impl FuseChannel {
                         }
                     }
                 } else if event.is_error() {
-                    info!("FUSE channel already closed!");
+                    debug!("FUSE channel already closed!");
                     return Err(SessionFailure("epoll error".to_string()));
                 } else {
                     // We should not step into this branch as other event is not registered.
