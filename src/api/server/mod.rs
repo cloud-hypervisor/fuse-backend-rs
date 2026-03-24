@@ -112,10 +112,13 @@ impl<S: BitmapSlice> io::Write for ZcWriter<'_, S> {
     }
 }
 
-#[allow(dead_code)]
-struct ServerVersion {
-    major: u32,
-    minor: u32,
+/// The major and minor version number of the FUSE ABI
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ServerVersion {
+    /// The major version number of the FUSE ABI
+    pub major: u32,
+    /// The minor version number of the FUSE ABI
+    pub minor: u32,
 }
 
 struct ServerUtil();
@@ -158,10 +161,23 @@ impl ServerUtil {
     }
 }
 
+/// Holds information of the handshake that happened between kernel and
+/// userspace.
+pub struct InitParams {
+    /// Version of the FUSE ABI
+    pub version: ServerVersion,
+    /// Indicates the features supported by the kernel module
+    pub capable: FsOptions,
+    /// Indicates the features that we requested
+    pub want: FsOptions,
+}
+
 /// Provide concrete backend filesystem a way to catch information/metrics from fuse.
 pub trait MetricsHook {
     /// `collect()` will be invoked before the real request is processed
     fn collect(&self, ih: &InHeader);
+    /// `on_init_params()` will be called with some agreed connection parameters
+    fn on_init_params(&self, _init_params: &InitParams) {}
     /// `release()` will be invoked after the real request is processed
     fn release(&self, oh: Option<&OutHeader>);
 }

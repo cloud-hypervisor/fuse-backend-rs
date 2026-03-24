@@ -18,7 +18,7 @@ use crate::api::filesystem::{
     AsyncFileSystem, AsyncZeroCopyReader, AsyncZeroCopyWriter, ZeroCopyReader, ZeroCopyWriter,
 };
 use crate::api::server::{
-    MetricsHook, Server, ServerUtil, SrvContext, BUFFER_HEADER_SIZE, MAX_BUFFER_SIZE,
+    InitParams, MetricsHook, Server, ServerUtil, SrvContext, BUFFER_HEADER_SIZE, MAX_BUFFER_SIZE,
 };
 use crate::file_traits::{AsyncFileReadWriteVolatile, FileReadWriteVolatile};
 use crate::transport::{FsCacheReqHandler, Reader, Writer};
@@ -169,7 +169,11 @@ impl<F: AsyncFileSystem + Sync> Server<F> {
             x if x == Opcode::Listxattr as u32 => self.listxattr(ctx),
             x if x == Opcode::Removexattr as u32 => self.removexattr(ctx),
             x if x == Opcode::Flush as u32 => self.flush(ctx),
-            x if x == Opcode::Init as u32 => self.init(ctx),
+            x if x == Opcode::Init as u32 => self.init(ctx, |init_params: &InitParams| {
+                if let Some(h) = hook {
+                    h.on_init_params(init_params);
+                }
+            }),
             x if x == Opcode::Opendir as u32 => self.opendir(ctx),
             x if x == Opcode::Readdir as u32 => self.readdir(ctx),
             x if x == Opcode::Releasedir as u32 => self.releasedir(ctx),
