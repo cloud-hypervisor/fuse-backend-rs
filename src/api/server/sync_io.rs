@@ -10,7 +10,7 @@ use std::time::Duration;
 use vm_memory::ByteValued;
 
 use super::{
-    MetricsHook, Server, ServerUtil, ServerVersion, SrvContext, ZcReader, ZcWriter,
+    InitParams, MetricsHook, Server, ServerUtil, ServerVersion, SrvContext, ZcReader, ZcWriter,
     BUFFER_HEADER_SIZE, DIRENT_PADDING, MAX_BUFFER_SIZE, MAX_REQ_PAGES, MIN_READ_BUFFER,
 };
 use crate::abi::fuse_abi::*;
@@ -172,7 +172,11 @@ impl<F: FileSystem + Sync> Server<F> {
             x if x == Opcode::Listxattr as u32 => self.listxattr(ctx),
             x if x == Opcode::Removexattr as u32 => self.removexattr(ctx),
             x if x == Opcode::Flush as u32 => self.flush(ctx),
-            x if x == Opcode::Init as u32 => self.init(ctx),
+            x if x == Opcode::Init as u32 => self.init(ctx, |init_params: &InitParams| {
+                if let Some(h) = hook {
+                    h.on_init_params(init_params);
+                }
+            }),
             x if x == Opcode::Opendir as u32 => self.opendir(ctx),
             x if x == Opcode::Readdir as u32 => self.readdir(ctx),
             x if x == Opcode::Releasedir as u32 => self.releasedir(ctx),
@@ -708,7 +712,11 @@ impl<F: FileSystem + Sync> Server<F> {
         }
     }
 
-    pub(super) fn init<S: BitmapSlice>(&self, mut ctx: SrvContext<'_, F, S>) -> Result<usize> {
+    pub(super) fn init<S: BitmapSlice>(
+        &self,
+        mut ctx: SrvContext<'_, F, S>,
+        mut on_init_params: impl FnMut(&InitParams),
+    ) -> Result<usize> {
         let InitIn {
             major,
             minor,
@@ -745,11 +753,12 @@ impl<F: FileSystem + Sync> Server<F> {
 
         match self.fs.init(capable) {
             Ok(want) => {
-                let enabled = capable & want;
-                debug!(
-                    "FUSE INIT major {} minor {}\n in_opts: {:?}\nout_opts: {:?}",
-                    major, minor, capable, enabled
-                );
+                let version = ServerVersion { major, minor };
+                on_init_params(&InitParams {
+                    version: version.clone(),
+                    capable,
+                    want,
+                });
 
                 let readahead = if cfg!(target_os = "macos") {
                     0
@@ -757,6 +766,7 @@ impl<F: FileSystem + Sync> Server<F> {
                     max_readahead
                 };
 
+                let enabled = capable & want;
                 let enabled_flags = enabled.bits();
                 let mut out = InitOut {
                     major: KERNEL_VERSION,
@@ -778,8 +788,7 @@ impl<F: FileSystem + Sync> Server<F> {
                     out.max_pages = MAX_REQ_PAGES;
                     out.max_write = MAX_REQ_PAGES as u32 * pagesize() as u32; // 1MB
                 }
-                let vers = ServerVersion { major, minor };
-                self.vers.store(Arc::new(vers));
+                self.vers.store(Arc::new(version));
                 if minor < KERNEL_MINOR_VERSION_INIT_OUT_SIZE {
                     ctx.reply_ok(
                         Some(
@@ -1472,7 +1481,9 @@ mod tests {
             let mut write_buf = [0u8; 4096];
             let (ctx, _file) = prepare_srvcontext(&mut read_buf, &mut write_buf);
 
-            let res = server.init(ctx).unwrap();
+            let res = server
+                .init(ctx, |_| unreachable!("shouldn't be called"))
+                .unwrap();
             assert_eq!(res, 80);
 
             let mut read_buf1 = [
@@ -1484,7 +1495,16 @@ mod tests {
             let mut write_buf1 = [0u8; 4096];
             let (ctx1, _file) = prepare_srvcontext(&mut read_buf1, &mut write_buf1);
 
-            let res = server.init(ctx1).unwrap();
+            let mut init_params_called = false;
+            let res = server
+                .init(ctx1, |init_params| {
+                    assert_eq!(init_params.version.major, 0x0007);
+                    assert_eq!(init_params.version.minor, 0x0000);
+                    init_params_called = true
+                })
+                .unwrap();
+            assert!(init_params_called);
+
             assert_eq!(res, 24);
         }
 
