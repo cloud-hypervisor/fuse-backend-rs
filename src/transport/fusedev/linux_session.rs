@@ -57,6 +57,7 @@ pub struct FuseSession {
     target_mntns: Option<libc::pid_t>,
     // fusermount binary, default to fusermount3
     fusermount: String,
+    mount_flags: Option<MsFlags>,
 }
 
 impl FuseSession {
@@ -98,6 +99,7 @@ impl FuseSession {
             target_mntns: None,
             fusermount: FUSERMOUNT_BIN.to_string(),
             allow_other: true,
+            mount_flags: None,
         })
     }
 
@@ -132,6 +134,21 @@ impl FuseSession {
     /// Force setting the associated FUSE session file.
     pub fn set_fuse_file(&mut self, file: File) {
         self.file = Some(file);
+    }
+
+    /// Set custom mount flags for the session.
+    /// If not set, default flags (MS_NOSUID | MS_NODEV | MS_NOATIME) will be
+    /// used. MS_RDONLY will be added automatically if the session is readonly.
+    /// Not setting MS_NOSUID and MS_NODEV will probably get ignored by
+    /// fusermount3 for security reasons, so it means you need to be root to
+    /// mount the FS.
+    pub fn set_mount_flags(&mut self, flags: MsFlags) {
+        self.mount_flags = Some(flags);
+    }
+
+    /// Get the currently configured mount flags, or None if using defaults.
+    pub fn get_mount_flags(&self) -> Option<MsFlags> {
+        self.mount_flags
     }
 
     /// Clone fuse file using ioctl FUSE_DEV_IOC_CLONE.
@@ -185,7 +202,9 @@ impl FuseSession {
 
     /// Mount the fuse mountpoint, building connection with the in kernel fuse driver.
     pub fn mount(&mut self) -> Result<()> {
-        let mut flags = MsFlags::MS_NOSUID | MsFlags::MS_NODEV | MsFlags::MS_NOATIME;
+        let mut flags = self.mount_flags.unwrap_or(
+            MsFlags::MS_NOSUID | MsFlags::MS_NODEV | MsFlags::MS_NOATIME
+        );
         if self.readonly {
             flags |= MsFlags::MS_RDONLY;
         }
