@@ -38,7 +38,20 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
             if !self.cfg.allow_direct_io && flags & libc::O_DIRECT != 0 {
                 new_flags &= !libc::O_DIRECT;
             }
-            data.open_file(new_flags | libc::O_CLOEXEC, &self.proc_self_fd)
+            // Try with promoted flags first. If that fails with EACCES (e.g., O_WRONLY
+            // promoted to O_RDWR but file has no read permission), fall back to original.
+            match data.open_file(new_flags | libc::O_CLOEXEC, &self.proc_self_fd) {
+                Ok(file) => Ok(file),
+                Err(e) if e.raw_os_error() == Some(libc::EACCES) && new_flags != flags => {
+                    // Promotion failed due to permissions, try original flags
+                    let mut orig_flags = flags;
+                    if !self.cfg.allow_direct_io && flags & libc::O_DIRECT != 0 {
+                        orig_flags &= !libc::O_DIRECT;
+                    }
+                    data.open_file(orig_flags | libc::O_CLOEXEC, &self.proc_self_fd)
+                }
+                Err(e) => Err(e),
+            }
         }
     }
 
@@ -365,11 +378,13 @@ impl<S: BitmapSlice + Send + Sync> FileSystem for PassthroughFs<S> {
         }
     }
 
-    fn lookup(&self, _ctx: &Context, parent: Inode, name: &CStr) -> io::Result<Entry> {
+    fn lookup(&self, ctx: &Context, parent: Inode, name: &CStr) -> io::Result<Entry> {
         // Don't use is_safe_path_component(), allow "." and ".." for NFS export support
         if name.to_bytes_with_nul().contains(&SLASH_ASCII) {
             return Err(einval());
         }
+        // Switch to caller's credentials for directory search permission check
+        let _creds = set_creds_from_context(ctx)?;
         self.do_lookup(parent, name)
     }
 
@@ -389,7 +404,7 @@ impl<S: BitmapSlice + Send + Sync> FileSystem for PassthroughFs<S> {
 
     fn opendir(
         &self,
-        _ctx: &Context,
+        ctx: &Context,
         inode: Inode,
         flags: u32,
     ) -> io::Result<(Option<Handle>, OpenOptions)> {
@@ -397,6 +412,8 @@ impl<S: BitmapSlice + Send + Sync> FileSystem for PassthroughFs<S> {
             info!("fuse: opendir is not supported.");
             Err(enosys())
         } else {
+            // Switch to caller's credentials for permission check
+            let _creds = set_creds_from_context(ctx)?;
             self.do_open(inode, flags | (libc::O_DIRECTORY as u32), 0)
                 .map(|(a, b, _)| (a, b))
         }
@@ -429,13 +446,11 @@ impl<S: BitmapSlice + Send + Sync> FileSystem for PassthroughFs<S> {
 
         let data = self.inode_map.get(parent)?;
 
-        let res = {
-            let (_uid, _gid) = set_creds(ctx.uid, ctx.gid)?;
-
-            let file = data.get_file()?;
-            // Safe because this doesn't modify any memory and we check the return value.
-            unsafe { libc::mkdirat(file.as_raw_fd(), name.as_ptr(), mode & !umask) }
-        };
+        let file = data.get_file()?;
+        // Switch to caller's credentials so the directory is owned by them
+        let _creds = set_creds_from_context(ctx)?;
+        // Safe because this doesn't modify any memory and we check the return value.
+        let res = unsafe { libc::mkdirat(file.as_raw_fd(), name.as_ptr(), mode & !umask) };
         if res < 0 {
             return Err(io::Error::last_os_error());
         }
@@ -443,8 +458,10 @@ impl<S: BitmapSlice + Send + Sync> FileSystem for PassthroughFs<S> {
         self.do_lookup(parent, name)
     }
 
-    fn rmdir(&self, _ctx: &Context, parent: Inode, name: &CStr) -> io::Result<()> {
+    fn rmdir(&self, ctx: &Context, parent: Inode, name: &CStr) -> io::Result<()> {
         self.validate_path_component(name)?;
+        // Switch to caller's credentials for permission check
+        let _creds = set_creds_from_context(ctx)?;
         self.do_unlink(parent, name, libc::AT_REMOVEDIR)
     }
 
@@ -519,7 +536,7 @@ impl<S: BitmapSlice + Send + Sync> FileSystem for PassthroughFs<S> {
 
     fn open(
         &self,
-        _ctx: &Context,
+        ctx: &Context,
         inode: Inode,
         flags: u32,
         fuse_flags: u32,
@@ -528,6 +545,8 @@ impl<S: BitmapSlice + Send + Sync> FileSystem for PassthroughFs<S> {
             info!("fuse: open is not supported.");
             Err(enosys())
         } else {
+            // Switch to caller's credentials for permission check
+            let _creds = set_creds_from_context(ctx)?;
             self.do_open(inode, flags, fuse_flags)
         }
     }
@@ -561,12 +580,11 @@ impl<S: BitmapSlice + Send + Sync> FileSystem for PassthroughFs<S> {
         let dir = self.inode_map.get(parent)?;
         let dir_file = dir.get_file()?;
 
-        let new_file = {
-            let (_uid, _gid) = set_creds(ctx.uid, ctx.gid)?;
-
-            let flags = self.get_writeback_open_flags(args.flags as i32);
-            Self::create_file_excl(&dir_file, name, flags, args.mode & !(args.umask & 0o777))?
-        };
+        let flags = self.get_writeback_open_flags(args.flags as i32);
+        // Switch to caller's credentials so the file is owned by them
+        let _creds = set_creds_from_context(ctx)?;
+        let new_file =
+            Self::create_file_excl(&dir_file, name, flags, args.mode & !(args.umask & 0o777))?;
 
         let entry = self.do_lookup(parent, name)?;
         let file = match new_file {
@@ -584,7 +602,6 @@ impl<S: BitmapSlice + Send + Sync> FileSystem for PassthroughFs<S> {
                     None
                 };
 
-                let (_uid, _gid) = set_creds(ctx.uid, ctx.gid)?;
                 self.open_inode(entry.inode, args.flags as i32)?
             }
         };
@@ -610,8 +627,10 @@ impl<S: BitmapSlice + Send + Sync> FileSystem for PassthroughFs<S> {
         Ok((entry, ret_handle, opts, None))
     }
 
-    fn unlink(&self, _ctx: &Context, parent: Inode, name: &CStr) -> io::Result<()> {
+    fn unlink(&self, ctx: &Context, parent: Inode, name: &CStr) -> io::Result<()> {
         self.validate_path_component(name)?;
+        // Switch to caller's credentials for permission check
+        let _creds = set_creds_from_context(ctx)?;
         self.do_unlink(parent, name, 0)
     }
 
@@ -680,7 +699,7 @@ impl<S: BitmapSlice + Send + Sync> FileSystem for PassthroughFs<S> {
 
     fn write(
         &self,
-        _ctx: &Context,
+        ctx: &Context,
         inode: Inode,
         handle: Handle,
         r: &mut dyn ZeroCopyReader,
@@ -691,6 +710,23 @@ impl<S: BitmapSlice + Send + Sync> FileSystem for PassthroughFs<S> {
         flags: u32,
         fuse_flags: u32,
     ) -> io::Result<usize> {
+        debug!(
+            "write: inode={} handle={} size={} uid={} gid={}",
+            inode, handle, size, ctx.uid, ctx.gid
+        );
+        // Switch to caller's credentials for the write operation.
+        // This is needed for proper SUID/SGID bit handling when a non-owner writes.
+        let _creds = match set_creds_from_context(ctx) {
+            Ok(c) => {
+                debug!("write: set_creds succeeded");
+                c
+            }
+            Err(e) => {
+                debug!("write: set_creds FAILED: {:?}", e);
+                return Err(e);
+            }
+        };
+
         let data = self.get_data(handle, inode, libc::O_RDWR)?;
 
         // Manually implement File::try_clone() by borrowing fd of data.file instead of dup().
@@ -729,12 +765,14 @@ impl<S: BitmapSlice + Send + Sync> FileSystem for PassthroughFs<S> {
 
     fn setattr(
         &self,
-        _ctx: &Context,
+        ctx: &Context,
         inode: Inode,
         attr: libc::stat64,
         handle: Option<Handle>,
         valid: SetattrValid,
     ) -> io::Result<(libc::stat64, Duration)> {
+        let no_open_val = self.no_open.load(Ordering::Relaxed);
+        debug!(target: "passthrough", "setattr inode={} handle={:?} valid={:?} no_open={}", inode, handle, valid, no_open_val);
         let inode_data = self.inode_map.get(inode)?;
 
         enum Data {
@@ -764,6 +802,44 @@ impl<S: BitmapSlice + Send + Sync> FileSystem for PassthroughFs<S> {
         }
 
         if valid.contains(SetattrValid::MODE) {
+            // Get current mode to detect SUID/SGID clearing
+            let current_mode = {
+                let mut st: libc::stat64 = unsafe { std::mem::zeroed() };
+                let res = unsafe {
+                    match &data {
+                        Data::Handle(h) => libc::fstat64(h.borrow_fd().as_raw_fd(), &mut st),
+                        Data::ProcPath(p) => {
+                            libc::fstatat64(self.proc_self_fd.as_raw_fd(), p.as_ptr(), &mut st, 0)
+                        }
+                    }
+                };
+                if res < 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                st.st_mode
+            };
+
+            // Check if this is SUID/SGID clearing by the kernel (happens on write by non-owner)
+            // The kernel sends SETATTR with the new mode = old mode with S_ISUID/S_ISGID cleared.
+            // In this case, we should NOT switch credentials because:
+            // 1. The operation is kernel-initiated, not user-initiated
+            // 2. The writing user doesn't have permission to chmod (they're not the owner)
+            // 3. The SUID/SGID clearing must succeed for POSIX compliance
+            let old_special_bits = current_mode & (libc::S_ISUID | libc::S_ISGID);
+            let new_special_bits = attr.st_mode & (libc::S_ISUID | libc::S_ISGID);
+            let is_suid_sgid_clearing = old_special_bits != 0
+                && new_special_bits == 0
+                && (current_mode & 0o777) == (attr.st_mode & 0o777);
+
+            let _creds = if is_suid_sgid_clearing {
+                // Kernel clearing SUID/SGID - do as root
+                None
+            } else {
+                // User-initiated chmod - switch to caller's credentials for permission check
+                // (only file owner or root can chmod)
+                Some(set_creds_from_context(ctx)?)
+            };
+
             // Safe because this doesn't modify any memory and we check the return value.
             let res = unsafe {
                 match data {
@@ -795,6 +871,10 @@ impl<S: BitmapSlice + Send + Sync> FileSystem for PassthroughFs<S> {
             // Safe because this is a constant value and a valid C string.
             let empty = unsafe { CStr::from_bytes_with_nul_unchecked(EMPTY_CSTR) };
 
+            // Switch to caller's credentials for permission check
+            // (only root can change owner, owner can change group)
+            let _creds = set_creds_from_context(ctx)?;
+
             // Safe because this doesn't modify any memory and we check the return value.
             let res = unsafe {
                 libc::fchownat(
@@ -822,10 +902,17 @@ impl<S: BitmapSlice + Send + Sync> FileSystem for PassthroughFs<S> {
 
             // Safe because this doesn't modify any memory and we check the return value.
             let res = match data {
-                Data::Handle(ref h) => unsafe {
-                    libc::ftruncate(h.borrow_fd().as_raw_fd(), attr.st_size)
-                },
+                Data::Handle(ref h) => {
+                    // ftruncate on an already-opened fd doesn't re-check file permissions.
+                    // The permission was validated when the fd was opened, so we don't
+                    // switch credentials here - ftruncate should succeed if the fd has
+                    // write access, regardless of current file mode.
+                    unsafe { libc::ftruncate(h.borrow_fd().as_raw_fd(), attr.st_size) }
+                }
                 _ => {
+                    // No file handle - need to open the file, which requires permission check.
+                    // Switch to caller's credentials for this case.
+                    let _creds = set_creds_from_context(ctx)?;
                     // There is no `ftruncateat` so we need to get a new fd and truncate it.
                     let f = self.open_inode(inode, libc::O_NONBLOCK | libc::O_RDWR)?;
                     unsafe { libc::ftruncate(f.as_raw_fd(), attr.st_size) }
@@ -862,6 +949,10 @@ impl<S: BitmapSlice + Send + Sync> FileSystem for PassthroughFs<S> {
                 tvs[1].tv_nsec = attr.st_mtime_nsec;
             }
 
+            // Switch to caller's credentials for permission check
+            // (utimensat requires write permission or ownership)
+            let _creds = set_creds_from_context(ctx)?;
+
             // Safe because this doesn't modify any memory and we check the return value.
             let res = match data {
                 Data::Handle(ref h) => unsafe {
@@ -881,7 +972,7 @@ impl<S: BitmapSlice + Send + Sync> FileSystem for PassthroughFs<S> {
 
     fn rename(
         &self,
-        _ctx: &Context,
+        ctx: &Context,
         olddir: Inode,
         oldname: &CStr,
         newdir: Inode,
@@ -895,6 +986,9 @@ impl<S: BitmapSlice + Send + Sync> FileSystem for PassthroughFs<S> {
         let new_inode = self.inode_map.get(newdir)?;
         let old_file = old_inode.get_file()?;
         let new_file = new_inode.get_file()?;
+
+        // Switch to caller's credentials for permission check
+        let _creds = set_creds_from_context(ctx)?;
 
         // Safe because this doesn't modify any memory and we check the return value.
         // TODO: Switch to libc::renameat2 once https://github.com/rust-lang/libc/pull/1508 lands
@@ -930,18 +1024,16 @@ impl<S: BitmapSlice + Send + Sync> FileSystem for PassthroughFs<S> {
         let data = self.inode_map.get(parent)?;
         let file = data.get_file()?;
 
-        let res = {
-            let (_uid, _gid) = set_creds(ctx.uid, ctx.gid)?;
-
-            // Safe because this doesn't modify any memory and we check the return value.
-            unsafe {
-                libc::mknodat(
-                    file.as_raw_fd(),
-                    name.as_ptr(),
-                    (mode & !umask) as libc::mode_t,
-                    u64::from(rdev),
-                )
-            }
+        // Switch to caller's credentials so the node is owned by them
+        let _creds = set_creds_from_context(ctx)?;
+        // Safe because this doesn't modify any memory and we check the return value.
+        let res = unsafe {
+            libc::mknodat(
+                file.as_raw_fd(),
+                name.as_ptr(),
+                (mode & !umask) as libc::mode_t,
+                u64::from(rdev),
+            )
         };
         if res < 0 {
             Err(io::Error::last_os_error())
@@ -966,6 +1058,12 @@ impl<S: BitmapSlice + Send + Sync> FileSystem for PassthroughFs<S> {
 
         // Safe because this is a constant value and a valid C string.
         let empty = unsafe { CStr::from_bytes_with_nul_unchecked(EMPTY_CSTR) };
+
+        // NOTE: We do NOT call set_creds() here because:
+        // 1. linkat with AT_EMPTY_PATH requires CAP_DAC_READ_SEARCH capability
+        // 2. set_creds() drops to non-root uid which loses CAP_DAC_READ_SEARCH
+        // 3. Permission checks should be done by the kernel via default_permissions
+        //    mount option before the LINK request reaches the FUSE server
 
         // Safe because this doesn't modify any memory and we check the return value.
         let res = unsafe {
@@ -994,14 +1092,12 @@ impl<S: BitmapSlice + Send + Sync> FileSystem for PassthroughFs<S> {
         self.validate_path_component(name)?;
 
         let data = self.inode_map.get(parent)?;
+        let file = data.get_file()?;
 
-        let res = {
-            let (_uid, _gid) = set_creds(ctx.uid, ctx.gid)?;
-
-            let file = data.get_file()?;
-            // Safe because this doesn't modify any memory and we check the return value.
-            unsafe { libc::symlinkat(linkname.as_ptr(), file.as_raw_fd(), name.as_ptr()) }
-        };
+        // Switch to caller's credentials so the symlink is owned by them
+        let _creds = set_creds_from_context(ctx)?;
+        // Safe because this doesn't modify any memory and we check the return value.
+        let res = unsafe { libc::symlinkat(linkname.as_ptr(), file.as_raw_fd(), name.as_ptr()) };
         if res == 0 {
             self.do_lookup(parent, name)
         } else {
@@ -1311,6 +1407,17 @@ impl<S: BitmapSlice + Send + Sync> FileSystem for PassthroughFs<S> {
         offset: u64,
         whence: u32,
     ) -> io::Result<u64> {
+        self.lseek_signed(_ctx, inode, handle, offset as i64, whence)
+    }
+
+    fn lseek_signed(
+        &self,
+        _ctx: &Context,
+        inode: Inode,
+        handle: Handle,
+        offset: i64,
+        whence: u32,
+    ) -> io::Result<u64> {
         // Let the Arc<HandleData> in scope, otherwise fd may get invalid.
         let data = self.handle_map.get(handle, inode)?;
 
@@ -1329,6 +1436,139 @@ impl<S: BitmapSlice + Send + Sync> FileSystem for PassthroughFs<S> {
             Err(io::Error::last_os_error())
         } else {
             Ok(res as u64)
+        }
+    }
+
+    fn copy_file_range(
+        &self,
+        _ctx: &Context,
+        inode_in: Inode,
+        handle_in: Handle,
+        offset_in: u64,
+        inode_out: Inode,
+        handle_out: Handle,
+        offset_out: u64,
+        len: u64,
+        flags: u64,
+    ) -> io::Result<usize> {
+        // Get file descriptors from handles
+        let data_in = self.handle_map.get(handle_in, inode_in)?;
+        let data_out = self.handle_map.get(handle_out, inode_out)?;
+
+        let (_guard_in, file_in) = data_in.get_file_mut();
+        let (_guard_out, file_out) = data_out.get_file_mut();
+
+        let mut off_in = offset_in as libc::off64_t;
+        let mut off_out = offset_out as libc::off64_t;
+
+        // Safe because we check the return value and the fds are valid
+        let result = unsafe {
+            libc::copy_file_range(
+                file_in.as_raw_fd(),
+                &mut off_in,
+                file_out.as_raw_fd(),
+                &mut off_out,
+                len as libc::size_t,
+                flags as libc::c_uint,
+            )
+        };
+
+        if result < 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(result as usize)
+        }
+    }
+
+    fn remap_file_range(
+        &self,
+        _ctx: &Context,
+        inode_in: Inode,
+        handle_in: Handle,
+        offset_in: u64,
+        inode_out: Inode,
+        handle_out: Handle,
+        offset_out: u64,
+        len: u64,
+        flags: u32,
+    ) -> io::Result<usize> {
+        debug!(
+            "remap_file_range: ino_in={} fh_in={} ino_out={} fh_out={} len={} flags={}",
+            inode_in, handle_in, inode_out, handle_out, len, flags
+        );
+
+        // Get file descriptors from handles
+        let data_in = match self.handle_map.get(handle_in, inode_in) {
+            Ok(d) => d,
+            Err(e) => {
+                debug!("remap_file_range: handle_map.get(in) failed: {:?}", e);
+                return Err(e);
+            }
+        };
+        let data_out = match self.handle_map.get(handle_out, inode_out) {
+            Ok(d) => d,
+            Err(e) => {
+                debug!("remap_file_range: handle_map.get(out) failed: {:?}", e);
+                return Err(e);
+            }
+        };
+
+        let (_guard_in, file_in) = data_in.get_file_mut();
+        let (_guard_out, file_out) = data_out.get_file_mut();
+
+        let fd_in = file_in.as_raw_fd();
+        let fd_out = file_out.as_raw_fd();
+
+        debug!("remap_file_range: fd_in={} fd_out={}", fd_in, fd_out);
+
+        // FICLONE = _IOW('9', 1, int) = 0x40049409
+        // FICLONERANGE = _IOW('9', 13, struct file_clone_range) = 0x4020940d
+        const FICLONE: libc::Ioctl = 0x40049409;
+        const FICLONERANGE: libc::Ioctl = 0x4020940d;
+
+        // struct file_clone_range from <linux/fs.h>
+        #[repr(C)]
+        struct FileCloneRange {
+            src_fd: i64,
+            src_offset: u64,
+            src_length: u64,
+            dest_offset: u64,
+        }
+
+        let result = if len == 0 && offset_in == 0 && offset_out == 0 && flags == 0 {
+            // Whole-file clone (FICLONE)
+            debug!("remap_file_range: using FICLONE ioctl");
+            unsafe { libc::ioctl(fd_out, FICLONE, fd_in) }
+        } else {
+            // Partial clone (FICLONERANGE)
+            let range = FileCloneRange {
+                src_fd: fd_in as i64,
+                src_offset: offset_in,
+                src_length: len,
+                dest_offset: offset_out,
+            };
+            debug!("remap_file_range: using FICLONERANGE ioctl");
+            unsafe { libc::ioctl(fd_out, FICLONERANGE, &range as *const FileCloneRange) }
+        };
+
+        if result < 0 {
+            let err = io::Error::last_os_error();
+            debug!("remap_file_range: ioctl failed: {:?}", err);
+            Err(err)
+        } else {
+            // For whole-file clone (len=0), get actual size from source file
+            let cloned_len = if len == 0 {
+                let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+                if unsafe { libc::fstat(fd_in, &mut stat) } == 0 {
+                    stat.st_size as usize
+                } else {
+                    0
+                }
+            } else {
+                len as usize
+            };
+            debug!("remap_file_range: success, cloned {} bytes", cloned_len);
+            Ok(cloned_len)
         }
     }
 }
@@ -1621,11 +1861,196 @@ mod tests {
     }
 
     #[test]
+    fn test_lseek_signed_negative_offset() {
+        let (fs, source) = prepare_fs_tmpdir();
+        let ctx = prepare_context();
+
+        let path = source.as_path().join("seek.txt");
+        std::fs::write(&path, b"abcdef").unwrap();
+
+        let name = CString::new("seek.txt").unwrap();
+        let entry = fs.lookup(&ctx, ROOT_ID, &name).unwrap();
+        let (handle, _, _) = fs
+            .open(&ctx, entry.inode, libc::O_RDONLY as u32, 0)
+            .unwrap();
+        let handle = handle.expect("expected handle");
+
+        let offset = fs
+            .lseek_signed(&ctx, entry.inode, handle, -2, libc::SEEK_END as u32)
+            .unwrap();
+        assert_eq!(offset, 4);
+    }
+
+    #[test]
     fn test_fsync_dir() {
         let (fs, _source) = prepare_fs_tmpdir();
         let ctx = prepare_context();
         fs.no_opendir.store(true, Ordering::Relaxed);
 
         assert!(fs.fsyncdir(&ctx, ROOT_ID, false, 0).is_ok());
+    }
+
+    #[test]
+    fn test_copy_file_range() {
+        let (fs, source) = prepare_fs_tmpdir();
+        let ctx = prepare_context();
+
+        // Create source file with data (using std::fs for simplicity)
+        let test_data = b"Hello, copy_file_range!";
+        let src_path = source.as_path().join("source.txt");
+        let dst_path = source.as_path().join("dest.txt");
+        std::fs::write(&src_path, test_data).unwrap();
+        std::fs::write(&dst_path, b"").unwrap(); // Create empty destination
+
+        // Look up and open both files through the passthrough fs
+        let src_name = CString::new("source.txt").unwrap();
+        let src_entry = fs.lookup(&ctx, ROOT_ID, &src_name).unwrap();
+        let (src_handle, _, _) = fs
+            .open(&ctx, src_entry.inode, libc::O_RDWR as u32, 0)
+            .unwrap();
+        let src_handle = src_handle.expect("expected src handle");
+
+        let dst_name = CString::new("dest.txt").unwrap();
+        let dst_entry = fs.lookup(&ctx, ROOT_ID, &dst_name).unwrap();
+        let (dst_handle, _, _) = fs
+            .open(&ctx, dst_entry.inode, libc::O_RDWR as u32, 0)
+            .unwrap();
+        let dst_handle = dst_handle.expect("expected dst handle");
+
+        // Copy data from source to destination using copy_file_range
+        let copied = fs
+            .copy_file_range(
+                &ctx,
+                src_entry.inode,
+                src_handle,
+                0, // offset_in
+                dst_entry.inode,
+                dst_handle,
+                0, // offset_out
+                test_data.len() as u64,
+                0, // flags
+            )
+            .unwrap();
+        assert_eq!(copied, test_data.len());
+
+        // Sync and verify by reading directly from disk
+        fs.fsync(&ctx, dst_entry.inode, false, dst_handle).unwrap();
+        let result = std::fs::read(&dst_path).unwrap();
+        assert_eq!(&result, test_data);
+
+        // Test partial copy with offset
+        let offset = 7; // "Hello, " is 7 bytes
+        let partial_len = test_data.len() - offset;
+        let copied = fs
+            .copy_file_range(
+                &ctx,
+                src_entry.inode,
+                src_handle,
+                offset as u64,
+                dst_entry.inode,
+                dst_handle,
+                test_data.len() as u64, // append after existing data
+                partial_len as u64,
+                0,
+            )
+            .unwrap();
+        assert_eq!(copied, partial_len);
+
+        // Verify the appended data
+        fs.fsync(&ctx, dst_entry.inode, false, dst_handle).unwrap();
+        let result = std::fs::read(&dst_path).unwrap();
+        assert_eq!(result.len(), test_data.len() + partial_len);
+        assert_eq!(&result[..test_data.len()], test_data);
+        assert_eq!(&result[test_data.len()..], &test_data[offset..]);
+    }
+
+    /// Test that Arc<PassthroughFs> properly delegates all FileSystem methods.
+    ///
+    /// This catches a subtle bug where the `impl<FS: FileSystem> FileSystem for Arc<FS>`
+    /// blanket implementation might forget to delegate a method, causing it to use
+    /// the default trait implementation (which returns ENOSYS) instead.
+    #[test]
+    fn test_arc_delegates_filesystem_methods() {
+        let (fs, source) = prepare_fs_tmpdir();
+        let arc_fs = Arc::new(fs);
+        let ctx = prepare_context();
+
+        // Create test files for copy/remap operations
+        let src_name = CString::new("arc_test_src.txt").unwrap();
+        let dst_name = CString::new("arc_test_dst.txt").unwrap();
+        let test_data = b"Arc delegation test data";
+
+        let args = CreateIn {
+            flags: libc::O_RDWR as u32,
+            mode: 0o644,
+            umask: 0,
+            fuse_flags: 0,
+        };
+
+        // Test basic operations through Arc - these should work, not return ENOSYS
+        let (src_entry, src_handle, _, _) = arc_fs.create(&ctx, ROOT_ID, &src_name, args).unwrap();
+        let src_handle = src_handle.unwrap();
+
+        // Write test data
+        let src_path = source.as_path().join("arc_test_src.txt");
+        std::fs::write(&src_path, test_data).unwrap();
+
+        let (dst_entry, dst_handle, _, _) = arc_fs.create(&ctx, ROOT_ID, &dst_name, args).unwrap();
+        let dst_handle = dst_handle.unwrap();
+
+        // Test copy_file_range through Arc - should NOT return ENOSYS
+        let result = arc_fs.copy_file_range(
+            &ctx,
+            src_entry.inode,
+            src_handle,
+            0,
+            dst_entry.inode,
+            dst_handle,
+            0,
+            test_data.len() as u64,
+            0,
+        );
+        // copy_file_range should succeed or fail with a real error, never ENOSYS
+        match &result {
+            Ok(_) => {} // Success
+            Err(e) => {
+                assert_ne!(
+                    e.raw_os_error(),
+                    Some(libc::ENOSYS),
+                    "Arc<FS> must delegate copy_file_range, not use default ENOSYS impl"
+                );
+            }
+        }
+
+        // Test remap_file_range through Arc - should NOT return ENOSYS
+        // On tmpfs this will return EOPNOTSUPP or EINVAL (no reflink support),
+        // but it should NEVER return ENOSYS (which would mean missing delegation)
+        let result = arc_fs.remap_file_range(
+            &ctx,
+            src_entry.inode,
+            src_handle,
+            0,
+            dst_entry.inode,
+            dst_handle,
+            0,
+            0, // len=0 means whole file
+            0,
+        );
+        match &result {
+            Ok(_) => {} // Success (would require btrfs/xfs with reflink)
+            Err(e) => {
+                assert_ne!(
+                    e.raw_os_error(),
+                    Some(libc::ENOSYS),
+                    "Arc<FS> must delegate remap_file_range, not use default ENOSYS impl. \
+                     Got ENOSYS which means the Arc<FS> blanket impl is missing this method."
+                );
+                // Expected: EOPNOTSUPP (95) or EINVAL (22) on tmpfs
+            }
+        }
+
+        // Cleanup
+        arc_fs.release(&ctx, src_entry.inode, 0, src_handle, true, true, None).unwrap();
+        arc_fs.release(&ctx, dst_entry.inode, 0, dst_handle, true, true, None).unwrap();
     }
 }
