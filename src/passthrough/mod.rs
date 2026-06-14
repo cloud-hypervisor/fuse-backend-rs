@@ -986,6 +986,29 @@ impl ScopedCreds {
             return Ok(None);
         }
 
+        // Capability gate (rootless support, #683): the per-request fs-credential switch
+        // below uses setfsuid/setfsgid, which only take effect with CAP_SETUID/CAP_SETGID.
+        // When fcvm runs ROOTLESS the volume server is the unprivileged user (no caps), so
+        // setfsuid is a silent no-op and the verify-and-hard-fail below returns
+        // PermissionDenied — which the fuse-pipe server maps to EIO, breaking non-root reads
+        // of --map'd volumes (e.g. nginx's worker → HTTP 500). Skip the switch when we lack
+        // the caps: the op then runs as the server's own uid (which owns the mapped files),
+        // and the guest FUSE mount uses DefaultPermissions so the guest kernel already
+        // enforces the real POSIX DAC against the forwarded uid/gid before the request
+        // reaches us. Privileged paths (root / bridged / pjdfstest run the server as root)
+        // keep the caps, so the switch and full POSIX enforcement are unchanged there.
+        let can_setid = caps::has_cap(None, caps::CapSet::Effective, caps::Capability::CAP_SETUID)
+            .unwrap_or(false)
+            && caps::has_cap(None, caps::CapSet::Effective, caps::Capability::CAP_SETGID)
+                .unwrap_or(false);
+        if !can_setid {
+            debug!(
+                "set_creds: lacking CAP_SETUID/CAP_SETGID (rootless), skipping fs-cred \
+                 switch; op runs as server uid"
+            );
+            return Ok(None);
+        }
+
         // Get current groups before we change anything
         let original_groups = get_current_groups().unwrap_or_default();
         debug!("set_creds: original_groups={:?}", original_groups);
