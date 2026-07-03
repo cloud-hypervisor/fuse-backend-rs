@@ -554,10 +554,10 @@ impl Vfs {
             // If id_mapping is enabled, map the internal ID to the external ID.
             if let Some((internal_id, external_id, range)) = self.id_mapping {
                 if entry.attr.st_uid >= internal_id && entry.attr.st_uid < internal_id + range {
-                    entry.attr.st_uid += external_id - internal_id;
+                    entry.attr.st_uid = entry.attr.st_uid - internal_id + external_id;
                 }
                 if entry.attr.st_gid >= internal_id && entry.attr.st_gid < internal_id + range {
-                    entry.attr.st_gid += external_id - internal_id;
+                    entry.attr.st_gid = entry.attr.st_gid - internal_id + external_id;
                 }
             }
             *entry
@@ -572,29 +572,31 @@ impl Vfs {
     /// to VFS internal IDs.
     fn remap_attr_id(&self, map_internal_to_external: bool, attr: &mut stat64) {
         if let Some((internal_id, external_id, range)) = self.id_mapping {
+            // Subtract the (guaranteed <=) base before adding the target base so the
+            // arithmetic never underflows regardless of which base is larger.
             if map_internal_to_external
                 && attr.st_uid >= internal_id
                 && attr.st_uid < internal_id + range
             {
-                attr.st_uid += external_id - internal_id;
+                attr.st_uid = attr.st_uid - internal_id + external_id;
             }
             if map_internal_to_external
                 && attr.st_gid >= internal_id
                 && attr.st_gid < internal_id + range
             {
-                attr.st_gid += external_id - internal_id;
+                attr.st_gid = attr.st_gid- internal_id + external_id;
             }
             if !map_internal_to_external
                 && attr.st_uid >= external_id
                 && attr.st_uid < external_id + range
             {
-                attr.st_uid += internal_id - external_id;
+                attr.st_uid = attr.st_uid - external_id + internal_id;
             }
             if !map_internal_to_external
                 && attr.st_gid >= external_id
                 && attr.st_gid < external_id + range
             {
-                attr.st_gid += internal_id - external_id;
+                attr.st_gid = attr.st_gid - external_id + internal_id;
             }
         }
     }
@@ -1495,6 +1497,102 @@ mod tests {
             assert_eq!(opts.killpriv_v2, false);
         }
         assert_eq!(opts.out_opts, out_opts & in_opts);
+    }
+
+    #[test]
+    fn test_id_mapping_disabled_by_default() {
+        // range == 0 means the mapping is disabled.
+        let vfs = Vfs::new(VfsOptions::default());
+        assert!(vfs.id_mapping.is_none());
+
+        let opts = VfsOptions {
+            id_mapping: (0, 100000, 0),
+            ..Default::default()
+        };
+        let vfs = Vfs::new(opts);
+        assert!(vfs.id_mapping.is_none());
+    }
+
+    #[test]
+    fn test_remap_attr_id() {
+        let opts = VfsOptions {
+            id_mapping: (0, 100000, 65536),
+            ..Default::default()
+        };
+        let vfs = Vfs::new(opts);
+        assert_eq!(vfs.id_mapping, Some((0, 100000, 65536)));
+
+        // internal -> external: image root (0) is presented to the host as 100000.
+        let mut attr: stat64 = unsafe { std::mem::zeroed() };
+        attr.st_uid = 0;
+        attr.st_gid = 0;
+        vfs.remap_attr_id(true, &mut attr);
+        assert_eq!(attr.st_uid, 100000);
+        assert_eq!(attr.st_gid, 100000);
+
+        // external -> internal: host 100000 maps back to image root (0).
+        let mut attr: stat64 = unsafe { std::mem::zeroed() };
+        attr.st_uid = 100000;
+        attr.st_gid = 100000;
+        vfs.remap_attr_id(false, &mut attr);
+        assert_eq!(attr.st_uid, 0);
+        assert_eq!(attr.st_gid, 0);
+
+        // Boundary: last id in range (internal 65535 -> external 165535) is mapped,
+        // but one past the range (65536) is left untouched.
+        let mut attr: stat64 = unsafe { std::mem::zeroed() };
+        attr.st_uid = 65535;
+        attr.st_gid = 65536;
+        vfs.remap_attr_id(true, &mut attr);
+        assert_eq!(attr.st_uid, 165535);
+        assert_eq!(attr.st_gid, 65536);
+    }
+
+    #[test]
+    fn test_remap_attr_id_noop_when_disabled() {
+        let vfs = Vfs::new(VfsOptions::default());
+        let mut attr: stat64 = unsafe { std::mem::zeroed() };
+        attr.st_uid = 0;
+        attr.st_gid = 0;
+        vfs.remap_attr_id(true, &mut attr);
+        assert_eq!(attr.st_uid, 0);
+        assert_eq!(attr.st_gid, 0);
+    }
+
+    #[test]
+    fn test_convert_entry_remaps_ids_without_underflow() {
+        // Reverse config (internal > external): the old `+= external - internal`
+        // form would panic in debug builds on subtract overflow. The reordered
+        // form relies on the range-check guarantee that st_uid >= internal_id,
+        // so `st_uid - internal_id` never underflows.
+        let opts = VfsOptions {
+            id_mapping: (100000, 0, 65536),
+            ..Default::default()
+        };
+        let vfs = Vfs::new(opts);
+
+        let mut entry = Entry {
+            inode: 1,
+            generation: 0,
+            attr: unsafe { std::mem::zeroed() },
+            attr_flags: 0,
+            attr_timeout: Duration::from_secs(0),
+            entry_timeout: Duration::from_secs(0),
+        };
+        entry.attr.st_uid = 100000;
+        entry.attr.st_gid = 165535;
+
+        vfs.convert_entry(0, 1, &mut entry).unwrap();
+        // internal 100000 -> external 0, last in range 165535 -> 65535
+        assert_eq!(entry.attr.st_uid, 0);
+        assert_eq!(entry.attr.st_gid, 65535);
+
+        // ID outside the mapped range is left untouched.
+        entry.attr.st_uid = 65536;
+        entry.attr.st_gid = 65536;
+        vfs.convert_entry(0, 1, &mut entry).unwrap();
+        assert_eq!(entry.attr.st_uid, 65536);
+        assert_eq!(entry.attr.st_gid, 65536);
     }
 
     #[test]
