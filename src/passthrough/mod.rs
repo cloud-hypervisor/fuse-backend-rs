@@ -1063,7 +1063,7 @@ mod tests {
         };
         let fs = PassthroughFs::<()>::new(fs_cfg.clone()).unwrap();
         fs.import().unwrap();
-        vfs.mount(Box::new(fs), "/submnt/A").unwrap();
+        vfs.mount(Box::new(fs), "/submnt/A", None).unwrap();
 
         let (p_fs, _) = vfs.get_rootfs("/submnt/A").unwrap().unwrap();
         let any_fs = p_fs.deref().as_any();

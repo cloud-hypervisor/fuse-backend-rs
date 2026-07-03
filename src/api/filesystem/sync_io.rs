@@ -904,7 +904,9 @@ pub trait FileSystem {
     }
 
     /// Remap the external IDs in context to internal IDs.
-    fn id_remap(&self, ctx: &mut Context) -> io::Result<()> {
+    /// `nodeid` is the FUSE inode number, which may encode a filesystem index
+    /// (e.g. VfsInode) allowing per-mount id_mapping lookup.
+    fn id_remap(&self, ctx: &mut Context, _nodeid: Self::Inode) -> io::Result<()> {
         Ok(())
     }
 }
@@ -1354,7 +1356,7 @@ impl<FS: FileSystem> FileSystem for Arc<FS> {
     }
 
     #[inline]
-    fn id_remap(&self, ctx: &mut Context) -> io::Result<()> {
-        self.deref().id_remap(ctx)
+    fn id_remap(&self, ctx: &mut Context, nodeid: Self::Inode) -> io::Result<()> {
+        self.deref().id_remap(ctx, nodeid)
     }
 }

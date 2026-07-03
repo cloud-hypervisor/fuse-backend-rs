@@ -54,7 +54,7 @@ impl Daemon {
         fs.import().unwrap();
 
         // attach passthrough fs to vfs root
-        vfs.mount(Box::new(fs), "/").unwrap();
+        vfs.mount(Box::new(fs), "/", None).unwrap();
 
         Ok(Daemon {
             mountpoint: mountpoint.to_string(),

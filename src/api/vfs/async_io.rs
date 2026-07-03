@@ -44,7 +44,7 @@ impl AsyncFileSystem for Vfs {
                     .await
                     .map(|(mut attr, duration)| {
                         attr.st_ino = idata.into();
-                        self.remap_attr_id(true, &mut attr);
+                        self.remap_attr_id(idata.fs_idx(), true, &mut attr);
                         (attr, duration)
                     })
             }
@@ -63,12 +63,12 @@ impl AsyncFileSystem for Vfs {
             (Left(fs), idata) => fs.setattr(ctx, idata.ino(), attr, handle, valid),
             (Right(fs), idata) => {
                 let mut attr = attr;
-                self.remap_attr_id(false, &mut attr);
+                self.remap_attr_id(idata.fs_idx(), false, &mut attr);
                 fs.async_setattr(ctx, idata.ino(), attr, handle, valid)
                     .await
                     .map(|(mut attr, duration)| {
                         attr.st_ino = idata.into();
-                        self.remap_attr_id(true, &mut attr);
+                        self.remap_attr_id(idata.fs_idx(), true, &mut attr);
                         (attr, duration)
                     })
             }
@@ -239,7 +239,7 @@ mod tests {
             pid: 0,
         };
 
-        assert!(vfs.mount(Box::new(fs), "/x/y").is_ok());
+        assert!(vfs.mount(Box::new(fs), "/x/y", None).is_ok());
 
         let handle = tokio::spawn(async move {
             // Lookup inode on pseudo file system.
