@@ -648,10 +648,10 @@ impl FileSystem for Vfs {
         // If id_mapping is enabled, map the external ID to the internal ID.
         if let Some((internal_id, external_id, range)) = self.id_mapping {
             if ctx.uid >= external_id && ctx.uid < external_id + range {
-                ctx.uid += internal_id - external_id;
+                ctx.uid = ctx.uid - external_id + internal_id;
             }
             if ctx.gid >= external_id && ctx.gid < external_id + range {
-                ctx.gid += internal_id - external_id;
+                ctx.gid = ctx.gid - external_id + internal_id;
             }
         }
 
@@ -692,5 +692,28 @@ impl FileSystem for Vfs {
             (Left(fs), idata) => fs.removemapping(ctx, idata.ino(), requests, req),
             (Right(fs), idata) => fs.removemapping(ctx, idata.ino(), requests, req),
         }
+    }
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_id_remap_reverse_direction_without_underflow() {
+        let vfs = Vfs::new(VfsOptions {
+            id_mapping: (0, 100000, 65536),
+            ..Default::default()
+        });
+
+        let mut ctx = Context {
+            uid: 100000,
+            gid: 100123,
+            pid: 1,
+        };
+
+        vfs.id_remap(&mut ctx).unwrap();
+
+        assert_eq!(ctx.uid, 0);
+        assert_eq!(ctx.gid, 123);
     }
 }
