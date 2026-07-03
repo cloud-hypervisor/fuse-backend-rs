@@ -319,6 +319,8 @@ pub struct Vfs {
     mountpoints: ArcSwap<HashMap<u64, Arc<MountPointData>>>,
     // superblocks keeps track of all mounted file systems
     superblocks: ArcSuperBlock,
+    // per-mount id_mapping, indexed by fs_idx (parallel to superblocks)
+    mount_id_mappings: ArcSwap<Vec<Option<(u32, u32, u32)>>>,
     opts: ArcSwap<VfsOptions>,
     initialized: AtomicBool,
     lock: Mutex<()>,
@@ -339,6 +341,7 @@ impl Vfs {
             next_super: AtomicU8::new(VFS_PSEUDO_FS_IDX + 1),
             mountpoints: ArcSwap::new(Arc::new(HashMap::new())),
             superblocks: ArcSwap::new(Arc::new(vec![None; MAX_VFS_INDEX])),
+            mount_id_mappings: ArcSwap::new(Arc::new(vec![None; MAX_VFS_INDEX])),
             root: PseudoFs::new(),
             opts: ArcSwap::new(Arc::new(opts)),
             lock: Mutex::new(()),
@@ -405,7 +408,12 @@ impl Vfs {
     }
 
     /// Mount a backend file system to path
-    pub fn mount(&self, fs: BackFileSystem, path: &str) -> VfsResult<VfsIndex> {
+    pub fn mount(
+        &self,
+        fs: BackFileSystem,
+        path: &str,
+        id_mapping: Option<(u32, u32, u32)>,
+    ) -> VfsResult<VfsIndex> {
         let (entry, ino) = fs.mount().map_err(VfsError::Mount)?;
         if ino > VFS_MAX_INO {
             fs.destroy();
@@ -423,6 +431,13 @@ impl Vfs {
             })?;
         }
         let index = self.allocate_fs_idx().map_err(VfsError::FsIndex)?;
+        // Store per-mount id_mapping before insert_mount_locked so that
+        // convert_entry during insertion can use it.
+        if id_mapping.is_some() {
+            let mut mappings = self.mount_id_mappings.load().deref().deref().clone();
+            mappings[index as usize] = id_mapping;
+            self.mount_id_mappings.store(Arc::new(mappings));
+        }
         self.insert_mount_locked(fs, entry, index, path)
             .map_err(VfsError::Mount)?;
 
@@ -431,7 +446,13 @@ impl Vfs {
 
     /// Restore a backend file system to path
     #[cfg(feature = "persist")]
-    pub fn restore_mount(&self, fs: BackFileSystem, fs_idx: VfsIndex, path: &str) -> Result<()> {
+    pub fn restore_mount(
+        &self,
+        fs: BackFileSystem,
+        fs_idx: VfsIndex,
+        path: &str,
+        id_mapping: Option<(u32, u32, u32)>,
+    ) -> Result<()> {
         let (entry, ino) = fs.mount()?;
         if ino > VFS_MAX_INO {
             return Err(Error::other(format!(
@@ -441,6 +462,11 @@ impl Vfs {
         }
 
         let _guard = self.lock.lock().unwrap();
+
+        let mut mappings = self.mount_id_mappings.load().deref().deref().clone();
+        mappings[fs_idx as usize] = id_mapping;
+        self.mount_id_mappings.store(Arc::new(mappings));
+
         self.insert_mount_locked(fs, entry, fs_idx, path)
     }
 
@@ -492,6 +518,11 @@ impl Vfs {
             fs.destroy();
         }
         self.superblocks.store(Arc::new(superblocks));
+
+        // Clear per-mount id_mapping for this slot.
+        let mut mappings = self.mount_id_mappings.load().deref().deref().clone();
+        mappings[fs_idx as usize] = None;
+        self.mount_id_mappings.store(Arc::new(mappings));
 
         Ok((inode, parent))
     }
@@ -547,12 +578,28 @@ impl Vfs {
         Ok(ino)
     }
 
+    /// Returns the per-mount id_mapping for `fs_idx`, falling back to the
+    /// global `id_mapping` when no per-mount override is set (or when
+    /// `fs_idx` refers to the pseudo filesystem).
+    fn get_effective_id_mapping(&self, fs_idx: VfsIndex) -> Option<(u32, u32, u32)> {
+        if let Some(m) = self
+            .mount_id_mappings
+            .load()
+            .get(fs_idx as usize)
+            .copied()
+            .flatten()
+        {
+            return Some(m);
+        }
+        self.id_mapping
+    }
+
     fn convert_entry(&self, fs_idx: VfsIndex, inode: u64, entry: &mut Entry) -> Result<Entry> {
         self.convert_inode(fs_idx, inode).map(|ino| {
             entry.inode = ino;
             entry.attr.st_ino = ino;
             // If id_mapping is enabled, map the internal ID to the external ID.
-            if let Some((internal_id, external_id, range)) = self.id_mapping {
+            if let Some((internal_id, external_id, range)) = self.get_effective_id_mapping(fs_idx) {
                 if entry.attr.st_uid >= internal_id && entry.attr.st_uid < internal_id + range {
                     entry.attr.st_uid = entry.attr.st_uid - internal_id + external_id;
                 }
@@ -570,8 +617,8 @@ impl Vfs {
     /// to external IDs.
     /// If `map_internal_to_external` is false, the external IDs will be mapped
     /// to VFS internal IDs.
-    fn remap_attr_id(&self, map_internal_to_external: bool, attr: &mut stat64) {
-        if let Some((internal_id, external_id, range)) = self.id_mapping {
+    fn remap_attr_id(&self, fs_idx: VfsIndex, map_internal_to_external: bool, attr: &mut stat64) {
+        if let Some((internal_id, external_id, range)) = self.get_effective_id_mapping(fs_idx) {
             // Subtract the (guaranteed <=) base before adding the target base so the
             // arithmetic never underflows regardless of which base is larger.
             if map_internal_to_external
@@ -584,7 +631,7 @@ impl Vfs {
                 && attr.st_gid >= internal_id
                 && attr.st_gid < internal_id + range
             {
-                attr.st_gid = attr.st_gid- internal_id + external_id;
+                attr.st_gid = attr.st_gid - internal_id + external_id;
             }
             if !map_internal_to_external
                 && attr.st_uid >= external_id
@@ -853,7 +900,7 @@ pub mod persist {
         /// // mount the backend fs
         /// backend_fs_list.into_iter().for_each(|(path, idx)| {
         ///     let fs = new_backend_fs();
-        ///     vfs.restore_mount(fs, idx, path).unwrap();
+        ///     vfs.restore_mount(fs, idx, path, None).unwrap();
         /// });
         /// ```
         pub fn save_to_bytes(&self) -> VfsResult<Vec<u8>> {
@@ -939,7 +986,7 @@ pub mod persist {
                 .iter()
                 .map(|path| {
                     let fs = new_backend_fs();
-                    let idx = vfs.mount(fs, path).unwrap();
+                    let idx = vfs.mount(fs, path, None).unwrap();
 
                     (path.to_owned(), idx)
                 })
@@ -954,7 +1001,7 @@ pub mod persist {
             // restore the backend fs
             backend_fs_list.into_iter().for_each(|(path, idx)| {
                 let fs = new_backend_fs();
-                vfs.restore_mount(fs, idx, path).unwrap();
+                vfs.restore_mount(fs, idx, path, None).unwrap();
             });
 
             // check the vfs and restored_vfs
@@ -998,7 +1045,7 @@ pub mod persist {
                 .iter()
                 .map(|path| {
                     let fs = new_backend_fs();
-                    let idx = vfs.mount(fs, path).unwrap();
+                    let idx = vfs.mount(fs, path, None).unwrap();
 
                     (path.to_owned(), idx)
                 })
@@ -1016,7 +1063,7 @@ pub mod persist {
             // restore the backend fs
             backend_fs_list.into_iter().for_each(|(path, idx)| {
                 let fs = new_backend_fs();
-                vfs.restore_mount(fs, idx, path).unwrap();
+                vfs.restore_mount(fs, idx, path, None).unwrap();
             });
 
             // check the vfs and restored_vfs
@@ -1526,7 +1573,7 @@ mod tests {
         let mut attr: stat64 = unsafe { std::mem::zeroed() };
         attr.st_uid = 0;
         attr.st_gid = 0;
-        vfs.remap_attr_id(true, &mut attr);
+        vfs.remap_attr_id(0, true, &mut attr);
         assert_eq!(attr.st_uid, 100000);
         assert_eq!(attr.st_gid, 100000);
 
@@ -1534,7 +1581,7 @@ mod tests {
         let mut attr: stat64 = unsafe { std::mem::zeroed() };
         attr.st_uid = 100000;
         attr.st_gid = 100000;
-        vfs.remap_attr_id(false, &mut attr);
+        vfs.remap_attr_id(0, false, &mut attr);
         assert_eq!(attr.st_uid, 0);
         assert_eq!(attr.st_gid, 0);
 
@@ -1543,7 +1590,7 @@ mod tests {
         let mut attr: stat64 = unsafe { std::mem::zeroed() };
         attr.st_uid = 65535;
         attr.st_gid = 65536;
-        vfs.remap_attr_id(true, &mut attr);
+        vfs.remap_attr_id(0, true, &mut attr);
         assert_eq!(attr.st_uid, 165535);
         assert_eq!(attr.st_gid, 65536);
     }
@@ -1554,7 +1601,7 @@ mod tests {
         let mut attr: stat64 = unsafe { std::mem::zeroed() };
         attr.st_uid = 0;
         attr.st_gid = 0;
-        vfs.remap_attr_id(true, &mut attr);
+        vfs.remap_attr_id(0, true, &mut attr);
         assert_eq!(attr.st_uid, 0);
         assert_eq!(attr.st_gid, 0);
     }
@@ -1596,12 +1643,81 @@ mod tests {
     }
 
     #[test]
+    fn test_per_mount_id_mapping() {
+        // No global id_mapping — per-mount mappings are independent.
+        let vfs = Vfs::new(VfsOptions::default());
+
+        let idx1 = vfs
+            .mount(
+                Box::new(FakeFileSystemOne {}),
+                "/a",
+                Some((0, 100000, 65536)),
+            )
+            .unwrap();
+        let idx2 = vfs
+            .mount(
+                Box::new(FakeFileSystemTwo {}),
+                "/b",
+                Some((0, 200000, 65536)),
+            )
+            .unwrap();
+
+        // Per-mount mappings are independent.
+        assert_eq!(vfs.get_effective_id_mapping(idx1), Some((0, 100000, 65536)));
+        assert_eq!(vfs.get_effective_id_mapping(idx2), Some((0, 200000, 65536)));
+
+        // remap_attr_id with idx1 maps 0 → 100000
+        let mut attr: stat64 = unsafe { std::mem::zeroed() };
+        attr.st_uid = 0;
+        vfs.remap_attr_id(idx1, true, &mut attr);
+        assert_eq!(attr.st_uid, 100000);
+
+        // remap_attr_id with idx2 maps 0 → 200000
+        let mut attr: stat64 = unsafe { std::mem::zeroed() };
+        attr.st_uid = 0;
+        vfs.remap_attr_id(idx2, true, &mut attr);
+        assert_eq!(attr.st_uid, 200000);
+
+        // Pseudo-fs (fs_idx == 0) falls back to global (None) → no remap.
+        let mut attr: stat64 = unsafe { std::mem::zeroed() };
+        attr.st_uid = 0;
+        vfs.remap_attr_id(0, true, &mut attr);
+        assert_eq!(attr.st_uid, 0);
+    }
+
+    #[test]
+    fn test_per_mount_id_mapping_fallback_to_global() {
+        // Global id_mapping is set, per-mount is not — falls back to global.
+        let opts = VfsOptions {
+            id_mapping: (0, 100000, 65536),
+            ..Default::default()
+        };
+        let vfs = Vfs::new(opts);
+
+        // Mount without per-mount id_mapping → falls back to global.
+        let idx = vfs
+            .mount(Box::new(FakeFileSystemOne {}), "/a", None)
+            .unwrap();
+        assert_eq!(vfs.get_effective_id_mapping(idx), Some((0, 100000, 65536)));
+
+        // Per-mount overrides global.
+        let idx2 = vfs
+            .mount(
+                Box::new(FakeFileSystemTwo {}),
+                "/b",
+                Some((0, 300000, 65536)),
+            )
+            .unwrap();
+        assert_eq!(vfs.get_effective_id_mapping(idx2), Some((0, 300000, 65536)));
+    }
+
+    #[test]
     fn test_vfs_lookup() {
         let vfs = Vfs::new(VfsOptions::default());
         let fs = FakeFileSystemOne {};
         let ctx = Context::new();
 
-        assert!(vfs.mount(Box::new(fs), "/x/y").is_ok());
+        assert!(vfs.mount(Box::new(fs), "/x/y", None).is_ok());
 
         // Lookup inode on pseudo file system.
         let entry1 = vfs
@@ -1640,8 +1756,8 @@ mod tests {
         let vfs = Vfs::new(VfsOptions::default());
         let fs1 = FakeFileSystemOne {};
         let fs2 = FakeFileSystemTwo {};
-        assert!(vfs.mount(Box::new(fs1), "/foo").is_ok());
-        assert!(vfs.mount(Box::new(fs2), "/bar").is_ok());
+        assert!(vfs.mount(Box::new(fs1), "/foo", None).is_ok());
+        assert!(vfs.mount(Box::new(fs2), "/bar", None).is_ok());
 
         // Lookup inode on pseudo file system.
         let ctx = Context::new();
@@ -1661,10 +1777,10 @@ mod tests {
         let vfs = Vfs::new(VfsOptions::default());
         let fs1 = FakeFileSystemOne {};
         let fs2 = FakeFileSystemOne {};
-        assert!(vfs.mount(Box::new(fs1), "/foo").is_ok());
+        assert!(vfs.mount(Box::new(fs1), "/foo", None).is_ok());
         assert!(vfs.umount("/foo").is_ok());
 
-        assert!(vfs.mount(Box::new(fs2), "/x/y").is_ok());
+        assert!(vfs.mount(Box::new(fs2), "/x/y", None).is_ok());
 
         match vfs.umount("/x") {
             Err(VfsError::NotFound(_e)) => {}
@@ -1678,8 +1794,8 @@ mod tests {
         let fs1 = FakeFileSystemOne {};
         let fs2 = FakeFileSystemTwo {};
 
-        assert!(vfs.mount(Box::new(fs1), "/x/y/z").is_ok());
-        assert!(vfs.mount(Box::new(fs2), "/x/y").is_ok());
+        assert!(vfs.mount(Box::new(fs1), "/x/y/z", None).is_ok());
+        assert!(vfs.mount(Box::new(fs2), "/x/y", None).is_ok());
 
         let (m1, _) = vfs.get_rootfs("/x/y/z").unwrap().unwrap();
         assert!(m1.as_any().is::<FakeFileSystemOne>());
@@ -1701,8 +1817,8 @@ mod tests {
         let fs1 = FakeFileSystemOne {};
         let fs2 = FakeFileSystemTwo {};
 
-        assert!(vfs.mount(Box::new(fs1), "/x/y").is_ok());
-        assert!(vfs.mount(Box::new(fs2), "/x/y").is_ok());
+        assert!(vfs.mount(Box::new(fs1), "/x/y", None).is_ok());
+        assert!(vfs.mount(Box::new(fs2), "/x/y", None).is_ok());
 
         let (m1, _) = vfs.get_rootfs("/x/y").unwrap().unwrap();
         assert!(m1.as_any().is::<FakeFileSystemTwo>());

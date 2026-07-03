@@ -121,7 +121,7 @@ impl FileSystem for Vfs {
                 fs.getattr(ctx, idata.ino(), handle)
                     .map(|(mut attr, duration)| {
                         attr.st_ino = idata.into();
-                        self.remap_attr_id(true, &mut attr);
+                        self.remap_attr_id(idata.fs_idx(), true, &mut attr);
                         (attr, duration)
                     })
             }
@@ -140,11 +140,11 @@ impl FileSystem for Vfs {
             (Left(fs), idata) => fs.setattr(ctx, idata.ino(), attr, handle, valid),
             (Right(fs), idata) => {
                 let mut attr = attr;
-                self.remap_attr_id(false, &mut attr);
+                self.remap_attr_id(idata.fs_idx(), false, &mut attr);
                 fs.setattr(ctx, idata.ino(), attr, handle, valid)
                     .map(|(mut attr, duration)| {
                         attr.st_ino = idata.into();
-                        self.remap_attr_id(true, &mut attr);
+                        self.remap_attr_id(idata.fs_idx(), true, &mut attr);
                         (attr, duration)
                     })
             }
@@ -615,7 +615,7 @@ impl FileSystem for Vfs {
                     dir_entry.ino = self.convert_inode(idata.fs_idx(), entry.inode)?;
                     entry.inode = dir_entry.ino;
                     entry.attr.st_ino = entry.inode;
-                    self.remap_attr_id(true, &mut entry.attr);
+                    self.remap_attr_id(idata.fs_idx(), true, &mut entry.attr);
                     add_entry(dir_entry, entry)
                 },
             ),
@@ -644,9 +644,12 @@ impl FileSystem for Vfs {
     }
 
     #[inline]
-    fn id_remap(&self, ctx: &mut Context) -> Result<()> {
+    fn id_remap(&self, ctx: &mut Context, nodeid: Self::Inode) -> Result<()> {
         // If id_mapping is enabled, map the external ID to the internal ID.
-        if let Some((internal_id, external_id, range)) = self.id_mapping {
+        // Use per-mount mapping based on the fs_idx encoded in nodeid, falling
+        // back to the global mapping for pseudo-fs operations (fs_idx == 0).
+        let fs_idx = nodeid.fs_idx();
+        if let Some((internal_id, external_id, range)) = self.get_effective_id_mapping(fs_idx) {
             if ctx.uid >= external_id && ctx.uid < external_id + range {
                 ctx.uid = ctx.uid - external_id + internal_id;
             }
@@ -711,7 +714,7 @@ mod tests {
             pid: 1,
         };
 
-        vfs.id_remap(&mut ctx).unwrap();
+        vfs.id_remap(&mut ctx, VfsInode::from(0)).unwrap();
 
         assert_eq!(ctx.uid, 0);
         assert_eq!(ctx.gid, 123);
