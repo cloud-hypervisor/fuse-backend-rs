@@ -58,6 +58,33 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
         Ok(())
     }
 
+    /// Skip entries in a getdents64 buffer up to and including the entry whose
+    /// `d_off` equals `offset`.  After this returns, `buf` starts with the entry
+    /// immediately after the matched one.  Returns `true` if the target cookie
+    /// was found, `false` otherwise.
+    fn skip_to_cookie(buf: &mut Vec<u8>, offset: u64) -> bool {
+        let mut cur: usize = 0;
+        let mut found = false;
+        let mut target_reclen: usize = 0;
+        while cur + size_of::<LinuxDirent64>() <= buf.len() {
+            let front = &buf[cur..cur + size_of::<LinuxDirent64>()];
+            let dirent64 = LinuxDirent64::from_slice(front)
+                .expect("fuse: unable to get LinuxDirent64 from slice");
+            if dirent64.d_off as u64 == offset {
+                found = true;
+                target_reclen = dirent64.d_reclen as usize;
+                break;
+            }
+            cur += dirent64.d_reclen as usize;
+        }
+
+        if found {
+            cur += target_reclen;
+            buf.drain(..cur);
+        }
+        found
+    }
+
     fn do_readdir(
         &self,
         inode: Inode,
@@ -79,29 +106,89 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
             // changes the kernel offset while we are using it.
             let (guard, dir) = data.get_file_mut();
 
-            // Safe because this doesn't modify any memory and we check the return value.
-            let res =
-                unsafe { libc::lseek64(dir.as_raw_fd(), offset as libc::off64_t, libc::SEEK_SET) };
-            if res < 0 {
-                return Err(io::Error::last_os_error());
-            }
-
-            // Safe because the kernel guarantees that it will only write to `buf` and we check the
-            // return value.
-            let res = unsafe {
-                libc::syscall(
-                    libc::SYS_getdents64,
-                    dir.as_raw_fd(),
-                    buf.as_mut_ptr() as *mut LinuxDirent64,
-                    size as libc::c_int,
-                )
+            // NFSv4 directory cookies (`nfs_cookie4`, RFC 7530) are unsigned 64-bit and roughly
+            // half exceed `INT64_MAX`. When the guest resumes a readdir from such a cookie, the
+            // `u64` -> `off64_t` cast produces a negative value and the host kernel's
+            // `nfs_llseek_dir()` rejects it with `EINVAL`. In that case fall back to a linear scan
+            // from the beginning, skipping past the target cookie so the caller receives exactly the
+            // entries it has not seen yet.
+            let seek_ok = if offset > i64::MAX as u64 {
+                false
+            } else {
+                // Safe because this doesn't modify any memory and we check the return value.
+                let res = unsafe {
+                    libc::lseek64(dir.as_raw_fd(), offset as libc::off64_t, libc::SEEK_SET)
+                };
+                if res >= 0 {
+                    true
+                } else {
+                    let err = io::Error::last_os_error();
+                    // Only the "offset too large" case is recoverable here.
+                    if err.raw_os_error() != Some(libc::EINVAL) {
+                        return Err(err);
+                    }
+                    false
+                }
             };
-            if res < 0 {
-                return Err(io::Error::last_os_error());
-            }
 
-            // Safe because we trust the value returned by kernel.
-            unsafe { buf.set_len(res as usize) };
+            if seek_ok {
+                // Safe because the kernel guarantees that it will only write to `buf` and we check
+                // the return value.
+                let res = unsafe {
+                    libc::syscall(
+                        libc::SYS_getdents64,
+                        dir.as_raw_fd(),
+                        buf.as_mut_ptr() as *mut LinuxDirent64,
+                        size as libc::c_int,
+                    )
+                };
+                if res < 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                // Safe because we trust the value returned by kernel.
+                unsafe { buf.set_len(res as usize) };
+            } else {
+                // Fallback for cookies the kernel cannot `lseek()` to: rewind and walk batches with
+                // `getdents64` until the entry whose `d_off == offset` is found, then return that
+                // batch from just past it. We never re-seek nor discard an already-read batch, so
+                // no entries are lost.
+                //
+                // Safe because this doesn't modify any memory and we check the return value.
+                let res = unsafe { libc::lseek64(dir.as_raw_fd(), 0, libc::SEEK_SET) };
+                if res < 0 {
+                    return Err(io::Error::last_os_error());
+                }
+
+                loop {
+                    // Safe because the kernel guarantees that it will only write to `buf` and we
+                    // check the return value.
+                    let res = unsafe {
+                        libc::syscall(
+                            libc::SYS_getdents64,
+                            dir.as_raw_fd(),
+                            buf.as_mut_ptr() as *mut LinuxDirent64,
+                            size as libc::c_int,
+                        )
+                    };
+                    if res < 0 {
+                        return Err(io::Error::last_os_error());
+                    }
+                    // Safe because we trust the value returned by kernel.
+                    unsafe { buf.set_len(res as usize) };
+
+                    if res == 0 {
+                        // EOF without finding the target cookie: the entry is gone (directory
+                        // changed, or the cookie was stale). Return an empty buffer so the guest
+                        // stops iterating instead of looping forever.
+                        break;
+                    }
+
+                    if Self::skip_to_cookie(&mut buf, offset) {
+                        break;
+                    }
+                    buf.clear();
+                }
+            }
 
             // Explicitly drop the lock so that it's not held while we fill in the fuse buffer.
             mem::drop(guard);
@@ -1627,5 +1714,90 @@ mod tests {
         fs.no_opendir.store(true, Ordering::Relaxed);
 
         assert!(fs.fsyncdir(&ctx, ROOT_ID, false, 0).is_ok());
+    }
+}
+
+#[cfg(test)]
+mod readdir_cookie_tests {
+    use super::*;
+    use std::ffi::CStr;
+
+    /// Build a buffer containing the serialized dirent records described by
+    /// `entries`.  Each entry is (d_off, name).  The inode number and type
+    /// are dummies.
+    fn build_dirent_buf(entries: &[(u64, &[u8])]) -> Vec<u8> {
+        let header = size_of::<LinuxDirent64>();
+        // Allocate enough for the entries plus padding to 8-byte alignment.
+        let mut buf = Vec::new();
+        for (off, name) in entries {
+            let name_len = name.len() + 1; // include trailing NUL
+            let reclen = (header + name_len + 7) & !7;
+            let dirent = LinuxDirent64 {
+                d_ino: 1,
+                d_off: *off as libc::off64_t,
+                d_reclen: reclen as libc::c_ushort,
+                d_ty: libc::DT_REG as libc::c_uchar,
+            };
+            let mut entry = dirent.as_slice().to_vec();
+            entry.resize(header, 0);
+            entry.extend_from_slice(name);
+            entry.resize(reclen, 0);
+            buf.extend_from_slice(&entry);
+        }
+        buf
+    }
+
+    fn names(buf: &Vec<u8>) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut pos = 0;
+        while pos + size_of::<LinuxDirent64>() <= buf.len() {
+            let front = &buf[pos..pos + size_of::<LinuxDirent64>()];
+            let dirent = LinuxDirent64::from_slice(front).unwrap();
+            let namelen = dirent.d_reclen as usize - size_of::<LinuxDirent64>();
+            let name_start = pos + size_of::<LinuxDirent64>();
+            let name_slice = &buf[name_start..name_start + namelen];
+            let cstr = CStr::from_bytes_until_nul(name_slice).unwrap();
+            out.push(String::from_utf8_lossy(cstr.to_bytes()).to_string());
+            pos += dirent.d_reclen as usize;
+        }
+        out
+    }
+
+    #[test]
+    fn skip_to_cookie_finds_middle_entry() {
+        let mut buf = build_dirent_buf(&[(1, b"a"), (2, b"b"), (3, b"c")]);
+        assert!(PassthroughFs::<()>::skip_to_cookie(&mut buf, 2));
+        assert_eq!(names(&buf), vec!["c".to_string()]);
+    }
+
+    #[test]
+    fn skip_to_cookie_finds_first_entry() {
+        let mut buf = build_dirent_buf(&[(1, b"a"), (2, b"b")]);
+        assert!(PassthroughFs::<()>::skip_to_cookie(&mut buf, 1));
+        assert_eq!(names(&buf), vec!["b".to_string()]);
+    }
+
+    #[test]
+    fn skip_to_cookie_finds_last_entry() {
+        let mut buf = build_dirent_buf(&[(1, b"a"), (2, b"b")]);
+        assert!(PassthroughFs::<()>::skip_to_cookie(&mut buf, 2));
+        assert!(buf.is_empty());
+    }
+
+    #[test]
+    fn skip_to_cookie_not_found() {
+        let mut buf = build_dirent_buf(&[(1, b"a"), (2, b"b")]);
+        assert!(!PassthroughFs::<()>::skip_to_cookie(&mut buf, 99));
+        // Buffer should be left untouched when the cookie is not present.
+        assert_eq!(names(&buf), vec!["a".to_string(), "b".to_string()]);
+    }
+
+    #[test]
+    fn skip_to_cookie_large_cookie() {
+        // Simulate the NFS case: a cookie whose high bit is set.
+        let large = u64::MAX - 42;
+        let mut buf = build_dirent_buf(&[(1, b"a"), (large, b"b"), (3, b"c")]);
+        assert!(PassthroughFs::<()>::skip_to_cookie(&mut buf, large));
+        assert_eq!(names(&buf), vec!["c".to_string()]);
     }
 }
