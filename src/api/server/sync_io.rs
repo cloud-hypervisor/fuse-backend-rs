@@ -746,8 +746,15 @@ impl<F: FileSystem + Sync> Server<F> {
         let mut flags_u64 = flags as u64;
         #[cfg(target_os = "linux")]
         if flags_u64 & FsOptions::INIT_EXT.bits() != 0 {
-            let InitIn2 { flags2, unused: _ } = ctx.r.read_obj().map_err(Error::DecodeMessage)?;
-            flags_u64 |= (flags2 as u64) << 32;
+            if ctx.r.available_bytes() >= size_of::<InitIn2>() {
+                let InitIn2 { flags2, unused: _ } =
+                    ctx.r.read_obj().map_err(Error::DecodeMessage)?;
+                flags_u64 |= (flags2 as u64) << 32;
+            } else {
+                // Some kernels set INIT_EXT without appending the InitIn2 payload.
+                // Fall back to the legacy 32-bit flag set instead of failing init.
+                flags_u64 &= !FsOptions::INIT_EXT.bits();
+            }
         }
         let capable = FsOptions::from_bits_truncate(flags_u64);
 
@@ -1506,6 +1513,34 @@ mod tests {
             assert!(init_params_called);
 
             assert_eq!(res, 24);
+        }
+
+        #[test]
+        fn test_server_init_ext_without_payload() {
+            let fs = PassthroughFs::<()>::new(Config::default()).unwrap();
+            let server = Server::new(fs);
+
+            let mut read_buf = [
+                0x7u8, 0x0, 0x0, 0x0, // major = 0x0007
+                0x24u8, 0x0, 0x0, 0x0, // minor = 0x0024
+                0x0, 0x0, 0x0, 0x0, // max_readahead = 0x0000
+                0x0, 0x0, 0x0, 0x40, // flags = INIT_EXT
+            ];
+            let mut write_buf = [0u8; 4096];
+            let (ctx, _file) = prepare_srvcontext(&mut read_buf, &mut write_buf);
+
+            let mut init_params_called = false;
+            let res = server
+                .init(ctx, |init_params| {
+                    assert_eq!(init_params.version.major, 0x0007);
+                    assert_eq!(init_params.version.minor, 0x0024);
+                    assert!(!init_params.capable.contains(FsOptions::INIT_EXT));
+                    init_params_called = true;
+                })
+                .unwrap();
+
+            assert!(init_params_called);
+            assert_eq!(res, 80);
         }
 
         #[test]
