@@ -650,12 +650,8 @@ impl FileSystem for Vfs {
         // back to the global mapping for pseudo-fs operations (fs_idx == 0).
         let fs_idx = nodeid.fs_idx();
         if let Some((internal_id, external_id, range)) = self.get_effective_id_mapping(fs_idx) {
-            if ctx.uid >= external_id && ctx.uid < external_id + range {
-                ctx.uid = ctx.uid - external_id + internal_id;
-            }
-            if ctx.gid >= external_id && ctx.gid < external_id + range {
-                ctx.gid = ctx.gid - external_id + internal_id;
-            }
+            ctx.uid = remap_id(ctx.uid, external_id, internal_id, range);
+            ctx.gid = remap_id(ctx.gid, external_id, internal_id, range);
         }
 
         Ok(())

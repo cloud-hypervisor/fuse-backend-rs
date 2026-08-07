@@ -122,6 +122,18 @@ fn is_dot_or_dotdot(name: &CStr) -> bool {
     bytes.starts_with(CURRENT_DIR_CSTR) || bytes.starts_with(PARENT_DIR_CSTR)
 }
 
+/// Remaps `value` from a source range beginning at `from_base` to a target
+/// range beginning at `to_base`. Returns `value` unchanged if it falls
+/// outside the source range.
+#[inline]
+fn remap_id(value: u32, from_base: u32, to_base: u32, range: u32) -> u32 {
+    if value >= from_base && value - from_base < range {
+        value - from_base + to_base
+    } else {
+        value
+    }
+}
+
 // Is `path` a single path component that is not "." or ".."?
 fn is_safe_path_component(name: &CStr) -> bool {
     let bytes = name.to_bytes_with_nul();
@@ -600,12 +612,8 @@ impl Vfs {
             entry.attr.st_ino = ino;
             // If id_mapping is enabled, map the internal ID to the external ID.
             if let Some((internal_id, external_id, range)) = self.get_effective_id_mapping(fs_idx) {
-                if entry.attr.st_uid >= internal_id && entry.attr.st_uid < internal_id + range {
-                    entry.attr.st_uid = entry.attr.st_uid - internal_id + external_id;
-                }
-                if entry.attr.st_gid >= internal_id && entry.attr.st_gid < internal_id + range {
-                    entry.attr.st_gid = entry.attr.st_gid - internal_id + external_id;
-                }
+                entry.attr.st_uid = remap_id(entry.attr.st_uid, internal_id, external_id, range);
+                entry.attr.st_gid = remap_id(entry.attr.st_gid, internal_id, external_id, range);
             }
             *entry
         })
@@ -619,32 +627,13 @@ impl Vfs {
     /// to VFS internal IDs.
     fn remap_attr_id(&self, fs_idx: VfsIndex, map_internal_to_external: bool, attr: &mut stat64) {
         if let Some((internal_id, external_id, range)) = self.get_effective_id_mapping(fs_idx) {
-            // Subtract the (guaranteed <=) base before adding the target base so the
-            // arithmetic never underflows regardless of which base is larger.
-            if map_internal_to_external
-                && attr.st_uid >= internal_id
-                && attr.st_uid < internal_id + range
-            {
-                attr.st_uid = attr.st_uid - internal_id + external_id;
-            }
-            if map_internal_to_external
-                && attr.st_gid >= internal_id
-                && attr.st_gid < internal_id + range
-            {
-                attr.st_gid = attr.st_gid - internal_id + external_id;
-            }
-            if !map_internal_to_external
-                && attr.st_uid >= external_id
-                && attr.st_uid < external_id + range
-            {
-                attr.st_uid = attr.st_uid - external_id + internal_id;
-            }
-            if !map_internal_to_external
-                && attr.st_gid >= external_id
-                && attr.st_gid < external_id + range
-            {
-                attr.st_gid = attr.st_gid - external_id + internal_id;
-            }
+            let (from_base, to_base) = if map_internal_to_external {
+                (internal_id, external_id)
+            } else {
+                (external_id, internal_id)
+            };
+            attr.st_uid = remap_id(attr.st_uid, from_base, to_base, range);
+            attr.st_gid = remap_id(attr.st_gid, from_base, to_base, range);
         }
     }
 
@@ -1558,6 +1547,15 @@ mod tests {
         };
         let vfs = Vfs::new(opts);
         assert!(vfs.id_mapping.is_none());
+    }
+
+    #[test]
+    fn test_remap_id() {
+        assert_eq!(remap_id(100, 100, 200, 10), 200);
+        assert_eq!(remap_id(109, 100, 200, 10), 209);
+        assert_eq!(remap_id(99, 100, 200, 10), 99);
+        assert_eq!(remap_id(110, 100, 200, 10), 110);
+        assert_eq!(remap_id(u32::MAX, u32::MAX, 0, 1), 0);
     }
 
     #[test]
