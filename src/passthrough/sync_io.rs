@@ -70,12 +70,18 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
             let front = &buf[cur..cur + size_of::<LinuxDirent64>()];
             let dirent64 = LinuxDirent64::from_slice(front)
                 .expect("fuse: unable to get LinuxDirent64 from slice");
-            if dirent64.d_off as u64 == offset {
-                found = true;
-                target_reclen = dirent64.d_reclen as usize;
+            let reclen = dirent64.d_reclen as usize;
+            // Defend against a malformed getdents64 buffer: a record shorter
+            // than the header would loop forever.
+            if reclen < size_of::<LinuxDirent64>() {
                 break;
             }
-            cur += dirent64.d_reclen as usize;
+            if dirent64.d_off as u64 == offset {
+                found = true;
+                target_reclen = reclen;
+                break;
+            }
+            cur += reclen;
         }
 
         if found {
@@ -83,6 +89,57 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
             buf.drain(..cur);
         }
         found
+    }
+
+    /// Return the `d_off` of the last dirent in a `getdents64` buffer, or
+    /// `None` if the buffer is empty.
+    fn last_cookie_in_buf(mut buf: &[u8]) -> Option<u64> {
+        let mut last = None;
+        while buf.len() >= size_of::<LinuxDirent64>() {
+            let dirent64 = LinuxDirent64::from_slice(&buf[..size_of::<LinuxDirent64>()])
+                .expect("fuse: unable to get LinuxDirent64 from slice");
+            let reclen = dirent64.d_reclen as usize;
+            // Defend against a malformed getdents64 buffer: a record shorter
+            // than the header would loop forever and an oversized one would
+            // index out of bounds below.
+            if reclen < size_of::<LinuxDirent64>() || reclen > buf.len() {
+                break;
+            }
+            last = Some(dirent64.d_off as u64);
+            buf = &buf[reclen..];
+        }
+        last
+    }
+
+    /// Consume the cookie cached for `handle` and report whether it equals
+    /// `offset`.  A match means the persistent directory fd is already
+    /// positioned right after that entry and the next `getdents64` can start
+    /// without an `lseek64`.  The entry is removed either way: a cookie that
+    /// doesn't match the requested offset is stale and must not be reused.
+    ///
+    /// In `no_opendir` mode every READDIR works on a fresh fd at position 0,
+    /// so there is no position to remember and the cache must not be used.
+    fn consume_cached_cookie(&self, handle: Handle, offset: u64) -> bool {
+        if self.no_opendir.load(Ordering::Relaxed) {
+            return false;
+        }
+        self.handle_map
+            .remove_cookie(handle)
+            .is_some_and(|cookie| cookie == offset)
+    }
+
+    /// Record the position of the directory fd of `handle`: the `d_off` of the last dirent in
+    /// `buf`, i.e. right after the last entry returned by `getdents64`.  A subsequent resume
+    /// from that cookie can then skip the `lseek64`/scan (see `consume_cached_cookie`).  Does
+    /// nothing for an empty `buf` (end-of-directory) or in `no_opendir` mode, where directory
+    /// fds are never reused.
+    fn cache_cookie(&self, handle: Handle, buf: &[u8]) {
+        if self.no_opendir.load(Ordering::Relaxed) {
+            return;
+        }
+        if let Some(cookie) = Self::last_cookie_in_buf(buf) {
+            self.handle_map.set_cookie(handle, cookie);
+        }
     }
 
     fn do_readdir(
@@ -106,13 +163,20 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
             // changes the kernel offset while we are using it.
             let (guard, dir) = data.get_file_mut();
 
+            // Fast path: if the guest resumes from exactly the cookie recorded by the previous
+            // call, the fd is already positioned right after that entry and the `lseek64` below
+            // can be skipped entirely — O(1) instead of O(n) for sequential readdir.
+            let cookie_hit = self.consume_cached_cookie(handle, offset);
+
             // NFSv4 directory cookies (`nfs_cookie4`, RFC 7530) are unsigned 64-bit and roughly
             // half exceed `INT64_MAX`. When the guest resumes a readdir from such a cookie, the
             // `u64` -> `off64_t` cast produces a negative value and the host kernel's
             // `nfs_llseek_dir()` rejects it with `EINVAL`. In that case fall back to a linear scan
             // from the beginning, skipping past the target cookie so the caller receives exactly the
             // entries it has not seen yet.
-            let seek_ok = if offset > i64::MAX as u64 {
+            let seek_ok = if cookie_hit {
+                true
+            } else if offset > i64::MAX as u64 {
                 false
             } else {
                 // Safe because this doesn't modify any memory and we check the return value.
@@ -149,9 +213,9 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
                 unsafe { buf.set_len(res as usize) };
             } else {
                 // Fallback for cookies the kernel cannot `lseek()` to: rewind and walk batches with
-                // `getdents64` until the entry whose `d_off == offset` is found, then return that
-                // batch from just past it. We never re-seek nor discard an already-read batch, so
-                // no entries are lost.
+                // `getdents64` until the entry whose `d_off == offset` is consumed, then return the
+                // entries after it. We never re-seek nor discard an already-read batch, so no
+                // entries are lost.
                 //
                 // Safe because this doesn't modify any memory and we check the return value.
                 let res = unsafe { libc::lseek64(dir.as_raw_fd(), 0, libc::SEEK_SET) };
@@ -159,6 +223,7 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
                     return Err(io::Error::last_os_error());
                 }
 
+                let mut found = false;
                 loop {
                     // Safe because the kernel guarantees that it will only write to `buf` and we
                     // check the return value.
@@ -177,18 +242,38 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
                     unsafe { buf.set_len(res as usize) };
 
                     if res == 0 {
-                        // EOF without finding the target cookie: the entry is gone (directory
-                        // changed, or the cookie was stale). Return an empty buffer so the guest
-                        // stops iterating instead of looping forever.
+                        // EOF: either the target cookie was never found (the entry is gone or the
+                        // cookie was stale) or it was the very last entry of the directory. Return
+                        // an empty buffer so the guest stops iterating instead of looping forever.
+                        break;
+                    }
+
+                    if found {
+                        // Already past the target entry, this batch is the reply.
                         break;
                     }
 
                     if Self::skip_to_cookie(&mut buf, offset) {
-                        break;
+                        // Consumed everything up to and including the target entry. If it was the
+                        // last record of this batch, fetch the next one: returning an empty reply
+                        // here would falsely signal end-of-directory.
+                        found = true;
+                        if !buf.is_empty() {
+                            break;
+                        }
+                    } else {
+                        buf.clear();
                     }
-                    buf.clear();
                 }
             }
+
+            // Both paths leave the fd right after the last entry in `buf`; remember that
+            // position so a resume from its cookie can skip the `lseek64`/scan entirely.
+            // The guest can only ask to resume from that cookie if it consumed every entry up
+            // to it, in which case this position is exactly right; if some entries were not
+            // delivered (reply buffer full) the cookie is never requested and the cached
+            // value just goes unused.
+            self.cache_cookie(handle, &buf);
 
             // Explicitly drop the lock so that it's not held while we fill in the fuse buffer.
             mem::drop(guard);
@@ -1404,6 +1489,9 @@ impl<S: BitmapSlice + Send + Sync> FileSystem for PassthroughFs<S> {
         // Acquire the lock to get exclusive access, otherwise it may break do_readdir().
         let (_guard, file) = data.get_file_mut();
 
+        // TODO: `offset as off64_t` truncates high-bit NFS directory cookies
+        // the same way as the old do_readdir code.  SEEK_SET with offset >
+        // i64::MAX will receive EINVAL from nfs_llseek_dir().
         // Safe because this doesn't modify any memory and we check the return value.
         let res = unsafe {
             libc::lseek(
@@ -1715,6 +1803,108 @@ mod tests {
 
         assert!(fs.fsyncdir(&ctx, ROOT_ID, false, 0).is_ok());
     }
+
+    // -- sidecar cookie cache tests --
+
+    #[test]
+    fn cookie_set_and_remove() {
+        let map = HandleMap::new();
+        assert_eq!(map.remove_cookie(1), None);
+
+        map.set_cookie(1, 42);
+        assert_eq!(map.remove_cookie(1), Some(42));
+
+        // Already removed — second remove returns None.
+        assert_eq!(map.remove_cookie(1), None);
+    }
+
+    #[test]
+    fn cookie_overwrite() {
+        let map = HandleMap::new();
+        map.set_cookie(1, 10);
+        map.set_cookie(1, u64::MAX);
+        assert_eq!(map.remove_cookie(1), Some(u64::MAX));
+    }
+
+    #[test]
+    fn cookie_independent_handles() {
+        let map = HandleMap::new();
+        map.set_cookie(1, 100);
+        map.set_cookie(2, 200);
+        assert_eq!(map.remove_cookie(1), Some(100));
+        assert_eq!(map.remove_cookie(2), Some(200));
+    }
+
+    #[test]
+    fn cookie_clear_drops_all() {
+        let map = HandleMap::new();
+        map.set_cookie(1, 10);
+        map.set_cookie(2, 20);
+        map.clear();
+        assert_eq!(map.remove_cookie(1), None);
+        assert_eq!(map.remove_cookie(2), None);
+    }
+
+    #[test]
+    fn cookie_remove_nonexistent_is_noop() {
+        let map = HandleMap::new();
+        assert_eq!(map.remove_cookie(999), None);
+    }
+
+    #[test]
+    fn test_readdir_seek_no_opendir() {
+        // Regression test for xfstests generic/676: in `no_opendir` mode a
+        // fresh fd at position 0 is opened for every READDIR, so resuming
+        // from a cookie must never rely on the fd being left in place by a
+        // previous call.
+        let (fs, source) = prepare_fs_tmpdir();
+        let ctx = prepare_context();
+        fs.no_opendir.store(true, Ordering::Relaxed);
+
+        let count = 16_usize;
+        for i in 0..count {
+            std::fs::File::create(source.as_path().join(format!("file{:02}", i)))
+                .expect("create file");
+        }
+
+        // Read the whole directory, recording (cookie, name) in the order
+        // they are returned.
+        let mut entries: Vec<(u64, Vec<u8>)> = Vec::new();
+        let mut offset = 0_u64;
+        for _ in 0..=count + 2 {
+            let mut batch = Vec::new();
+            fs.readdir(&ctx, ROOT_ID, 0, 8192, offset, &mut |e| {
+                batch.push((e.offset, e.name.to_vec()));
+                Ok(1)
+            })
+            .unwrap();
+            if batch.is_empty() {
+                break;
+            }
+            offset = batch.last().unwrap().0;
+            entries.extend(batch);
+        }
+        assert_eq!(entries.len(), count);
+
+        // Seek back to every cookie and check that the next entry is the
+        // one immediately after it instead of a replay from the start.
+        for (idx, (cookie, _)) in entries.clone().into_iter().enumerate() {
+            let mut first = None;
+            fs.readdir(&ctx, ROOT_ID, 0, 8192, cookie, &mut |e| {
+                if first.is_none() {
+                    first = Some(e.name.to_vec());
+                }
+                Ok(1)
+            })
+            .unwrap();
+            if idx + 1 < entries.len() {
+                assert_eq!(first, Some(entries[idx + 1].1.clone()));
+            } else {
+                // Resuming from the last cookie must hit EOF.
+                assert_eq!(first, None);
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1799,5 +1989,50 @@ mod readdir_cookie_tests {
         let mut buf = build_dirent_buf(&[(1, b"a"), (large, b"b"), (3, b"c")]);
         assert!(PassthroughFs::<()>::skip_to_cookie(&mut buf, large));
         assert_eq!(names(&buf), vec!["c".to_string()]);
+    }
+
+    #[test]
+    fn last_cookie_in_buf_returns_last_d_off() {
+        let buf = build_dirent_buf(&[(1, b"a"), (7, b"b"), (u64::MAX - 1, b"c")]);
+        assert_eq!(
+            PassthroughFs::<()>::last_cookie_in_buf(&buf),
+            Some(u64::MAX - 1)
+        );
+
+        let buf = build_dirent_buf(&[(5, b"only")]);
+        assert_eq!(PassthroughFs::<()>::last_cookie_in_buf(&buf), Some(5));
+
+        assert_eq!(PassthroughFs::<()>::last_cookie_in_buf(&[]), None);
+    }
+
+    #[test]
+    fn last_cookie_in_buf_malformed_reclen() {
+        // A record with a zero reclen must not loop forever; the cookie of
+        // the last well-formed entry before it is returned.
+        let mut buf = build_dirent_buf(&[(1, b"a"), (7, b"b")]);
+        buf[40..42].copy_from_slice(&0u16.to_ne_bytes());
+        assert_eq!(PassthroughFs::<()>::last_cookie_in_buf(&buf), Some(1));
+
+        // Same for a reclen extending beyond the buffer: no out-of-bounds
+        // access, parsing stops at the malformed record.
+        let mut buf = build_dirent_buf(&[(1, b"a"), (7, b"b")]);
+        buf[40..42].copy_from_slice(&500u16.to_ne_bytes());
+        assert_eq!(PassthroughFs::<()>::last_cookie_in_buf(&buf), Some(1));
+
+        // A zero reclen right in the first record yields no cookie at all.
+        let mut buf = build_dirent_buf(&[(1, b"a")]);
+        buf[16..18].copy_from_slice(&0u16.to_ne_bytes());
+        assert_eq!(PassthroughFs::<()>::last_cookie_in_buf(&buf), None);
+    }
+
+    #[test]
+    fn skip_to_cookie_malformed_reclen() {
+        // A zero reclen must not loop forever; the cookie is simply not found
+        // and the buffer is left untouched.
+        let mut buf = build_dirent_buf(&[(1, b"a"), (2, b"b")]);
+        buf[16..18].copy_from_slice(&0u16.to_ne_bytes());
+        let corrupted = buf.clone();
+        assert!(!PassthroughFs::<()>::skip_to_cookie(&mut buf, 2));
+        assert_eq!(buf, corrupted);
     }
 }

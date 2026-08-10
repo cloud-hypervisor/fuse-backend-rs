@@ -12,7 +12,7 @@
 //! with heavy modification/enhancements from Alibaba Cloud OS team.
 
 use std::any::Any;
-use std::collections::{btree_map, BTreeMap};
+use std::collections::{btree_map, BTreeMap, HashMap};
 use std::ffi::{CStr, CString, OsString};
 use std::fs::File;
 use std::io;
@@ -294,18 +294,36 @@ impl HandleData {
 
 struct HandleMap {
     handles: RwLock<BTreeMap<Handle, Arc<HandleData>>>,
+    /// Sidecar cache of directory cookies, kept out of `HandleData` so that
+    /// ordinary (non-directory) handles don't pay for it.
+    ///
+    /// Maps the `Handle` of an *open directory stream* to the `d_off` of the
+    /// last directory entry consumed from its fd by `do_readdir`.  On the
+    /// next READDIR, if the requested offset matches the cached cookie the
+    /// host fd is already at the right position and the `lseek` can be
+    /// skipped entirely — O(1) instead of O(n) for sequential readdir.
+    ///
+    /// A cached cookie is only valid for the directory stream that produced
+    /// it, so entries must be removed when the stream is closed
+    /// (`do_release`): otherwise every opened-and-closed directory would
+    /// leave a stale entry behind and the map would grow without bound.  In
+    /// `no_opendir` mode no entries are ever inserted because each READDIR
+    /// works on a fresh fd opened just for that call.
+    cookies: Mutex<HashMap<Handle, u64>>,
 }
 
 impl HandleMap {
     fn new() -> Self {
         HandleMap {
             handles: RwLock::new(BTreeMap::new()),
+            cookies: Mutex::new(HashMap::new()),
         }
     }
 
     fn clear(&self) {
         // Do not expect poisoned lock here, so safe to unwrap().
         self.handles.write().unwrap().clear();
+        self.cookies.lock().unwrap().clear();
     }
 
     fn insert(&self, handle: Handle, data: HandleData) {
@@ -338,6 +356,14 @@ impl HandleMap {
             .filter(|hd| hd.inode == inode)
             .cloned()
             .ok_or_else(ebadf)
+    }
+
+    fn set_cookie(&self, handle: Handle, cookie: u64) {
+        self.cookies.lock().unwrap().insert(handle, cookie);
+    }
+
+    fn remove_cookie(&self, handle: Handle) -> Option<u64> {
+        self.cookies.lock().unwrap().remove(&handle)
     }
 }
 
@@ -786,7 +812,14 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
     }
 
     fn do_release(&self, inode: Inode, handle: Handle) -> io::Result<()> {
-        self.handle_map.release(handle, inode)
+        // Release the handle first so that every path touching both locks
+        // follows the same `handles`-then-`cookies` order as
+        // `HandleMap::clear()`.  If `release()` fails the cached cookie (if
+        // any) is left behind; that is harmless and it will be dropped by
+        // `destroy()`.
+        self.handle_map.release(handle, inode)?;
+        self.handle_map.remove_cookie(handle);
+        Ok(())
     }
 
     // Validate a path component, same as the one in vfs layer, but only do the validation if this
