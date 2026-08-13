@@ -82,9 +82,9 @@ impl FileSystem for Vfs {
             (Left(fs), idata) => self.lookup_pseudo(fs, idata, ctx, name),
             (Right(fs), idata) => {
                 // parent is in an underlying rootfs
-                let mut entry = fs.lookup(ctx, idata.ino(), name)?;
+                let entry = fs.lookup(ctx, idata.ino(), name)?;
                 // lookup success, hash it to a real fuse inode
-                self.convert_entry(idata.fs_idx(), entry.inode, &mut entry)
+                self.convert_backend_entry(idata, entry)
             }
         }
     }
@@ -162,7 +162,7 @@ impl FileSystem for Vfs {
             (Left(fs), idata) => fs.symlink(ctx, linkname, idata.ino(), name),
             (Right(fs), idata) => fs
                 .symlink(ctx, linkname, idata.ino(), name)
-                .map(|mut e| self.convert_entry(idata.fs_idx(), e.inode, &mut e))?,
+                .and_then(|e| self.convert_backend_entry(idata, e)),
         }
     }
 
@@ -181,7 +181,7 @@ impl FileSystem for Vfs {
             (Left(fs), idata) => fs.mknod(ctx, idata.ino(), name, mode, rdev, umask),
             (Right(fs), idata) => fs
                 .mknod(ctx, idata.ino(), name, mode, rdev, umask)
-                .map(|mut e| self.convert_entry(idata.fs_idx(), e.inode, &mut e))?,
+                .and_then(|e| self.convert_backend_entry(idata, e)),
         }
     }
 
@@ -199,7 +199,7 @@ impl FileSystem for Vfs {
             (Left(fs), idata) => fs.mkdir(ctx, idata.ino(), name, mode, umask),
             (Right(fs), idata) => fs
                 .mkdir(ctx, idata.ino(), name, mode, umask)
-                .map(|mut e| self.convert_entry(idata.fs_idx(), e.inode, &mut e))?,
+                .and_then(|e| self.convert_backend_entry(idata, e)),
         }
     }
 
@@ -280,7 +280,7 @@ impl FileSystem for Vfs {
             Left(fs) => fs.link(ctx, idata_old.ino(), idata_new.ino(), newname),
             Right(fs) => fs
                 .link(ctx, idata_old.ino(), idata_new.ino(), newname)
-                .map(|mut e| self.convert_entry(idata_new.fs_idx(), e.inode, &mut e))?,
+                .and_then(|e| self.convert_backend_entry(idata_new, e)),
         }
     }
 
@@ -314,10 +314,9 @@ impl FileSystem for Vfs {
             (Left(fs), idata) => fs.create(ctx, idata.ino(), name, args),
             (Right(fs), idata) => {
                 fs.create(ctx, idata.ino(), name, args)
-                    .map(|(mut a, b, c, d)| {
-                        self.convert_entry(idata.fs_idx(), a.inode, &mut a)?;
-                        Ok((a, b, c, d))
-                    })?
+                    .and_then(|(a, b, c, d)| {
+                        self.convert_backend_entry(idata, a).map(|a| (a, b, c, d))
+                    })
             }
         }
     }
@@ -636,28 +635,17 @@ impl FileSystem for Vfs {
 
     #[inline]
     fn id_remap(&self, ctx: &mut Context) -> Result<()> {
-        // If id_mapping is enabled, map the external ID to the internal ID.
-        // Use the global mapping (no per-mount lookup without nodeid).
-        if let Some((internal_id, external_id, range)) = self.id_mapping {
-            ctx.uid = remap_id(ctx.uid, external_id, internal_id, range);
-            ctx.gid = remap_id(ctx.gid, external_id, internal_id, range);
-        }
-
-        Ok(())
+        // Without an inode there is no way to identify the target mount, so
+        // fall back to the global id_mapping.
+        self.remap_ctx_ids(ctx, self.id_mapping)
     }
 
     #[inline]
     fn id_remap_with_nodeid(&self, ctx: &mut Context, nodeid: Self::Inode) -> Result<()> {
-        // If id_mapping is enabled, map the external ID to the internal ID.
-        // Use per-mount mapping based on the fs_idx encoded in nodeid, falling
-        // back to the global mapping for pseudo-fs operations (fs_idx == 0).
-        let fs_idx = nodeid.fs_idx();
-        if let Some((internal_id, external_id, range)) = self.get_effective_id_mapping(fs_idx) {
-            ctx.uid = remap_id(ctx.uid, external_id, internal_id, range);
-            ctx.gid = remap_id(ctx.gid, external_id, internal_id, range);
-        }
-
-        Ok(())
+        // Use the per-mount mapping identified by the fs_idx encoded in
+        // nodeid, falling back to the global mapping for pseudo-fs
+        // operations (fs_idx == 0).
+        self.remap_ctx_ids(ctx, self.get_effective_id_mapping(nodeid.fs_idx()))
     }
 
     #[cfg(any(feature = "vhost-user-fs", feature = "virtiofs"))]
@@ -734,7 +722,8 @@ mod tests {
         };
 
         // fs_idx == 0 (pseudo fs) falls back to global mapping
-        vfs.id_remap_with_nodeid(&mut ctx, VfsInode::from(0)).unwrap();
+        vfs.id_remap_with_nodeid(&mut ctx, VfsInode::from(0))
+            .unwrap();
 
         assert_eq!(ctx.uid, 0);
         assert_eq!(ctx.gid, 123);

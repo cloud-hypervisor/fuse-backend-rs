@@ -126,10 +126,7 @@ impl<F: AsyncFileSystem + Sync> Server<F> {
     ) -> Result<usize> {
         let in_header = r.read_obj().map_err(Error::DecodeMessage)?;
         let mut ctx = SrvContext::<F, S>::new(in_header, r, w);
-        let nodeid = ctx.nodeid();
-        self.fs
-            .id_remap_with_nodeid(&mut ctx.context, nodeid)
-            .map_err(|e| Error::FailedToRemapID((ctx.context.uid, ctx.context.gid)))?;
+        self.remap_ctx_ids(&mut ctx)?;
         if ctx.in_header.len > (MAX_BUFFER_SIZE + BUFFER_HEADER_SIZE)
             || ctx.w.available_bytes() < size_of::<OutHeader>()
         {

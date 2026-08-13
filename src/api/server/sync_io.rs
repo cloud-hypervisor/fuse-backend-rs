@@ -123,10 +123,7 @@ impl<F: FileSystem + Sync> Server<F> {
     ) -> Result<usize> {
         let in_header: InHeader = r.read_obj().map_err(Error::DecodeMessage)?;
         let mut ctx = SrvContext::<F, S>::new(in_header, r, w);
-        let nodeid = ctx.nodeid();
-        self.fs
-            .id_remap_with_nodeid(&mut ctx.context, nodeid)
-            .map_err(|e| Error::FailedToRemapID((ctx.context.uid, ctx.context.gid)))?;
+        self.remap_ctx_ids(&mut ctx)?;
         if ctx.in_header.len > (MAX_BUFFER_SIZE + BUFFER_HEADER_SIZE) {
             if in_header.opcode == Opcode::Forget as u32
                 || in_header.opcode == Opcode::BatchForget as u32
