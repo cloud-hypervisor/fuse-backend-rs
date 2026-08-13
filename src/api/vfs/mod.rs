@@ -634,6 +634,15 @@ impl Vfs {
         }
     }
 
+    /// Fix up attributes returned by a backend filesystem before they are
+    /// passed back to the FUSE client: encode the full VFS inode into
+    /// `st_ino` and remap internal IDs to external IDs.
+    fn convert_attr(&self, idata: VfsInode, mut attr: stat64) -> stat64 {
+        attr.st_ino = idata.into();
+        self.remap_attr_id(idata.fs_idx(), true, &mut attr);
+        attr
+    }
+
     fn allocate_fs_idx(&self) -> Result<VfsIndex> {
         let superblocks = self.superblocks.load().deref().deref().clone();
         let start = self.next_super.load(Ordering::SeqCst);

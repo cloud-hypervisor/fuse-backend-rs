@@ -39,15 +39,10 @@ impl AsyncFileSystem for Vfs {
     ) -> Result<(libc::stat64, Duration)> {
         match self.get_real_rootfs(inode)? {
             (Left(fs), idata) => fs.getattr(ctx, idata.ino(), handle),
-            (Right(fs), idata) => {
-                fs.async_getattr(ctx, idata.ino(), handle)
-                    .await
-                    .map(|(mut attr, duration)| {
-                        attr.st_ino = idata.into();
-                        self.remap_attr_id(idata.fs_idx(), true, &mut attr);
-                        (attr, duration)
-                    })
-            }
+            (Right(fs), idata) => fs
+                .async_getattr(ctx, idata.ino(), handle)
+                .await
+                .map(|(attr, duration)| (self.convert_attr(idata, attr), duration)),
         }
     }
 
@@ -66,11 +61,7 @@ impl AsyncFileSystem for Vfs {
                 self.remap_attr_id(idata.fs_idx(), false, &mut attr);
                 fs.async_setattr(ctx, idata.ino(), attr, handle, valid)
                     .await
-                    .map(|(mut attr, duration)| {
-                        attr.st_ino = idata.into();
-                        self.remap_attr_id(idata.fs_idx(), true, &mut attr);
-                        (attr, duration)
-                    })
+                    .map(|(attr, duration)| (self.convert_attr(idata, attr), duration))
             }
         }
     }
