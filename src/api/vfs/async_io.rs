@@ -239,7 +239,7 @@ mod tests {
             pid: 0,
         };
 
-        assert!(vfs.mount(Box::new(fs), "/x/y", None).is_ok());
+        assert!(vfs.mount(Box::new(fs), "/x/y").is_ok());
 
         let handle = tokio::spawn(async move {
             // Lookup inode on pseudo file system.
