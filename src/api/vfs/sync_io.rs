@@ -117,14 +117,9 @@ impl FileSystem for Vfs {
     ) -> Result<(stat64, Duration)> {
         match self.get_real_rootfs(inode)? {
             (Left(fs), idata) => fs.getattr(ctx, idata.ino(), handle),
-            (Right(fs), idata) => {
-                fs.getattr(ctx, idata.ino(), handle)
-                    .map(|(mut attr, duration)| {
-                        attr.st_ino = idata.into();
-                        self.remap_attr_id(idata.fs_idx(), true, &mut attr);
-                        (attr, duration)
-                    })
-            }
+            (Right(fs), idata) => fs
+                .getattr(ctx, idata.ino(), handle)
+                .map(|(attr, duration)| (self.convert_attr(idata, attr), duration)),
         }
     }
 
@@ -142,11 +137,7 @@ impl FileSystem for Vfs {
                 let mut attr = attr;
                 self.remap_attr_id(idata.fs_idx(), false, &mut attr);
                 fs.setattr(ctx, idata.ino(), attr, handle, valid)
-                    .map(|(mut attr, duration)| {
-                        attr.st_ino = idata.into();
-                        self.remap_attr_id(idata.fs_idx(), true, &mut attr);
-                        (attr, duration)
-                    })
+                    .map(|(attr, duration)| (self.convert_attr(idata, attr), duration))
             }
         }
     }
