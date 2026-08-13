@@ -466,13 +466,7 @@ impl Vfs {
 
     /// Restore a backend file system to path
     #[cfg(feature = "persist")]
-    pub fn restore_mount(
-        &self,
-        fs: BackFileSystem,
-        fs_idx: VfsIndex,
-        path: &str,
-        id_mapping: Option<(u32, u32, u32)>,
-    ) -> Result<()> {
+    pub fn restore_mount(&self, fs: BackFileSystem, fs_idx: VfsIndex, path: &str) -> Result<()> {
         let (entry, ino) = fs.mount()?;
         if ino > VFS_MAX_INO {
             return Err(Error::other(format!(
@@ -482,11 +476,6 @@ impl Vfs {
         }
 
         let _guard = self.lock.lock().unwrap();
-
-        let mut mappings = self.mount_id_mappings.load().deref().deref().clone();
-        mappings[fs_idx as usize] = id_mapping;
-        self.mount_id_mappings.store(Arc::new(mappings));
-
         self.insert_mount_locked(fs, entry, fs_idx, path)
     }
 
@@ -750,7 +739,18 @@ pub mod persist {
         Vfs, VfsOptions,
     };
 
+    /// Serializable form of a per-mount id_mapping entry.
+    #[derive(Versionize, Debug, Default, Clone, Copy)]
+    struct IdMappingState {
+        internal_id: u32,
+        external_id: u32,
+        range: u32,
+    }
+
     /// VfsState stores the state of the VFS.
+    ///
+    /// Version 2 adds `mount_id_mappings` for per-mount id_mapping persistence.
+    /// Version 1 snapshots are still loadable; missing mappings default to `None`.
     #[derive(Versionize, Debug)]
     struct VfsState {
         /// Vfs options
@@ -759,6 +759,15 @@ pub mod persist {
         root: Vec<u8>,
         /// next super block index
         next_super: u8,
+        /// per-mount id_mappings (version >= 2)
+        #[version(start = 2, default_fn = "default_mount_id_mappings")]
+        mount_id_mappings: Vec<Option<IdMappingState>>,
+    }
+
+    impl VfsState {
+        fn default_mount_id_mappings(_source_version: u16) -> Vec<Option<IdMappingState>> {
+            vec![None; super::MAX_VFS_INDEX]
+        }
     }
 
     #[derive(Versionize, Debug, Default)]
@@ -838,6 +847,10 @@ pub mod persist {
                 .set_type_version(VfsState::type_id(), 1)
                 .set_type_version(PseudoFsState::type_id(), 1)
                 .set_type_version(VfsOptionsState::type_id(), 1);
+            // Root version 2: VfsState gains per-mount id_mapping persistence.
+            version_map
+                .new_version()
+                .set_type_version(VfsState::type_id(), 2);
 
             // more versions for the future
 
@@ -897,7 +910,7 @@ pub mod persist {
         /// // mount the backend fs
         /// backend_fs_list.into_iter().for_each(|(path, idx)| {
         ///     let fs = new_backend_fs();
-        ///     vfs.restore_mount(fs, idx, path, None).unwrap();
+        ///     vfs.restore_mount(fs, idx, path).unwrap();
         /// });
         /// ```
         pub fn save_to_bytes(&self) -> VfsResult<Vec<u8>> {
@@ -905,10 +918,22 @@ pub mod persist {
                 .root
                 .save_to_bytes()
                 .map_err(|e| VfsError::Persist(format!("Failed to save Vfs root: {:?}", e)))?;
+            let mappings = self.mount_id_mappings.load();
+            let mount_id_mappings: Vec<Option<IdMappingState>> = mappings
+                .iter()
+                .map(|m| {
+                    m.map(|(i, e, r)| IdMappingState {
+                        internal_id: i,
+                        external_id: e,
+                        range: r,
+                    })
+                })
+                .collect();
             let vfs_state = VfsState {
                 options: self.opts.load().deref().deref().save(),
                 root: root_state,
                 next_super: self.next_super.load(Ordering::SeqCst),
+                mount_id_mappings,
             };
 
             let vm = Vfs::get_version_map();
@@ -937,6 +962,15 @@ pub mod persist {
             self.opts.store(Arc::new(opts));
 
             self.next_super.store(state.next_super, Ordering::SeqCst);
+
+            // Restore per-mount id_mappings
+            let mount_id_mappings: Vec<Option<(u32, u32, u32)>> = state
+                .mount_id_mappings
+                .iter()
+                .map(|m| m.map(|s| (s.internal_id, s.external_id, s.range)))
+                .collect();
+            self.mount_id_mappings.store(Arc::new(mount_id_mappings));
+
             self.root
                 .restore_from_bytes(&mut state.root)
                 .map_err(|e| VfsError::Persist(format!("Failed to restore Vfs root: {:?}", e)))?;
@@ -999,7 +1033,7 @@ pub mod persist {
             // restore the backend fs
             backend_fs_list.into_iter().for_each(|(path, idx)| {
                 let fs = new_backend_fs();
-                vfs.restore_mount(fs, idx, path, None).unwrap();
+                vfs.restore_mount(fs, idx, path).unwrap();
             });
 
             // check the vfs and restored_vfs
@@ -1062,7 +1096,7 @@ pub mod persist {
             // restore the backend fs
             backend_fs_list.into_iter().for_each(|(path, idx)| {
                 let fs = new_backend_fs();
-                vfs.restore_mount(fs, idx, path, None).unwrap();
+                vfs.restore_mount(fs, idx, path).unwrap();
             });
 
             // check the vfs and restored_vfs
@@ -1083,6 +1117,84 @@ pub mod persist {
                 let restored_inode = restored_vfs.root.path_walk(path).unwrap();
                 assert_eq!(inode, restored_inode);
             }
+        }
+
+        // Per-mount id_mappings must survive a save/restore roundtrip so that
+        // `restore_mount` does not need the mapping passed in again.
+        #[test]
+        fn test_vfs_save_restore_mount_id_mappings() {
+            use crate::api::vfs::tests::{FakeFileSystemOne, FakeFileSystemTwo};
+            use crate::api::{Vfs, VfsOptions};
+
+            let vfs = &Vfs::new(VfsOptions::default());
+            let idx1 = vfs
+                .mount_with_id_mapping(
+                    Box::new(FakeFileSystemOne {}),
+                    "/a",
+                    Some((0, 100000, 65536)),
+                )
+                .unwrap();
+            let idx2 = vfs
+                .mount_with_id_mapping(Box::new(FakeFileSystemTwo {}), "/b", None)
+                .unwrap();
+
+            let mut buf = vfs.save_to_bytes().unwrap();
+
+            let restored_vfs = &Vfs::new(VfsOptions::default());
+            restored_vfs.restore_from_bytes(&mut buf).unwrap();
+
+            assert_eq!(
+                restored_vfs.get_effective_id_mapping(idx1),
+                Some((0, 100000, 65536))
+            );
+            // No per-mount mapping and no global mapping -> remapping disabled.
+            assert_eq!(restored_vfs.get_effective_id_mapping(idx2), None);
+        }
+
+        // Snapshots written by the old (root version 1) format, which has no
+        // mount_id_mappings, must still load: mappings default to `None`.
+        #[test]
+        fn test_vfs_restore_v1_snapshot_defaults_mappings_to_none() {
+            use super::{
+                Deref, Ordering, PseudoFsState, Snapshot, VersionMap, Versionize, VfsOptionsState,
+                VfsState,
+            };
+            use crate::api::vfs::tests::FakeFileSystemOne;
+            use crate::api::{Vfs, VfsOptions};
+
+            let vfs = &Vfs::new(VfsOptions::default());
+            let idx = vfs
+                .mount_with_id_mapping(
+                    Box::new(FakeFileSystemOne {}),
+                    "/a",
+                    Some((0, 100000, 65536)),
+                )
+                .unwrap();
+
+            // Serialize with a root version 1 snapshot, like the old binary did:
+            // mount_id_mappings is not written at this version.
+            let root_state = vfs.root.save_to_bytes().unwrap();
+            let vfs_state = VfsState {
+                options: vfs.opts.load().deref().deref().save(),
+                root: root_state,
+                next_super: vfs.next_super.load(Ordering::SeqCst),
+                mount_id_mappings: Vec::new(),
+            };
+            let mut vm = VersionMap::new();
+            vm.set_type_version(VfsState::type_id(), 1)
+                .set_type_version(PseudoFsState::type_id(), 1)
+                .set_type_version(VfsOptionsState::type_id(), 1);
+            let mut snapshot = Snapshot::new(vm, 1);
+            let mut buf = Vec::new();
+            snapshot.save(&mut buf, &vfs_state).unwrap();
+
+            // Restore with the current (v2-aware) implementation.
+            let restored_vfs = &Vfs::new(VfsOptions::default());
+            restored_vfs.restore_from_bytes(&mut buf).unwrap();
+
+            // The per-mount mapping recorded before saving is gone; remapping
+            // falls back to the (disabled) global id_mapping.
+            assert_eq!(restored_vfs.get_effective_id_mapping(idx), None);
         }
     }
 }
