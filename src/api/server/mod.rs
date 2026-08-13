@@ -64,6 +64,15 @@ impl<F: FileSystem + Sync> Server<F> {
             })),
         }
     }
+
+    /// Remap the IDs in a request context to the IDs used by the backend
+    /// filesystem, based on the inode referenced by the request.
+    fn remap_ctx_ids<S: BitmapSlice>(&self, ctx: &mut SrvContext<F, S>) -> Result<()> {
+        let nodeid = ctx.nodeid();
+        self.fs
+            .id_remap_with_nodeid(&mut ctx.context, nodeid)
+            .map_err(|_| Error::FailedToRemapID((ctx.context.uid, ctx.context.gid)))
+    }
 }
 
 struct ZcReader<'a, S: BitmapSlice = ()>(Reader<'a, S>);

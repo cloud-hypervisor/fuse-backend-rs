@@ -24,9 +24,9 @@ impl AsyncFileSystem for Vfs {
             (Left(fs), idata) => self.lookup_pseudo(fs, idata, ctx, name),
             (Right(fs), idata) => {
                 // parent is in an underlying rootfs
-                let mut entry = fs.async_lookup(ctx, idata.ino(), name).await?;
+                let entry = fs.async_lookup(ctx, idata.ino(), name).await?;
                 // lookup success, hash it to a real fuse inode
-                self.convert_entry(idata.fs_idx(), entry.inode, &mut entry)
+                self.convert_backend_entry(idata, entry)
             }
         }
     }
@@ -101,14 +101,10 @@ impl AsyncFileSystem for Vfs {
             (Left(fs), idata) => fs
                 .create(ctx, idata.ino(), name, args)
                 .map(|(a, b, c, _)| (a, b, c)),
-            (Right(fs), idata) => {
-                fs.async_create(ctx, idata.ino(), name, args)
-                    .await
-                    .map(|(mut a, b, c)| {
-                        self.convert_entry(idata.fs_idx(), a.inode, &mut a)?;
-                        Ok((a, b, c))
-                    })?
-            }
+            (Right(fs), idata) => fs
+                .async_create(ctx, idata.ino(), name, args)
+                .await
+                .and_then(|(a, b, c)| self.convert_backend_entry(idata, a).map(|a| (a, b, c))),
         }
     }
 
