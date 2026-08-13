@@ -273,7 +273,7 @@ impl Daemon {
         });
 
         let fs = HelloFileSystem {};
-        vfs.mount(Box::new(fs), "/", None).unwrap();
+        vfs.mount(Box::new(fs), "/").unwrap();
 
         Ok(Daemon {
             mountpoint: mountpoint.to_string(),

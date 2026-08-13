@@ -420,7 +420,15 @@ impl Vfs {
     }
 
     /// Mount a backend file system to path
-    pub fn mount(
+    pub fn mount(&self, fs: BackFileSystem, path: &str) -> VfsResult<VfsIndex> {
+        self.mount_with_id_mapping(fs, path, None)
+    }
+
+    /// Mount a backend file system to path with a per-mount id_mapping.
+    ///
+    /// The `id_mapping` tuple is (internal_id, external_id, range), which
+    /// overrides the global `VfsOptions::id_mapping` for this mount point.
+    pub fn mount_with_id_mapping(
         &self,
         fs: BackFileSystem,
         path: &str,
@@ -956,6 +964,7 @@ pub mod persist {
             assert_eq!(vfs.next_super.load(std::sync::atomic::Ordering::SeqCst), 1);
         }
 
+        #[cfg(target_os = "linux")]
         #[test]
         fn test_vfs_save_restore_with_backend_fs() {
             use crate::api::{Vfs, VfsIndex, VfsOptions};
@@ -975,7 +984,7 @@ pub mod persist {
                 .iter()
                 .map(|path| {
                     let fs = new_backend_fs();
-                    let idx = vfs.mount(fs, path, None).unwrap();
+                    let idx = vfs.mount(fs, path).unwrap();
 
                     (path.to_owned(), idx)
                 })
@@ -1013,6 +1022,7 @@ pub mod persist {
             }
         }
 
+        #[cfg(target_os = "linux")]
         #[test]
         fn test_vfs_save_restore_with_backend_fs_with_initialized() {
             use crate::api::filesystem::{FileSystem, FsOptions};
@@ -1034,7 +1044,7 @@ pub mod persist {
                 .iter()
                 .map(|path| {
                     let fs = new_backend_fs();
-                    let idx = vfs.mount(fs, path, None).unwrap();
+                    let idx = vfs.mount(fs, path).unwrap();
 
                     (path.to_owned(), idx)
                 })
@@ -1646,14 +1656,14 @@ mod tests {
         let vfs = Vfs::new(VfsOptions::default());
 
         let idx1 = vfs
-            .mount(
+            .mount_with_id_mapping(
                 Box::new(FakeFileSystemOne {}),
                 "/a",
                 Some((0, 100000, 65536)),
             )
             .unwrap();
         let idx2 = vfs
-            .mount(
+            .mount_with_id_mapping(
                 Box::new(FakeFileSystemTwo {}),
                 "/b",
                 Some((0, 200000, 65536)),
@@ -1664,19 +1674,19 @@ mod tests {
         assert_eq!(vfs.get_effective_id_mapping(idx1), Some((0, 100000, 65536)));
         assert_eq!(vfs.get_effective_id_mapping(idx2), Some((0, 200000, 65536)));
 
-        // remap_attr_id with idx1 maps 0 → 100000
+        // remap_attr_id with idx1 maps 0 -> 100000
         let mut attr: stat64 = unsafe { std::mem::zeroed() };
         attr.st_uid = 0;
         vfs.remap_attr_id(idx1, true, &mut attr);
         assert_eq!(attr.st_uid, 100000);
 
-        // remap_attr_id with idx2 maps 0 → 200000
+        // remap_attr_id with idx2 maps 0 -> 200000
         let mut attr: stat64 = unsafe { std::mem::zeroed() };
         attr.st_uid = 0;
         vfs.remap_attr_id(idx2, true, &mut attr);
         assert_eq!(attr.st_uid, 200000);
 
-        // Pseudo-fs (fs_idx == 0) falls back to global (None) → no remap.
+        // Pseudo-fs (fs_idx == 0) falls back to global (None) -> no remap.
         let mut attr: stat64 = unsafe { std::mem::zeroed() };
         attr.st_uid = 0;
         vfs.remap_attr_id(0, true, &mut attr);
@@ -1692,15 +1702,15 @@ mod tests {
         };
         let vfs = Vfs::new(opts);
 
-        // Mount without per-mount id_mapping → falls back to global.
+        // Mount without per-mount id_mapping -> falls back to global.
         let idx = vfs
-            .mount(Box::new(FakeFileSystemOne {}), "/a", None)
+            .mount(Box::new(FakeFileSystemOne {}), "/a")
             .unwrap();
         assert_eq!(vfs.get_effective_id_mapping(idx), Some((0, 100000, 65536)));
 
         // Per-mount overrides global.
         let idx2 = vfs
-            .mount(
+            .mount_with_id_mapping(
                 Box::new(FakeFileSystemTwo {}),
                 "/b",
                 Some((0, 300000, 65536)),
@@ -1715,7 +1725,7 @@ mod tests {
         let fs = FakeFileSystemOne {};
         let ctx = Context::new();
 
-        assert!(vfs.mount(Box::new(fs), "/x/y", None).is_ok());
+        assert!(vfs.mount(Box::new(fs), "/x/y").is_ok());
 
         // Lookup inode on pseudo file system.
         let entry1 = vfs
@@ -1754,8 +1764,8 @@ mod tests {
         let vfs = Vfs::new(VfsOptions::default());
         let fs1 = FakeFileSystemOne {};
         let fs2 = FakeFileSystemTwo {};
-        assert!(vfs.mount(Box::new(fs1), "/foo", None).is_ok());
-        assert!(vfs.mount(Box::new(fs2), "/bar", None).is_ok());
+        assert!(vfs.mount(Box::new(fs1), "/foo").is_ok());
+        assert!(vfs.mount(Box::new(fs2), "/bar").is_ok());
 
         // Lookup inode on pseudo file system.
         let ctx = Context::new();
@@ -1775,10 +1785,10 @@ mod tests {
         let vfs = Vfs::new(VfsOptions::default());
         let fs1 = FakeFileSystemOne {};
         let fs2 = FakeFileSystemOne {};
-        assert!(vfs.mount(Box::new(fs1), "/foo", None).is_ok());
+        assert!(vfs.mount(Box::new(fs1), "/foo").is_ok());
         assert!(vfs.umount("/foo").is_ok());
 
-        assert!(vfs.mount(Box::new(fs2), "/x/y", None).is_ok());
+        assert!(vfs.mount(Box::new(fs2), "/x/y").is_ok());
 
         match vfs.umount("/x") {
             Err(VfsError::NotFound(_e)) => {}
@@ -1792,8 +1802,8 @@ mod tests {
         let fs1 = FakeFileSystemOne {};
         let fs2 = FakeFileSystemTwo {};
 
-        assert!(vfs.mount(Box::new(fs1), "/x/y/z", None).is_ok());
-        assert!(vfs.mount(Box::new(fs2), "/x/y", None).is_ok());
+        assert!(vfs.mount(Box::new(fs1), "/x/y/z").is_ok());
+        assert!(vfs.mount(Box::new(fs2), "/x/y").is_ok());
 
         let (m1, _) = vfs.get_rootfs("/x/y/z").unwrap().unwrap();
         assert!(m1.as_any().is::<FakeFileSystemOne>());
@@ -1815,8 +1825,8 @@ mod tests {
         let fs1 = FakeFileSystemOne {};
         let fs2 = FakeFileSystemTwo {};
 
-        assert!(vfs.mount(Box::new(fs1), "/x/y", None).is_ok());
-        assert!(vfs.mount(Box::new(fs2), "/x/y", None).is_ok());
+        assert!(vfs.mount(Box::new(fs1), "/x/y").is_ok());
+        assert!(vfs.mount(Box::new(fs2), "/x/y").is_ok());
 
         let (m1, _) = vfs.get_rootfs("/x/y").unwrap().unwrap();
         assert!(m1.as_any().is::<FakeFileSystemTwo>());

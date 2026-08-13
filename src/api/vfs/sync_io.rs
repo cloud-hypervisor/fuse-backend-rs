@@ -644,7 +644,19 @@ impl FileSystem for Vfs {
     }
 
     #[inline]
-    fn id_remap(&self, ctx: &mut Context, nodeid: Self::Inode) -> Result<()> {
+    fn id_remap(&self, ctx: &mut Context) -> Result<()> {
+        // If id_mapping is enabled, map the external ID to the internal ID.
+        // Use the global mapping (no per-mount lookup without nodeid).
+        if let Some((internal_id, external_id, range)) = self.id_mapping {
+            ctx.uid = remap_id(ctx.uid, external_id, internal_id, range);
+            ctx.gid = remap_id(ctx.gid, external_id, internal_id, range);
+        }
+
+        Ok(())
+    }
+
+    #[inline]
+    fn id_remap_with_nodeid(&self, ctx: &mut Context, nodeid: Self::Inode) -> Result<()> {
         // If id_mapping is enabled, map the external ID to the internal ID.
         // Use per-mount mapping based on the fs_idx encoded in nodeid, falling
         // back to the global mapping for pseudo-fs operations (fs_idx == 0).
@@ -693,6 +705,7 @@ impl FileSystem for Vfs {
         }
     }
 }
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -710,7 +723,27 @@ mod tests {
             pid: 1,
         };
 
-        vfs.id_remap(&mut ctx, VfsInode::from(0)).unwrap();
+        vfs.id_remap(&mut ctx).unwrap();
+
+        assert_eq!(ctx.uid, 0);
+        assert_eq!(ctx.gid, 123);
+    }
+
+    #[test]
+    fn test_id_remap_with_nodeid_fallback_to_global() {
+        let vfs = Vfs::new(VfsOptions {
+            id_mapping: (0, 100000, 65536),
+            ..Default::default()
+        });
+
+        let mut ctx = Context {
+            uid: 100000,
+            gid: 100123,
+            pid: 1,
+        };
+
+        // fs_idx == 0 (pseudo fs) falls back to global mapping
+        vfs.id_remap_with_nodeid(&mut ctx, VfsInode::from(0)).unwrap();
 
         assert_eq!(ctx.uid, 0);
         assert_eq!(ctx.gid, 123);
