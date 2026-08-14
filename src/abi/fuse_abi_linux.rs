@@ -200,6 +200,10 @@ const PERFILE_DAX: u64 = 0x2_0000_0000;
 // this flag indicates whether the guest kernel enable resend
 const HAS_RESEND: u64 = 1_u64 << 39;
 
+// The kernel sends a supplementary group matching the parent directory's
+// group in create/mkdir/symlink/mknod requests (FUSE_EXT_GROUPS extension).
+const CREATE_SUPP_GROUP: u64 = 1_u64 << 34;
+
 // This flag indicates whether to enable fd-passthrough. It was defined in the
 // Anolis kernel but not in the upstream kernel. To avoid collision, we'll set
 // it to the most significant bit.
@@ -464,6 +468,12 @@ bitflags! {
 
         /// indicates whether the kernel support resend inflight request
         const HAS_RESEND = HAS_RESEND;
+
+        /// Indicates that the kernel sends a supplementary group matching the
+        /// parent directory's group in create/mkdir/symlink/mknod requests
+        /// (FUSE_EXT_GROUPS extension), so that objects created in setgid
+        /// directories get the correct group ownership.
+        const CREATE_SUPP_GROUP = CREATE_SUPP_GROUP;
     }
 }
 
@@ -1085,6 +1095,34 @@ pub struct InitOut {
     pub unused: [u32; 7],
 }
 unsafe impl ByteValued for InitOut {}
+
+/// Extension type: supplementary group extension (`SuppGroups`).
+///
+/// Values 0..=31 of `ExtHeader::ext_type` are reserved for the security
+/// context extension.
+pub const FUSE_EXT_GROUPS: u32 = 32;
+
+/// Header of a request extension appended to create/mkdir/symlink/mknod
+/// requests by the kernel.
+#[repr(C)]
+#[derive(Debug, Default, Copy, Clone)]
+pub struct ExtHeader {
+    /// Total size of this extension including this header.
+    pub size: u32,
+    /// Type of extension.
+    pub ext_type: u32,
+}
+unsafe impl ByteValued for ExtHeader {}
+
+/// Payload of the supplementary group extension: `nr_groups` is followed by
+/// a flexible array of group IDs.
+#[repr(C)]
+#[derive(Debug, Default, Copy, Clone)]
+pub struct SuppGroups {
+    /// Number of supplementary groups.
+    pub nr_groups: u32,
+}
+unsafe impl ByteValued for SuppGroups {}
 
 #[repr(C)]
 #[derive(Debug, Default, Copy, Clone)]

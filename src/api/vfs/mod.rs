@@ -284,6 +284,7 @@ impl Default for VfsOptions {
             | FsOptions::EXPLICIT_INVAL_DATA
             | FsOptions::ZERO_MESSAGE_OPENDIR
             | FsOptions::HANDLE_KILLPRIV_V2
+            | FsOptions::CREATE_SUPP_GROUP
             | FsOptions::PERFILE_DAX;
         VfsOptions {
             no_open: true,

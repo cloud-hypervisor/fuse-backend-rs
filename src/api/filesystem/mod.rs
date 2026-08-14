@@ -393,6 +393,16 @@ pub struct Context {
 
     /// The thread group ID of the calling process.
     pub pid: libc::pid_t,
+
+    /// A supplementary group of the calling process matching the parent
+    /// directory's group.
+    ///
+    /// Set by the server for create/mkdir/symlink/mknod requests when the
+    /// kernel negotiated FUSE_CREATE_SUPP_GROUP and sent the FUSE_EXT_GROUPS
+    /// request extension.  File systems should create the new object with
+    /// this group in their supplementary group list so that objects created
+    /// in setgid directories get the correct group ownership.
+    pub supp_gid: Option<libc::gid_t>,
 }
 
 impl Context {
@@ -408,6 +418,7 @@ impl From<&fuse::InHeader> for Context {
             uid: source.uid,
             gid: source.gid,
             pid: source.pid as i32,
+            supp_gid: None,
         }
     }
 }
