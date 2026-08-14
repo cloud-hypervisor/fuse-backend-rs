@@ -246,21 +246,13 @@ impl RealInode {
         let handle = match opendir_res {
             Ok((handle, _)) => handle.unwrap_or_default(),
             // opendir may not be supported if no_opendir is set, so we can ignore this error.
-            Err(e) => {
-                match e.raw_os_error() {
-                    Some(raw_error) => {
-                        if raw_error == libc::ENOSYS {
-                            // We can still call readdir with inode if opendir is not supported in this layer.
-                            0
-                        } else {
-                            return Err(e);
-                        }
-                    }
-                    None => {
-                        return Err(e);
-                    }
+            Err(e) => match e.raw_os_error() {
+                Some(raw_error) if raw_error == libc::ENOSYS => {
+                    // We can still call readdir with inode if opendir is not supported in this layer.
+                    0
                 }
-            }
+                _ => return Err(e),
+            },
         };
 
         let mut child_names = vec![];
@@ -586,7 +578,7 @@ impl OverlayInode {
             return Err(Error::from_raw_os_error(libc::ENOTDIR));
         }
 
-        for (_, child) in self.childrens.lock().unwrap().iter() {
+        for child in self.childrens.lock().unwrap().values() {
             if child.whiteout.load(Ordering::Relaxed) {
                 whiteouts += 1;
             } else {
@@ -617,10 +609,9 @@ impl OverlayInode {
 
         let mut all_layer_inodes: HashMap<String, Vec<RealInode>> = HashMap::new();
         // read out directories from each layer
-        let mut counter = 1;
         let layers_count = self.real_inodes.lock().unwrap().len();
         // Scan from upper layer to lower layer.
-        for ri in self.real_inodes.lock().unwrap().iter() {
+        for (counter, ri) in (1..).zip(self.real_inodes.lock().unwrap().iter()) {
             debug!(
                 "loading Layer {}/{} for dir '{}', is_upper_layer: {}",
                 counter,
@@ -628,7 +619,6 @@ impl OverlayInode {
                 self.path.as_str(),
                 ri.in_upper_layer
             );
-            counter += 1;
             if ri.whiteout {
                 // Node is deleted from some upper layer, skip it.
                 debug!("directory is whiteout");
@@ -1171,7 +1161,7 @@ impl OverlayFs {
         };
         childrens.push(("..".to_string(), parent_node));
 
-        for (_, child) in ovl_inode.childrens.lock().unwrap().iter() {
+        for child in ovl_inode.childrens.lock().unwrap().values() {
             // skip whiteout node
             if child.whiteout.load(Ordering::Relaxed) {
                 continue;
@@ -1184,7 +1174,7 @@ impl OverlayFs {
             return Ok(());
         }
 
-        for (index, (name, child)) in (0_u64..).zip(childrens.into_iter()) {
+        for (index, (name, child)) in (0_u64..).zip(childrens) {
             if index >= offset {
                 // make struct DireEntry and Entry
                 let st = child.stat64(ctx)?;
