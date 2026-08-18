@@ -216,6 +216,11 @@ impl FuseSession {
             let mut status = -1;
             loop {
                 match recv(mon_fd, status.as_mut_slice(), MsgFlags::empty()) {
+                    Ok(0) => {
+                        return Err(SessionFailure(
+                            "mount helper exited before reporting mount status".to_string(),
+                        ));
+                    }
                     Ok(_size) => {
                         return if status == 0 {
                             Ok(())
@@ -259,12 +264,23 @@ impl FuseChannel {
         })
     }
 
-    fn read(&mut self, len: usize, offset: usize) -> Result<()> {
+    /// Read exactly `len` bytes into `self.buf[offset..offset + len]`.
+    ///
+    /// The fuse-t channel is a socket pair, so the peer closing its end shows
+    /// up as EOF, and unmounting the filesystem may surface as ENODEV.
+    /// Returns `Ok(true)` when the channel is gone in such a way; in that
+    /// case the buffer content is undefined and must not be consumed.
+    /// Returns `Ok(false)` once the full `len` bytes have been read.
+    fn read(&mut self, len: usize, offset: usize) -> Result<bool> {
         let mut total: usize = 0;
         let fd = self.file.as_raw_fd();
         while total < len {
             let read_buf = &mut self.buf[offset + total..offset + len];
             match read(fd, read_buf) {
+                Ok(0) => {
+                    debug!("reached EOF when reading fuse fd, assuming fuse-t helper exited");
+                    return Ok(true);
+                }
                 Ok(size) => {
                     total += size;
                 }
@@ -286,7 +302,7 @@ impl FuseChannel {
                     }
                     Errno::ENODEV => {
                         debug!("got ENODEV when reading fuse fd, assuming fuse filesystem was umounted.");
-                        return Ok(());
+                        return Ok(true);
                     }
                     e => {
                         warn! {"read fuse dev failed on fd {}: {}", fd, e};
@@ -295,7 +311,7 @@ impl FuseChannel {
                 },
             }
         }
-        Ok(())
+        Ok(false)
     }
 
     /// Get next available FUSE request from the underlying fuse device file.
@@ -307,7 +323,7 @@ impl FuseChannel {
     /// the correctness of the reading.
     ///
     /// Returns:
-    /// - Ok(None): signal has pending on the exiting event channel
+    /// - Ok(None): the channel reached EOF or got unmounted, or signal has pending on the exiting event channel
     /// - Ok(Some((reader, writer))): reader to receive request and writer to send reply
     /// - Err(e): error message
     pub fn get_request(&mut self) -> Result<Option<(Reader<'_>, FuseDevWriter<'_>)>> {
@@ -316,12 +332,20 @@ impl FuseChannel {
         let fd = self.file.as_raw_fd();
         let size = size_of::<InHeader>();
         // read header
-        self.read(size, 0)?;
+        if self.read(size, 0)? {
+            return Ok(None);
+        }
         let in_header = InHeader::from_slice(&self.buf[0..size]);
         let header_len = in_header.unwrap().len as usize;
+        if header_len < size || header_len > self.buf.len() {
+            return Err(SessionFailure(format!(
+                "invalid fuse request length {} received from fuse-t channel",
+                header_len
+            )));
+        }
         let should_read_size = header_len - size;
-        if should_read_size > 0 {
-            self.read(should_read_size, size)?;
+        if should_read_size > 0 && self.read(should_read_size, size)? {
+            return Ok(None);
         }
         drop(result);
 
