@@ -710,40 +710,44 @@ mod tests {
     }
 }
 
-#[cfg(feature = "async_io")]
+#[cfg(feature = "async-io")]
 pub use asyncio::FuseDevTask;
 
-#[cfg(feature = "async_io")]
+#[cfg(feature = "async-io")]
 /// Task context to handle fuse request in asynchronous mode.
 mod asyncio {
-    use std::os::unix::io::RawFd;
+    use std::os::unix::io::AsRawFd;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
 
     use crate::api::filesystem::AsyncFileSystem;
     use crate::api::server::Server;
-    use crate::transport::{FuseBuf, Reader, Writer};
+    use crate::async_file::File as AsyncFile;
+    use crate::file_buf::FileVolatileBuf;
+    use crate::transport::{FuseBuf, FuseDevWriter, Reader};
 
     /// Task context to handle fuse request in asynchronous mode.
     ///
     /// This structure provides a context to handle fuse request in asynchronous mode, including
-    /// the fuse fd, a internal buffer and a `Server` instance to serve requests.
+    /// the fuse device file, a internal buffer and a `Server` instance to serve requests.
     ///
     /// ## Examples
     /// ```ignore
     /// let buf_size = 0x1_0000;
-    /// let state = AsyncExecutorState::new();
-    /// let mut task = FuseDevTask::new(buf_size, fuse_dev_fd, fs_server, state.clone());
+    /// let file = session.clone_fuse_file().unwrap();
+    /// let state = Arc::new(AtomicBool::new(false));
+    /// let mut task = FuseDevTask::new(buf_size, file, fs_server, state.clone());
     ///
     /// // Run the task
     /// executor.spawn(async move { task.poll_handler().await });
     ///
     /// // Stop the task
-    /// state.quiesce();
+    /// state.store(true, Ordering::Relaxed);
     /// ```
     pub struct FuseDevTask<F: AsyncFileSystem + Sync> {
-        fd: RawFd,
+        file: AsyncFile,
         buf: Vec<u8>,
-        state: AsyncExecutorState,
+        state: Arc<AtomicBool>,
         server: Arc<Server<F>>,
     }
 
@@ -752,20 +756,19 @@ mod asyncio {
         ///
         /// # Parameters
         /// - buf_size: size of buffer to receive requests from/send reply to the fuse fd
-        /// - fd: fuse device file descriptor
+        /// - file: file object for the fuse device, ownership is taken by the task object
         /// - server: `Server` instance to serve requests from the fuse fd
-        /// - state: shared state object to control the task object
-        ///
-        /// # Safety
-        /// The caller must ensure `fd` is valid during the lifetime of the returned task object.
+        /// - state: shared flag to control the task object. The task stops picking up
+        ///   new requests once it's set to `true`; a request being processed is
+        ///   completed first.
         pub fn new(
             buf_size: usize,
-            fd: RawFd,
+            file: std::fs::File,
             server: Arc<Server<F>>,
-            state: AsyncExecutorState,
+            state: Arc<AtomicBool>,
         ) -> Self {
             FuseDevTask {
-                fd,
+                file: AsyncFile::from_std_file(file),
                 server,
                 state,
                 buf: vec![0x0u8; buf_size],
@@ -776,18 +779,25 @@ mod asyncio {
         ///
         /// An async fn to handle requests from the fuse fd. It works in asynchronous IO mode when:
         /// - receiving request from fuse fd
-        /// - handling requests by calling Server::async_handle_requests()
+        /// - handling requests by calling Server::async_handle_message()
         /// - sending reply to fuse fd
         ///
         /// The async fn repeatedly return Poll::Pending when polled until the state has been set
-        /// to quiesce mode.
+        /// to quiesce mode, or the fuse session has been torn down (EOF/`ENODEV` from the
+        /// fuse device).
         pub async fn poll_handler(&mut self) {
             // TODO: register self.buf as io uring buffers.
-            let drive = AsyncDriver::default();
+            let fd = self.file.as_raw_fd();
 
-            while !self.state.quiescing() {
-                let result = AsyncUtil::read(drive.clone(), self.fd, &mut self.buf, 0).await;
+            while !self.state.load(Ordering::Acquire) {
+                // Safe because `vbuf` doesn't out-live `self.buf`.
+                let vbuf = unsafe { FileVolatileBuf::new(&mut self.buf) };
+                let (result, _vbuf) = self.file.async_read_at(vbuf, 0).await;
                 match result {
+                    Ok(0) => {
+                        // EOF, the fuse session has been torn down.
+                        break;
+                    }
                     Ok(len) => {
                         // ###############################################
                         // Note: it's a heavy hack to reuse the same underlying data
@@ -798,13 +808,15 @@ mod asyncio {
                         let buf = unsafe {
                             std::slice::from_raw_parts_mut(self.buf.as_mut_ptr(), self.buf.len())
                         };
-                        // Reader::new() and Writer::new() should always return success.
+                        // Reader::from_fuse_buffer() and FuseDevWriter::new() should always
+                        // return success.
                         let reader =
-                            Reader::<()>::new(FuseBuf::new(&mut self.buf[0..len])).unwrap();
-                        let writer = Writer::new(self.fd, buf).unwrap();
+                            Reader::<()>::from_fuse_buffer(FuseBuf::new(&mut self.buf[0..len]))
+                                .unwrap();
+                        let writer = FuseDevWriter::<()>::new(fd, buf).unwrap();
                         let result = unsafe {
                             self.server
-                                .async_handle_message(drive.clone(), reader, writer, None, None)
+                                .async_handle_message(reader, writer.into(), None, None)
                                 .await
                         };
 
@@ -814,6 +826,10 @@ mod asyncio {
                         }
                     }
                     Err(e) => {
+                        if e.raw_os_error() == Some(libc::ENODEV) {
+                            // The fuse device was unmounted.
+                            break;
+                        }
                         // TODO: error handling
                         error!("failed to read request from fuse device fd, {}", e);
                     }
@@ -821,20 +837,27 @@ mod asyncio {
             }
 
             // TODO: unregister self.buf as io uring buffers.
-
-            // Report that the task has been quiesced.
-            self.state.report();
         }
     }
 
-    impl<F: AsyncFileSystem + Sync> Clone for FuseDevTask<F> {
-        fn clone(&self) -> Self {
-            FuseDevTask {
-                fd: self.fd,
-                server: self.server.clone(),
-                state: self.state.clone(),
-                buf: vec![0x0u8; self.buf.capacity()],
-            }
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use crate::async_runtime;
+        use crate::passthrough::{Config, PassthroughFs};
+        use vmm_sys_util::tempfile::TempFile;
+
+        #[test]
+        fn test_fuse_dev_task_quiesce() {
+            let fs = PassthroughFs::<()>::new(Config::default()).unwrap();
+            let server = Arc::new(Server::new(fs));
+            let file = TempFile::new().unwrap().into_file();
+            // Quiesce the task before polling it, so poll_handler() returns
+            // right away without touching the device.
+            let state = Arc::new(AtomicBool::new(true));
+            let mut task = FuseDevTask::new(0x1000, file, server, state);
+
+            async_runtime::block_on(task.poll_handler());
         }
     }
 }
