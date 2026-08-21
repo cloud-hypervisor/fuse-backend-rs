@@ -37,6 +37,7 @@ smoke:
 
 smoke-all: smoke
 	${CARGO} test ${TARGET} --features="fusedev,persist" -- --nocapture --ignored
+	${CARGO} test ${TARGET} --features="fusedev,async-io" --no-default-features -- --nocapture --ignored
 
 build-macos:
 	${CARGO} build --features="fusedev"
