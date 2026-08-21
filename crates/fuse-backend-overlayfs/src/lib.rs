@@ -168,10 +168,19 @@ impl RealInode {
 
     // Do real lookup action in specific layer, this call will increase Entry refcount which must be released later.
     fn lookup_child_ignore_enoent(&self, ctx: &Context, name: &str) -> Result<Option<Entry>> {
+        Self::lookup_in_layer(&self.layer, self.inode, ctx, name)
+    }
+
+    // Lookup `name` under the directory `dir` in `layer`, this call will
+    // increase Entry refcount which must be released later.
+    fn lookup_in_layer(
+        layer: &Arc<BoxedLayer>,
+        dir: u64,
+        ctx: &Context,
+        name: &str,
+    ) -> Result<Option<Entry>> {
         let cname = CString::new(name).map_err(|e| Error::new(ErrorKind::InvalidData, e))?;
-        // Real inode must have a layer.
-        let layer = self.layer.as_ref();
-        match layer.lookup(ctx, self.inode, cname.as_c_str()) {
+        match layer.lookup(ctx, dir, cname.as_c_str()) {
             Ok(v) => {
                 // Negative entry also indicates missing entry.
                 if v.inode == 0 {
@@ -204,10 +213,20 @@ impl RealInode {
         match self.lookup_child_ignore_enoent(ctx, name)? {
             Some(v) => {
                 // The Entry must be forgotten in each layer, which will be done automatically by Drop operation.
-                let (whiteout, opaque) = if utils::is_dir(v.attr) {
-                    (false, layer.is_opaque(ctx, v.inode)?)
+                let attr = if utils::is_dir(v.attr) {
+                    layer.is_opaque(ctx, v.inode).map(|opaque| (false, opaque))
                 } else {
-                    (layer.is_whiteout(ctx, v.inode)?, false)
+                    layer
+                        .is_whiteout(ctx, v.inode)
+                        .map(|whiteout| (whiteout, false))
+                };
+                let (whiteout, opaque) = match attr {
+                    Ok(v) => v,
+                    Err(e) => {
+                        // Release the lookup reference acquired in the layer.
+                        layer.forget(ctx, v.inode, 1);
+                        return Err(e);
+                    }
                 };
 
                 Ok(Some(RealInode {
@@ -476,6 +495,17 @@ impl Drop for RealInode {
 impl OverlayInode {
     pub fn new() -> Self {
         OverlayInode::default()
+    }
+
+    // Identity of the first backend inode, used to map hard links of the
+    // same file to the same overlay inode number.
+    pub fn first_real_key(&self) -> Option<(usize, u64)> {
+        self.real_inodes
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|ri| !ri.whiteout)
+            .map(|ri| real_inode_key(&ri.layer, ri.inode))
     }
 
     // Allocate new OverlayInode based on one RealInode,
@@ -828,6 +858,34 @@ fn entry_type_from_mode(mode: libc::mode_t) -> u8 {
     }
 }
 
+// Identity of a backend inode: layer object identity plus inode number.
+// Hard links of the same file share one identity within a layer.
+fn real_inode_key(layer: &Arc<BoxedLayer>, inode: u64) -> (usize, u64) {
+    (Arc::as_ptr(layer) as usize, inode)
+}
+
+// Identity of a file's first backend inode if the file has multiple hard
+// links. Files with nlink <= 1 (the common case) return None, so they
+// never touch the hard link index.
+fn multi_link_key(child: &OverlayInode) -> Option<(usize, u64)> {
+    child
+        .real_inodes
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|ri| !ri.whiteout)
+        .filter(|ri| ri.stat.map(is_multi_link_file).unwrap_or(false))
+        .map(|ri| real_inode_key(&ri.layer, ri.inode))
+}
+
+// Only files can gain a second directory entry, and only files with
+// nlink > 1 already have one.  Directories are excluded: their st_nlink
+// counts subdirectories, yet they can never have multiple entries, so
+// indexing them would only waste memory.
+fn is_multi_link_file(stat: stat64) -> bool {
+    !utils::is_dir(stat) && stat.st_nlink > 1
+}
+
 impl OverlayFs {
     pub fn new(
         upper: Option<Arc<BoxedLayer>>,
@@ -927,6 +985,57 @@ impl OverlayFs {
             .remove_inode(inode, path_removed)
     }
 
+    // Register (parent, name, path) as an extra hard link of an existing
+    // node, so all links of a file share the same overlay inode number.
+    fn register_link(
+        &self,
+        parent: &Arc<OverlayInode>,
+        node: &Arc<OverlayInode>,
+        name: &str,
+        path: String,
+    ) {
+        // Query the backend inode identity before taking the store lock.
+        let key = node.first_real_key();
+        parent.insert_child(name, Arc::clone(node));
+        let mut store = self.inodes.write().unwrap();
+        store.insert_path(&path, node.inode);
+        store.add_link(node.inode, (Arc::downgrade(parent), name.to_string(), path));
+        if let Some(key) = key {
+            store.insert_real_inode(key, node.inode);
+        }
+    }
+
+    // Find a directory entry still pointing to the node, preferring the
+    // primary link. Copy-up needs this because the primary link of a
+    // multi-linked file may have been unlinked already.
+    fn node_active_link(&self, node: &Arc<OverlayInode>) -> Option<(Arc<OverlayInode>, String)> {
+        let is_link = |p: &Arc<OverlayInode>, n: &str| {
+            p.child(n)
+                .map(|c| Arc::as_ptr(&c) == Arc::as_ptr(node))
+                .unwrap_or(false)
+        };
+
+        // Fast path for single-link inodes: the primary link is alive.
+        if let Some(p) = node.parent.lock().unwrap().upgrade() {
+            if is_link(&p, &node.name) {
+                return Some((p, node.name.clone()));
+            }
+        }
+
+        // Slow path for multi-link inodes with a stale primary link.
+        let store = self.inodes.read().unwrap();
+        if let Some(links) = store.get_links(node.inode) {
+            for (p, n, _) in links {
+                if let Some(p) = p.upgrade() {
+                    if is_link(&p, n) {
+                        return Some((p, n.clone()));
+                    }
+                }
+            }
+        }
+        None
+    }
+
     // Lookup child OverlayInode with <name> under <parent> directory.
     // If name is empty, return parent itself.
     // Parent dir will be loaded, but returned OverlayInode won't.
@@ -1016,10 +1125,58 @@ impl OverlayFs {
 
         // Now we have two locks' protection, Fs inodes lock and OverlayInode's childrens lock.
         for mut child in childrens.into_iter() {
+            let name = child.name.clone();
+
+            // Hard links of an already known file must share one overlay
+            // inode number. Only files with nlink > 1 are indexed, so
+            // this is a cheap comparison for regular files.
+            let key = multi_link_key(&child);
+            if let Some(key) = key {
+                if let Some(ino) = inode_store.get_real_inode(&key) {
+                    // A whiteout placeholder can never be a share
+                    // target, no matter how stale the index entry is.
+                    if let Some(existing) = inode_store
+                        .get_inode(ino)
+                        .filter(|e| !e.whiteout.load(Ordering::Relaxed))
+                    {
+                        // Share the existing overlay inode with this
+                        // hard link instead of allocating a new one.
+                        inode_store.insert_path(&child.path, ino);
+                        inode_store.add_link(
+                            ino,
+                            (Arc::downgrade(node), name.clone(), child.path.clone()),
+                        );
+                        node_children.insert(name, existing);
+                        continue;
+                    }
+                }
+            }
+
             // Allocate inode for each child.
             let ino = inode_store.alloc_inode(&child.path)?;
 
-            let name = child.name.clone();
+            // A copied-up link reports st_nlink == 1, so the multi-link
+            // index above is never consulted for it; but its path is
+            // still reserved to the live shared inode. Share that inode
+            // when the backend identity matches, instead of allocating
+            // a second Arc for the same file.
+            if key.is_none() {
+                let child_key = child.first_real_key();
+                if let Some(existing) = inode_store.get_inode(ino) {
+                    if inode_store.get_links(ino).is_some()
+                        && child_key.is_some()
+                        && child_key == existing.first_real_key()
+                    {
+                        inode_store.add_link(
+                            ino,
+                            (Arc::downgrade(node), name.clone(), child.path.clone()),
+                        );
+                        node_children.insert(name, existing);
+                        continue;
+                    }
+                }
+            }
+
             child.inode = ino;
             // Create bi-directional link between parent and child.
             child.parent = Mutex::new(Arc::downgrade(node));
@@ -1028,6 +1185,9 @@ impl OverlayFs {
             node_children.insert(name, arc_child.clone());
             // Record overlay inode in whole OverlayFs.
             inode_store.insert_inode(ino, arc_child.clone());
+            if let Some(key) = key {
+                inode_store.insert_real_inode(key, ino);
+            }
         }
 
         node.loaded.store(true, Ordering::Relaxed);
@@ -1048,22 +1208,57 @@ impl OverlayFs {
             }
         };
 
-        // FIXME: need atomic protection around lookups' load & store. @weizhang555
-        let mut lookups = v.lookups.load(Ordering::Relaxed);
-
-        if lookups < count {
-            lookups = 0;
-        } else {
-            lookups -= count;
-        }
-        v.lookups.store(lookups, Ordering::Relaxed);
-
-        // TODO: use compare_exchange.
-        //v.lookups.compare_exchange(old, new, Ordering::Acquire, Ordering::Relaxed);
+        // Decrement with saturation: forgets of previously unlinked
+        // links arrive after the unlink pre-accounted them, so the
+        // count of a multi-linked inode can reach zero before its last
+        // link is unlinked. The compare-and-swap loop keeps the update
+        // atomic with lookups and unlinks of the inode's links.
+        let lookups = v
+            .lookups
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |l| {
+                Some(l.saturating_sub(count))
+            })
+            .map(|prev| prev.saturating_sub(count))
+            .unwrap_or(0);
 
         if lookups == 0 {
             debug!("inode is forgotten: {}, name {}", inode, v.name);
-            let _ = self.remove_inode(inode, None);
+            // Re-check the hard link bookkeeping and finish the removal
+            // under a single store lock: load_directory() can re-register
+            // a link of this inode while loading another directory, and
+            // tearing down that fresh entry would corrupt the directory.
+            let links = {
+                let mut store = self.inodes.write().unwrap();
+                // Keep the overlay inode cached only while it has live
+                // hard link bookkeeping: the kernel drops its references
+                // to a multi-linked inode when one link is unlinked or on
+                // dentry cache eviction, but the remaining directory
+                // entries must keep resolving to it. Inodes without extra
+                // links (the common case) are evicted as before, so a
+                // long-running daemon does not pin every file it ever
+                // touched. Bookkeeping left behind by an evicted parent
+                // directory keeps the inode cached as well, until the last
+                // link is unlinked; that is what lets a reloaded directory
+                // re-share the inode.
+                if store.get_links(inode).is_some() && store.get_inode(inode).is_some() {
+                    return;
+                }
+
+                // The inode was unlinked already and its removal was
+                // deferred until the last reference went away, or it has
+                // no hard links keeping it alive. Finish the removal
+                // now: drop the bookkeeping and detach the remaining
+                // directory entries from their parent directories.
+                let links = store.take_links(inode);
+                let _ = store.remove_inode(inode, None);
+                links
+            };
+            for (p, n, _) in links {
+                if let Some(p) = p.upgrade() {
+                    p.remove_child(n.as_str());
+                }
+            }
+
             let parent = v.parent.lock().unwrap();
 
             if let Some(p) = parent.upgrade() {
@@ -1160,12 +1355,14 @@ impl OverlayFs {
         };
         childrens.push(("..".to_string(), parent_node));
 
-        for child in ovl_inode.childrens.lock().unwrap().values() {
+        for (name, child) in ovl_inode.childrens.lock().unwrap().iter() {
             // skip whiteout node
             if child.whiteout.load(Ordering::Relaxed) {
                 continue;
             }
-            childrens.push((child.name.clone(), child.clone()));
+            // Use the directory entry name instead of child.name, since a
+            // hard linked child may have a different primary name.
+            childrens.push((name.clone(), child.clone()));
         }
 
         let mut len: usize = 0;
@@ -1285,7 +1482,9 @@ impl OverlayFs {
             if set_opaque {
                 parent_real_inode.layer.set_opaque(ctx, child_dir.inode)?;
             }
-            let ovi = OverlayInode::new_from_real_inode(name, ino, path.clone(), child_dir);
+            let mut ovi = OverlayInode::new_from_real_inode(name, ino, path.clone(), child_dir);
+            // Create bi-directional link between parent and child.
+            ovi.parent = Mutex::new(Arc::downgrade(&pnode));
 
             new_node.replace(ovi);
             Ok(false)
@@ -1366,7 +1565,10 @@ impl OverlayFs {
                     // Allocate inode number.
                     let ino = self.alloc_inode(&path)?;
                     let child_ri = parent_real_inode.mknod(ctx, name, mode, rdev, umask)?;
-                    let ovi = OverlayInode::new_from_real_inode(name, ino, path.clone(), child_ri);
+                    let mut ovi =
+                        OverlayInode::new_from_real_inode(name, ino, path.clone(), child_ri);
+                    // Create bi-directional link between parent and child.
+                    ovi.parent = Mutex::new(Arc::downgrade(&pnode));
 
                     new_node.replace(ovi);
                     Ok(false)
@@ -1457,7 +1659,10 @@ impl OverlayFs {
                     handle = hd;
                     // Allocate inode number.
                     let ino = self.alloc_inode(&path)?;
-                    let ovi = OverlayInode::new_from_real_inode(name, ino, path.clone(), child_ri);
+                    let mut ovi =
+                        OverlayInode::new_from_real_inode(name, ino, path.clone(), child_ri);
+                    // Create bi-directional link between parent and child.
+                    ovi.parent = Mutex::new(Arc::downgrade(&pnode));
 
                     new_node.replace(ovi);
                     Ok(false)
@@ -1551,16 +1756,29 @@ impl OverlayFs {
                         );
                     }
 
-                    let child_ri = parent_real_inode.link(ctx, src_ino, name)?;
-
-                    // Replace existing real inodes with new one.
-                    n.add_upper_inode(child_ri, true);
+                    // Create the backend hard link. The lookup reference
+                    // of the returned entry is dropped, because src_node
+                    // already holds a reference to the backend inode.
+                    parent_real_inode.link(ctx, src_ino, name)?;
                     Ok(false)
                 })?;
+
+                // Replace the whiteout placeholder by a hard link to the
+                // source node, so both links share one overlay inode.
+                // Saturate like do_rm() and forget_one(): the placeholder
+                // can't be LOOKUP-ed, so the count is always the birth
+                // reference, but an underflow would park it on the
+                // deleted list forever.
+                let _ = n
+                    .lookups
+                    .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |l| {
+                        Some(l.saturating_sub(1))
+                    });
+                self.remove_inode(n.inode, Some(n.path.clone()));
+                self.register_link(&new_parent, &src_node, name, n.path.clone());
             }
             None => {
                 // Copy parent node up if necessary.
-                let mut new_node = None;
                 new_parent.handle_upper_inode_locked(&mut |parent_real_inode| -> Result<bool> {
                     let parent_real_inode = match parent_real_inode {
                         Some(inode) => inode,
@@ -1570,20 +1788,17 @@ impl OverlayFs {
                         }
                     };
 
-                    // Allocate inode number.
-                    let path = format!("{}/{}", new_parent.path, name);
-                    let ino = self.alloc_inode(&path)?;
-                    let child_ri = parent_real_inode.link(ctx, src_ino, name)?;
-                    let ovi = OverlayInode::new_from_real_inode(name, ino, path, child_ri);
-
-                    new_node.replace(ovi);
+                    // Create the backend hard link. The lookup reference
+                    // of the returned entry is dropped, because src_node
+                    // already holds a reference to the backend inode.
+                    parent_real_inode.link(ctx, src_ino, name)?;
                     Ok(false)
                 })?;
 
-                // new_node is always 'Some'
-                let arc_node = Arc::new(new_node.unwrap());
-                self.insert_inode(arc_node.inode, arc_node.clone());
-                new_parent.insert_child(name, arc_node);
+                // Register the new directory entry as a hard link of the
+                // source node, so both links share one overlay inode.
+                let path = format!("{}/{}", new_parent.path, name);
+                self.register_link(&new_parent, &src_node, name, path);
             }
         }
 
@@ -1656,7 +1871,10 @@ impl OverlayFs {
                     // Allocate inode number.
                     let ino = self.alloc_inode(&path)?;
                     let child_ri = parent_real_inode.symlink(ctx, linkname, name)?;
-                    let ovi = OverlayInode::new_from_real_inode(name, ino, path.clone(), child_ri);
+                    let mut ovi =
+                        OverlayInode::new_from_real_inode(name, ino, path.clone(), child_ri);
+                    // Create bi-directional link between parent and child.
+                    ovi.parent = Mutex::new(Arc::downgrade(&pnode));
 
                     new_node.replace(ovi);
                     Ok(false)
@@ -1677,10 +1895,11 @@ impl OverlayFs {
             return Ok(node);
         }
 
-        let parent_node = if let Some(ref n) = node.parent.lock().unwrap().upgrade() {
-            Arc::clone(n)
-        } else {
-            return Err(Error::other("no parent?"));
+        // For multi-linked files the primary link may have been removed,
+        // so find a directory entry still pointing to the node.
+        let (parent_node, name) = match self.node_active_link(&node) {
+            Some(v) => v,
+            None => return Err(Error::other("no parent?")),
         };
 
         let (self_layer, _, self_inode) = node.first_layer_inode();
@@ -1700,7 +1919,7 @@ impl OverlayFs {
             // We already create upper dir for parent_node above.
             let parent_real_inode =
                 parent_upper_inode.ok_or_else(|| Error::from_raw_os_error(libc::EROFS))?;
-            new_upper_real.replace(parent_real_inode.symlink(ctx, path, node.name.as_str())?);
+            new_upper_real.replace(parent_real_inode.symlink(ctx, path, name.as_str())?);
             Ok(false)
         })?;
 
@@ -1719,10 +1938,11 @@ impl OverlayFs {
             return Ok(node);
         }
 
-        let parent_node = if let Some(ref n) = node.parent.lock().unwrap().upgrade() {
-            Arc::clone(n)
-        } else {
-            return Err(Error::other("no parent?"));
+        // For multi-linked files the primary link may have been removed,
+        // so find a directory entry still pointing to the node.
+        let (parent_node, name) = match self.node_active_link(&node) {
+            Some(v) => v,
+            None => return Err(Error::other("no parent?")),
         };
 
         let st = node.stat64(ctx)?;
@@ -1748,7 +1968,7 @@ impl OverlayFs {
                 error!("parent {} has no upper inode", parent_node.inode);
                 Error::from_raw_os_error(libc::EINVAL)
             })?;
-            let (inode, h) = parent_real_inode.create(ctx, node.name.as_str(), args)?;
+            let (inode, h) = parent_real_inode.create(ctx, name.as_str(), args)?;
             upper_handle = h.unwrap_or(0);
             upper_real_inode.replace(inode);
             Ok(false)
@@ -1852,6 +2072,170 @@ impl OverlayFs {
         self.copy_regfile_up(ctx, Arc::clone(&node))
     }
 
+    // Location of the directory entry `name` in the upper layer under
+    // `dir`: (real entry exists, whiteout exists).
+    //
+    // With one overlay inode shared by all hard links of a file, the
+    // entry an operation targets may live in a different layer than the
+    // inode itself, e.g. after the file was copied up through another
+    // link. Removal then has to act on the entry's own location instead
+    // of the inode's.
+    fn upper_entry_status(
+        &self,
+        ctx: &Context,
+        dir: &Arc<OverlayInode>,
+        name: &str,
+    ) -> Result<(bool, bool)> {
+        let upper = {
+            let real_inodes = dir.real_inodes.lock().unwrap();
+            real_inodes
+                .iter()
+                .find(|ri| ri.in_upper_layer && !ri.whiteout)
+                .map(|ri| (ri.layer.clone(), ri.inode))
+        };
+        let (layer, dir_ino) = match upper {
+            Some(v) => v,
+            None => return Ok((false, false)),
+        };
+
+        match RealInode::lookup_in_layer(&layer, dir_ino, ctx, name)? {
+            Some(entry) => {
+                let whiteout = if utils::is_dir(entry.attr) {
+                    Ok(false)
+                } else {
+                    layer.is_whiteout(ctx, entry.inode)
+                };
+                // Release the lookup reference acquired in the layer.
+                layer.forget(ctx, entry.inode, 1);
+                Ok((true, whiteout?))
+            }
+            None => Ok((false, false)),
+        }
+    }
+
+    // Whether the directory entry `name` exists in any lower layer under `dir`.
+    fn lower_entry_exists(
+        &self,
+        ctx: &Context,
+        dir: &Arc<OverlayInode>,
+        name: &str,
+    ) -> Result<bool> {
+        let lowers = {
+            let real_inodes = dir.real_inodes.lock().unwrap();
+            real_inodes
+                .iter()
+                .filter(|ri| !ri.in_upper_layer && !ri.whiteout)
+                .map(|ri| (ri.layer.clone(), ri.inode))
+                .collect::<Vec<_>>()
+        };
+
+        for (layer, dir_ino) in lowers {
+            if let Some(entry) = RealInode::lookup_in_layer(&layer, dir_ino, ctx, name)? {
+                // Release the lookup reference acquired in the layer.
+                layer.forget(ctx, entry.inode, 1);
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    // Link the copied-up backend inode of `node` at each of its live
+    // directory entries in the upper layer, except the `(parent, name)`
+    // entry being removed.
+    //
+    // All hard links of a file share one overlay inode, so unlinking
+    // the inode's last upper-layer entry while other links exist only
+    // in lower layers would orphan the copied-up data: the shared node
+    // keeps working through the unlinked backend inode, but a remount
+    // would revert the remaining links to their stale lower content.
+    fn materialize_remaining_links(
+        &self,
+        ctx: &Context,
+        node: &Arc<OverlayInode>,
+        parent: &Arc<OverlayInode>,
+        name: &str,
+    ) -> Result<()> {
+        // Collect the live directory entries of the inode other than
+        // the one being removed. The primary link of the node is never
+        // recorded in the extra links, so the two sources can't
+        // duplicate each other.
+        let mut entries = Vec::new();
+        if let Some(p) = node.parent.lock().unwrap().upgrade() {
+            entries.push((p, node.name.clone()));
+        }
+        {
+            let store = self.inodes.read().unwrap();
+            if let Some(links) = store.get_links(node.inode) {
+                for (p, n, _) in links {
+                    if let Some(p) = p.upgrade() {
+                        entries.push((p, n.clone()));
+                    }
+                }
+            }
+        }
+        let node_ptr = Arc::as_ptr(node);
+        let parent_ptr = Arc::as_ptr(parent);
+        entries.retain(|(p, n)| {
+            // The entry being removed is excluded, and an entry counts
+            // only while its parent directory still lists the inode.
+            !(Arc::as_ptr(p) == parent_ptr && n == name)
+                && p.child(n)
+                    .map(|c| Arc::as_ptr(&c) == node_ptr)
+                    .unwrap_or(false)
+        });
+        if entries.is_empty() {
+            return Ok(());
+        }
+
+        // Live entries already in the upper layer reach the copied-up
+        // data. Lower-only ones still need the backend hard link: if
+        // the daemon died before they were unlinked or materialized,
+        // a remount would serve their stale lower content.
+        let mut missing = Vec::new();
+        for (p, n) in &entries {
+            if !self.upper_entry_status(ctx, p, n)?.0 {
+                missing.push((Arc::clone(p), n.clone()));
+            }
+        }
+        if missing.is_empty() {
+            return Ok(());
+        }
+
+        // Link the copied-up backend inode at each of them.
+        let src_ino = {
+            let real_inodes = node.real_inodes.lock().unwrap();
+            real_inodes
+                .iter()
+                .find(|ri| ri.in_upper_layer && !ri.whiteout)
+                .map(|ri| ri.inode)
+                .ok_or_else(|| Error::from_raw_os_error(libc::EINVAL))?
+        };
+        for (p, n) in missing {
+            let p = self.copy_node_up(ctx, p)?;
+            p.handle_upper_inode_locked(&mut |parent_real_inode| -> Result<bool> {
+                let parent_real_inode = match parent_real_inode {
+                    Some(inode) => inode,
+                    None => {
+                        error!("BUG: parent {} has no upper inode after copied up", p.inode);
+                        return Err(Error::from_raw_os_error(libc::EINVAL));
+                    }
+                };
+
+                // A stale whiteout for the name would shadow the new link.
+                let _ = parent_real_inode.layer.delete_whiteout(
+                    ctx,
+                    parent_real_inode.inode,
+                    utils::to_cstring(n.as_str())?.as_c_str(),
+                );
+                // The lookup reference of the returned entry is dropped:
+                // the node already references the backend inode.
+                parent_real_inode.link(ctx, src_ino, n.as_str())?;
+                Ok(false)
+            })?;
+        }
+        Ok(())
+    }
+
     fn do_rm(&self, ctx: &Context, parent: u64, name: &CStr, dir: bool) -> Result<()> {
         if self.upper_layer.is_none() {
             return Err(Error::from_raw_os_error(libc::EROFS));
@@ -1894,8 +2278,39 @@ impl OverlayFs {
             need_whiteout = false;
         }
 
+        // With one overlay inode shared by all hard links of a file, the
+        // directory entry being removed may live in a different layer
+        // than the node itself: after a copy-up through another link the
+        // node is upper-only, while this entry still exists only in a
+        // lower layer. Decide the backend unlink and the whiteout from
+        // the entry's own location then. Single-link inodes (the common
+        // case) skip the extra layer lookups: entry and node always
+        // agree there.
+        let mut entry_in_upper = node.in_upper_layer();
+        if self.inodes.read().unwrap().get_links(node.inode).is_some() {
+            let (upper_real, upper_whiteout) = self.upper_entry_status(ctx, &pnode, &sname)?;
+            entry_in_upper = upper_real;
+            if upper_whiteout {
+                // Already shadowed in the upper layer.
+                need_whiteout = false;
+            } else if self.lower_entry_exists(ctx, &pnode, &sname)? {
+                need_whiteout = true;
+            }
+        }
+
+        // Path of the directory entry being removed, which may be only
+        // one hard link of a multi-linked inode.
+        let link_path = format!("{}/{}", pnode.path, sname);
         let mut path_removed = None;
-        if node.in_upper_layer() {
+        if entry_in_upper {
+            // Unlinking the inode's last upper-layer entry while other
+            // hard links remain only in lower layers would orphan the
+            // copied-up data; materialize those links in the upper
+            // layer first.
+            if self.inodes.read().unwrap().get_links(node.inode).is_some() {
+                self.materialize_remaining_links(ctx, &node, &pnode, &sname)?;
+            }
+
             pnode.handle_upper_inode_locked(&mut |parent_upper_inode| -> Result<bool> {
                 let parent_real_inode = parent_upper_inode.ok_or_else(|| {
                     error!(
@@ -1922,7 +2337,7 @@ impl OverlayFs {
                 Ok(false)
             })?;
 
-            path_removed.replace(node.path.clone());
+            path_removed.replace(link_path.clone());
         }
 
         trace!(
@@ -1930,13 +2345,42 @@ impl OverlayFs {
             node.inode
         );
 
-        // lookups decrease by 1.
-        node.lookups.fetch_sub(1, Ordering::Relaxed);
+        // lookups decrease by 1, saturating at zero like forget_one():
+        // unlinks of the inode's other links each pre-accounted a forget,
+        // so the count can already be zero when the kernel settles forgets
+        // between unlinks of one multi-linked inode. Underflowing would
+        // park the inode on the deleted list forever. The compare-and-swap
+        // loop keeps the decrement atomic with lookups, forgets and
+        // unlinks of the inode's other links.
+        let _ = node
+            .lookups
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |l| {
+                Some(l.saturating_sub(1))
+            });
+
+        // Detach the directory entry from the inode. If other hard links
+        // remain, keep the overlay inode alive: the file is still
+        // reachable through them.
+        let remaining = {
+            let mut store = self.inodes.write().unwrap();
+            let remaining = store.remove_link(&node, &pnode, &sname);
+            if matches!(remaining, Some(count) if count > 0) {
+                store.remove_path(&link_path);
+            }
+            remaining
+        };
 
         // remove it from hashmap
-        self.remove_inode(node.inode, path_removed);
-        pnode.remove_child(node.name.as_str());
+        pnode.remove_child(sname.as_str());
+        if !matches!(remaining, Some(count) if count > 0) {
+            // The last link of the node is gone, drop the overlay inode.
+            self.remove_inode(node.inode, path_removed);
+        }
 
+        // A whiteout is still needed when other links remain and the
+        // removed name has a lower-layer entry to shadow, or the name
+        // would reappear once the parent directory is evicted and
+        // reloaded from the layers.
         if need_whiteout {
             trace!("do_rm: creating whiteout\n");
             // pnode is copied up, so it has upper layer.
@@ -1952,12 +2396,11 @@ impl OverlayFs {
                 let child_ri = parent_real_inode.create_whiteout(ctx, sname.as_str())?;
                 let path = format!("{}/{}", pnode.path, sname);
                 let ino = self.alloc_inode(&path)?;
-                let ovi = Arc::new(OverlayInode::new_from_real_inode(
-                    sname.as_str(),
-                    ino,
-                    path.clone(),
-                    child_ri,
-                ));
+                let mut new_ovi =
+                    OverlayInode::new_from_real_inode(sname.as_str(), ino, path.clone(), child_ri);
+                // Create bi-directional link between parent and child.
+                new_ovi.parent = Mutex::new(Arc::downgrade(&pnode));
+                let ovi = Arc::new(new_ovi);
 
                 self.insert_inode(ino, ovi.clone());
                 pnode.insert_child(sname.as_str(), ovi.clone());
@@ -2013,22 +2456,36 @@ impl OverlayFs {
             .childrens
             .lock()
             .unwrap()
-            .values()
-            .cloned()
+            .iter()
+            .map(|(name, child)| (name.clone(), child.clone()))
             .collect::<Vec<_>>();
 
-        for child in iter {
+        for (name, child) in iter {
             // We only care about upper layer, ignore lower layers.
-            if child.in_upper_layer() {
+            // A directory entry of a multi-linked child may exist only
+            // in a lower layer (e.g. after the file was copied up
+            // through another link); check the entry's own location
+            // instead of the child's.
+            let entry_in_upper = if !child.whiteout.load(Ordering::Relaxed)
+                && self.inodes.read().unwrap().get_links(child.inode).is_some()
+            {
+                self.upper_entry_status(ctx, &node, name.as_str())?.0
+            } else {
+                child.in_upper_layer()
+            };
+            if entry_in_upper {
                 if child.whiteout.load(Ordering::Relaxed) {
                     layer.delete_whiteout(
                         ctx,
                         inode,
-                        utils::to_cstring(child.name.as_str())?.as_c_str(),
+                        utils::to_cstring(name.as_str())?.as_c_str(),
                     )?
                 } else {
                     let s = child.stat64(ctx)?;
-                    let cname = utils::to_cstring(&child.name)?;
+                    // Use the directory entry name instead of child.name,
+                    // since a hard linked child may have a different
+                    // primary name.
+                    let cname = utils::to_cstring(&name)?;
                     if utils::is_dir(s) {
                         let (count, whiteouts) = child.count_entries_and_whiteout(ctx)?;
                         if count + whiteouts > 0 {
@@ -2041,9 +2498,48 @@ impl OverlayFs {
                     }
                 }
 
-                // delete the child
-                self.remove_inode(child.inode, Some(child.path.clone()));
-                node.remove_child(child.name.as_str());
+                // Delete the child. If it still has other hard links in
+                // other directories, keep the overlay inode alive and
+                // only drop this path.
+                let link_path = format!("{}/{}", node.path, name);
+                let remaining = self
+                    .inodes
+                    .write()
+                    .unwrap()
+                    .remove_link(&child, &node, &name);
+                if matches!(remaining, Some(count) if count > 0) {
+                    self.inodes.write().unwrap().remove_path(&link_path);
+                } else {
+                    self.remove_inode(child.inode, Some(link_path));
+                }
+                node.remove_child(name.as_str());
+            } else if self.inodes.read().unwrap().get_links(child.inode).is_some() {
+                // A multi-linked child whose entry under this directory
+                // exists only in a lower layer, e.g. after the file was
+                // copied up through another link. The entry dies with
+                // the directory and the directory's own whiteout shadows
+                // it, so no per-name whiteout is needed, but its link
+                // bookkeeping must be dropped: an entry left behind
+                // would keep the child's inode alive after its last live
+                // link is unlinked. Release the entry's lookups
+                // reference like do_rm() does for an unlink.
+                let _ = child
+                    .lookups
+                    .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |l| {
+                        Some(l.saturating_sub(1))
+                    });
+                let link_path = format!("{}/{}", node.path, name);
+                let remaining = self
+                    .inodes
+                    .write()
+                    .unwrap()
+                    .remove_link(&child, &node, &name);
+                if matches!(remaining, Some(count) if count > 0) {
+                    self.inodes.write().unwrap().remove_path(&link_path);
+                } else {
+                    self.remove_inode(child.inode, Some(link_path));
+                }
+                node.remove_child(name.as_str());
             }
         }
 
@@ -2149,5 +2645,34 @@ impl BackendFileSystem for OverlayFs {
     /// trait.
     fn as_any(&self) -> &dyn std::any::Any {
         self
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn stat_with(mode: u32, nlink: u64) -> stat64 {
+        // Safe: an all-zero stat64 is a valid stat of a hidden file.
+        let mut st: stat64 = unsafe { std::mem::zeroed() };
+        st.st_mode = mode;
+        st.st_nlink = nlink;
+        st
+    }
+
+    #[test]
+    fn test_is_multi_link_file() {
+        // Directories are never indexed even with nlink > 1: their
+        // nlink counts subdirectories, not directory entries.
+        assert!(!is_multi_link_file(stat_with(libc::S_IFDIR | 0o755, 2,)));
+
+        // A regular file with two links is the hard link case.
+        assert!(is_multi_link_file(stat_with(libc::S_IFREG | 0o644, 2)));
+
+        // Single-link files are the common case and stay out of the index.
+        assert!(!is_multi_link_file(stat_with(libc::S_IFREG | 0o644, 1)));
+
+        // Symlinks can be hard linked too.
+        assert!(is_multi_link_file(stat_with(libc::S_IFLNK | 0o777, 2)));
     }
 }
