@@ -482,10 +482,57 @@ pub enum Opcode {
 
 impl From<u32> for Opcode {
     fn from(op: u32) -> Opcode {
-        if op >= Opcode::MaxOpcode as u32 {
-            return Opcode::MaxOpcode;
+        // Don't use `mem::transmute` here: the value range contains holes
+        // (e.g. 0, 7, 19, 44..61), and transmuting an invalid value into the
+        // enum is undefined behavior. Unknown values are mapped to
+        // `MaxOpcode`, which callers treat as an unsupported opcode.
+        match op {
+            1 => Opcode::Lookup,
+            2 => Opcode::Forget,
+            3 => Opcode::Getattr,
+            4 => Opcode::Setattr,
+            5 => Opcode::Readlink,
+            6 => Opcode::Symlink,
+            8 => Opcode::Mknod,
+            9 => Opcode::Mkdir,
+            10 => Opcode::Unlink,
+            11 => Opcode::Rmdir,
+            12 => Opcode::Rename,
+            13 => Opcode::Link,
+            14 => Opcode::Open,
+            15 => Opcode::Read,
+            16 => Opcode::Write,
+            17 => Opcode::Statfs,
+            18 => Opcode::Release,
+            20 => Opcode::Fsync,
+            21 => Opcode::Setxattr,
+            22 => Opcode::Getxattr,
+            23 => Opcode::Listxattr,
+            24 => Opcode::Removexattr,
+            25 => Opcode::Flush,
+            26 => Opcode::Init,
+            27 => Opcode::Opendir,
+            28 => Opcode::Readdir,
+            29 => Opcode::Releasedir,
+            30 => Opcode::Fsyncdir,
+            31 => Opcode::Getlk,
+            32 => Opcode::Setlk,
+            33 => Opcode::Setlkw,
+            34 => Opcode::Access,
+            35 => Opcode::Create,
+            36 => Opcode::Interrupt,
+            37 => Opcode::Bmap,
+            38 => Opcode::Destroy,
+            39 => Opcode::Ioctl,
+            40 => Opcode::Poll,
+            41 => Opcode::NotifyReply,
+            42 => Opcode::BatchForget,
+            43 => Opcode::Fallocate,
+            61 => Opcode::Setvolname,
+            62 => Opcode::Getxtimes,
+            63 => Opcode::Exchange,
+            _ => Opcode::MaxOpcode,
         }
-        unsafe { mem::transmute(op) }
     }
 }
 
@@ -1109,5 +1156,82 @@ mod tests {
         assert_eq!(buf[1], 0x2u8);
         assert_eq!(buf[8], 0x5u8);
         assert_eq!(buf[9], 0x6u8);
+    }
+
+    #[test]
+    fn test_opcode_from_valid_values() {
+        let valid = [
+            Opcode::Lookup,
+            Opcode::Forget,
+            Opcode::Getattr,
+            Opcode::Setattr,
+            Opcode::Readlink,
+            Opcode::Symlink,
+            Opcode::Mknod,
+            Opcode::Mkdir,
+            Opcode::Unlink,
+            Opcode::Rmdir,
+            Opcode::Rename,
+            Opcode::Link,
+            Opcode::Open,
+            Opcode::Read,
+            Opcode::Write,
+            Opcode::Statfs,
+            Opcode::Release,
+            Opcode::Fsync,
+            Opcode::Setxattr,
+            Opcode::Getxattr,
+            Opcode::Listxattr,
+            Opcode::Removexattr,
+            Opcode::Flush,
+            Opcode::Init,
+            Opcode::Opendir,
+            Opcode::Readdir,
+            Opcode::Releasedir,
+            Opcode::Fsyncdir,
+            Opcode::Getlk,
+            Opcode::Setlk,
+            Opcode::Setlkw,
+            Opcode::Access,
+            Opcode::Create,
+            Opcode::Interrupt,
+            Opcode::Bmap,
+            Opcode::Destroy,
+            Opcode::Ioctl,
+            Opcode::Poll,
+            Opcode::NotifyReply,
+            Opcode::BatchForget,
+            Opcode::Fallocate,
+            Opcode::Setvolname,
+            Opcode::Getxtimes,
+            Opcode::Exchange,
+        ];
+        for op in valid {
+            assert_eq!(Opcode::from(op as u32) as u32, op as u32);
+        }
+    }
+
+    #[test]
+    fn test_opcode_from_invalid_values() {
+        // Holes in the enum value range and out-of-range values must map to
+        // MaxOpcode without triggering undefined behavior (issue #226).
+        assert_eq!(Opcode::from(0) as u32, Opcode::MaxOpcode as u32);
+        assert_eq!(Opcode::from(7) as u32, Opcode::MaxOpcode as u32);
+        assert_eq!(Opcode::from(19) as u32, Opcode::MaxOpcode as u32);
+        assert_eq!(Opcode::from(44) as u32, Opcode::MaxOpcode as u32);
+        assert_eq!(Opcode::from(60) as u32, Opcode::MaxOpcode as u32);
+        assert_eq!(
+            Opcode::from(Opcode::MaxOpcode as u32) as u32,
+            Opcode::MaxOpcode as u32
+        );
+        assert_eq!(Opcode::from(u32::MAX) as u32, Opcode::MaxOpcode as u32);
+        assert_eq!(
+            Opcode::from(Opcode::CuseInitBswapReserved as u32) as u32,
+            Opcode::MaxOpcode as u32
+        );
+        assert_eq!(
+            Opcode::from(Opcode::InitBswapReserved as u32) as u32,
+            Opcode::MaxOpcode as u32
+        );
     }
 }
