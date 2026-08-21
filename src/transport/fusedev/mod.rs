@@ -392,10 +392,7 @@ mod async_io {
                 Ok(data.len())
             } else {
                 nix::sys::uio::pwrite(self.fd, data, 0)
-                    .map(|x| {
-                        self.account_written(x);
-                        x
-                    })
+                    .inspect(|x| self.account_written(*x))
                     .map_err(|e| {
                         error! {"fail to write to fuse device fd {}: {}", self.fd, e};
                         io::Error::other(format!("{}", e))
@@ -418,10 +415,7 @@ mod async_io {
             } else {
                 let bufs = [IoSlice::new(data), IoSlice::new(data2)];
                 writev(self.fd, &bufs)
-                    .map(|x| {
-                        self.account_written(x);
-                        x
-                    })
+                    .inspect(|x| self.account_written(*x))
                     .map_err(|e| {
                         error! {"fail to write to fuse device fd {}: {}", self.fd, e};
                         io::Error::other(format!("{}", e))
@@ -450,10 +444,7 @@ mod async_io {
             } else {
                 let bufs = [IoSlice::new(data), IoSlice::new(data2), IoSlice::new(data3)];
                 writev(self.fd, &bufs)
-                    .map(|x| {
-                        self.account_written(x);
-                        x
-                    })
+                    .inspect(|x| self.account_written(*x))
                     .map_err(|e| {
                         error! {"fail to write to fuse device fd {}: {}", self.fd, e};
                         io::Error::other(format!("{}", e))

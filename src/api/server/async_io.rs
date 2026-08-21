@@ -143,7 +143,7 @@ impl<F: AsyncFileSystem + Sync> Server<F> {
         );
 
         if let Some(h) = hook {
-            h.collect(&in_header);
+            h.collect(in_header);
         }
 
         let res = match in_header.opcode {

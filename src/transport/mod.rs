@@ -196,7 +196,7 @@ impl<S: BitmapSlice> IoBuffers<'_, S> {
             ));
 
             // Don't need check_sub() as we just made sure rem >= local_buf.len()
-            rem -= local_buf.len() as usize;
+            rem -= local_buf.len();
         }
 
         bufs
@@ -227,7 +227,7 @@ impl<S: BitmapSlice> IoBuffers<'_, S> {
             ));
 
             // Don't need check_sub() as we just made sure rem >= local_buf.len()
-            rem -= local_buf.len() as usize;
+            rem -= local_buf.len();
         }
 
         bufs
