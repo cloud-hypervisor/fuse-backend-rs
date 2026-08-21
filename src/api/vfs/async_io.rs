@@ -213,8 +213,11 @@ mod tests {
     use super::super::tests::FakeFileSystemOne;
     use super::*;
     use crate::api::Vfs;
+    use crate::file_buf::FileVolatileSlice;
+    use crate::file_traits::{AsyncFileReadWriteVolatile, FileReadWriteVolatile};
 
     use std::ffi::CString;
+    use std::sync::Arc;
 
     #[tokio::test]
     async fn test_vfs_async_lookup() {
@@ -258,5 +261,125 @@ mod tests {
             assert_eq!(entry3.inode, 0);
         });
         handle.await.unwrap();
+    }
+
+    /// An in-memory sink implementing `AsyncZeroCopyWriter`, to receive data
+    /// from `async_read()`.
+    struct MemWriter(Vec<u8>);
+
+    impl io::Write for MemWriter {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.0.extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl ZeroCopyWriter for MemWriter {
+        fn write_from(
+            &mut self,
+            f: &mut dyn FileReadWriteVolatile,
+            count: usize,
+            off: u64,
+        ) -> io::Result<usize> {
+            if self.0.len() < count {
+                self.0.resize(count, 0);
+            }
+            // Safe because the slice points into `self.0` and doesn't out-live it.
+            // The file offset only selects the read position within `f`; received
+            // data is always placed at the start of the buffer.
+            let slice = unsafe { FileVolatileSlice::from_raw_ptr(self.0.as_mut_ptr(), count) };
+            f.read_at_volatile(slice, off)
+        }
+
+        fn available_bytes(&self) -> usize {
+            usize::MAX
+        }
+    }
+
+    #[async_trait(?Send)]
+    impl AsyncZeroCopyWriter for MemWriter {
+        async fn async_write_from(
+            &mut self,
+            _f: Arc<dyn AsyncFileReadWriteVolatile>,
+            _count: usize,
+            _off: u64,
+        ) -> io::Result<usize> {
+            unreachable!("the synchronous delegation never uses the async zero-copy path")
+        }
+    }
+
+    // Integration test: drive async requests through the Vfs layer down to a
+    // real `PassthroughFs` instance, covering inode remapping on the way.
+    #[tokio::test]
+    async fn test_vfs_async_passthrough() {
+        use crate::passthrough::{Config, PassthroughFs};
+
+        let source = vmm_sys_util::tempdir::TempDir::new().unwrap();
+        std::fs::write(source.as_path().join("testfile"), b"hello vfs").unwrap();
+
+        let cfg = Config {
+            root_dir: source.as_path().to_str().unwrap().to_string(),
+            do_import: true,
+            ..Default::default()
+        };
+        let fs = PassthroughFs::<()>::new(cfg).unwrap();
+        fs.import().unwrap();
+        fs.init(FsOptions::all()).unwrap();
+
+        // Disable zero-message open/opendir so that `async_open()` and
+        // `async_read()` are actually exercised through the Vfs layer.
+        let vfs = Vfs::new(VfsOptions {
+            no_open: false,
+            no_opendir: false,
+            ..Default::default()
+        });
+        vfs.mount(Box::new(fs), "/").unwrap();
+
+        let ctx = Context {
+            uid: unsafe { libc::getuid() },
+            gid: unsafe { libc::getgid() },
+            pid: unsafe { libc::getpid() },
+        };
+
+        // Lookup the file through the Vfs layer.
+        let name = CString::new("testfile").unwrap();
+        let entry = vfs
+            .async_lookup(&ctx, ROOT_ID.into(), name.as_c_str())
+            .await
+            .unwrap();
+        assert_ne!(entry.inode, 0);
+
+        let (attr, _) = vfs
+            .async_getattr(&ctx, entry.inode.into(), None)
+            .await
+            .unwrap();
+        assert_eq!(attr.st_size, 9);
+
+        // Open and read the file back through the Vfs layer.
+        let (handle, _opts) = vfs
+            .async_open(&ctx, entry.inode.into(), libc::O_RDONLY as u32, 0)
+            .await
+            .unwrap();
+        let handle = handle.unwrap();
+        let mut w = MemWriter(Vec::new());
+        let n = vfs
+            .async_read(
+                &ctx,
+                entry.inode.into(),
+                handle,
+                &mut w,
+                9,
+                0,
+                None,
+                libc::O_RDONLY as u32,
+            )
+            .await
+            .unwrap();
+        assert_eq!(n, 9);
+        assert_eq!(&w.0, b"hello vfs");
     }
 }
