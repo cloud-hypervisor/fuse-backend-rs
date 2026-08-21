@@ -733,7 +733,7 @@ mod asyncio {
     ///
     /// ## Examples
     /// ```ignore
-    /// let buf_size = 0x1_0000;
+    /// let buf_size = (crate::api::server::MAX_BUFFER_SIZE + 0x1000) as usize;
     /// let file = session.clone_fuse_file().unwrap();
     /// let state = Arc::new(AtomicBool::new(false));
     /// let mut task = FuseDevTask::new(buf_size, file, fs_server, state.clone());
@@ -755,7 +755,10 @@ mod asyncio {
         /// Create a new fuse task context for asynchronous IO.
         ///
         /// # Parameters
-        /// - buf_size: size of buffer to receive requests from/send reply to the fuse fd
+        /// - buf_size: size of buffer to receive requests from/send reply to the fuse fd.
+        ///   It must be big enough to hold any request, at least
+        ///   `crate::api::server::MAX_BUFFER_SIZE + 0x1000`, otherwise the kernel rejects
+        ///   reads from the fuse device with `EINVAL` once the INIT handshake is done.
         /// - file: file object for the fuse device, ownership is taken by the task object
         /// - server: `Server` instance to serve requests from the fuse fd
         /// - state: shared flag to control the task object. The task stops picking up
@@ -826,12 +829,23 @@ mod asyncio {
                         }
                     }
                     Err(e) => {
-                        if e.raw_os_error() == Some(libc::ENODEV) {
-                            // The fuse device was unmounted.
-                            break;
+                        match e.raw_os_error() {
+                            Some(libc::ENODEV)
+                            | Some(libc::ENOTCONN)
+                            | Some(libc::ECONNABORTED) => {
+                                // The fuse device was unmounted or the
+                                // connection was aborted.
+                                break;
+                            }
+                            Some(libc::EINTR) => {
+                                // Interrupted by a signal, retry the read.
+                                continue;
+                            }
+                            _ => {
+                                // TODO: error handling
+                                error!("failed to read request from fuse device fd, {}", e);
+                            }
                         }
-                        // TODO: error handling
-                        error!("failed to read request from fuse device fd, {}", e);
                     }
                 }
             }
