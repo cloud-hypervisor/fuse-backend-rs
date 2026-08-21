@@ -41,6 +41,8 @@ mod fusedev;
 mod virtiofs;
 
 pub use self::fs_cache_req_handler::FsCacheReqHandler;
+#[cfg(all(target_os = "linux", feature = "fusedev", feature = "async-io"))]
+pub use self::fusedev::FuseDevTask;
 #[cfg(feature = "fusedev")]
 pub use self::fusedev::{FuseBuf, FuseChannel, FuseDevWriter, FuseSession, FuseSessionExt};
 #[cfg(feature = "virtiofs")]

@@ -48,6 +48,18 @@ impl File {
         }
     }
 
+    /// Wrap an existing `std::fs::File` object into an asynchronous `File` object.
+    ///
+    /// The returned object takes ownership of `file` and closes the underlying file
+    /// descriptor when dropped.
+    pub fn from_std_file(file: std::fs::File) -> Self {
+        match *RUNTIME_TYPE {
+            RuntimeType::Tokio => File::Tokio(tokio::fs::File::from_std(file)),
+            #[cfg(target_os = "linux")]
+            RuntimeType::Uring => File::Uring(tokio_uring::fs::File::from_std(file)),
+        }
+    }
+
     /// Asynchronously read data at `offset` into the buffer.
     pub async fn async_read_at(
         &self,
@@ -248,6 +260,27 @@ mod tests {
         let file = block_on(async { File::async_open(&path, false, false).await.unwrap() });
         assert!(file.as_raw_fd() >= 0);
         drop(file);
+    }
+
+    #[test]
+    fn test_from_std_file() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.as_path().to_path_buf().join("test.txt");
+        std::fs::write(&path, b"test").unwrap();
+
+        let file = File::from_std_file(std::fs::File::open(&path).unwrap());
+        assert!(file.as_raw_fd() >= 0);
+        let md = file.metadata().unwrap();
+        assert!(md.is_file());
+
+        block_on(async {
+            let mut buffer = [0u8; 4];
+            let buf = unsafe { FileVolatileBuf::new(&mut buffer) };
+            let (res, buf) = file.async_read_at(buf, 0).await;
+            assert_eq!(res.unwrap(), 4);
+            assert_eq!(buf.len(), 4);
+            assert_eq!(&buffer, b"test");
+        });
     }
 
     #[test]
