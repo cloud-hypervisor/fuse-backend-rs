@@ -3,10 +3,20 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! `Runtime` to wrap over tokio current-thread `Runtime` and tokio-uring `Runtime`.
+//!
+//! By default the runtime type is auto-detected: `tokio-uring` is used if io-uring is
+//! available, otherwise the tokio current-thread runtime is used. The detection result
+//! may be overridden with the `FUSE_BACKEND_RS_ASYNC_RUNTIME` environment variable,
+//! which accepts `tokio` or `uring`. This is useful when asynchronous futures created
+//! by this crate (e.g. `FuseDevTask::poll_handler()`) are driven by the application's
+//! own tokio runtime, where `tokio-uring` objects can't be polled.
 
 use std::future::Future;
 
 use lazy_static::lazy_static;
+
+/// Environment variable to select the asynchronous runtime type, `tokio` or `uring`.
+pub const RUNTIME_TYPE_ENV: &str = "FUSE_BACKEND_RS_ASYNC_RUNTIME";
 
 lazy_static! {
     pub(crate) static ref RUNTIME_TYPE: RuntimeType = RuntimeType::new();
@@ -20,6 +30,28 @@ pub(crate) enum RuntimeType {
 
 impl RuntimeType {
     fn new() -> Self {
+        if let Ok(val) = std::env::var(RUNTIME_TYPE_ENV) {
+            match Self::parse_env(&val) {
+                Some(RuntimeType::Tokio) => return Self::Tokio,
+                #[cfg(target_os = "linux")]
+                Some(RuntimeType::Uring) => {
+                    if Self::probe_io_uring() {
+                        return Self::Uring;
+                    }
+                    warn!(
+                        "'uring' is requested via {} but io-uring isn't available, falling back to tokio",
+                        RUNTIME_TYPE_ENV
+                    );
+                }
+                None => {
+                    warn!(
+                        "unknown value '{}' for environment variable {}, ignored",
+                        val, RUNTIME_TYPE_ENV
+                    );
+                }
+            }
+        }
+
         #[cfg(target_os = "linux")]
         {
             if Self::probe_io_uring() {
@@ -27,6 +59,15 @@ impl RuntimeType {
             }
         }
         Self::Tokio
+    }
+
+    fn parse_env(val: &str) -> Option<Self> {
+        match val.trim().to_ascii_lowercase().as_str() {
+            "tokio" => Some(Self::Tokio),
+            #[cfg(target_os = "linux")]
+            "uring" | "io-uring" => Some(Self::Uring),
+            _ => None,
+        }
     }
 
     #[cfg(target_os = "linux")]
@@ -44,7 +85,7 @@ impl RuntimeType {
         let mut probe = Probe::new();
 
         // Check we can register a probe to validate supported operations.
-        if let Err(_) = submitter.register_probe(&mut probe) {
+        if submitter.register_probe(&mut probe).is_err() {
             return false;
         }
 
@@ -62,7 +103,7 @@ impl RuntimeType {
         if !probe.is_supported(opcode::Write::CODE) {
             return false;
         }
-        return true;
+        true
     }
 }
 
@@ -79,7 +120,8 @@ impl Runtime {
     /// Create a new instance of async Runtime.
     ///
     /// A `tokio-uring::Runtime` is create if io-uring is available, otherwise a tokio current
-    /// thread Runtime will be created.
+    /// thread Runtime will be created. The runtime type may also be forced with the
+    /// `FUSE_BACKEND_RS_ASYNC_RUNTIME` environment variable, see the module documentation.
     ///
     /// # Panic
     /// Panic if failed to create the Runtime object.
@@ -174,6 +216,32 @@ pub fn spawn<T: std::future::Future + 'static>(task: T) -> tokio::task::JoinHand
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_parse_env() {
+        assert!(matches!(
+            RuntimeType::parse_env("tokio"),
+            Some(RuntimeType::Tokio)
+        ));
+        assert!(matches!(
+            RuntimeType::parse_env(" Tokio "),
+            Some(RuntimeType::Tokio)
+        ));
+        assert!(RuntimeType::parse_env("").is_none());
+        assert!(RuntimeType::parse_env("foobar").is_none());
+
+        #[cfg(target_os = "linux")]
+        {
+            assert!(matches!(
+                RuntimeType::parse_env("uring"),
+                Some(RuntimeType::Uring)
+            ));
+            assert!(matches!(
+                RuntimeType::parse_env("IO-URING"),
+                Some(RuntimeType::Uring)
+            ));
+        }
+    }
 
     #[test]
     fn test_with_runtime() {

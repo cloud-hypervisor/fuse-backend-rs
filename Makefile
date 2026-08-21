@@ -19,6 +19,10 @@ check: build
 	${CARGO} clippy ${TARGET} --features="virtiofs" --no-default-features -- -Dwarnings
 	${CARGO} clippy ${TARGET} --features="vhost-user-fs" --no-default-features -- -Dwarnings
 	${CARGO} clippy ${TARGET} --features="fusedev,virtiofs" --no-default-features -- -Dwarnings
+	${CARGO} clippy ${TARGET} --features="fusedev,async-io" --no-default-features -- -Dwarnings
+	${CARGO} clippy ${TARGET} --features="virtiofs,async-io" --no-default-features -- -Dwarnings
+	${CARGO} clippy ${TARGET} --features="vhost-user-fs,async-io" --no-default-features -- -Dwarnings
+	${CARGO} clippy ${TARGET} --features="fusedev,virtiofs,async-io" --no-default-features -- -Dwarnings
 
 test:
 	${CARGO} test ${TARGET} --features="fusedev" --no-default-features -- --nocapture --skip integration
@@ -37,6 +41,7 @@ smoke:
 
 smoke-all: smoke
 	${CARGO} test ${TARGET} --features="fusedev,persist" -- --nocapture --ignored
+	${CARGO} test ${TARGET} --features="fusedev,async-io" --no-default-features -- --nocapture --ignored
 
 build-macos:
 	${CARGO} build --features="fusedev"

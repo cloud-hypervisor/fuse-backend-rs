@@ -80,10 +80,7 @@ impl AsyncFileSystem for Vfs {
                 (Left(fs), idata) => fs
                     .open(ctx, idata.ino(), flags, fuse_flags)
                     .map(|(a, b, _)| (a, b)),
-                (Right(fs), idata) => fs
-                    .async_open(ctx, idata.ino(), flags, fuse_flags)
-                    .await
-                    .map(|(h, opt)| (h.map(Into::into), opt)),
+                (Right(fs), idata) => fs.async_open(ctx, idata.ino(), flags, fuse_flags).await,
             }
         }
     }
