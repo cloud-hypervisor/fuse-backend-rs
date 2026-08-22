@@ -11,6 +11,7 @@ use std::thread;
 use fuse_backend_rs::api::{server::Server, Vfs, VfsOptions};
 use fuse_backend_rs::passthrough::{Config, PassthroughFs};
 use fuse_backend_rs::transport::{FuseChannel, FuseSession};
+use nix::mount::MsFlags;
 
 /// A fusedev daemon example
 #[allow(dead_code)]
@@ -19,6 +20,7 @@ pub struct Daemon {
     server: Arc<Server<Arc<Vfs>>>,
     thread_cnt: u32,
     session: Option<FuseSession>,
+    mount_flags: Option<MsFlags>,
 }
 
 #[allow(dead_code)]
@@ -47,7 +49,13 @@ impl Daemon {
             server: Arc::new(Server::new(Arc::new(vfs))),
             thread_cnt,
             session: None,
+            mount_flags: None,
         })
+    }
+
+    /// Set custom mount flags to pass to the session
+    pub fn set_mount_flags(&mut self, flags: MsFlags) {
+        self.mount_flags = Some(flags);
     }
 
     /// Mounts a fusedev daemon to the mountpoint, then start service threads to handle
@@ -55,6 +63,11 @@ impl Daemon {
     pub fn mount(&mut self) -> Result<()> {
         let mut se =
             FuseSession::new(Path::new(&self.mountpoint), "passthru_example", "", false).unwrap();
+
+        if let Some(flags) = self.mount_flags {
+            se.set_mount_flags(flags);
+        }
+
         se.mount().unwrap();
         for _ in 0..self.thread_cnt {
             let mut server = FuseServer {
