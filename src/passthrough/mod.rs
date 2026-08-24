@@ -983,6 +983,86 @@ fn set_creds(
     ScopedGid::new(gid).and_then(|gid| Ok((ScopedUid::new(uid)?, gid)))
 }
 
+/// RAII guard that temporarily adds a supplementary group to the current
+/// thread's group list.
+///
+/// The FUSE_CREATE_SUPP_GROUP extension tells the server which supplementary
+/// group of the caller matches the parent directory's group, so that objects
+/// created in setgid directories get the correct group ownership.
+#[cfg(target_os = "linux")]
+#[derive(Debug)]
+pub(crate) struct ScopedSuppGroups {
+    old_groups: Vec<libc::gid_t>,
+}
+
+#[cfg(target_os = "linux")]
+impl ScopedSuppGroups {
+    /// Add `supp_gid` to the supplementary group list of the current thread.
+    /// Does nothing and returns `None` if `supp_gid` is `None`.  The original
+    /// group list is restored when the returned guard is dropped.
+    fn new(supp_gid: Option<libc::gid_t>) -> io::Result<Option<Self>> {
+        let gid = match supp_gid {
+            Some(gid) => gid,
+            None => return Ok(None),
+        };
+
+        // Save the current supplementary group list.
+        let count = unsafe { libc::getgroups(0, std::ptr::null_mut()) };
+        if count < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let mut old_groups = vec![0 as libc::gid_t; count as usize];
+        if count > 0 {
+            let res = unsafe { libc::getgroups(count, old_groups.as_mut_ptr()) };
+            if res < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            old_groups.truncate(res as usize);
+        }
+
+        // Like scoped_cred!, invoke the syscall directly so that only the
+        // calling thread's credentials are changed.  And setgroups() needs
+        // CAP_SETGID, so this must run before set_creds() drops privileges.
+        let res = unsafe { libc::syscall(libc::SYS_setgroups, 1, [gid].as_ptr()) };
+        if res < 0 {
+            return Err(io::Error::last_os_error());
+        }
+
+        Ok(Some(ScopedSuppGroups { old_groups }))
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for ScopedSuppGroups {
+    fn drop(&mut self) {
+        let res = unsafe {
+            libc::syscall(
+                libc::SYS_setgroups,
+                self.old_groups.len(),
+                self.old_groups.as_ptr(),
+            )
+        };
+        if res < 0 {
+            error!(
+                "fuse: failed to restore supplementary groups: {}",
+                io::Error::last_os_error(),
+            );
+        }
+    }
+}
+
+// The macOS kernel never sends the FUSE_EXT_GROUPS extension.
+#[cfg(not(target_os = "linux"))]
+#[derive(Debug)]
+pub(crate) struct ScopedSuppGroups;
+
+#[cfg(not(target_os = "linux"))]
+impl ScopedSuppGroups {
+    fn new(_supp_gid: Option<libc::gid_t>) -> io::Result<Option<Self>> {
+        Ok(None)
+    }
+}
+
 struct CapFsetid {}
 
 impl Drop for CapFsetid {
