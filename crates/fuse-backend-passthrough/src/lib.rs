@@ -415,6 +415,18 @@ pub struct PassthroughFs<S: BitmapSlice + Send + Sync = ()> {
     // Init from guest kernel Init cmd of fuse fs.
     perfile_dax: AtomicBool,
 
+    // Whether to offload the synchronous handlers to the blocking thread
+    // pool with the async-io feature, see
+    // PassthroughFs::enable_async_thread_pool().
+    #[cfg(feature = "async-io")]
+    async_thread_pool_enabled: AtomicBool,
+    // Weak reference to the `Arc` created by `new_shared()`, used by the
+    // async handlers to offload the synchronous handlers to the blocking
+    // thread pool. It is dangling for instances created with `new()`, so
+    // `upgrade()` always fails for those.
+    #[cfg(feature = "async-io")]
+    shared_ref: std::sync::Weak<PassthroughFs<S>>,
+
     dir_entry_timeout: Duration,
     dir_attr_timeout: Duration,
 
@@ -474,6 +486,10 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
             no_readdir: AtomicBool::new(cfg.no_readdir),
             seal_size: AtomicBool::new(cfg.seal_size),
             perfile_dax: AtomicBool::new(false),
+            #[cfg(feature = "async-io")]
+            async_thread_pool_enabled: AtomicBool::new(false),
+            #[cfg(feature = "async-io")]
+            shared_ref: std::sync::Weak::new(),
             dir_entry_timeout,
             dir_attr_timeout,
             cfg,
