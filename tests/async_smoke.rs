@@ -61,24 +61,47 @@ mod fusedev_async_tests {
     #[test]
     #[ignore] // it depends on privileged mode to pass through /dev/fuse
     fn integration_test_async_passthrough_io() {
-        // This is the only test in this binary, so it's safe to install
-        // the logger unconditionally.
+        run_async_passthrough_io(false);
+    }
+
+    /// Same as `integration_test_async_passthrough_io()`, but the async
+    /// handlers offload the synchronous work to the runtime's blocking
+    /// thread pool.
+    #[test]
+    #[ignore] // it depends on privileged mode to pass through /dev/fuse
+    fn integration_test_async_passthrough_io_thread_pool() {
+        run_async_passthrough_io(true);
+    }
+
+    fn run_async_passthrough_io(thread_pool: bool) {
+        // All tests in this binary share the same logger, and installing
+        // it multiple times is harmless.
         let _ = log::set_logger(&LOGGER);
         log::set_max_level(log::LevelFilter::Trace);
 
         let src = TempDir::new().unwrap();
         let mnt = TempDir::new().unwrap();
 
-        // Build the filesystem and attach it to a Vfs instance.
+        // Build the filesystem and attach it to a Vfs instance. In thread
+        // pool mode create a shared instance, so the async handlers can
+        // offload the synchronous work to the runtime's blocking thread
+        // pool.
         let cfg = Config {
             root_dir: src.as_path().to_str().unwrap().to_string(),
             do_import: false,
             ..Default::default()
         };
-        let fs = PassthroughFs::<()>::new(cfg).unwrap();
-        fs.import().unwrap();
         let vfs = Vfs::new(VfsOptions::default());
-        vfs.mount(Box::new(fs), "/").unwrap();
+        if thread_pool {
+            let fs = PassthroughFs::<()>::new_shared(cfg).unwrap();
+            fs.import().unwrap();
+            fs.enable_async_thread_pool(true);
+            vfs.mount(Box::new(fs), "/").unwrap();
+        } else {
+            let fs = PassthroughFs::<()>::new(cfg).unwrap();
+            fs.import().unwrap();
+            vfs.mount(Box::new(fs), "/").unwrap();
+        }
         let server = Arc::new(Server::new(Arc::new(vfs)));
 
         // Mount the fuse session and start an async task to serve requests.

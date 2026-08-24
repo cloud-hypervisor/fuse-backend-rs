@@ -5,9 +5,14 @@
 //! Asynchronous IO support for `PassthroughFs`.
 //!
 //! The asynchronous interface is implemented by relaying operations to the
-//! synchronous io handlers, so the blocking syscalls are executed in the context
-//! of the asynchronous runtime. An io_uring based implementation may be added
-//! in the future.
+//! synchronous io handlers, which execute blocking syscalls. By default the
+//! handlers run inline in the context of the asynchronous runtime, which is
+//! single-threaded: a blocking syscall stalls the processing of all other
+//! requests. Calling `PassthroughFs::enable_async_thread_pool(true)`
+//! instead offloads the handlers to the runtime's blocking thread pool,
+//! so the async task can keep receiving and dispatching requests while
+//! the syscalls execute in parallel on pool threads. An io_uring based
+//! implementation may be added in the future.
 
 use std::io;
 
@@ -18,6 +23,87 @@ use fuse_backend_core::abi::fuse_abi::{CreateIn, OpenOptions, SetattrValid};
 use fuse_backend_core::api::filesystem::{
     AsyncFileSystem, AsyncZeroCopyReader, AsyncZeroCopyWriter, Context, FileSystem,
 };
+use fuse_backend_core::async_runtime::Runtime;
+
+impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
+    /// Create a Passthrough file system instance shared between threads.
+    ///
+    /// A shared instance can offload its synchronous handlers to the
+    /// blocking thread pool, see `enable_async_thread_pool()`. A file
+    /// system created with `PassthroughFs::new()` always serves its async
+    /// requests inline.
+    pub fn new_shared(cfg: Config) -> io::Result<Arc<Self>> {
+        let mut fs = Self::new(cfg)?;
+
+        Ok(Arc::new_cyclic(|weak| {
+            fs.shared_ref = weak.clone();
+            fs
+        }))
+    }
+
+    /// Enable or disable offloading the synchronous handlers to the
+    /// runtime's blocking thread pool.
+    ///
+    /// When disabled (the default), the asynchronous handlers execute the
+    /// synchronous handlers inline in the context of the asynchronous
+    /// runtime. When enabled, the synchronous handlers are offloaded to the
+    /// runtime's blocking thread pool instead, so the async task can keep
+    /// receiving and dispatching requests while the blocking syscalls
+    /// execute in parallel on pool threads. Note that the offloading
+    /// requires the file system to be created with `new_shared()`,
+    /// requests of other instances are served inline.
+    ///
+    /// The blocking pool is a tokio runtime property configured when the
+    /// runtime is created, this method only selects between the two modes
+    /// of operation.
+    ///
+    /// `async_read()` and `async_write()` always execute inline, because
+    /// the zero-copy reader and writer borrow the request and reply
+    /// buffers of the fuse transport, which can't be moved to a pool
+    /// thread.
+    pub fn enable_async_thread_pool(&self, enable: bool) {
+        self.async_thread_pool_enabled
+            .store(enable, Ordering::Relaxed);
+    }
+}
+
+// `BackendFileSystem` is implemented for `Arc<FS>` by a blanket impl in
+// `fuse-backend_core::api::filesystem`, so a shared instance created with
+// `new_shared()` can be mounted to a `Vfs` directly; `as_any()` exposes the
+// wrapped instance, keeping downcasts identical for both forms.
+
+/// Await the result of a task offloaded to the blocking thread pool.
+///
+/// Panics of the blocking task are propagated, a cancelled task is reported
+/// as an `Other` io error.
+async fn join_blocking<T>(handle: tokio::task::JoinHandle<io::Result<T>>) -> io::Result<T> {
+    match handle.await {
+        Ok(res) => res,
+        Err(e) if e.is_panic() => std::panic::resume_unwind(e.into_panic()),
+        Err(e) => Err(io::Error::other(e)),
+    }
+}
+
+/// Relay a synchronous handler according to the `async_thread_pool_enabled`
+/// setting: offload it to the runtime's blocking thread pool if the setting
+/// is enabled and the file system was created with `PassthroughFs::new_shared()`
+/// (so the handler can hold a reference to it across threads), otherwise
+/// execute it inline. `$capture` rebinds the borrowed request arguments to
+/// owned copies which can be moved into the pool closure, and `$pool_fn`
+/// is a `move` closure taking the file system and the request context by
+/// value.
+macro_rules! async_relay {
+    ($self:expr, $ctx:expr, [$($capture:tt)*], $inline_call:expr, $pool_fn:expr) => {
+        match $self.shared_ref.upgrade() {
+            Some(fs) if $self.async_thread_pool_enabled.load(Ordering::Relaxed) => {
+                let ctx = *$ctx;
+                $($capture)*
+                join_blocking(Runtime::spawn_blocking(move || ($pool_fn)(fs, ctx))).await
+            }
+            _ => $inline_call,
+        }
+    };
+}
 
 impl<S: BitmapSlice + Send + Sync + 'static> BackendFileSystem for PassthroughFs<S> {
     fn mount(&self) -> io::Result<(Entry, u64)> {
@@ -31,14 +117,20 @@ impl<S: BitmapSlice + Send + Sync + 'static> BackendFileSystem for PassthroughFs
 }
 
 #[async_trait]
-impl<S: BitmapSlice + Send + Sync> AsyncFileSystem for PassthroughFs<S> {
+impl<S: BitmapSlice + Send + Sync + 'static> AsyncFileSystem for PassthroughFs<S> {
     async fn async_lookup(
         &self,
         ctx: &Context,
         parent: <Self as FileSystem>::Inode,
         name: &CStr,
     ) -> io::Result<Entry> {
-        self.lookup(ctx, parent, name)
+        async_relay!(
+            self,
+            ctx,
+            [let name = name.to_owned();],
+            self.lookup(ctx, parent, name),
+            move |fs: Arc<Self>, ctx: Context| fs.lookup(&ctx, parent, &name)
+        )
     }
 
     async fn async_getattr(
@@ -47,7 +139,13 @@ impl<S: BitmapSlice + Send + Sync> AsyncFileSystem for PassthroughFs<S> {
         inode: <Self as FileSystem>::Inode,
         handle: Option<<Self as FileSystem>::Handle>,
     ) -> io::Result<(libc::stat64, Duration)> {
-        self.getattr(ctx, inode, handle)
+        async_relay!(
+            self,
+            ctx,
+            [],
+            self.getattr(ctx, inode, handle),
+            move |fs: Arc<Self>, ctx: Context| fs.getattr(&ctx, inode, handle)
+        )
     }
 
     async fn async_setattr(
@@ -58,7 +156,13 @@ impl<S: BitmapSlice + Send + Sync> AsyncFileSystem for PassthroughFs<S> {
         handle: Option<<Self as FileSystem>::Handle>,
         valid: SetattrValid,
     ) -> io::Result<(libc::stat64, Duration)> {
-        self.setattr(ctx, inode, attr, handle, valid)
+        async_relay!(
+            self,
+            ctx,
+            [],
+            self.setattr(ctx, inode, attr, handle, valid),
+            move |fs: Arc<Self>, ctx: Context| fs.setattr(&ctx, inode, attr, handle, valid)
+        )
     }
 
     async fn async_open(
@@ -68,8 +172,17 @@ impl<S: BitmapSlice + Send + Sync> AsyncFileSystem for PassthroughFs<S> {
         flags: u32,
         fuse_flags: u32,
     ) -> io::Result<(Option<<Self as FileSystem>::Handle>, OpenOptions)> {
-        let (handle, opts, _) = self.open(ctx, inode, flags, fuse_flags)?;
-        Ok((handle, opts))
+        async_relay!(
+            self,
+            ctx,
+            [],
+            self.open(ctx, inode, flags, fuse_flags)
+                .map(|(handle, opts, _)| (handle, opts)),
+            move |fs: Arc<Self>, ctx: Context| {
+                fs.open(&ctx, inode, flags, fuse_flags)
+                    .map(|(handle, opts, _)| (handle, opts))
+            }
+        )
     }
 
     async fn async_create(
@@ -79,8 +192,17 @@ impl<S: BitmapSlice + Send + Sync> AsyncFileSystem for PassthroughFs<S> {
         name: &CStr,
         args: CreateIn,
     ) -> io::Result<(Entry, Option<<Self as FileSystem>::Handle>, OpenOptions)> {
-        let (entry, handle, opts, _) = self.create(ctx, parent, name, args)?;
-        Ok((entry, handle, opts))
+        async_relay!(
+            self,
+            ctx,
+            [let name = name.to_owned();],
+            self.create(ctx, parent, name, args)
+                .map(|(entry, handle, opts, _)| (entry, handle, opts)),
+            move |fs: Arc<Self>, ctx: Context| {
+                fs.create(&ctx, parent, &name, args)
+                    .map(|(entry, handle, opts, _)| (entry, handle, opts))
+            }
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -95,6 +217,9 @@ impl<S: BitmapSlice + Send + Sync> AsyncFileSystem for PassthroughFs<S> {
         lock_owner: Option<u64>,
         flags: u32,
     ) -> io::Result<usize> {
+        // The writer borrows the reply buffer of the fuse transport, so the
+        // request can't be offloaded to the blocking thread pool and is
+        // always served inline.
         self.read(ctx, inode, handle, w, size, offset, lock_owner, flags)
     }
 
@@ -112,6 +237,9 @@ impl<S: BitmapSlice + Send + Sync> AsyncFileSystem for PassthroughFs<S> {
         flags: u32,
         fuse_flags: u32,
     ) -> io::Result<usize> {
+        // The reader borrows the request buffer of the fuse transport, so the
+        // request can't be offloaded to the blocking thread pool and is
+        // always served inline.
         self.write(
             ctx,
             inode,
@@ -133,7 +261,13 @@ impl<S: BitmapSlice + Send + Sync> AsyncFileSystem for PassthroughFs<S> {
         datasync: bool,
         handle: <Self as FileSystem>::Handle,
     ) -> io::Result<()> {
-        self.fsync(ctx, inode, datasync, handle)
+        async_relay!(
+            self,
+            ctx,
+            [],
+            self.fsync(ctx, inode, datasync, handle),
+            move |fs: Arc<Self>, ctx: Context| fs.fsync(&ctx, inode, datasync, handle)
+        )
     }
 
     async fn async_fallocate(
@@ -145,7 +279,14 @@ impl<S: BitmapSlice + Send + Sync> AsyncFileSystem for PassthroughFs<S> {
         offset: u64,
         length: u64,
     ) -> io::Result<()> {
-        self.fallocate(ctx, inode, handle, mode, offset, length)
+        async_relay!(
+            self,
+            ctx,
+            [],
+            self.fallocate(ctx, inode, handle, mode, offset, length),
+            move |fs: Arc<Self>, ctx: Context| fs
+                .fallocate(&ctx, inode, handle, mode, offset, length)
+        )
     }
 
     async fn async_fsyncdir(
@@ -155,7 +296,13 @@ impl<S: BitmapSlice + Send + Sync> AsyncFileSystem for PassthroughFs<S> {
         datasync: bool,
         handle: <Self as FileSystem>::Handle,
     ) -> io::Result<()> {
-        self.fsyncdir(ctx, inode, datasync, handle)
+        async_relay!(
+            self,
+            ctx,
+            [],
+            self.fsyncdir(ctx, inode, datasync, handle),
+            move |fs: Arc<Self>, ctx: Context| fs.fsyncdir(&ctx, inode, datasync, handle)
+        )
     }
 }
 
@@ -283,6 +430,23 @@ mod tests {
         let fs = PassthroughFs::<()>::new(cfg).unwrap();
         fs.import().unwrap();
         fs.init(FsOptions::all()).unwrap();
+
+        (fs, source)
+    }
+
+    fn prepare_async_fs_shared(enable_pool: bool) -> (Arc<PassthroughFs<()>>, TempDir) {
+        let source = TempDir::new().expect("Cannot create temporary directory.");
+        let cfg = Config {
+            root_dir: source.as_path().to_str().unwrap().to_string(),
+            do_import: true,
+            ..Default::default()
+        };
+        let fs = PassthroughFs::<()>::new_shared(cfg).unwrap();
+        fs.import().unwrap();
+        fs.init(FsOptions::all()).unwrap();
+        if enable_pool {
+            fs.enable_async_thread_pool(true);
+        }
 
         (fs, source)
     }
@@ -435,6 +599,81 @@ mod tests {
         });
 
         assert_eq!(std::fs::metadata(&path).unwrap().len(), 4096);
+    }
+
+    // Exercise the blocking thread pool path: the file system is created
+    // with `new_shared()` and the async thread pool is enabled, so the
+    // relayed handlers run on pool threads instead of inline.
+    #[test]
+    fn test_async_pool_lookup_getattr() {
+        let (fs, source) = prepare_async_fs_shared(true);
+        let ctx = prepare_context();
+        let path = source.as_path().join("testfile");
+        std::fs::write(&path, b"hello").unwrap();
+        let name = CString::new("testfile").unwrap();
+
+        async_runtime::block_on(async {
+            let entry = fs.async_lookup(&ctx, ROOT_ID, &name).await.unwrap();
+            let sync_entry = fs.lookup(&ctx, ROOT_ID, &name).unwrap();
+            assert_eq!(entry.inode, sync_entry.inode);
+            assert_eq!(entry.attr.st_size, 5);
+
+            let (attr, _) = fs.async_getattr(&ctx, entry.inode, None).await.unwrap();
+            assert_eq!(attr.st_size, 5);
+        });
+    }
+
+    #[test]
+    fn test_async_pool_create_open_fallocate() {
+        let (fs, source) = prepare_async_fs_shared(true);
+        let ctx = prepare_context();
+
+        async_runtime::block_on(async {
+            let name = CString::new("newfile").unwrap();
+            let args = CreateIn {
+                flags: (libc::O_RDWR | libc::O_CREAT | libc::O_TRUNC) as u32,
+                mode: 0o644,
+                umask: 0,
+                fuse_flags: 0,
+            };
+            let (entry, handle, _opts) = fs.async_create(&ctx, ROOT_ID, &name, args).await.unwrap();
+            let handle = handle.unwrap();
+            fs.async_fsync(&ctx, entry.inode, true, handle)
+                .await
+                .unwrap();
+
+            let (handle, _opts) = fs
+                .async_open(&ctx, entry.inode, libc::O_RDWR as u32, 0)
+                .await
+                .unwrap();
+            let handle = handle.unwrap();
+            fs.async_fallocate(&ctx, entry.inode, handle, 0, 0, 4096)
+                .await
+                .unwrap();
+        });
+
+        assert_eq!(
+            std::fs::metadata(source.as_path().join("newfile"))
+                .unwrap()
+                .len(),
+            4096
+        );
+    }
+
+    // A shared instance with the thread pool disabled serves its requests
+    // inline.
+    #[test]
+    fn test_async_shared_pool_disabled() {
+        let (fs, source) = prepare_async_fs_shared(false);
+        let ctx = prepare_context();
+        std::fs::write(source.as_path().join("testfile"), b"hello").unwrap();
+        let name = CString::new("testfile").unwrap();
+
+        async_runtime::block_on(async {
+            let entry = fs.async_lookup(&ctx, ROOT_ID, &name).await.unwrap();
+            let (attr, _) = fs.async_getattr(&ctx, entry.inode, None).await.unwrap();
+            assert_eq!(attr.st_size, 5);
+        });
     }
 
     // Regression test for async_fsyncdir() in `no_opendir` mode: the request must

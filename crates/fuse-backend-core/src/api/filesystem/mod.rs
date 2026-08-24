@@ -13,6 +13,7 @@ use std::convert::TryInto;
 use std::ffi::CStr;
 use std::fs::File;
 use std::io;
+use std::sync::Arc;
 use std::time::Duration;
 
 use crate::abi::fuse_abi as fuse;
@@ -112,6 +113,19 @@ pub trait BackendFileSystem: FileSystem {
     fn as_any(&self) -> &dyn Any;
 }
 
+#[cfg(not(feature = "async-io"))]
+impl<FS: BackendFileSystem> BackendFileSystem for Arc<FS> {
+    fn mount(&self) -> io::Result<(Entry, u64)> {
+        (**self).mount()
+    }
+
+    // Expose the wrapped file system, not the `Arc` itself, so downcasts
+    // work the same way for shared and non-shared instances.
+    fn as_any(&self) -> &dyn Any {
+        (**self).as_any()
+    }
+}
+
 #[cfg(feature = "async-io")]
 /// BackendFileSystem abstracts all backend file systems under vfs
 pub trait BackendFileSystem: AsyncFileSystem {
@@ -125,6 +139,19 @@ pub trait BackendFileSystem: AsyncFileSystem {
     /// the caller have access to the underlying type behind the
     /// trait.
     fn as_any(&self) -> &dyn Any;
+}
+
+#[cfg(feature = "async-io")]
+impl<FS: BackendFileSystem> BackendFileSystem for Arc<FS> {
+    fn mount(&self) -> io::Result<(Entry, u64)> {
+        (**self).mount()
+    }
+
+    // Expose the wrapped file system, not the `Arc` itself, so downcasts
+    // work the same way for shared and non-shared instances.
+    fn as_any(&self) -> &dyn Any {
+        (**self).as_any()
+    }
 }
 
 /// Information about a path in the filesystem.

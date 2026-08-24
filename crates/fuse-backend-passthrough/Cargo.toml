@@ -20,6 +20,9 @@ documentation = "https://docs.rs/fuse-backend-passthrough"
 [dependencies]
 fuse-backend-core = { path = "../fuse-backend-core", version = "0.14.0" }
 async-trait = { version = "0.1.42", optional = true }
+# The blocking thread pool offload hands `tokio::task::JoinHandle`s from
+# `Runtime::spawn_blocking()` to `join_blocking()`, which names the type.
+tokio = { version = "1", optional = true }
 bitflags = "1.1"
 libc = "0.2.68"
 log = "0.4.6"
@@ -36,7 +39,7 @@ fuse-backend-vfs = { path = "../fuse-backend-vfs", version = "0.14.0" }
 
 [features]
 default = []
-async-io = ["async-trait", "fuse-backend-core/async-io"]
+async-io = ["async-trait", "tokio/rt", "fuse-backend-core/async-io"]
 # The DAX window callbacks (`setupmapping`/`removemapping`) operate on
 # `fuse_backend_core::abi::virtio_fs` types, which are gated on core's
 # `virtiofs` cfg. The feature is forwarded from the umbrella
