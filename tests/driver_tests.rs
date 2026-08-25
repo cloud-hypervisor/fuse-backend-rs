@@ -136,7 +136,7 @@ mod vfs_async {
         ROOT_ID,
     };
     use fuse_backend_rs::api::{Vfs, VfsOptions};
-    use fuse_backend_rs::file_buf::FileVolatileSlice;
+    use fuse_backend_rs::file_buf::{FileVolatileBuf, FileVolatileSlice};
     use fuse_backend_rs::file_traits::{AsyncFileReadWriteVolatile, FileReadWriteVolatile};
     use fuse_backend_rs::passthrough::{Config, PassthroughFs};
 
@@ -181,81 +181,97 @@ mod vfs_async {
     impl AsyncZeroCopyWriter for MemWriter {
         async fn async_write_from(
             &mut self,
-            _f: Arc<dyn AsyncFileReadWriteVolatile>,
-            _count: usize,
-            _off: u64,
+            f: Arc<dyn AsyncFileReadWriteVolatile>,
+            count: usize,
+            off: u64,
         ) -> io::Result<usize> {
-            unreachable!("the synchronous delegation never uses the async zero-copy path")
+            if self.0.len() < count {
+                self.0.resize(count, 0);
+            }
+            // Safe because the buffer points into `self.0` and doesn't out-live it.
+            let buf = unsafe { FileVolatileBuf::from_raw_ptr(self.0.as_mut_ptr(), 0, count) };
+            let (res, _) = f.async_read_at_volatile(buf, off).await;
+            // Received data is always placed at the start of the buffer.
+            if let Ok(n) = &res {
+                self.0.truncate(*n);
+            }
+            res
         }
     }
 
     // Integration test: drive async requests through the Vfs layer down to a
     // real `PassthroughFs` instance, covering inode remapping on the way.
-    #[tokio::test]
-    async fn test_vfs_async_passthrough() {
-        let source = tempfile::tempdir().unwrap();
-        std::fs::write(source.path().join("testfile"), b"hello vfs").unwrap();
+    //
+    // Use the crate's own async runtime, because `async_read()` is served
+    // with native asynchronous IO and `tokio_uring` objects can't be polled
+    // on a plain `#[tokio::test]` runtime.
+    #[test]
+    fn test_vfs_async_passthrough() {
+        fuse_backend_rs::async_runtime::block_on(async {
+            let source = tempfile::tempdir().unwrap();
+            std::fs::write(source.path().join("testfile"), b"hello vfs").unwrap();
 
-        let cfg = Config {
-            root_dir: source.path().to_str().unwrap().to_string(),
-            do_import: true,
-            ..Default::default()
-        };
-        let fs = PassthroughFs::<()>::new(cfg).unwrap();
-        fs.import().unwrap();
-        fs.init(FsOptions::all()).unwrap();
+            let cfg = Config {
+                root_dir: source.path().to_str().unwrap().to_string(),
+                do_import: true,
+                ..Default::default()
+            };
+            let fs = PassthroughFs::<()>::new(cfg).unwrap();
+            fs.import().unwrap();
+            fs.init(FsOptions::all()).unwrap();
 
-        // Disable zero-message open/opendir so that `async_open()` and
-        // `async_read()` are actually exercised through the Vfs layer.
-        let vfs = Vfs::new(VfsOptions {
-            no_open: false,
-            no_opendir: false,
-            ..Default::default()
+            // Disable zero-message open/opendir so that `async_open()` and
+            // `async_read()` are actually exercised through the Vfs layer.
+            let vfs = Vfs::new(VfsOptions {
+                no_open: false,
+                no_opendir: false,
+                ..Default::default()
+            });
+            vfs.mount(Box::new(fs), "/").unwrap();
+
+            let ctx = Context {
+                uid: unsafe { libc::getuid() },
+                gid: unsafe { libc::getgid() },
+                pid: unsafe { libc::getpid() },
+                ..Default::default()
+            };
+
+            // Lookup the file through the Vfs layer.
+            let name = CString::new("testfile").unwrap();
+            let entry = vfs
+                .async_lookup(&ctx, ROOT_ID.into(), name.as_c_str())
+                .await
+                .unwrap();
+            assert_ne!(entry.inode, 0);
+
+            let (attr, _) = vfs
+                .async_getattr(&ctx, entry.inode.into(), None)
+                .await
+                .unwrap();
+            assert_eq!(attr.st_size, 9);
+
+            // Open and read the file back through the Vfs layer.
+            let (handle, _opts) = vfs
+                .async_open(&ctx, entry.inode.into(), libc::O_RDONLY as u32, 0)
+                .await
+                .unwrap();
+            let handle = handle.unwrap();
+            let mut w = MemWriter(Vec::new());
+            let n = vfs
+                .async_read(
+                    &ctx,
+                    entry.inode.into(),
+                    handle,
+                    &mut w,
+                    9,
+                    0,
+                    None,
+                    libc::O_RDONLY as u32,
+                )
+                .await
+                .unwrap();
+            assert_eq!(n, 9);
+            assert_eq!(&w.0, b"hello vfs");
         });
-        vfs.mount(Box::new(fs), "/").unwrap();
-
-        let ctx = Context {
-            uid: unsafe { libc::getuid() },
-            gid: unsafe { libc::getgid() },
-            pid: unsafe { libc::getpid() },
-            ..Default::default()
-        };
-
-        // Lookup the file through the Vfs layer.
-        let name = CString::new("testfile").unwrap();
-        let entry = vfs
-            .async_lookup(&ctx, ROOT_ID.into(), name.as_c_str())
-            .await
-            .unwrap();
-        assert_ne!(entry.inode, 0);
-
-        let (attr, _) = vfs
-            .async_getattr(&ctx, entry.inode.into(), None)
-            .await
-            .unwrap();
-        assert_eq!(attr.st_size, 9);
-
-        // Open and read the file back through the Vfs layer.
-        let (handle, _opts) = vfs
-            .async_open(&ctx, entry.inode.into(), libc::O_RDONLY as u32, 0)
-            .await
-            .unwrap();
-        let handle = handle.unwrap();
-        let mut w = MemWriter(Vec::new());
-        let n = vfs
-            .async_read(
-                &ctx,
-                entry.inode.into(),
-                handle,
-                &mut w,
-                9,
-                0,
-                None,
-                libc::O_RDONLY as u32,
-            )
-            .await
-            .unwrap();
-        assert_eq!(n, 9);
-        assert_eq!(&w.0, b"hello vfs");
     }
 }

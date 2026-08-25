@@ -90,7 +90,7 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
     /// if these do not match update the file descriptor flags and store the new
     /// result in the HandleData entry
     #[inline(always)]
-    fn ensure_file_flags<'a>(
+    pub(super) fn ensure_file_flags<'a>(
         &self,
         data: &'a Arc<HandleData>,
         fd: &impl AsRawFd,
@@ -637,7 +637,7 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
         }
     }
 
-    fn get_data(
+    pub(super) fn get_data(
         &self,
         handle: Handle,
         inode: Inode,

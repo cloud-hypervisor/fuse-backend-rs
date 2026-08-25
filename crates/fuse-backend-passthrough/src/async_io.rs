@@ -4,26 +4,38 @@
 
 //! Asynchronous IO support for `PassthroughFs`.
 //!
-//! The asynchronous interface is implemented by relaying operations to the
-//! synchronous io handlers, which execute blocking syscalls. By default the
-//! handlers run inline in the context of the asynchronous runtime, which is
-//! single-threaded: a blocking syscall stalls the processing of all other
-//! requests. Calling `PassthroughFs::enable_async_thread_pool(true)`
-//! instead offloads the handlers to the runtime's blocking thread pool,
-//! so the async task can keep receiving and dispatching requests while
-//! the syscalls execute in parallel on pool threads. An io_uring based
-//! implementation may be added in the future.
+//! READ and WRITE requests are served with native asynchronous IO: the data
+//! is transferred directly between the transport buffer and the backing file
+//! through the runtime's asynchronous file interface (io_uring when
+//! available), without going through the blocking synchronous handlers.
+//!
+//! The remaining operations are relayed to the synchronous handlers, which
+//! execute blocking syscalls. By default they run inline in the context of
+//! the asynchronous runtime, which is single-threaded: a blocking syscall
+//! stalls the processing of all other requests. Calling
+//! `PassthroughFs::enable_async_thread_pool(true)` instead offloads them to
+//! the runtime's blocking thread pool, so the async task can keep receiving
+//! and dispatching requests while the syscalls execute in parallel on pool
+//! threads.
 
+use std::future::Future;
 use std::io;
+use std::os::unix::io::FromRawFd;
+use std::pin::Pin;
 
 use async_trait::async_trait;
 
+use super::util::stat_fd;
 use super::*;
-use fuse_backend_core::abi::fuse_abi::{CreateIn, OpenOptions, SetattrValid};
+use fuse_backend_core::abi::fuse_abi::{
+    CreateIn, Opcode, OpenOptions, SetattrValid, WRITE_KILL_PRIV,
+};
 use fuse_backend_core::api::filesystem::{
     AsyncFileSystem, AsyncZeroCopyReader, AsyncZeroCopyWriter, Context, FileSystem,
 };
+use fuse_backend_core::async_file::File as AsyncFile;
 use fuse_backend_core::async_runtime::Runtime;
+use fuse_backend_core::file_traits::AsyncFileReadWriteVolatile;
 
 impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
     /// Create a Passthrough file system instance shared between threads.
@@ -57,13 +69,49 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
     /// runtime is created, this method only selects between the two modes
     /// of operation.
     ///
-    /// `async_read()` and `async_write()` always execute inline, because
-    /// the zero-copy reader and writer borrow the request and reply
-    /// buffers of the fuse transport, which can't be moved to a pool
-    /// thread.
+    /// `async_read()` and `async_write()` are served with native
+    /// asynchronous IO instead of relaying to the synchronous handlers,
+    /// so they are never offloaded to the blocking thread pool.
     pub fn enable_async_thread_pool(&self, enable: bool) {
         self.async_thread_pool_enabled
             .store(enable, Ordering::Relaxed);
+    }
+
+    /// Wrap a standard file into the asynchronous file object used to serve
+    /// READ/WRITE requests with native asynchronous IO.
+    // The asynchronous IO engine (io_uring) is bound to the thread polling
+    // it, so asynchronous file objects are neither `Send` nor `Sync`; they
+    // are only used within the single-threaded async runtime context.
+    #[allow(clippy::arc_with_non_send_sync)]
+    fn async_file_from_std(file: File) -> Arc<dyn AsyncFileReadWriteVolatile> {
+        Arc::new(AsyncFile::from_std_file(file))
+    }
+
+    /// Create an asynchronous file object for the file referenced by a
+    /// handle, to serve READ/WRITE requests with native asynchronous IO.
+    ///
+    /// The fd of the handle is duplicated so that the asynchronous file
+    /// object owns an independent descriptor.
+    fn async_file_from_data(
+        &self,
+        data: &Arc<HandleData>,
+        flags: u32,
+    ) -> io::Result<Arc<dyn AsyncFileReadWriteVolatile>> {
+        let fd = unsafe { libc::dup(data.borrow_fd().as_raw_fd()) };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // Reconcile the O_DIRECT flag of the shared file description before
+        // the request is served with native asynchronous IO. The guard is
+        // dropped right away instead of being held over the IO like the
+        // synchronous handlers do: the zero-copy future must stay `Send`,
+        // and the asynchronous engines submit with the flags in effect at
+        // submission time.
+        drop(self.ensure_file_flags(data, &data.borrow_fd(), flags)?);
+        // Safe because `fd` is a fresh descriptor returned by dup().
+        let file = unsafe { File::from_raw_fd(fd) };
+
+        Ok(Self::async_file_from_std(file))
     }
 }
 
@@ -81,6 +129,32 @@ async fn join_blocking<T>(handle: tokio::task::JoinHandle<io::Result<T>>) -> io:
         Ok(res) => res,
         Err(e) if e.is_panic() => std::panic::resume_unwind(e.into_panic()),
         Err(e) => Err(io::Error::other(e)),
+    }
+}
+
+/// The asynchronous zero-copy traits (`AsyncZeroCopyReader`/`AsyncZeroCopyWriter`)
+/// return `!Send` futures, but `AsyncFileSystem` requires `Send` futures. The
+/// zero-copy buffers borrow transport memory and the asynchronous IO engines
+/// (io_uring) are bound to the thread polling them, so the data path relies
+/// on the async runtime being a single-threaded worker anyway, cf. the
+/// `unsafe impl Send` for the transport adapters in `api/server/async_io.rs`.
+/// Mark the zero-copy futures as `Send` on the same grounds.
+#[repr(transparent)]
+struct SendZeroCopyFuture<F>(F);
+
+// Safe because the async runtime executing the zero-copy path is a
+// single-threaded worker, so the future is never moved between threads.
+unsafe impl<F> Send for SendZeroCopyFuture<F> {}
+
+impl<F: Future> Future for SendZeroCopyFuture<F> {
+    type Output = F::Output;
+
+    fn poll(
+        self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        // Safe because `SendZeroCopyFuture` is `repr(transparent)`.
+        unsafe { self.map_unchecked_mut(|s: &mut Self| &mut s.0) }.poll(cx)
     }
 }
 
@@ -208,50 +282,77 @@ impl<S: BitmapSlice + Send + Sync + 'static> AsyncFileSystem for PassthroughFs<S
     #[allow(clippy::too_many_arguments)]
     async fn async_read(
         &self,
-        ctx: &Context,
+        _ctx: &Context,
         inode: <Self as FileSystem>::Inode,
         handle: <Self as FileSystem>::Handle,
         w: &mut (dyn AsyncZeroCopyWriter + Send),
         size: u32,
         offset: u64,
-        lock_owner: Option<u64>,
+        _lock_owner: Option<u64>,
         flags: u32,
     ) -> io::Result<usize> {
-        // The writer borrows the reply buffer of the fuse transport, so the
-        // request can't be offloaded to the blocking thread pool and is
-        // always served inline.
-        self.read(ctx, inode, handle, w, size, offset, lock_owner, flags)
+        let data = self.get_data(handle, inode, libc::O_RDONLY)?;
+        let file = self.async_file_from_data(&data, flags)?;
+
+        // Serve the request with native asynchronous IO: the transport
+        // transfers the data directly between its buffer and the file.
+        SendZeroCopyFuture(w.async_write_from(file, size as usize, offset)).await
     }
 
     #[allow(clippy::too_many_arguments)]
     async fn async_write(
         &self,
-        ctx: &Context,
+        _ctx: &Context,
         inode: <Self as FileSystem>::Inode,
         handle: <Self as FileSystem>::Handle,
         r: &mut (dyn AsyncZeroCopyReader + Send),
         size: u32,
         offset: u64,
-        lock_owner: Option<u64>,
-        delayed_write: bool,
+        _lock_owner: Option<u64>,
+        _delayed_write: bool,
         flags: u32,
         fuse_flags: u32,
     ) -> io::Result<usize> {
-        // The reader borrows the request buffer of the fuse transport, so the
-        // request can't be offloaded to the blocking thread pool and is
-        // always served inline.
-        self.write(
-            ctx,
-            inode,
-            handle,
-            r,
-            size,
-            offset,
-            lock_owner,
-            delayed_write,
-            flags,
-            fuse_flags,
-        )
+        let data = self.get_data(handle, inode, libc::O_RDWR)?;
+
+        // Dup the fd of the handle to create an independent descriptor for
+        // the asynchronous file object, and keep the `std::fs::File` around
+        // until all checks are done.
+        let fd = unsafe { libc::dup(data.borrow_fd().as_raw_fd()) };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // Safe because `fd` is a fresh descriptor returned by dup().
+        let file = unsafe { File::from_raw_fd(fd) };
+
+        // Reconcile the O_DIRECT flag of the shared file description before
+        // the request is served with native asynchronous IO. The guard is
+        // dropped right away instead of being held over the IO like the
+        // synchronous handlers do: the zero-copy future must stay `Send`,
+        // and the asynchronous engines submit with the flags in effect at
+        // submission time.
+        drop(self.ensure_file_flags(&data, &file, flags)?);
+
+        if self.seal_size.load(Ordering::Relaxed) {
+            let st = stat_fd(&file, None)?;
+            self.seal_size_check(Opcode::Write, st.st_size as u64, offset, size as u64, 0)?;
+        }
+
+        // The capability is restored when `_killpriv` is dropped. The async
+        // runtime is single-threaded, so the capability state stays
+        // consistent while the future may be suspended.
+        let _killpriv =
+            if self.killpriv_v2.load(Ordering::Relaxed) && (fuse_flags & WRITE_KILL_PRIV != 0) {
+                super::drop_cap_fsetid()?
+            } else {
+                None
+            };
+
+        let file = Self::async_file_from_std(file);
+
+        // Serve the request with native asynchronous IO: the transport
+        // transfers the data directly between its buffer and the file.
+        SendZeroCopyFuture(r.async_read_to(file, size as usize, offset)).await
     }
 
     async fn async_fsync(
@@ -315,7 +416,7 @@ mod tests {
     use fuse_backend_core::abi::fuse_abi::ROOT_ID;
     use fuse_backend_core::api::filesystem::{FsOptions, ZeroCopyReader, ZeroCopyWriter};
     use fuse_backend_core::async_runtime;
-    use fuse_backend_core::file_buf::FileVolatileSlice;
+    use fuse_backend_core::file_buf::{FileVolatileBuf, FileVolatileSlice};
     use fuse_backend_core::file_traits::{AsyncFileReadWriteVolatile, FileReadWriteVolatile};
     use vmm_sys_util::tempdir::TempDir;
 
@@ -366,11 +467,21 @@ mod tests {
     impl AsyncZeroCopyWriter for MemWriter {
         async fn async_write_from(
             &mut self,
-            _f: Arc<dyn AsyncFileReadWriteVolatile>,
-            _count: usize,
-            _off: u64,
+            f: Arc<dyn AsyncFileReadWriteVolatile>,
+            count: usize,
+            off: u64,
         ) -> io::Result<usize> {
-            unreachable!("the synchronous delegation never uses the async zero-copy path")
+            if self.0.len() < count {
+                self.0.resize(count, 0);
+            }
+            // Safe because the buffer points into `self.0` and doesn't out-live it.
+            let buf = unsafe { FileVolatileBuf::from_raw_ptr(self.0.as_mut_ptr(), 0, count) };
+            let (res, _) = f.async_read_at_volatile(buf, off).await;
+            // Received data is always placed at the start of the buffer.
+            if let Ok(n) = &res {
+                self.0.truncate(*n);
+            }
+            res
         }
     }
 
@@ -412,11 +523,22 @@ mod tests {
     impl AsyncZeroCopyReader for MemReader {
         async fn async_read_to(
             &mut self,
-            _f: Arc<dyn AsyncFileReadWriteVolatile>,
-            _count: usize,
-            _off: u64,
+            f: Arc<dyn AsyncFileReadWriteVolatile>,
+            count: usize,
+            off: u64,
         ) -> io::Result<usize> {
-            unreachable!("the synchronous delegation never uses the async zero-copy path")
+            let start = off as usize;
+            if start >= self.0.len() {
+                return Ok(0);
+            }
+            let n = std::cmp::min(count, self.0.len() - start);
+            // Safe because the buffer is only read from and doesn't out-live
+            // `self.0`.
+            let buf = unsafe {
+                FileVolatileBuf::from_raw_ptr(self.0.as_ptr().add(start) as *mut u8, n, n)
+            };
+            let (res, _) = f.async_write_at_volatile(buf, off).await;
+            res
         }
     }
 
