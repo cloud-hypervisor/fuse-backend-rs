@@ -20,7 +20,6 @@
 
 use std::future::Future;
 use std::io;
-use std::os::unix::io::FromRawFd;
 use std::pin::Pin;
 
 use async_trait::async_trait;
@@ -77,30 +76,24 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
             .store(enable, Ordering::Relaxed);
     }
 
-    /// Wrap a standard file into the asynchronous file object used to serve
-    /// READ/WRITE requests with native asynchronous IO.
+    /// Create an asynchronous file object for the file referenced by a
+    /// handle, to serve READ/WRITE requests with native asynchronous IO.
+    ///
+    /// The fd of the handle is borrowed for the duration of the IO: the
+    /// asynchronous file object holds a reference to the handle data, which
+    /// keeps the descriptor valid until the request completes, even if the
+    /// handle is released in the meantime. This avoids the `dup()`/`close()`
+    /// syscall pair of owning an independent descriptor per request.
     // The asynchronous IO engine (io_uring) is bound to the thread polling
     // it, so asynchronous file objects are neither `Send` nor `Sync`; they
     // are only used within the single-threaded async runtime context.
     #[allow(clippy::arc_with_non_send_sync)]
-    fn async_file_from_std(file: File) -> Arc<dyn AsyncFileReadWriteVolatile> {
-        Arc::new(AsyncFile::from_std_file(file))
-    }
-
-    /// Create an asynchronous file object for the file referenced by a
-    /// handle, to serve READ/WRITE requests with native asynchronous IO.
-    ///
-    /// The fd of the handle is duplicated so that the asynchronous file
-    /// object owns an independent descriptor.
     fn async_file_from_data(
         &self,
         data: &Arc<HandleData>,
         flags: u32,
     ) -> io::Result<Arc<dyn AsyncFileReadWriteVolatile>> {
-        let fd = unsafe { libc::dup(data.borrow_fd().as_raw_fd()) };
-        if fd < 0 {
-            return Err(io::Error::last_os_error());
-        }
+        let fd = data.borrow_fd().as_raw_fd();
         // Reconcile the O_DIRECT flag of the shared file description before
         // the request is served with native asynchronous IO. The guard is
         // dropped right away instead of being held over the IO like the
@@ -108,10 +101,8 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
         // and the asynchronous engines submit with the flags in effect at
         // submission time.
         drop(self.ensure_file_flags(data, &data.borrow_fd(), flags)?);
-        // Safe because `fd` is a fresh descriptor returned by dup().
-        let file = unsafe { File::from_raw_fd(fd) };
 
-        Ok(Self::async_file_from_std(file))
+        Ok(Arc::new(AsyncFile::borrow_fd(fd, data.clone())))
     }
 }
 
@@ -315,26 +306,8 @@ impl<S: BitmapSlice + Send + Sync + 'static> AsyncFileSystem for PassthroughFs<S
     ) -> io::Result<usize> {
         let data = self.get_data(handle, inode, libc::O_RDWR)?;
 
-        // Dup the fd of the handle to create an independent descriptor for
-        // the asynchronous file object, and keep the `std::fs::File` around
-        // until all checks are done.
-        let fd = unsafe { libc::dup(data.borrow_fd().as_raw_fd()) };
-        if fd < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        // Safe because `fd` is a fresh descriptor returned by dup().
-        let file = unsafe { File::from_raw_fd(fd) };
-
-        // Reconcile the O_DIRECT flag of the shared file description before
-        // the request is served with native asynchronous IO. The guard is
-        // dropped right away instead of being held over the IO like the
-        // synchronous handlers do: the zero-copy future must stay `Send`,
-        // and the asynchronous engines submit with the flags in effect at
-        // submission time.
-        drop(self.ensure_file_flags(&data, &file, flags)?);
-
         if self.seal_size.load(Ordering::Relaxed) {
-            let st = stat_fd(&file, None)?;
+            let st = stat_fd(data.get_file(), None)?;
             self.seal_size_check(Opcode::Write, st.st_size as u64, offset, size as u64, 0)?;
         }
 
@@ -348,7 +321,11 @@ impl<S: BitmapSlice + Send + Sync + 'static> AsyncFileSystem for PassthroughFs<S
                 None
             };
 
-        let file = Self::async_file_from_std(file);
+        // Borrow the fd of the handle for the duration of the write: the
+        // asynchronous file object holds a reference to the handle data,
+        // which keeps the descriptor valid until the request completes,
+        // avoiding the `dup()`/`close()` syscall pair per request.
+        let file = self.async_file_from_data(&data, flags)?;
 
         // Serve the request with native asynchronous IO: the transport
         // transfers the data directly between its buffer and the file.
