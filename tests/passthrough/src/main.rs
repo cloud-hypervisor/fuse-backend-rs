@@ -41,9 +41,12 @@ impl Daemon {
     /// Creates a fusedev daemon instance
     pub fn new(src: &str, mountpoint: &str, thread_cnt: u32, blocking: bool) -> Result<Self> {
         // create vfs
+        // no_writeback: fuser cannot negotiate FUSE_WRITEBACK_CACHE, so keep it
+        // off here to keep the write-path comparison against fuser fair.
         let vfs = Vfs::new(VfsOptions {
             no_open: false,
             no_opendir: false,
+            no_writeback: true,
             ..Default::default()
         });
 

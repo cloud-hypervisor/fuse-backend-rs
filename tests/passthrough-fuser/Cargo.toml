@@ -1,0 +1,15 @@
+[package]
+name = "passthrough-fuser"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# abi-7-31: without an abi-7-x feature fuser falls back to protocol 7.8,
+# whose fuse_init_out layout mismatches modern kernels and makes the kernel
+# cap writes at 4k.
+fuser = { version = "0.15", features = ["abi-7-31"] }
+libc = "0.2"
+log = "0.4"
+simple_logger = "4"
+signal-hook = "0.3"
+clap = { version = "4", features = ["derive"] }

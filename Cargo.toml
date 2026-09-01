@@ -25,6 +25,7 @@ members = [
     "crates/fuse-backend-overlayfs",
     "crates/fuse-backend-vfs",
     "tests/passthrough",
+    "tests/passthrough-fuser",
     "tests/overlay",
     "tests/benchmark",
 ]
