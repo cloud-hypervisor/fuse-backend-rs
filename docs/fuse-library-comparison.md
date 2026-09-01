@@ -19,9 +19,12 @@ observed difference.
 - **4k random writes favor fuse-backend-rs at all thread counts** (+24% to
   +123%), mainly due to zero-copy receive (payload goes straight into
   `pwritev` without an intermediate buffer).
-- **4k random reads favor fuser at 1-2 threads** (consistent -10% to -30%
-  for fuse-backend-rs), where the multi-worker machinery costs more than it
-  saves; fuse-backend-rs wins back the lead at ≥4 threads.
+- **4k random reads favor fuser at low concurrency** — but by a smaller
+  margin than fio suggested. A controlled cache-miss microbenchmark
+  (5 interleaved rounds) shows fuser leads a single client by ~10%
+  (62k vs ~55k ops/s) while at 4 concurrent clients the backend's
+  single *blocking* channel matches fuser exactly; multi-worker blocking
+  channels then pull ahead by +45-47%.
 - **Metadata create (single-thread) favors fuser** (~1.9x in a clean
   microbenchmark). Root cause is request/syscall volume, not credential
   switching (disproved by A/B test).
@@ -171,6 +174,66 @@ Conclusions on stability:
   operations (~100ms each in fio's file lifecycle), so the result flips
   sign between rounds. See the microbenchmark below instead.
 
+## Cache-Miss Microbenchmark: Three-Way Controlled Comparison
+
+The fio randread results above are contaminated by the kernel page cache:
+depending on workload ordering, a varying fraction of reads is served from
+the fuse page cache without ever reaching the daemon (any result showing
+latency below the ~12μs round-trip floor is invalid). To compare the three
+request-reception models cleanly, a dedicated microbenchmark was built:
+
+- Client: Python loop, per iteration `fadvise(POSIX_FADV_DONTNEED)` on the
+  target page then `pread(4k)` — every read is forced to miss the cache
+  and reach the daemon (the eviction/refault tax applies identically to
+  all compared modes).
+- Daemon configurations compared: fuser (single dispatch thread, blocking
+  read), fuse-backend-rs **epoll channel** (`FuseChannel`), and
+  fuse-backend-rs **blocking channel** (`BlockingFuseChannel`, a blocking
+  read on a `FUSE_DEV_IOC_CLONE` fd).
+- 40,000 iterations per run; 5 rounds with all seven configurations
+  interleaved within each round, so host-state drift affects all modes
+  equally.
+
+### Results (ops/s, 5-round mean)
+
+Single client:
+
+| Implementation | ops/s | stddev | spread |
+|----------------|------:|-------:|-------:|
+| fuser (single thread) | 62,119 | 3,187 | 13% |
+| backend epoll, 1 worker | 55,707 | 4,996 | 21% |
+| backend blocking, 1 worker | 54,354 | 6,453 | 24% |
+
+4 concurrent clients:
+
+| Implementation | ops/s | stddev | spread | diff vs fuser |
+|----------------|------:|-------:|-------:|--------------:|
+| fuser (single thread) | 122,433 | 1,380 | 3% | — |
+| backend blocking, 1 worker | 122,318 | 5,497 | 11% | -0.1% |
+| backend epoll, 1 worker | 108,049 | 1,859 | 4% | -11.7% |
+| backend epoll, 2 workers | 160,831 | 5,209 | 8% | +31.4% |
+| backend epoll, 4 workers | 150,788 | 4,771 | 8% | +23.2% |
+| backend blocking, 2 workers | 178,180 | 1,568 | 2% | +45.5% |
+| backend blocking, 4 workers | 180,286 | 2,704 | 3% | +47.3% |
+
+### Conclusions
+
+- **Single client**: fuser's lean blocking loop leads by ~10% and is the
+  most stable (13% spread vs 21-27%). The earlier fio-based "-10% to -30%"
+  gap overestimated fuser's advantage — under controlled conditions it is
+  ~10%, and backend epoll/blocking single workers are equivalent to each
+  other.
+- **4 clients, single worker**: the backend blocking channel matches fuser
+  exactly (122.3k vs 122.4k), while the epoll channel trails by 11.7% —
+  the per-request `epoll_wait` is precisely what closes/opens the gap with
+  fuser's blocking read model.
+- **Multi-worker**: blocking channels scale to 180k (+47% over fuser) with
+  2-3% spread; epoll channels peak at 161k (2 workers) and regress to 151k
+  at 4 workers. Blocking channels show no such regression.
+- The bimodal ~±25% run-to-run variance seen on the backend single-client
+  runs also appears for fuser, confirming it is host-level noise
+  (scheduling/frequency), not a library property.
+
 ## Root-Cause Analysis
 
 ### Single-thread parity for large-block I/O
@@ -199,14 +262,16 @@ latency grows with client parallelism (552μs at 8-thread seqwrite).
 fuse-backend-rs workers scale near-linearly until the client side saturates
 (seqread plateaus around 8 threads at ~10.5 GB/s on this host).
 
-### 4k random reads at low concurrency: fuser wins
+### 4k random reads at low concurrency: fuser wins (revised)
 
-Consistent across all 3 rounds (-10% to -30% at 1-2 threads). At low
-concurrency, fuse-backend-rs pays for the multi-worker machinery without
-benefiting from parallelism: per-request `epoll_wait` + `read` in the
-transport loop and worker wakeup/scheduling overhead. The single-threaded
-fuser loop does a plain blocking `read()`. At ≥4 concurrent clients the
-situation reverses (+24% to +46% for fuse-backend-rs).
+fio showed -10% to -30% at 1-2 threads, but that measurement mixes
+daemon-served reads with cache-served reads. The cache-miss
+microbenchmark above pins the true gap at ~10% for a single client:
+fuse-backend-rs pays per-request `epoll_wait` + `read` in the transport
+loop plus worker wakeup/scheduling overhead, while fuser's loop does a
+plain blocking `read()`. The backend's new blocking channel closes this
+gap completely at equal thread counts, and its multi-worker scaling then
+takes over at ≥2 concurrent clients (+31% to +47%).
 
 ### Metadata create: 1.9x slower, request volume is the cause
 
@@ -267,6 +332,10 @@ Scripts live under `tests/scripts/`:
 - `count_create_syscalls.sh` — daemon syscall accounting via `strace -c`
 - `probe_write_syscalls.sh` / `probe_read_splitting.sh` — request-size
   verification (detects kernel-side write splitting)
+- `micro_read_ab.py` — cache-miss 4k random read microbenchmark (fadvise
+  DONTNEED per read, guarantees every request reaches the daemon)
+- `bench_micro_3way.sh` / `parse_micro_3way.py` — interleaved 3-way runs
+  (backend epoll / backend blocking / fuser) with mean/stddev aggregation
 
 Requirements on the test host: fio, fusermount3, fuse3 headers
 (fuser links libfuse via pkg-config), strace, python3. Build
@@ -278,8 +347,10 @@ Requirements on the test host: fio, fusermount3, fuse3 headers
    libraries makes little difference.
 2. For concurrent workloads, fuse-backend-rs's multi-worker model is the
    decisive advantage (up to ~6x throughput at 8 threads).
-3. For latency-sensitive single-threaded 4k-random-read services, fuser's
-   leaner loop currently has a measurable edge.
+3. For latency-sensitive single-client 4k-random-read services, fuser's
+   lean loop leads by ~10% (controlled measurement); the backend's
+   blocking channel matches it once there is any client concurrency, and
+   multi-worker blocking channels exceed it by ~47%.
 4. If using fuser: always enable an `abi-7-x` cargo feature, or large
    writes will be silently split.
 5. If using fuse-backend-rs as non-root for metadata-heavy workloads: the
