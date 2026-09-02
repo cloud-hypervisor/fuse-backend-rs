@@ -4,10 +4,11 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-# abi-7-31: without an abi-7-x feature fuser falls back to protocol 7.8,
-# whose fuse_init_out layout mismatches modern kernels and makes the kernel
-# cap writes at 4k.
-fuser = { version = "0.15", features = ["abi-7-31"] }
+# fuser >= 0.17: &self Filesystem methods (Send + Sync), Config::n_threads
+# and Config::clone_fd for multi-threaded event loops. The abi-7-x feature
+# flags were removed in 0.18 (ABI negotiation moved to runtime, so the old
+# protocol-7.8 4k-write-splitting trap no longer exists).
+fuser = "0.18"
 libc = "0.2"
 log = "0.4"
 simple_logger = "4"

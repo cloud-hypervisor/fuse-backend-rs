@@ -22,7 +22,7 @@ print("rounds collected: %d" % nrounds)
 order = [
     ("epoll", 1), ("epoll", 2), ("epoll", 4),
     ("block", 1), ("block", 2), ("block", 4),
-    ("fuser", 1),
+    ("fuser", 1), ("fuser", 2), ("fuser", 4), ("fuser-nc", 4),
 ]
 for procs in (1, 4):
     print("\n=== client_procs=%d ===" % procs)
@@ -41,16 +41,16 @@ for procs in (1, 4):
         print("%-7s w=%-5d %10.0f %8.0f %10.0f %10.0f | %8.1f %7.0f%%" %
               (impl, workers, m, sd, min(ops), max(ops), lm, spread))
 
-# pairwise diff vs fuser at matching concurrency
-print("\n=== diff vs fuser (procs=4) ===")
-fus = rows.get(("fuser", 1, 4))
+# pairwise diffs vs the strongest fuser config (4 threads, clone_fd) at 4 clients
+print("\n=== diff vs fuser w4 clone_fd (procs=4) ===")
+fus = rows.get(("fuser", 4, 4))
 if fus:
     fm = statistics.mean([v[0] for v in fus])
     for impl, workers in order:
-        if impl == "fuser":
+        if impl == "fuser" and workers == 4:
             continue
         vals = rows.get((impl, workers, 4))
         if not vals:
             continue
         m = statistics.mean([v[0] for v in vals])
-        print("  %-7s w=%d: %+.1f%%" % (impl, workers, (m - fm) / fm * 100))
+        print("  %-8s w=%d: %+.1f%%" % (impl, workers, (m - fm) / fm * 100))

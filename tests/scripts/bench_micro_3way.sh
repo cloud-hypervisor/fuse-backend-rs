@@ -26,15 +26,19 @@ cleanup() {
 }
 trap cleanup EXIT
 
-# run_one <label> <workers> -- starts daemon named by $1/$2, runs micro, appends
-run_daemon() { # impl workers blocking_or_fuser round
+# run_daemon <impl> <workers> <backend-blocking-flag> <round> [extra fuser args...]
+run_daemon() {
     local impl=$1 workers=$2 flag=$3 round=$4
+    shift 4
     rm -rf "$SRC"/*
-    if [ "$impl" = "fuser" ]; then
-        "$FUSER_BIN" "$SRC" "$MNT" >/dev/null 2>&1 &
-    else
-        "$BACK_BIN" "$SRC" "$MNT" "$workers" "$flag" >/dev/null 2>&1 &
-    fi
+    case "$impl" in
+        fuser*)
+            "$FUSER_BIN" "$SRC" "$MNT" --threads "$workers" "$@" >/dev/null 2>&1 &
+            ;;
+        *)
+            "$BACK_BIN" "$SRC" "$MNT" "$workers" "$flag" >/dev/null 2>&1 &
+            ;;
+    esac
     local dp=$!
     sleep 2
     if ! kill -0 "$dp" 2>/dev/null; then
@@ -65,5 +69,8 @@ for r in $(seq 1 "$ROUNDS"); do
     run_daemon block  2 true  "$r"
     run_daemon block  4 true  "$r"
     run_daemon fuser  1 -     "$r"
+    run_daemon fuser  2 -     "$r"
+    run_daemon fuser  4 -     "$r"
+    run_daemon fuser-nc 4 -   "$r" --no-clone-fd
 done
 echo "ALL ROUNDS DONE"

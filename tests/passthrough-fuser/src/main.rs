@@ -2,12 +2,17 @@
 //!
 //! This mirrors all operations to a backing directory, providing a baseline
 //! for comparing fuser performance against fuse-backend-rs.
+//!
+//! Uses fuser >= 0.17 APIs: `&self` Filesystem methods (shared state behind
+//! locks) and `Config::{n_threads, clone_fd}` for multi-threaded event loops
+//! with per-worker FUSE_DEV_IOC_CLONE fds.
 
 use clap::Parser;
 use fuser::{
-    Filesystem, KernelConfig, MountOption, ReplyAttr, ReplyCreate, ReplyData,
-    ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyStatfs, ReplyWrite, ReplyXattr,
-    Request,
+    AccessFlags, BsdFileFlags, Config, Errno, FileAttr, FileHandle, FileType, Filesystem,
+    FopenFlags, Generation, INodeNo, KernelConfig, LockOwner, MountOption, OpenFlags, RenameFlags,
+    ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen,
+    ReplyStatfs, ReplyWrite, ReplyXattr, Request, SessionACL, TimeOrNow, WriteFlags,
 };
 use log::{error, info};
 use signal_hook::{consts::TERM_SIGNALS, iterator::Signals};
@@ -16,6 +21,8 @@ use std::ffi::OsStr;
 use std::fs::{self, File};
 use std::os::unix::fs::{FileExt, MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, RwLock};
 use std::time::{Duration, SystemTime};
 
 const TTL: Duration = Duration::from_secs(1);
@@ -28,9 +35,13 @@ struct Args {
     src: String,
     /// Mount point
     dest: String,
-    /// Number of worker threads (unused by fuser — single-threaded dispatch)
+    /// Number of event loop threads (fuser >= 0.17 Config::n_threads)
     #[arg(short, long, default_value = "1")]
     threads: usize,
+    /// Share one dup'ed /dev/fuse fd across event loop threads instead of
+    /// giving each thread its own FUSE_DEV_IOC_CLONE fd (Config::clone_fd)
+    #[arg(long, default_value_t = false)]
+    no_clone_fd: bool,
 }
 
 /// Inode data stored per inode number
@@ -39,18 +50,23 @@ struct InodeData {
     path: PathBuf,
 }
 
-/// File handle data for open files
-struct FileHandle {
-    file: File,
-}
-
-/// Passthrough filesystem implementation
+/// Passthrough filesystem implementation.
+///
+/// Shared across event loop threads (`&self` methods), so all mutable state
+/// lives behind locks/atomics. File handles are stored as `Arc<File>`: the
+/// read/write paths clone the Arc and release the lock before doing I/O, so
+/// concurrent pread/pwrite never contend on the handle map.
 struct PassthroughFs {
     _source: PathBuf,
-    inodes: HashMap<u64, InodeData>,
-    next_ino: u64,
-    handles: HashMap<u64, FileHandle>,
-    next_fh: u64,
+    inodes: RwLock<HashMap<u64, InodeData>>,
+    next_ino: AtomicU64,
+    handles: RwLock<HashMap<u64, Arc<File>>>,
+    next_fh: AtomicU64,
+}
+
+/// Map a std io error to the fuser Errno reply type
+fn errno_of(e: std::io::Error) -> Errno {
+    Errno::from_i32(e.raw_os_error().unwrap_or(libc::EIO))
 }
 
 impl PassthroughFs {
@@ -64,34 +80,40 @@ impl PassthroughFs {
         );
         PassthroughFs {
             _source: source,
-            inodes,
-            next_ino: 2,
-            handles: HashMap::new(),
-            next_fh: 1,
+            inodes: RwLock::new(inodes),
+            next_ino: AtomicU64::new(2),
+            handles: RwLock::new(HashMap::new()),
+            next_fh: AtomicU64::new(1),
         }
     }
 
     fn get_path(&self, ino: u64) -> Option<PathBuf> {
-        self.inodes.get(&ino).map(|d| d.path.clone())
+        self.inodes
+            .read()
+            .unwrap()
+            .get(&ino)
+            .map(|d| d.path.clone())
     }
 
-    fn alloc_ino(&mut self, path: PathBuf) -> u64 {
-        let ino = self.next_ino;
-        self.next_ino += 1;
-        self.inodes.insert(ino, InodeData { path });
+    fn alloc_ino(&self, path: PathBuf) -> u64 {
+        let ino = self.next_ino.fetch_add(1, Ordering::Relaxed);
+        self.inodes.write().unwrap().insert(ino, InodeData { path });
         ino
     }
 
-    fn alloc_fh(&mut self, file: File) -> u64 {
-        let fh = self.next_fh;
-        self.next_fh += 1;
-        self.handles.insert(fh, FileHandle { file });
+    fn alloc_fh(&self, file: File) -> u64 {
+        let fh = self.next_fh.fetch_add(1, Ordering::Relaxed);
+        self.handles.write().unwrap().insert(fh, Arc::new(file));
         fh
     }
 
-    fn metadata_to_attr(&self, ino: u64, meta: &fs::Metadata) -> fuser::FileAttr {
-        fuser::FileAttr {
-            ino,
+    fn get_file(&self, fh: u64) -> Option<Arc<File>> {
+        self.handles.read().unwrap().get(&fh).cloned()
+    }
+
+    fn metadata_to_attr(&self, ino: u64, meta: &fs::Metadata) -> FileAttr {
+        FileAttr {
+            ino: INodeNo(ino),
             size: meta.len(),
             blocks: meta.blocks(),
             atime: meta.accessed().unwrap_or(SystemTime::UNIX_EPOCH),
@@ -99,11 +121,11 @@ impl PassthroughFs {
             ctime: SystemTime::UNIX_EPOCH,
             crtime: SystemTime::UNIX_EPOCH,
             kind: if meta.is_dir() {
-                fuser::FileType::Directory
+                FileType::Directory
             } else if meta.is_symlink() {
-                fuser::FileType::Symlink
+                FileType::Symlink
             } else {
-                fuser::FileType::RegularFile
+                FileType::RegularFile
             },
             perm: (meta.mode() & 0o7777) as u16,
             nlink: meta.nlink() as u32,
@@ -117,9 +139,11 @@ impl PassthroughFs {
 }
 
 impl Filesystem for PassthroughFs {
-    fn init(&mut self, _req: &Request<'_>, config: &mut KernelConfig) -> Result<(), libc::c_int> {
-        // Match fuse-backend-rs INIT: 1MB max write (256 pages). Without this the
-        // kernel splits large writes into 4k chunks on this host.
+    fn init(&mut self, _req: &Request, config: &mut KernelConfig) -> std::io::Result<()> {
+        // Match fuse-backend-rs INIT: 1MB max write (256 pages). fuser >= 0.17
+        // negotiates the ABI at runtime, so the old abi-7-x feature-flag trap
+        // (protocol 7.8 fallback splitting writes into 4k) no longer exists,
+        // but set max_write explicitly for a like-for-like comparison.
         let _ = config.set_max_write(1024 * 1024);
         info!("Passthrough filesystem initialized");
         Ok(())
@@ -129,11 +153,11 @@ impl Filesystem for PassthroughFs {
         info!("Passthrough filesystem destroyed");
     }
 
-    fn lookup(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEntry) {
-        let parent_path = match self.get_path(parent) {
+    fn lookup(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEntry) {
+        let parent_path = match self.get_path(u64::from(parent)) {
             Some(p) => p,
             None => {
-                reply.error(libc::ENOENT);
+                reply.error(Errno::ENOENT);
                 return;
             }
         };
@@ -143,56 +167,53 @@ impl Filesystem for PassthroughFs {
             Ok(meta) => {
                 let ino = self.alloc_ino(child_path);
                 let attr = self.metadata_to_attr(ino, &meta);
-                reply.entry(&TTL, &attr, 0);
+                reply.entry(&TTL, &attr, Generation(0));
             }
-            Err(e) => {
-                reply.error(e.raw_os_error().unwrap_or(libc::EIO));
-            }
+            Err(e) => reply.error(errno_of(e)),
         }
     }
 
-    fn getattr(&mut self, _req: &Request<'_>, ino: u64, _fh: Option<u64>, reply: ReplyAttr) {
-        let path = match self.get_path(ino) {
+    fn getattr(&self, _req: &Request, ino: INodeNo, _fh: Option<FileHandle>, reply: ReplyAttr) {
+        let path = match self.get_path(u64::from(ino)) {
             Some(p) => p,
             None => {
-                reply.error(libc::ENOENT);
+                reply.error(Errno::ENOENT);
                 return;
             }
         };
 
         match fs::metadata(&path) {
             Ok(meta) => {
-                let attr = self.metadata_to_attr(ino, &meta);
+                let attr = self.metadata_to_attr(u64::from(ino), &meta);
                 reply.attr(&TTL, &attr);
             }
-            Err(e) => {
-                reply.error(e.raw_os_error().unwrap_or(libc::EIO));
-            }
+            Err(e) => reply.error(errno_of(e)),
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn setattr(
-        &mut self,
-        _req: &Request<'_>,
-        ino: u64,
+        &self,
+        _req: &Request,
+        ino: INodeNo,
         mode: Option<u32>,
         _uid: Option<u32>,
         _gid: Option<u32>,
         size: Option<u64>,
-        _atime: Option<fuser::TimeOrNow>,
-        _mtime: Option<fuser::TimeOrNow>,
+        _atime: Option<TimeOrNow>,
+        _mtime: Option<TimeOrNow>,
         _ctime: Option<SystemTime>,
-        _fh: Option<u64>,
+        _fh: Option<FileHandle>,
         _crtime: Option<SystemTime>,
         _chgtime: Option<SystemTime>,
         _bkuptime: Option<SystemTime>,
-        _flags: Option<u32>,
+        _flags: Option<BsdFileFlags>,
         reply: ReplyAttr,
     ) {
-        let path = match self.get_path(ino) {
+        let path = match self.get_path(u64::from(ino)) {
             Some(p) => p,
             None => {
-                reply.error(libc::ENOENT);
+                reply.error(Errno::ENOENT);
                 return;
             }
         };
@@ -203,7 +224,7 @@ impl Filesystem for PassthroughFs {
                 .open(&path)
                 .and_then(|f| f.set_len(size))
             {
-                reply.error(e.raw_os_error().unwrap_or(libc::EIO));
+                reply.error(errno_of(e));
                 return;
             }
         }
@@ -214,75 +235,76 @@ impl Filesystem for PassthroughFs {
 
         match fs::metadata(&path) {
             Ok(meta) => {
-                let attr = self.metadata_to_attr(ino, &meta);
+                let attr = self.metadata_to_attr(u64::from(ino), &meta);
                 reply.attr(&TTL, &attr);
             }
-            Err(e) => {
-                reply.error(e.raw_os_error().unwrap_or(libc::EIO));
-            }
+            Err(e) => reply.error(errno_of(e)),
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn read(
-        &mut self,
-        _req: &Request<'_>,
-        _ino: u64,
-        fh: u64,
-        offset: i64,
+        &self,
+        _req: &Request,
+        _ino: INodeNo,
+        fh: FileHandle,
+        offset: u64,
         size: u32,
-        _flags: i32,
-        _lock_owner: Option<u64>,
+        _flags: OpenFlags,
+        _lock_owner: Option<LockOwner>,
         reply: ReplyData,
     ) {
-        if let Some(handle) = self.handles.get_mut(&fh) {
+        if let Some(file) = self.get_file(fh.0) {
             let mut buf = vec![0u8; size as usize];
             // pread: single syscall, no seek (matches fuse-backend-rs read_at path)
-            match handle.file.read_at(&mut buf, offset as u64) {
+            match file.read_at(&mut buf, offset) {
                 Ok(n) => {
                     buf.truncate(n);
                     reply.data(&buf);
                 }
-                Err(e) => reply.error(e.raw_os_error().unwrap_or(libc::EIO)),
+                Err(e) => reply.error(errno_of(e)),
             }
         } else {
-            reply.error(libc::EBADF);
+            reply.error(Errno::EBADF);
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn write(
-        &mut self,
-        _req: &Request<'_>,
-        _ino: u64,
-        fh: u64,
-        offset: i64,
+        &self,
+        _req: &Request,
+        _ino: INodeNo,
+        fh: FileHandle,
+        offset: u64,
         data: &[u8],
-        _write_flags: u32,
-        _flags: i32,
-        _lock_owner: Option<u64>,
+        _write_flags: WriteFlags,
+        _flags: OpenFlags,
+        _lock_owner: Option<LockOwner>,
         reply: ReplyWrite,
     ) {
-        if let Some(handle) = self.handles.get_mut(&fh) {
+        if let Some(file) = self.get_file(fh.0) {
             // pwrite: single syscall, no seek (matches fuse-backend-rs write path)
-            match handle.file.write_at(data, offset as u64) {
+            match file.write_at(data, offset) {
                 Ok(n) => reply.written(n as u32),
-                Err(e) => reply.error(e.raw_os_error().unwrap_or(libc::EIO)),
+                Err(e) => reply.error(errno_of(e)),
             }
         } else {
-            reply.error(libc::EBADF);
+            reply.error(Errno::EBADF);
         }
     }
 
-    fn open(&mut self, _req: &Request<'_>, ino: u64, flags: i32, reply: ReplyOpen) {
-        let path = match self.get_path(ino) {
+    fn open(&self, _req: &Request, ino: INodeNo, flags: OpenFlags, reply: ReplyOpen) {
+        let path = match self.get_path(u64::from(ino)) {
             Some(p) => p,
             None => {
-                reply.error(libc::ENOENT);
+                reply.error(Errno::ENOENT);
                 return;
             }
         };
 
+        let raw = flags.0;
         let mut opts = fs::OpenOptions::new();
-        let access_mode = flags & libc::O_ACCMODE;
+        let access_mode = raw & libc::O_ACCMODE;
         if access_mode == libc::O_RDONLY {
             opts.read(true);
         } else if access_mode == libc::O_WRONLY {
@@ -290,50 +312,50 @@ impl Filesystem for PassthroughFs {
         } else if access_mode == libc::O_RDWR {
             opts.read(true).write(true);
         }
-        if flags & libc::O_APPEND != 0 {
+        if raw & libc::O_APPEND != 0 {
             opts.append(true);
         }
-        if flags & libc::O_TRUNC != 0 {
+        if raw & libc::O_TRUNC != 0 {
             opts.truncate(true);
         }
 
         match opts.open(&path) {
             Ok(file) => {
                 let fh = self.alloc_fh(file);
-                reply.opened(fh, 0);
+                reply.opened(FileHandle(fh), FopenFlags::empty());
             }
-            Err(e) => reply.error(e.raw_os_error().unwrap_or(libc::EIO)),
+            Err(e) => reply.error(errno_of(e)),
         }
     }
 
     fn release(
-        &mut self,
-        _req: &Request<'_>,
-        _ino: u64,
-        fh: u64,
-        _flags: i32,
-        _lock_owner: Option<u64>,
+        &self,
+        _req: &Request,
+        _ino: INodeNo,
+        fh: FileHandle,
+        _flags: OpenFlags,
+        _lock_owner: Option<LockOwner>,
         _flush: bool,
         reply: ReplyEmpty,
     ) {
-        self.handles.remove(&fh);
+        self.handles.write().unwrap().remove(&fh.0);
         reply.ok();
     }
 
     fn create(
-        &mut self,
-        _req: &Request<'_>,
-        parent: u64,
+        &self,
+        _req: &Request,
+        parent: INodeNo,
         name: &OsStr,
         mode: u32,
         _umask: u32,
         flags: i32,
         reply: ReplyCreate,
     ) {
-        let parent_path = match self.get_path(parent) {
+        let parent_path = match self.get_path(u64::from(parent)) {
             Some(p) => p,
             None => {
-                reply.error(libc::ENOENT);
+                reply.error(Errno::ENOENT);
                 return;
             }
         };
@@ -353,58 +375,64 @@ impl Filesystem for PassthroughFs {
                         let ino = self.alloc_ino(child_path);
                         let attr = self.metadata_to_attr(ino, &meta);
                         let fh = self.alloc_fh(file);
-                        reply.created(&TTL, &attr, 0, fh, 0);
+                        reply.created(
+                            &TTL,
+                            &attr,
+                            Generation(0),
+                            FileHandle(fh),
+                            FopenFlags::empty(),
+                        );
                     }
-                    Err(e) => reply.error(e.raw_os_error().unwrap_or(libc::EIO)),
+                    Err(e) => reply.error(errno_of(e)),
                 }
             }
-            Err(e) => reply.error(e.raw_os_error().unwrap_or(libc::EIO)),
+            Err(e) => reply.error(errno_of(e)),
         }
     }
 
-    fn unlink(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEmpty) {
-        let parent_path = match self.get_path(parent) {
+    fn unlink(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
+        let parent_path = match self.get_path(u64::from(parent)) {
             Some(p) => p,
             None => {
-                reply.error(libc::ENOENT);
+                reply.error(Errno::ENOENT);
                 return;
             }
         };
         let child_path = parent_path.join(name);
         match fs::remove_file(&child_path) {
             Ok(_) => reply.ok(),
-            Err(e) => reply.error(e.raw_os_error().unwrap_or(libc::EIO)),
+            Err(e) => reply.error(errno_of(e)),
         }
     }
 
-    fn rmdir(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEmpty) {
-        let parent_path = match self.get_path(parent) {
+    fn rmdir(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
+        let parent_path = match self.get_path(u64::from(parent)) {
             Some(p) => p,
             None => {
-                reply.error(libc::ENOENT);
+                reply.error(Errno::ENOENT);
                 return;
             }
         };
         let child_path = parent_path.join(name);
         match fs::remove_dir(&child_path) {
             Ok(_) => reply.ok(),
-            Err(e) => reply.error(e.raw_os_error().unwrap_or(libc::EIO)),
+            Err(e) => reply.error(errno_of(e)),
         }
     }
 
     fn mkdir(
-        &mut self,
-        _req: &Request<'_>,
-        parent: u64,
+        &self,
+        _req: &Request,
+        parent: INodeNo,
         name: &OsStr,
         mode: u32,
         _umask: u32,
         reply: ReplyEntry,
     ) {
-        let parent_path = match self.get_path(parent) {
+        let parent_path = match self.get_path(u64::from(parent)) {
             Some(p) => p,
             None => {
-                reply.error(libc::ENOENT);
+                reply.error(Errno::ENOENT);
                 return;
             }
         };
@@ -416,27 +444,27 @@ impl Filesystem for PassthroughFs {
                     Ok(meta) => {
                         let ino = self.alloc_ino(child_path);
                         let attr = self.metadata_to_attr(ino, &meta);
-                        reply.entry(&TTL, &attr, 0);
+                        reply.entry(&TTL, &attr, Generation(0));
                     }
-                    Err(e) => reply.error(e.raw_os_error().unwrap_or(libc::EIO)),
+                    Err(e) => reply.error(errno_of(e)),
                 }
             }
-            Err(e) => reply.error(e.raw_os_error().unwrap_or(libc::EIO)),
+            Err(e) => reply.error(errno_of(e)),
         }
     }
 
     fn readdir(
-        &mut self,
-        _req: &Request<'_>,
-        ino: u64,
-        _fh: u64,
-        offset: i64,
+        &self,
+        _req: &Request,
+        ino: INodeNo,
+        _fh: FileHandle,
+        offset: u64,
         mut reply: ReplyDirectory,
     ) {
-        let path = match self.get_path(ino) {
+        let path = match self.get_path(u64::from(ino)) {
             Some(p) => p,
             None => {
-                reply.error(libc::ENOENT);
+                reply.error(Errno::ENOENT);
                 return;
             }
         };
@@ -444,40 +472,40 @@ impl Filesystem for PassthroughFs {
         let entries = match fs::read_dir(&path) {
             Ok(entries) => entries,
             Err(e) => {
-                reply.error(e.raw_os_error().unwrap_or(libc::EIO));
+                reply.error(errno_of(e));
                 return;
             }
         };
 
-        let mut result: Vec<(u64, fuser::FileType, String)> = vec![
-            (1, fuser::FileType::Directory, ".".to_string()),
-            (1, fuser::FileType::Directory, "..".to_string()),
+        let mut result: Vec<(u64, FileType, String)> = vec![
+            (1, FileType::Directory, ".".to_string()),
+            (1, FileType::Directory, "..".to_string()),
         ];
 
         for entry in entries.filter_map(|e| e.ok()) {
             let name = entry.file_name().to_string_lossy().to_string();
             let ft = match entry.file_type() {
-                Ok(ft) if ft.is_dir() => fuser::FileType::Directory,
-                Ok(ft) if ft.is_symlink() => fuser::FileType::Symlink,
-                _ => fuser::FileType::RegularFile,
+                Ok(ft) if ft.is_dir() => FileType::Directory,
+                Ok(ft) if ft.is_symlink() => FileType::Symlink,
+                _ => FileType::RegularFile,
             };
             let ino = self.alloc_ino(entry.path());
             result.push((ino, ft, name));
         }
 
         for (i, (ino, ft, name)) in result.iter().enumerate().skip(offset as usize) {
-            if reply.add(*ino, (i + 1) as i64, *ft, name) {
+            if reply.add(INodeNo(*ino), (i + 1) as u64, *ft, name) {
                 break;
             }
         }
         reply.ok();
     }
 
-    fn statfs(&mut self, _req: &Request<'_>, ino: u64, reply: ReplyStatfs) {
-        let path = match self.get_path(ino) {
+    fn statfs(&self, _req: &Request, ino: INodeNo, reply: ReplyStatfs) {
+        let path = match self.get_path(u64::from(ino)) {
             Some(p) => p,
             None => {
-                reply.error(libc::ENOENT);
+                reply.error(Errno::ENOENT);
                 return;
             }
         };
@@ -487,97 +515,104 @@ impl Filesystem for PassthroughFs {
         let ret = unsafe { libc::statvfs(c_path.as_ptr(), &mut stat) };
         if ret == 0 {
             reply.statfs(
-                stat.f_blocks as u64,
-                stat.f_bfree as u64,
-                stat.f_bavail as u64,
-                stat.f_files as u64,
-                stat.f_ffree as u64,
+                stat.f_blocks,
+                stat.f_bfree,
+                stat.f_bavail,
+                stat.f_files,
+                stat.f_ffree,
                 stat.f_bsize as u32,
                 stat.f_namemax as u32,
                 stat.f_frsize as u32,
             );
         } else {
-            reply.error(libc::EIO);
+            reply.error(Errno::EIO);
         }
     }
 
-    fn flush(&mut self, _req: &Request<'_>, _ino: u64, fh: u64, _lock_owner: u64, reply: ReplyEmpty) {
-        if let Some(handle) = self.handles.get(&fh) {
-            let _ = handle.file.sync_all();
+    fn flush(
+        &self,
+        _req: &Request,
+        _ino: INodeNo,
+        fh: FileHandle,
+        _lock_owner: LockOwner,
+        reply: ReplyEmpty,
+    ) {
+        if let Some(file) = self.get_file(fh.0) {
+            let _ = file.sync_all();
         }
         reply.ok();
     }
 
-    fn fsync(&mut self, _req: &Request<'_>, _ino: u64, fh: u64, datasync: bool, reply: ReplyEmpty) {
-        if let Some(handle) = self.handles.get(&fh) {
+    fn fsync(
+        &self,
+        _req: &Request,
+        _ino: INodeNo,
+        fh: FileHandle,
+        datasync: bool,
+        reply: ReplyEmpty,
+    ) {
+        if let Some(file) = self.get_file(fh.0) {
             if datasync {
-                let _ = handle.file.sync_data();
+                let _ = file.sync_data();
             } else {
-                let _ = handle.file.sync_all();
+                let _ = file.sync_all();
             }
         }
         reply.ok();
     }
 
-    fn access(&mut self, _req: &Request<'_>, ino: u64, mask: i32, reply: ReplyEmpty) {
-        let path = match self.get_path(ino) {
+    fn access(&self, _req: &Request, ino: INodeNo, mask: AccessFlags, reply: ReplyEmpty) {
+        let path = match self.get_path(u64::from(ino)) {
             Some(p) => p,
             None => {
-                reply.error(libc::ENOENT);
+                reply.error(Errno::ENOENT);
                 return;
             }
         };
         let c_path = std::ffi::CString::new(path.to_string_lossy().as_bytes()).unwrap();
-        let ret = unsafe { libc::access(c_path.as_ptr(), mask) };
+        let ret = unsafe { libc::access(c_path.as_ptr(), mask.bits()) };
         if ret == 0 {
             reply.ok();
         } else {
-            reply.error(std::io::Error::last_os_error().raw_os_error().unwrap_or(libc::EIO));
+            reply.error(errno_of(std::io::Error::last_os_error()));
         }
     }
 
     fn rename(
-        &mut self,
-        _req: &Request<'_>,
-        parent: u64,
+        &self,
+        _req: &Request,
+        parent: INodeNo,
         name: &OsStr,
-        newparent: u64,
+        newparent: INodeNo,
         newname: &OsStr,
-        _flags: u32,
+        _flags: RenameFlags,
         reply: ReplyEmpty,
     ) {
-        let parent_path = match self.get_path(parent) {
+        let parent_path = match self.get_path(u64::from(parent)) {
             Some(p) => p,
             None => {
-                reply.error(libc::ENOENT);
+                reply.error(Errno::ENOENT);
                 return;
             }
         };
-        let newparent_path = match self.get_path(newparent) {
+        let newparent_path = match self.get_path(u64::from(newparent)) {
             Some(p) => p,
             None => {
-                reply.error(libc::ENOENT);
+                reply.error(Errno::ENOENT);
                 return;
             }
         };
         match fs::rename(parent_path.join(name), newparent_path.join(newname)) {
             Ok(_) => reply.ok(),
-            Err(e) => reply.error(e.raw_os_error().unwrap_or(libc::EIO)),
+            Err(e) => reply.error(errno_of(e)),
         }
     }
 
-    fn getxattr(
-        &mut self,
-        _req: &Request<'_>,
-        ino: u64,
-        name: &OsStr,
-        size: u32,
-        reply: ReplyXattr,
-    ) {
-        let path = match self.get_path(ino) {
+    fn getxattr(&self, _req: &Request, ino: INodeNo, name: &OsStr, size: u32, reply: ReplyXattr) {
+        let path = match self.get_path(u64::from(ino)) {
             Some(p) => p,
             None => {
-                reply.error(libc::ENOENT);
+                reply.error(Errno::ENOENT);
                 return;
             }
         };
@@ -591,7 +626,7 @@ impl Filesystem for PassthroughFs {
             if ret >= 0 {
                 reply.size(ret as u32);
             } else {
-                reply.error(std::io::Error::last_os_error().raw_os_error().unwrap_or(libc::EIO));
+                reply.error(errno_of(std::io::Error::last_os_error()));
             }
         } else {
             let mut buf = vec![0u8; size as usize];
@@ -607,16 +642,16 @@ impl Filesystem for PassthroughFs {
                 buf.truncate(ret as usize);
                 reply.data(&buf);
             } else {
-                reply.error(std::io::Error::last_os_error().raw_os_error().unwrap_or(libc::EIO));
+                reply.error(errno_of(std::io::Error::last_os_error()));
             }
         }
     }
 
-    fn listxattr(&mut self, _req: &Request<'_>, ino: u64, size: u32, reply: ReplyXattr) {
-        let path = match self.get_path(ino) {
+    fn listxattr(&self, _req: &Request, ino: INodeNo, size: u32, reply: ReplyXattr) {
+        let path = match self.get_path(u64::from(ino)) {
             Some(p) => p,
             None => {
-                reply.error(libc::ENOENT);
+                reply.error(Errno::ENOENT);
                 return;
             }
         };
@@ -627,7 +662,7 @@ impl Filesystem for PassthroughFs {
             if ret >= 0 {
                 reply.size(ret as u32);
             } else {
-                reply.error(std::io::Error::last_os_error().raw_os_error().unwrap_or(libc::EIO));
+                reply.error(errno_of(std::io::Error::last_os_error()));
             }
         } else {
             let mut buf = vec![0u8; size as usize];
@@ -642,25 +677,25 @@ impl Filesystem for PassthroughFs {
                 buf.truncate(ret as usize);
                 reply.data(&buf);
             } else {
-                reply.error(std::io::Error::last_os_error().raw_os_error().unwrap_or(libc::EIO));
+                reply.error(errno_of(std::io::Error::last_os_error()));
             }
         }
     }
 
     fn setxattr(
-        &mut self,
-        _req: &Request<'_>,
-        ino: u64,
+        &self,
+        _req: &Request,
+        ino: INodeNo,
         name: &OsStr,
         value: &[u8],
         flags: i32,
         _position: u32,
         reply: ReplyEmpty,
     ) {
-        let path = match self.get_path(ino) {
+        let path = match self.get_path(u64::from(ino)) {
             Some(p) => p,
             None => {
-                reply.error(libc::ENOENT);
+                reply.error(Errno::ENOENT);
                 return;
             }
         };
@@ -679,15 +714,15 @@ impl Filesystem for PassthroughFs {
         if ret == 0 {
             reply.ok();
         } else {
-            reply.error(std::io::Error::last_os_error().raw_os_error().unwrap_or(libc::EIO));
+            reply.error(errno_of(std::io::Error::last_os_error()));
         }
     }
 
-    fn removexattr(&mut self, _req: &Request<'_>, ino: u64, name: &OsStr, reply: ReplyEmpty) {
-        let path = match self.get_path(ino) {
+    fn removexattr(&self, _req: &Request, ino: INodeNo, name: &OsStr, reply: ReplyEmpty) {
+        let path = match self.get_path(u64::from(ino)) {
             Some(p) => p,
             None => {
-                reply.error(libc::ENOENT);
+                reply.error(Errno::ENOENT);
                 return;
             }
         };
@@ -698,7 +733,7 @@ impl Filesystem for PassthroughFs {
         if ret == 0 {
             reply.ok();
         } else {
-            reply.error(std::io::Error::last_os_error().raw_os_error().unwrap_or(libc::EIO));
+            reply.error(errno_of(std::io::Error::last_os_error()));
         }
     }
 }
@@ -731,26 +766,29 @@ fn main() -> std::io::Result<()> {
     }
 
     info!(
-        "Starting passthrough-fuser: src={:?} mountpoint={:?} threads={}",
-        src, dest, args.threads
+        "Starting passthrough-fuser: src={:?} mountpoint={:?} threads={} clone_fd={}",
+        src, dest, args.threads, !args.no_clone_fd
     );
 
     let fs = PassthroughFs::new(src.to_path_buf());
 
-    let options = vec![
+    // Config is #[non_exhaustive]: start from Default and assign the pub fields.
+    // SessionACL::All corresponds to allow_other, which AutoUnmount requires.
+    let mut config = Config::default();
+    config.mount_options = vec![
         MountOption::FSName("passthrough-fuser".to_string()),
         MountOption::AutoUnmount,
-        MountOption::AllowOther,
     ];
+    config.acl = SessionACL::All;
+    config.n_threads = Some(args.threads);
+    config.clone_fd = !args.no_clone_fd;
 
-    // Use spawn_mount2 for background session — dropping the handle unmounts
-    let bg = fuser::spawn_mount2(fs, dest, &options)?;
+    // Background session — dropping the handle unmounts
+    let bg = fuser::spawn_mount(fs, dest, &config)?;
 
     // Wait for signal
     let mut signals = Signals::new(TERM_SIGNALS)?;
-    for _sig in signals.forever() {
-        break;
-    }
+    let _sig = signals.forever().next();
 
     info!("Received signal, unmounting...");
     drop(bg);
