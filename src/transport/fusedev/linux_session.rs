@@ -32,7 +32,13 @@ use super::{
 };
 
 // These follows definition from libfuse.
-const POLL_EVENTS_CAPACITY: usize = 1024;
+//
+// Each channel registers exactly two tokens with its epoll instance (the exit
+// waker and the fuse device fd), so a single `poll` can return at most two
+// events. The event buffer is reused across requests (see `FuseChannel`), so a
+// small fixed capacity is enough; 8 leaves ample headroom while keeping the
+// buffer tiny instead of libfuse's 1024-entry (~12KB) allocation.
+const POLL_EVENTS_CAPACITY: usize = 8;
 
 const FUSE_DEVICE: &str = "/dev/fuse";
 const FUSE_FSTYPE: &str = "fuse";
@@ -320,6 +326,7 @@ pub struct FuseChannel {
     poll: Poll,
     waker: Arc<Waker>,
     buf: Vec<u8>,
+    events: Events,
 }
 
 impl FuseChannel {
@@ -332,21 +339,38 @@ impl FuseChannel {
         // mio default add EPOLLET to event flags, so epoll will use edge-triggered mode.
         // It may let poll miss some event, so manually register the fd with only EPOLLIN flag
         // to use level-triggered mode.
+        //
+        // Also request EPOLLEXCLUSIVE: a session hands out channels over the
+        // *same* fuse device fd (via `try_clone`), so without it one arriving
+        // request makes every channel's `epoll_wait` report readable and they
+        // all race into `read()`, where all but one get `EAGAIN` and re-poll
+        // (thundering herd). EPOLLEXCLUSIVE makes the kernel wake a single
+        // waiting channel per event instead. It requires level-triggered mode
+        // (which we use) and kernel >= 4.5; older kernels reject the flag with
+        // EINVAL, so fall back to a plain EPOLLIN registration there.
         let epoll = poll.as_raw_fd();
-        let mut event = EpollEvent::new(EpollFlags::EPOLLIN, usize::from(FUSE_DEV_EVENT) as u64);
-        epoll_ctl(
-            epoll,
-            EpollOp::EpollCtlAdd,
-            file.as_raw_fd(),
-            Some(&mut event),
-        )
-        .map_err(|e| SessionFailure(format!("epoll register channel fd: {e}")))?;
+        let fd = file.as_raw_fd();
+        let mut event = EpollEvent::new(
+            EpollFlags::EPOLLIN | EpollFlags::EPOLLEXCLUSIVE,
+            usize::from(FUSE_DEV_EVENT) as u64,
+        );
+        match epoll_ctl(epoll, EpollOp::EpollCtlAdd, fd, Some(&mut event)) {
+            Ok(_) => {}
+            Err(Errno::EINVAL) => {
+                // Kernel < 4.5: EPOLLEXCLUSIVE is unsupported, retry without it.
+                event = EpollEvent::new(EpollFlags::EPOLLIN, usize::from(FUSE_DEV_EVENT) as u64);
+                epoll_ctl(epoll, EpollOp::EpollCtlAdd, fd, Some(&mut event))
+                    .map_err(|e| SessionFailure(format!("epoll register channel fd: {e}")))?;
+            }
+            Err(e) => return Err(SessionFailure(format!("epoll register channel fd: {e}"))),
+        }
 
         Ok(FuseChannel {
             file,
             poll,
             waker,
             buf: vec![0x0u8; bufsize],
+            events: Events::with_capacity(POLL_EVENTS_CAPACITY),
         })
     }
 
@@ -361,17 +385,16 @@ impl FuseChannel {
     /// - Ok(Some((reader, writer))): reader to receive request and writer to send reply
     /// - Err(e): error message
     pub fn get_request(&mut self) -> Result<Option<(Reader<'_>, FuseDevWriter<'_>)>> {
-        let mut events = Events::with_capacity(POLL_EVENTS_CAPACITY);
         let mut need_exit = false;
         loop {
             let mut fusereq_available = false;
-            match self.poll.poll(&mut events, None) {
+            match self.poll.poll(&mut self.events, None) {
                 Ok(_) => {}
                 Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
                 Err(e) => return Err(SessionFailure(format!("epoll wait: {e}"))),
             }
 
-            for event in events.iter() {
+            for event in self.events.iter() {
                 // We will handle errors when reading from the fuse device
                 if event.is_readable() || event.is_error() {
                     match event.token() {
