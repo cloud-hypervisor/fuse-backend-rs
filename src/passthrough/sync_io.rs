@@ -90,16 +90,34 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
     /// if these do not match update the file descriptor flags and store the new
     /// result in the HandleData entry
     #[inline(always)]
-    fn check_fd_flags(&self, data: Arc<HandleData>, fd: RawFd, flags: u32) -> io::Result<()> {
-        let open_flags = data.get_flags();
-        if open_flags != flags {
-            let ret = unsafe { libc::fcntl(fd, libc::F_SETFL, flags) };
+    fn ensure_file_flags<'a>(
+        &self,
+        data: &'a Arc<HandleData>,
+        fd: &impl AsRawFd,
+        mut flags: u32,
+    ) -> io::Result<FileFlagGuard<'a, u32>> {
+        let guard = data.open_flags.read().unwrap();
+        if *guard & libc::O_DIRECT as u32 == flags & libc::O_DIRECT as u32 {
+            return Ok(FileFlagGuard::Reader(guard));
+        }
+        drop(guard);
+
+        let mut guard = data.open_flags.write().unwrap();
+        // Update the O_DIRECT flag if needed
+        if *guard & libc::O_DIRECT as u32 != flags & libc::O_DIRECT as u32 {
+            if flags & libc::O_DIRECT as u32 != 0 {
+                flags = *guard | libc::O_DIRECT as u32;
+            } else {
+                flags = *guard & !libc::O_DIRECT as u32;
+            }
+            let ret = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETFL, flags) };
             if ret != 0 {
                 return Err(io::Error::last_os_error());
             }
-            data.set_flags(flags);
+            *guard = flags;
         }
-        Ok(())
+
+        Ok(FileFlagGuard::Writer(guard))
     }
 
     /// Serve a write request targeting a file opened with `O_DIRECT`.
@@ -999,20 +1017,21 @@ impl<S: BitmapSlice + Send + Sync> FileSystem for PassthroughFs<S> {
         flags: u32,
     ) -> io::Result<usize> {
         let data = self.get_data(handle, inode, libc::O_RDONLY)?;
+        let fd = data.borrow_fd();
+
+        // Hold the guard over the whole IO operation, so that no other request
+        // can change the O_DIRECT flag of the fd while we are using it.
+        let _flags_guard = self.ensure_file_flags(&data, &fd, flags)?;
 
         // Manually implement File::try_clone() by borrowing fd of data.file instead of dup().
         // It's safe because the `data` variable's lifetime spans the whole function,
         // so data.file won't be closed.
-        let f = unsafe { File::from_raw_fd(data.borrow_fd().as_raw_fd()) };
-
-        self.check_fd_flags(data.clone(), f.as_raw_fd(), flags)?;
-
-        let mut f = ManuallyDrop::new(f);
+        let mut f = unsafe { ManuallyDrop::new(File::from_raw_fd(fd.as_raw_fd())) };
 
         // The backing file was opened with O_DIRECT (see `open_inode()`), whose
         // alignment constraints the transport buffers don't satisfy, so stage
         // the data through an aligned bounce buffer.
-        if self.cfg.allow_direct_io && data.get_flags() & (libc::O_DIRECT as u32) != 0 {
+        if self.cfg.allow_direct_io && flags & (libc::O_DIRECT as u32) != 0 {
             return self.read_direct(&f, w, size as usize, offset);
         }
 
@@ -1033,20 +1052,15 @@ impl<S: BitmapSlice + Send + Sync> FileSystem for PassthroughFs<S> {
         fuse_flags: u32,
     ) -> io::Result<usize> {
         let data = self.get_data(handle, inode, libc::O_RDWR)?;
+        let fd = data.borrow_fd();
 
-        // Manually implement File::try_clone() by borrowing fd of data.file instead of dup().
-        // It's safe because the `data` variable's lifetime spans the whole function,
-        // so data.file won't be closed.
-        let f = unsafe { File::from_raw_fd(data.borrow_fd().as_raw_fd()) };
-
-        self.check_fd_flags(data.clone(), f.as_raw_fd(), flags)?;
-
+        // Hold the guard over the whole IO operation, so that no other request
+        // can change the O_DIRECT flag of the fd while we are using it.
+        let _flags_guard = self.ensure_file_flags(&data, &fd, flags)?;
         if self.seal_size.load(Ordering::Relaxed) {
-            let st = stat_fd(&f, None)?;
+            let st = stat_fd(&fd, None)?;
             self.seal_size_check(Opcode::Write, st.st_size as u64, offset, size as u64, 0)?;
         }
-
-        let mut f = ManuallyDrop::new(f);
 
         // Cap restored when _killpriv is dropped
         let _killpriv =
@@ -1056,10 +1070,15 @@ impl<S: BitmapSlice + Send + Sync> FileSystem for PassthroughFs<S> {
                 None
             };
 
+        // Manually implement File::try_clone() by borrowing fd of data.file instead of dup().
+        // It's safe because the `data` variable's lifetime spans the whole function,
+        // so data.file won't be closed.
+        let mut f = unsafe { ManuallyDrop::new(File::from_raw_fd(fd.as_raw_fd())) };
+
         // The backing file was opened with O_DIRECT (see `open_inode()`), whose
         // alignment constraints the transport buffers don't satisfy, so stage
         // the payload through an aligned bounce buffer.
-        if self.cfg.allow_direct_io && data.get_flags() & (libc::O_DIRECT as u32) != 0 {
+        if self.cfg.allow_direct_io && flags & (libc::O_DIRECT as u32) != 0 {
             return self.write_direct(&f, r, size as usize, offset);
         }
 
