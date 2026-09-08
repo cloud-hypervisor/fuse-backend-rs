@@ -25,8 +25,52 @@ use crate::api::filesystem::{
     SetattrValid, ZeroCopyReader, ZeroCopyWriter,
 };
 use crate::bytes_to_cstr;
+use crate::transport::pagesize;
 #[cfg(any(feature = "vhost-user-fs", feature = "virtiofs"))]
 use crate::transport::FsCacheReqHandler;
+
+/// A byte buffer allocated by `posix_memalign()` and freed with `libc::free()`
+/// on drop.
+///
+/// Pairing the C allocation with an explicit free(), instead of wrapping the
+/// pointer in a `Vec` whose deallocator always receives a layout with an
+/// alignment of 1, keeps the `GlobalAlloc` contract satisfied no matter which
+/// global allocator the embedding crate is built with.
+struct AlignedBuf {
+    ptr: *mut u8,
+    len: usize,
+}
+
+impl AlignedBuf {
+    fn new(alignment: usize, len: usize) -> io::Result<Self> {
+        let mut ptr = std::ptr::null_mut();
+        // Safe because `ptr` is a valid out-pointer and the return value is
+        // checked, so `ptr` is only read when posix_memalign() succeeded.
+        let ret = unsafe { libc::posix_memalign(&mut ptr, alignment, len) };
+        if ret != 0 {
+            return Err(io::Error::from_raw_os_error(ret));
+        }
+        Ok(AlignedBuf {
+            ptr: ptr as *mut u8,
+            len,
+        })
+    }
+
+    fn as_mut_slice(&mut self) -> &mut [u8] {
+        // Safe because posix_memalign() returned a valid allocation of `len`
+        // bytes; `u8` has no invalid bit patterns, so it's fine to treat the
+        // memory as initialized before it's actually written.
+        unsafe { std::slice::from_raw_parts_mut(self.ptr, self.len) }
+    }
+}
+
+impl Drop for AlignedBuf {
+    fn drop(&mut self) {
+        // Safe because `ptr` came from posix_memalign() and is passed to
+        // free() exactly once, here.
+        unsafe { libc::free(self.ptr as *mut libc::c_void) };
+    }
+}
 
 impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
     fn open_inode(&self, inode: Inode, flags: i32) -> io::Result<File> {
@@ -56,6 +100,113 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
             data.set_flags(flags);
         }
         Ok(())
+    }
+
+    /// Serve a write request targeting a file opened with `O_DIRECT`.
+    ///
+    /// The payload of a fuse WRITE request sits in the request buffer right
+    /// after the request headers, an offset the daemon can't control, so it
+    /// generally doesn't satisfy the alignment constraints of direct IO
+    /// (buffer address, length and file offset must all be multiples of the
+    /// device logical block size) and `pwritev()` fails with `EINVAL`.
+    /// Stage the payload through a page-aligned buffer instead. That lifts
+    /// only the buffer-address constraint: a request whose size or offset is
+    /// unaligned still fails with `EINVAL`, the same error the underlying
+    /// filesystem reports for it.
+    fn write_direct(
+        &self,
+        f: &File,
+        r: &mut dyn ZeroCopyReader,
+        size: usize,
+        offset: u64,
+    ) -> io::Result<usize> {
+        use std::os::unix::fs::FileExt;
+
+        if size == 0 {
+            return Ok(0);
+        }
+
+        // Align the bounce buffer to the runtime page size, which is always a
+        // multiple of the device logical block size that O_DIRECT requires,
+        // instead of assuming a fixed 4096 (wrong on 16K/64K-page systems).
+        let mut buffer = AlignedBuf::new(pagesize(), size)?;
+        let buf = buffer.as_mut_slice();
+
+        let mut copied = 0usize;
+        while copied < size {
+            match r.read(&mut buf[copied..]) {
+                Ok(0) => break,
+                Ok(n) => copied += n,
+                Err(ref e) if e.kind() == io::ErrorKind::Interrupted => {}
+                Err(e) => return Err(e),
+            }
+        }
+
+        let mut written = 0usize;
+        while written < copied {
+            match f.write_at(&buf[written..copied], offset + written as u64) {
+                Ok(0) => break,
+                Ok(n) => written += n,
+                Err(ref e) if e.kind() == io::ErrorKind::Interrupted => {}
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(written)
+    }
+
+    /// Serve a read request targeting a file opened with `O_DIRECT`.
+    ///
+    /// The data of a fuse READ reply is appended to the reply right after
+    /// the response header, an offset the daemon can't control, so it
+    /// generally doesn't satisfy the alignment constraints of direct IO and
+    /// `preadv()` fails with `EINVAL`. Stage the data through a page-aligned
+    /// buffer instead. That lifts only the buffer-address constraint: a
+    /// request whose size or offset is unaligned still fails with `EINVAL`,
+    /// the same error the underlying filesystem reports for it.
+    fn read_direct(
+        &self,
+        f: &File,
+        w: &mut dyn ZeroCopyWriter,
+        size: usize,
+        offset: u64,
+    ) -> io::Result<usize> {
+        use std::os::unix::fs::FileExt;
+
+        if size == 0 {
+            return Ok(0);
+        }
+
+        // Align the bounce buffer to the runtime page size, which is always a
+        // multiple of the device logical block size that O_DIRECT requires,
+        // instead of assuming a fixed 4096 (wrong on 16K/64K-page systems).
+        let mut buffer = AlignedBuf::new(pagesize(), size)?;
+        let buf = buffer.as_mut_slice();
+
+        let mut read_cnt = 0usize;
+        while read_cnt < size {
+            match f.read_at(&mut buf[read_cnt..], offset + read_cnt as u64) {
+                Ok(0) => break,
+                Ok(n) => read_cnt += n,
+                Err(ref e) if e.kind() == io::ErrorKind::Interrupted => {}
+                Err(e) => return Err(e),
+            }
+        }
+
+        let mut written = 0usize;
+        while written < read_cnt {
+            match w.write(&buf[written..read_cnt]) {
+                Ok(0) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::WriteZero,
+                        "failed to write whole buffer",
+                    ))
+                }
+                Ok(n) => written += n,
+                Err(ref e) if e.kind() == io::ErrorKind::Interrupted => {}
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(written)
     }
 
     /// Skip entries in a getdents64 buffer up to and including the entry whose
@@ -372,6 +523,17 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
         self.handle_map.insert(handle, data);
 
         let mut opts = OpenOptions::empty();
+        // If the client requested O_DIRECT and we honor it, `open_inode()`
+        // opened the backing file with O_DIRECT, so the kernel must route IO
+        // on this handle through the direct IO path: serving an O_DIRECT fd
+        // through the page-cache path fails with EINVAL because the page-cache
+        // buffers don't satisfy direct IO alignment requirements.
+        if self.cfg.allow_direct_io
+            && flags & (libc::O_DIRECT as u32) != 0
+            && flags & (libc::O_DIRECTORY as u32) == 0
+        {
+            opts |= OpenOptions::DIRECT_IO;
+        }
         match self.cfg.cache_policy {
             // We only set the direct I/O option on files.
             CachePolicy::Never => opts.set(
@@ -847,6 +1009,13 @@ impl<S: BitmapSlice + Send + Sync> FileSystem for PassthroughFs<S> {
 
         let mut f = ManuallyDrop::new(f);
 
+        // The backing file was opened with O_DIRECT (see `open_inode()`), whose
+        // alignment constraints the transport buffers don't satisfy, so stage
+        // the data through an aligned bounce buffer.
+        if self.cfg.allow_direct_io && data.get_flags() & (libc::O_DIRECT as u32) != 0 {
+            return self.read_direct(&f, w, size as usize, offset);
+        }
+
         w.write_from(&mut *f, size as usize, offset)
     }
 
@@ -886,6 +1055,13 @@ impl<S: BitmapSlice + Send + Sync> FileSystem for PassthroughFs<S> {
             } else {
                 None
             };
+
+        // The backing file was opened with O_DIRECT (see `open_inode()`), whose
+        // alignment constraints the transport buffers don't satisfy, so stage
+        // the payload through an aligned bounce buffer.
+        if self.cfg.allow_direct_io && data.get_flags() & (libc::O_DIRECT as u32) != 0 {
+            return self.write_direct(&f, r, size as usize, offset);
+        }
 
         r.read_to(&mut *f, size as usize, offset)
     }
@@ -1514,6 +1690,8 @@ mod tests {
 
     use super::*;
     use crate::abi::fuse_abi::ROOT_ID;
+    use crate::file_buf::FileVolatileSlice;
+    use crate::file_traits::FileReadWriteVolatile;
     use std::path::Path;
     use vmm_sys_util::{tempdir::TempDir, tempfile::TempFile};
 
@@ -1564,6 +1742,158 @@ mod tests {
         let (test_entry, handle, _, _) = fs.create(&ctx, ROOT_ID, &fname, args).unwrap();
 
         (test_entry, handle.unwrap())
+    }
+
+    /// An in-memory sink implementing `ZeroCopyWriter`, to receive the data
+    /// staged back out by `read_direct()`.
+    struct MemWriter(Vec<u8>);
+
+    impl MemWriter {
+        fn new() -> Self {
+            MemWriter(Vec::new())
+        }
+    }
+
+    impl io::Write for MemWriter {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.0.extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl ZeroCopyWriter for MemWriter {
+        fn write_from(
+            &mut self,
+            f: &mut dyn FileReadWriteVolatile,
+            count: usize,
+            off: u64,
+        ) -> io::Result<usize> {
+            if self.0.len() < count {
+                self.0.resize(count, 0);
+            }
+            // Safe because the slice points into `self.0` and doesn't out-live it.
+            let slice = unsafe { FileVolatileSlice::from_raw_ptr(self.0.as_mut_ptr(), count) };
+            f.read_at_volatile(slice, off)
+        }
+
+        fn available_bytes(&self) -> usize {
+            usize::MAX
+        }
+    }
+
+    /// An in-memory source implementing `ZeroCopyReader`, to provide the data
+    /// staged through the bounce buffer by `write_direct()`.
+    struct MemReader(Vec<u8>);
+
+    impl io::Read for MemReader {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            let n = std::cmp::min(buf.len(), self.0.len());
+            buf[..n].copy_from_slice(&self.0[..n]);
+            self.0.drain(..n);
+            Ok(n)
+        }
+    }
+
+    impl ZeroCopyReader for MemReader {
+        fn read_to(
+            &mut self,
+            f: &mut dyn FileReadWriteVolatile,
+            count: usize,
+            off: u64,
+        ) -> io::Result<usize> {
+            let start = off as usize;
+            if start >= self.0.len() {
+                return Ok(0);
+            }
+            let n = std::cmp::min(count, self.0.len() - start);
+            // Safe because the buffer is only read from and the slice doesn't
+            // out-live `self.0`.
+            let slice = unsafe {
+                FileVolatileSlice::from_raw_ptr(self.0.as_ptr().add(start) as *mut u8, n)
+            };
+            f.write_at_volatile(slice, off)
+        }
+    }
+
+    // A direct IO request has to stage its payload through a page-aligned bounce
+    // buffer, because the fuse transport buffer holds the payload at an offset
+    // the daemon can't align (right after the request/response headers). Verify
+    // both halves of that contract against a real O_DIRECT fd: a raw unaligned
+    // access fails with EINVAL, while `write_direct()`/`read_direct()` succeed
+    // and round-trip the payload byte for byte.
+    //
+    // O_DIRECT needs a backing filesystem that supports it; tmpfs (a common
+    // /tmp) rejects it at open() with EINVAL, so skip gracefully there rather
+    // than fail, to keep the test from being environment-dependent.
+    #[test]
+    fn test_direct_io_bounce_buffer() {
+        use std::os::unix::fs::{FileExt, OpenOptionsExt};
+
+        const BLOCK: usize = 4096;
+
+        let dir = TempDir::new().expect("Cannot create temporary directory.");
+        let path = dir.as_path().join("direct_io_file");
+
+        let file = match std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .custom_flags(libc::O_DIRECT)
+            .open(&path)
+        {
+            Ok(f) => f,
+            Err(e) if e.raw_os_error() == Some(libc::EINVAL) => {
+                eprintln!(
+                    "skipping test_direct_io_bounce_buffer: {:?} does not support O_DIRECT",
+                    dir.as_path()
+                );
+                return;
+            }
+            Err(e) => panic!("unexpected error opening {:?} with O_DIRECT: {}", path, e),
+        };
+
+        // A minimal, unprivileged fs instance. The helpers don't consult it, but
+        // they hang off `PassthroughFs`, so an instance is needed to call them.
+        let fs_cfg = Config {
+            root_dir: dir.as_path().to_str().unwrap().to_string(),
+            allow_direct_io: true,
+            ..Default::default()
+        };
+        let fs = PassthroughFs::<()>::new(fs_cfg).unwrap();
+
+        // Reproduce the bug: pwrite from a buffer whose address is misaligned by
+        // one byte, while the length and file offset stay block-aligned, so only
+        // the address violates the O_DIRECT constraint -- exactly like a payload
+        // that follows the fuse headers in the transport buffer.
+        let backing = vec![0u8; BLOCK + 1];
+        match file.write_at(&backing[1..=BLOCK], 0) {
+            Err(e) if e.raw_os_error() == Some(libc::EINVAL) => {}
+            Ok(_) => {
+                eprintln!(
+                    "skipping test_direct_io_bounce_buffer: {:?} does not enforce O_DIRECT alignment",
+                    dir.as_path()
+                );
+                return;
+            }
+            Err(e) => panic!("expected EINVAL from unaligned O_DIRECT pwrite, got: {}", e),
+        }
+
+        // The fix: write_direct() stages the payload through an aligned buffer.
+        let payload: Vec<u8> = (0..BLOCK).map(|i| (i % 251) as u8).collect();
+        let mut reader = MemReader(payload.clone());
+        let written = fs.write_direct(&file, &mut reader, BLOCK, 0).unwrap();
+        assert_eq!(written, BLOCK);
+
+        // ...and read_direct() stages it back out, byte for byte.
+        let mut writer = MemWriter::new();
+        let read = fs.read_direct(&file, &mut writer, BLOCK, 0).unwrap();
+        assert_eq!(read, BLOCK);
+        assert_eq!(writer.0, payload);
     }
 
     #[test]
