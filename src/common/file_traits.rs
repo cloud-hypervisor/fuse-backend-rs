@@ -877,8 +877,8 @@ mod async_io {
 
         #[test]
         fn io_uring_async_read_at_volatile() {
-            let tmpfile = vmm_sys_util::tempdir::TempDir::new().unwrap();
-            let path = tmpfile.as_path().to_path_buf().join("test.txt");
+            let tmpfile = tempfile::tempdir().unwrap();
+            let path = tmpfile.path().to_path_buf().join("test.txt");
             std::fs::write(&path, b"this is a test").unwrap();
 
             let mut buf = vec![0; 4096];
@@ -896,8 +896,8 @@ mod async_io {
 
         #[test]
         fn io_uring_async_read_vectored_at_volatile() {
-            let tmpfile = vmm_sys_util::tempdir::TempDir::new().unwrap();
-            let path = tmpfile.as_path().to_path_buf().join("test.txt");
+            let tmpfile = tempfile::tempdir().unwrap();
+            let path = tmpfile.path().to_path_buf().join("test.txt");
             std::fs::write(&path, b"this is a test").unwrap();
 
             let mut buf1 = vec![0; 4];
@@ -1085,11 +1085,10 @@ mod async_io {
 mod tests {
     use super::*;
     use std::io::{Seek, SeekFrom, Write};
-    use vmm_sys_util::tempfile::TempFile;
 
     #[test]
     fn test_read_volatile() {
-        let mut file = TempFile::new().unwrap().into_file();
+        let mut file = tempfile::tempfile().unwrap();
 
         let buf = [0xfu8; 32];
         file.write_all(&buf).unwrap();
@@ -1106,7 +1105,7 @@ mod tests {
 
     #[test]
     fn test_read_vectored_volatile() {
-        let mut file = TempFile::new().unwrap().into_file();
+        let mut file = tempfile::tempfile().unwrap();
 
         let buf = [0xfu8; 32];
         file.write_all(&buf).unwrap();
@@ -1127,7 +1126,7 @@ mod tests {
 
     #[test]
     fn test_read_exact_volatile() {
-        let mut file = TempFile::new().unwrap().into_file();
+        let mut file = tempfile::tempfile().unwrap();
 
         let buf = [0xfu8; 32];
         file.write_all(&buf).unwrap();
@@ -1144,7 +1143,7 @@ mod tests {
 
     #[test]
     fn test_read_at_volatile() {
-        let mut file = TempFile::new().unwrap().into_file();
+        let mut file = tempfile::tempfile().unwrap();
 
         let buf = [0xfu8; 32];
         file.write_all(&buf).unwrap();
@@ -1161,7 +1160,7 @@ mod tests {
 
     #[test]
     fn test_read_vectored_at_volatile() {
-        let mut file = TempFile::new().unwrap().into_file();
+        let mut file = tempfile::tempfile().unwrap();
 
         let buf = [0xfu8; 32];
         file.write_all(&buf).unwrap();
@@ -1182,7 +1181,7 @@ mod tests {
 
     #[test]
     fn test_read_exact_at_volatile() {
-        let mut file = TempFile::new().unwrap().into_file();
+        let mut file = tempfile::tempfile().unwrap();
 
         let buf = [0xfu8; 32];
         file.write_all(&buf).unwrap();
@@ -1199,7 +1198,7 @@ mod tests {
 
     #[test]
     fn test_write_volatile() {
-        let mut file = TempFile::new().unwrap().into_file();
+        let mut file = tempfile::tempfile().unwrap();
 
         let mut buf = [0xfu8; 32];
         let slice1 =
@@ -1218,7 +1217,7 @@ mod tests {
 
     #[test]
     fn test_write_vectored_volatile() {
-        let mut file = TempFile::new().unwrap().into_file();
+        let mut file = tempfile::tempfile().unwrap();
 
         let mut buf = [0xfu8; 32];
         let slices1 = unsafe {
@@ -1245,7 +1244,7 @@ mod tests {
 
     #[test]
     fn test_write_exact_volatile() {
-        let mut file = TempFile::new().unwrap().into_file();
+        let mut file = tempfile::tempfile().unwrap();
 
         let mut buf = [0xfu8; 32];
         let slice1 =
@@ -1264,7 +1263,7 @@ mod tests {
 
     #[test]
     fn test_write_at_volatile() {
-        let mut file = TempFile::new().unwrap().into_file();
+        let mut file = tempfile::tempfile().unwrap();
 
         let mut buf = [0xfu8; 32];
         let slice1 =
@@ -1284,7 +1283,7 @@ mod tests {
 
     #[test]
     fn test_write_vectored_at_volatile() {
-        let mut file = TempFile::new().unwrap().into_file();
+        let mut file = tempfile::tempfile().unwrap();
 
         let mut buf = [0xfu8; 32];
         let slices1 = unsafe {
@@ -1312,7 +1311,7 @@ mod tests {
 
     #[test]
     fn test_write_exact_at_volatile() {
-        let mut file = TempFile::new().unwrap().into_file();
+        let mut file = tempfile::tempfile().unwrap();
 
         let mut buf = [0xfu8; 32];
         let slice1 =

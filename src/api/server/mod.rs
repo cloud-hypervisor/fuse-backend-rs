@@ -26,8 +26,8 @@ use arc_swap::ArcSwap;
 
 use crate::abi::fuse_abi::*;
 use crate::api::filesystem::{Context, FileSystem, ZeroCopyReader, ZeroCopyWriter};
+use crate::buffer::{Reader, Writer};
 use crate::file_traits::FileReadWriteVolatile;
-use crate::transport::{Reader, Writer};
 use crate::{bytes_to_cstr, BitmapSlice, Error, Result};
 #[cfg(all(target_os = "linux", feature = "fusedev-uring"))]
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -35,6 +35,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 #[cfg(feature = "async-io")]
 mod async_io;
 mod sync_io;
+// MockFS is only exercised by the linux-only sync_io tests, so parts of the
+// module may be unused on other platforms or feature combinations.
+#[cfg(test)]
+#[allow(dead_code)]
+mod test_util;
 
 /// Maximum buffer size of FUSE requests.
 #[cfg(target_os = "linux")]
@@ -123,7 +128,10 @@ impl<F: FileSystem + Sync> Server<F> {
 
     /// Remap the IDs in a request context to the IDs used by the backend
     /// filesystem, based on the inode referenced by the request.
-    fn remap_ctx_ids<S: BitmapSlice>(&self, ctx: &mut SrvContext<F, S>) -> Result<()> {
+    fn remap_ctx_ids<S: BitmapSlice, W: Writer>(
+        &self,
+        ctx: &mut SrvContext<F, S, W>,
+    ) -> Result<()> {
         let nodeid = ctx.nodeid();
         self.fs
             .id_remap_with_nodeid(&mut ctx.context, nodeid)
@@ -150,9 +158,9 @@ impl<S: BitmapSlice> io::Read for ZcReader<'_, S> {
     }
 }
 
-struct ZcWriter<'a, S: BitmapSlice = ()>(Writer<'a, S>);
+struct ZcWriter<W>(W);
 
-impl<S: BitmapSlice> ZeroCopyWriter for ZcWriter<'_, S> {
+impl<W: Writer> ZeroCopyWriter for ZcWriter<W> {
     fn write_from(
         &mut self,
         f: &mut dyn FileReadWriteVolatile,
@@ -167,7 +175,7 @@ impl<S: BitmapSlice> ZeroCopyWriter for ZcWriter<'_, S> {
     }
 }
 
-impl<S: BitmapSlice> io::Write for ZcWriter<'_, S> {
+impl<W: Writer> io::Write for ZcWriter<W> {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         self.0.write(buf)
     }
@@ -247,17 +255,17 @@ pub trait MetricsHook {
     fn release(&self, oh: Option<&OutHeader>);
 }
 
-struct SrvContext<'a, F, S: BitmapSlice = ()> {
+struct SrvContext<'a, F, S: BitmapSlice, W: Writer> {
     in_header: InHeader,
     context: Context,
     r: Reader<'a, S>,
-    w: Writer<'a, S>,
+    w: W,
     phantom: PhantomData<F>,
     phantom2: PhantomData<S>,
 }
 
-impl<'a, F: FileSystem, S: BitmapSlice> SrvContext<'a, F, S> {
-    fn new(in_header: InHeader, r: Reader<'a, S>, w: Writer<'a, S>) -> Self {
+impl<'a, F: FileSystem, S: BitmapSlice, W: Writer> SrvContext<'a, F, S, W> {
+    fn new(in_header: InHeader, r: Reader<'a, S>, w: W) -> Self {
         let context = Context::from(&in_header);
 
         SrvContext {
@@ -294,8 +302,6 @@ impl<'a, F: FileSystem, S: BitmapSlice> SrvContext<'a, F, S> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[cfg(feature = "fusedev")]
-    use crate::transport::FuseBuf;
 
     #[test]
     fn test_extract_cstrs() {
@@ -333,12 +339,11 @@ mod tests {
         ServerUtil::extract_two_cstrs(&[0x1u8, 0x2u8]).unwrap_err();
     }
 
-    #[cfg(feature = "fusedev")]
     #[test]
     fn test_get_message_body() {
         let mut read_buf = [0u8; 4096];
 
-        let mut r = Reader::<()>::from_fuse_buffer(FuseBuf::new(&mut read_buf)).unwrap();
+        let mut r = Reader::<()>::from_slice(&mut read_buf);
         let in_header = InHeader {
             len: 0x1000,
             ..Default::default()
@@ -346,7 +351,7 @@ mod tests {
         let buf = ServerUtil::get_message_body(&mut r, &in_header, 0).unwrap();
         assert_eq!(buf.len(), 0x1000 - size_of::<InHeader>());
 
-        let mut r = Reader::<()>::from_fuse_buffer(FuseBuf::new(&mut read_buf)).unwrap();
+        let mut r = Reader::<()>::from_slice(&mut read_buf);
         let in_header = InHeader {
             len: 0x1000,
             ..Default::default()
@@ -354,7 +359,7 @@ mod tests {
         let buf = ServerUtil::get_message_body(&mut r, &in_header, 0x100).unwrap();
         assert_eq!(buf.len(), 0x1000 - size_of::<InHeader>() - 0x100);
 
-        let mut r = Reader::<()>::from_fuse_buffer(FuseBuf::new(&mut read_buf)).unwrap();
+        let mut r = Reader::<()>::from_slice(&mut read_buf);
         let in_header = InHeader {
             len: 0x1000,
             ..Default::default()
@@ -362,7 +367,7 @@ mod tests {
         // shoutld fail because of invalid sub header size
         assert!(ServerUtil::get_message_body(&mut r, &in_header, 0x1000).is_err());
 
-        let mut r = Reader::<()>::from_fuse_buffer(FuseBuf::new(&mut read_buf)).unwrap();
+        let mut r = Reader::<()>::from_slice(&mut read_buf);
         let in_header = InHeader {
             len: 0x1000,
             ..Default::default()

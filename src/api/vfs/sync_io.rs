@@ -8,7 +8,7 @@ use crate::abi::fuse_abi::{stat64, statvfs64};
 #[cfg(any(feature = "vhost-user-fs", feature = "virtiofs"))]
 use crate::abi::virtio_fs;
 #[cfg(any(feature = "vhost-user-fs", feature = "virtiofs"))]
-use crate::transport::FsCacheReqHandler;
+use crate::api::filesystem::FsCacheReqHandler;
 
 impl FileSystem for Vfs {
     type Inode = VfsInode;

@@ -29,7 +29,7 @@ use super::{
     Error::IoError, Error::SessionFailure, FuseBuf, FuseDevWriter, Reader, Result,
     FUSE_HEADER_SIZE, FUSE_KERN_BUF_PAGES,
 };
-use crate::transport::fusedev::FuseChannelExt;
+use crate::transport::fusedev::{FuseChannelExt, FuseDevReaderExt};
 use crate::transport::pagesize;
 
 // These follows definition from libfuse.

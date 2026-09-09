@@ -120,6 +120,7 @@ pub type Result<T> = ::std::result::Result<T, Error>;
 
 pub mod abi;
 pub mod api;
+pub mod buffer;
 
 #[cfg(all(any(feature = "fusedev", feature = "virtiofs"), target_os = "linux"))]
 pub mod overlayfs;
@@ -129,6 +130,12 @@ pub mod transport;
 
 pub mod common;
 pub use self::common::*;
+
+// Tests exercising the Vfs layer together with real filesystem drivers from
+// this crate. They stay here — instead of next to the `api` modules — so the
+// `api` layer remains independent of filesystem drivers.
+#[cfg(test)]
+mod driver_tests;
 
 /// Convert io::ErrorKind to OS error code.
 /// Reference to libstd/sys/unix/mod.rs => decode_error_kind.

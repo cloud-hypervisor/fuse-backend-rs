@@ -898,18 +898,62 @@ pub mod persist {
         /// # Example
         ///
         /// The following example shows how the function is used in conjunction with
-        /// `restore_from_bytes` to implement the serialization and deserialization of VFS.
+        /// `restore_from_bytes` to implement the serialization and deserialization
+        /// of VFS, using a minimal in-memory backend filesystem.
         ///
         /// ```
-        /// use fuse_backend_rs::api::{Vfs, VfsIndex, VfsOptions};
-        /// use fuse_backend_rs::passthrough::{Config, PassthroughFs};
+        /// use std::any::Any;
+        /// use std::io;
         ///
-        /// let new_backend_fs = || {
-        ///     let fs_cfg = Config::default();
-        ///     let fs = PassthroughFs::<()>::new(fs_cfg.clone()).unwrap();
-        ///     fs.import().unwrap();
-        ///     Box::new(fs)
-        /// };
+        /// use fuse_backend_rs::api::filesystem::{Entry, FileSystem};
+        /// use fuse_backend_rs::api::vfs::BackendFileSystem;
+        /// use fuse_backend_rs::api::{Vfs, VfsIndex, VfsOptions};
+        /// # #[cfg(feature = "async-io")]
+        /// # use std::ffi::CStr;
+        /// # #[cfg(feature = "async-io")]
+        /// # use std::time::Duration;
+        /// # #[cfg(feature = "async-io")]
+        /// # use fuse_backend_rs::abi::fuse_abi::{CreateIn, stat64};
+        /// # #[cfg(feature = "async-io")]
+        /// # use fuse_backend_rs::api::filesystem::{
+        /// #     AsyncFileSystem, AsyncZeroCopyReader, AsyncZeroCopyWriter, Context, OpenOptions,
+        /// #     SetattrValid,
+        /// # };
+        ///
+        /// // A minimal backend filesystem, only `mount()` is really needed here.
+        /// struct MockFs;
+        ///
+        /// impl FileSystem for MockFs {
+        ///     type Inode = u64;
+        ///     type Handle = u64;
+        /// }
+        ///
+        /// // With the `async-io` feature the backend must also implement
+        /// // `AsyncFileSystem`; all operations are left unimplemented.
+        /// # #[cfg(feature = "async-io")]
+        /// # #[async_trait::async_trait]
+        /// # impl AsyncFileSystem for MockFs {
+        /// #     async fn async_lookup(&self, _ctx: &Context, _parent: Self::Inode, _name: &CStr) -> io::Result<Entry> { Err(io::Error::from_raw_os_error(libc::ENOSYS)) }
+        /// #     async fn async_getattr(&self, _ctx: &Context, _inode: Self::Inode, _handle: Option<Self::Handle>) -> io::Result<(stat64, Duration)> { Err(io::Error::from_raw_os_error(libc::ENOSYS)) }
+        /// #     async fn async_setattr(&self, _ctx: &Context, _inode: Self::Inode, _attr: stat64, _handle: Option<Self::Handle>, _valid: SetattrValid) -> io::Result<(stat64, Duration)> { Err(io::Error::from_raw_os_error(libc::ENOSYS)) }
+        /// #     async fn async_open(&self, _ctx: &Context, _inode: Self::Inode, _flags: u32, _fuse_flags: u32) -> io::Result<(Option<Self::Handle>, OpenOptions)> { Err(io::Error::from_raw_os_error(libc::ENOSYS)) }
+        /// #     async fn async_create(&self, _ctx: &Context, _parent: Self::Inode, _name: &CStr, _args: CreateIn) -> io::Result<(Entry, Option<Self::Handle>, OpenOptions)> { Err(io::Error::from_raw_os_error(libc::ENOSYS)) }
+        /// #     async fn async_read(&self, _ctx: &Context, _inode: Self::Inode, _handle: Self::Handle, _w: &mut (dyn AsyncZeroCopyWriter + Send), _size: u32, _offset: u64, _lock_owner: Option<u64>, _flags: u32) -> io::Result<usize> { Err(io::Error::from_raw_os_error(libc::ENOSYS)) }
+        /// #     async fn async_write(&self, _ctx: &Context, _inode: Self::Inode, _handle: Self::Handle, _r: &mut (dyn AsyncZeroCopyReader + Send), _size: u32, _offset: u64, _lock_owner: Option<u64>, _delayed_write: bool, _flags: u32, _fuse_flags: u32) -> io::Result<usize> { Err(io::Error::from_raw_os_error(libc::ENOSYS)) }
+        /// #     async fn async_fsync(&self, _ctx: &Context, _inode: Self::Inode, _datasync: bool, _handle: Self::Handle) -> io::Result<()> { Err(io::Error::from_raw_os_error(libc::ENOSYS)) }
+        /// #     async fn async_fallocate(&self, _ctx: &Context, _inode: Self::Inode, _handle: Self::Handle, _mode: u32, _offset: u64, _length: u64) -> io::Result<()> { Err(io::Error::from_raw_os_error(libc::ENOSYS)) }
+        /// #     async fn async_fsyncdir(&self, _ctx: &Context, _inode: Self::Inode, _datasync: bool, _handle: Self::Handle) -> io::Result<()> { Err(io::Error::from_raw_os_error(libc::ENOSYS)) }
+        /// # }
+        ///
+        /// impl BackendFileSystem for MockFs {
+        ///     fn mount(&self) -> io::Result<(Entry, u64)> {
+        ///         Ok((Entry { inode: 1, ..Default::default() }, 1))
+        ///     }
+        ///
+        ///     fn as_any(&self) -> &dyn Any {
+        ///         self
+        ///     }
+        /// }
         ///
         /// // create new vfs
         /// let vfs = &Vfs::new(VfsOptions::default());
@@ -918,8 +962,7 @@ pub mod persist {
         /// let backend_fs_list: Vec<(&str, VfsIndex)> = paths
         ///     .iter()
         ///     .map(|path| {
-        ///         let fs = new_backend_fs();
-        ///         let idx = vfs.mount(fs, path).unwrap();
+        ///         let idx = vfs.mount(Box::new(MockFs), path).unwrap();
         ///
         ///         (path.to_owned(), idx)
         ///     })
@@ -934,8 +977,7 @@ pub mod persist {
         ///
         /// // mount the backend fs
         /// backend_fs_list.into_iter().for_each(|(path, idx)| {
-        ///     let fs = new_backend_fs();
-        ///     vfs.restore_mount(fs, idx, path).unwrap();
+        ///     vfs.restore_mount(Box::new(MockFs), idx, path).unwrap();
         /// });
         /// ```
         pub fn save_to_bytes(&self) -> VfsResult<Vec<u8>> {
@@ -1023,126 +1065,9 @@ pub mod persist {
             assert_eq!(vfs.next_super.load(std::sync::atomic::Ordering::SeqCst), 1);
         }
 
-        #[cfg(target_os = "linux")]
-        #[test]
-        fn test_vfs_save_restore_with_backend_fs() {
-            use crate::api::{Vfs, VfsIndex, VfsOptions};
-            use crate::passthrough::{Config, PassthroughFs};
-
-            let new_backend_fs = || {
-                let fs_cfg = Config::default();
-                let fs = PassthroughFs::<()>::new(fs_cfg.clone()).unwrap();
-                fs.import().unwrap();
-                Box::new(fs)
-            };
-
-            // create new vfs
-            let vfs = &Vfs::new(VfsOptions::default());
-            let paths = vec!["/a", "/a/b", "/a/b/c", "/b", "/b/a/c", "/d"];
-            let backend_fs_list: Vec<(&str, VfsIndex)> = paths
-                .iter()
-                .map(|path| {
-                    let fs = new_backend_fs();
-                    let idx = vfs.mount(fs, path).unwrap();
-
-                    (path.to_owned(), idx)
-                })
-                .collect();
-
-            // save the vfs state using Snapshot
-            let mut buf = vfs.save_to_bytes().unwrap();
-
-            // restore the vfs state
-            let restored_vfs = &Vfs::new(VfsOptions::default());
-            restored_vfs.restore_from_bytes(&mut buf).unwrap();
-            // restore the backend fs
-            backend_fs_list.into_iter().for_each(|(path, idx)| {
-                let fs = new_backend_fs();
-                vfs.restore_mount(fs, idx, path).unwrap();
-            });
-
-            // check the vfs and restored_vfs
-            assert_eq!(
-                vfs.next_super.load(std::sync::atomic::Ordering::SeqCst),
-                restored_vfs
-                    .next_super
-                    .load(std::sync::atomic::Ordering::SeqCst)
-            );
-            assert_eq!(
-                vfs.initialized.load(std::sync::atomic::Ordering::SeqCst),
-                restored_vfs
-                    .initialized
-                    .load(std::sync::atomic::Ordering::SeqCst)
-            );
-            for path in paths.iter() {
-                let inode = vfs.root.path_walk(path).unwrap();
-                let restored_inode = restored_vfs.root.path_walk(path).unwrap();
-                assert_eq!(inode, restored_inode);
-            }
-        }
-
-        #[cfg(target_os = "linux")]
-        #[test]
-        fn test_vfs_save_restore_with_backend_fs_with_initialized() {
-            use crate::api::filesystem::{FileSystem, FsOptions};
-            use crate::api::{Vfs, VfsIndex, VfsOptions};
-            use crate::passthrough::{Config, PassthroughFs};
-            use std::sync::atomic::Ordering;
-
-            let new_backend_fs = || {
-                let fs_cfg = Config::default();
-                let fs = PassthroughFs::<()>::new(fs_cfg.clone()).unwrap();
-                fs.import().unwrap();
-                Box::new(fs)
-            };
-
-            // create new vfs
-            let vfs = &Vfs::new(VfsOptions::default());
-            let paths = vec!["/a", "/a/b", "/a/b/c", "/b", "/b/a/c", "/d"];
-            let backend_fs_list: Vec<(&str, VfsIndex)> = paths
-                .iter()
-                .map(|path| {
-                    let fs = new_backend_fs();
-                    let idx = vfs.mount(fs, path).unwrap();
-
-                    (path.to_owned(), idx)
-                })
-                .collect();
-            vfs.init(FsOptions::ASYNC_READ).unwrap();
-            assert!(vfs.initialized.load(Ordering::Acquire));
-
-            // save the vfs state using Snapshot
-            let mut buf = vfs.save_to_bytes().unwrap();
-
-            // restore the vfs state
-            let restored_vfs = &Vfs::new(VfsOptions::default());
-            restored_vfs.restore_from_bytes(&mut buf).unwrap();
-
-            // restore the backend fs
-            backend_fs_list.into_iter().for_each(|(path, idx)| {
-                let fs = new_backend_fs();
-                vfs.restore_mount(fs, idx, path).unwrap();
-            });
-
-            // check the vfs and restored_vfs
-            assert_eq!(
-                vfs.next_super.load(std::sync::atomic::Ordering::SeqCst),
-                restored_vfs
-                    .next_super
-                    .load(std::sync::atomic::Ordering::SeqCst)
-            );
-            assert_eq!(
-                vfs.initialized.load(std::sync::atomic::Ordering::Acquire),
-                restored_vfs
-                    .initialized
-                    .load(std::sync::atomic::Ordering::Acquire)
-            );
-            for path in paths.iter() {
-                let inode = vfs.root.path_walk(path).unwrap();
-                let restored_inode = restored_vfs.root.path_walk(path).unwrap();
-                assert_eq!(inode, restored_inode);
-            }
-        }
+        // Note: the save/restore tests with real `PassthroughFs` backends
+        // live in `crate::driver_tests`, since they depend on a filesystem
+        // driver and the public crate API only.
 
         // Per-mount id_mappings must survive a save/restore roundtrip so that
         // `restore_mount` does not need the mapping passed in again.

@@ -363,12 +363,12 @@ pub fn pwritev(fd: RawFd, bufs: &[FileVolatileBuf], offset: u64) -> std::io::Res
 mod tests {
     use super::*;
     use crate::async_runtime::block_on;
-    use vmm_sys_util::tempdir::TempDir;
+    use tempfile::TempDir;
 
     #[test]
     fn test_new_async_file() {
         let dir = TempDir::new().unwrap();
-        let path = dir.as_path().to_path_buf().join("test.txt");
+        let path = dir.path().to_path_buf().join("test.txt");
         std::fs::write(&path, b"test").unwrap();
 
         let file = block_on(async { File::async_open(&path, false, false).await.unwrap() });
@@ -379,7 +379,7 @@ mod tests {
     #[test]
     fn test_from_std_file() {
         let dir = TempDir::new().unwrap();
-        let path = dir.as_path().to_path_buf().join("test.txt");
+        let path = dir.path().to_path_buf().join("test.txt");
         std::fs::write(&path, b"test").unwrap();
 
         let file = File::from_std_file(std::fs::File::open(&path).unwrap());
@@ -400,7 +400,7 @@ mod tests {
     #[test]
     fn test_async_file_metadata() {
         let dir = TempDir::new().unwrap();
-        let path = dir.as_path().to_path_buf();
+        let path = dir.path().to_path_buf();
         std::fs::write(path.join("test.txt"), b"test").unwrap();
         let file = block_on(async {
             File::async_open(path.join("test.txt"), false, false)
@@ -419,7 +419,7 @@ mod tests {
     #[test]
     fn test_async_read_at() {
         let dir = TempDir::new().unwrap();
-        let path = dir.as_path().to_path_buf();
+        let path = dir.path().to_path_buf();
         std::fs::write(path.join("test.txt"), b"test").unwrap();
 
         block_on(async {
@@ -442,7 +442,7 @@ mod tests {
     #[test]
     fn test_async_readv_at() {
         let dir = TempDir::new().unwrap();
-        let path = dir.as_path().to_path_buf();
+        let path = dir.path().to_path_buf();
         std::fs::write(path.join("test.txt"), b"test").unwrap();
 
         block_on(async {
@@ -466,7 +466,7 @@ mod tests {
     #[test]
     fn test_async_write_at() {
         let dir = TempDir::new().unwrap();
-        let path = dir.as_path().to_path_buf();
+        let path = dir.path().to_path_buf();
 
         block_on(async {
             let file = File::async_open(path.join("test.txt"), true, true)
@@ -493,7 +493,7 @@ mod tests {
     #[test]
     fn test_async_writev_at() {
         let dir = TempDir::new().unwrap();
-        let path = dir.as_path().to_path_buf();
+        let path = dir.path().to_path_buf();
 
         block_on(async {
             let file = File::async_open(path.join("test.txt"), true, true)
@@ -531,7 +531,7 @@ mod tests {
     #[test]
     fn test_borrow_fd() {
         let dir = TempDir::new().unwrap();
-        let path = dir.as_path().to_path_buf().join("test.txt");
+        let path = dir.path().to_path_buf().join("test.txt");
         std::fs::write(&path, b"test").unwrap();
 
         // `owner` keeps the descriptor valid while the borrowed file lives.
@@ -557,7 +557,7 @@ mod tests {
     #[test]
     fn test_async_try_clone() {
         let dir = TempDir::new().unwrap();
-        let path = dir.as_path().to_path_buf();
+        let path = dir.path().to_path_buf();
 
         block_on(async {
             let file = File::async_open(path.join("test.txt"), true, true)

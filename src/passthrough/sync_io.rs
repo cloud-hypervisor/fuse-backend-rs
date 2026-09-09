@@ -20,14 +20,14 @@ use super::*;
 use crate::abi::fuse_abi::{CreateIn, Opcode, FOPEN_IN_KILL_SUIDGID, WRITE_KILL_PRIV};
 #[cfg(any(feature = "vhost-user-fs", feature = "virtiofs"))]
 use crate::abi::virtio_fs;
+#[cfg(any(feature = "vhost-user-fs", feature = "virtiofs"))]
+use crate::api::filesystem::FsCacheReqHandler;
 use crate::api::filesystem::{
     Context, DirEntry, Entry, FileSystem, FsOptions, GetxattrReply, ListxattrReply, OpenOptions,
     SetattrValid, ZeroCopyReader, ZeroCopyWriter,
 };
+use crate::buffer::pagesize;
 use crate::bytes_to_cstr;
-use crate::transport::pagesize;
-#[cfg(any(feature = "vhost-user-fs", feature = "virtiofs"))]
-use crate::transport::FsCacheReqHandler;
 
 /// A byte buffer allocated by `posix_memalign()` and freed with `libc::free()`
 /// on drop.

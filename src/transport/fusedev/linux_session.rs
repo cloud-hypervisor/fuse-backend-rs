@@ -16,7 +16,7 @@ use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use crate::transport::fusedev::{FuseChannelExt, FuseSessionExt};
+use crate::transport::fusedev::{FuseChannelExt, FuseDevReaderExt, FuseSessionExt};
 use mio::{Events, Poll, Token, Waker};
 use nix::errno::Errno;
 use nix::fcntl::{fcntl, FcntlArg, FdFlag, OFlag};
@@ -928,7 +928,7 @@ mod asyncio {
     use crate::api::server::Server;
     use crate::async_file::File as AsyncFile;
     use crate::file_buf::FileVolatileBuf;
-    use crate::transport::{FuseBuf, FuseDevWriter, Reader};
+    use crate::transport::{FuseBuf, FuseDevReaderExt, FuseDevWriter, Reader};
 
     /// Default limit on the number of concurrently processed requests.
     ///
@@ -1251,7 +1251,7 @@ mod asyncio {
         let writer = FuseDevWriter::<()>::new(fd, buf_slice).unwrap();
         let result = unsafe {
             server
-                .async_handle_message(reader, writer.into(), None, None)
+                .async_handle_message(reader, writer, None, None)
                 .await
         };
 

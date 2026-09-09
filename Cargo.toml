@@ -62,6 +62,7 @@ tokio-uring = { version = "0.4.0", optional = true }
 
 [dev-dependencies]
 vmm-sys-util = "0.15.0"
+tempfile = "3"
 vm-memory = { version = "=0.17.1", features = ["backend-mmap", "backend-bitmap"] }
 
 [features]

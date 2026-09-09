@@ -37,7 +37,9 @@ use crate::api::filesystem::FileSystem;
 use crate::api::server::Server;
 use crate::file_buf::FileVolatileSlice;
 use crate::file_traits::FileReadWriteVolatile;
-use crate::transport::fusedev::{FuseBuf, FuseChannel, FuseSession, FUSE_HEADER_SIZE};
+use crate::transport::fusedev::{
+    FuseBuf, FuseChannel, FuseDevReaderExt, FuseSession, FUSE_HEADER_SIZE,
+};
 use crate::transport::{Error::*, Reader, Result, Writer};
 use crate::BitmapSlice;
 
@@ -321,11 +323,8 @@ impl<'a, S: BitmapSlice> UringWriter<'a, S> {
     }
 
     /// Account the bytes written by self and an optional split-off partner.
-    pub fn commit(&mut self, other: Option<&Writer<'a, S>>) -> io::Result<usize> {
-        let o = match other {
-            Some(Writer::Uring(w)) => w.bytes_written(),
-            _ => 0,
-        };
+    pub fn commit(&mut self, other: Option<&UringWriter<'a, S>>) -> io::Result<usize> {
+        let o = other.map(|w| w.bytes_written()).unwrap_or(0);
         Ok(self.bytes_written() + o)
     }
 
@@ -405,6 +404,39 @@ impl<S: BitmapSlice> Write for UringWriter<'_, S> {
 
     fn flush(&mut self) -> io::Result<()> {
         Ok(())
+    }
+}
+
+impl<'a, S: BitmapSlice> Writer for UringWriter<'a, S> {
+    // All methods forward to the inherent methods of the same name; the
+    // explicit `UringWriter::` prefix keeps the forwarding unambiguous and
+    // makes removing an inherent method a compile error instead of silent
+    // infinite recursion. The uring transport has no async-io support and
+    // relies on the trait's default `EINVAL` implementations for the
+    // `async_*` methods.
+    fn write_from_at<F: FileReadWriteVolatile>(
+        &mut self,
+        src: F,
+        count: usize,
+        off: u64,
+    ) -> io::Result<usize> {
+        UringWriter::write_from_at(self, src, count, off)
+    }
+
+    fn split_at(&mut self, offset: usize) -> Result<Self> {
+        UringWriter::split_at(self, offset)
+    }
+
+    fn available_bytes(&self) -> usize {
+        UringWriter::available_bytes(self)
+    }
+
+    fn bytes_written(&self) -> usize {
+        UringWriter::bytes_written(self)
+    }
+
+    fn commit(&mut self, other: Option<&Self>) -> io::Result<usize> {
+        UringWriter::commit(self, other)
     }
 }
 
@@ -716,7 +748,7 @@ impl<F: FileSystem + Send + Sync + 'static> UringWorker<F> {
             let writer = UringWriter::<()>::new(in_out_header, payload_area);
 
             self.server
-                .handle_message(reader, Writer::Uring(writer), None, None)
+                .handle_message(reader, writer, None, None)
                 .map_err(|e| {
                     SessionFailure(format!(
                         "uring: handle message unique 0x{:x}: {}",
@@ -782,7 +814,7 @@ impl<F: FileSystem + Send + Sync + 'static> UringFuseServing<F> {
         match init_ch.get_request() {
             Ok(Some((reader, writer))) => {
                 server
-                    .handle_message(reader, Writer::FuseDev(writer), None, None)
+                    .handle_message(reader, writer, None, None)
                     .map_err(|e| SessionFailure(format!("uring: INIT failed: {e}")))?;
             }
             Ok(None) => {
@@ -906,9 +938,7 @@ impl<F: FileSystem + Send + Sync + 'static> UringFuseServing<F> {
         loop {
             match ch.get_request() {
                 Ok(Some((reader, writer))) => {
-                    if let Err(e) =
-                        server.handle_message(reader, Writer::FuseDev(writer), None, None)
-                    {
+                    if let Err(e) = server.handle_message(reader, writer, None, None) {
                         match e {
                             // The kernel has shut down this session.
                             crate::Error::EncodeMessage(ref err)
@@ -1402,7 +1432,7 @@ mod tests {
         assert_eq!(other.bytes_written(), 10);
 
         // Commit combines both.
-        let total = w.commit(Some(&Writer::Uring(other))).unwrap();
+        let total = w.commit(Some(&other)).unwrap();
         assert_eq!(total, OUT_HEADER_SIZE + 10);
     }
 

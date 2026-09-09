@@ -27,6 +27,9 @@ mod async_io;
 #[cfg(feature = "async-io")]
 pub use async_io::{AsyncFileSystem, AsyncZeroCopyReader, AsyncZeroCopyWriter};
 
+mod fs_cache_req_handler;
+pub use fs_cache_req_handler::FsCacheReqHandler;
+
 mod sync_io;
 pub use sync_io::FileSystem;
 

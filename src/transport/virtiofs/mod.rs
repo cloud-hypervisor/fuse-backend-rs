@@ -48,21 +48,31 @@ use virtio_queue::DescriptorChain;
 use vm_memory::bitmap::{BitmapSlice, MS};
 use vm_memory::{Address, ByteValued, GuestMemory, GuestMemoryRegion, MemoryRegionAddress};
 
-use super::{Error, FileReadWriteVolatile, FileVolatileSlice, IoBuffers, Reader, Result, Writer};
+use super::Writer;
+use crate::buffer::{Error, IoBuffers, Reader, Result};
+#[cfg(feature = "async-io")]
+use crate::file_traits::AsyncFileReadWriteVolatile;
+use crate::file_traits::FileReadWriteVolatile;
 
-impl<S: BitmapSlice> IoBuffers<'_, S> {
-    /// Consumes for write.
-    fn consume_for_write<F>(&mut self, count: usize, f: F) -> io::Result<usize>
+/// Extension trait for constructing core `Reader`s from virtio descriptor
+/// chains.
+///
+/// Defined as a trait (rather than an inherent impl on [`Reader`]) because
+/// `Reader` is defined by the transport-neutral buffer layer, and inherent
+/// impls are only allowed in the defining crate.
+pub trait VirtioFsReaderExt<'a> {
+    /// Construct a new Reader wrapper over `desc_chain`.
+    fn from_descriptor_chain<M>(
+        mem: &'a M::Target,
+        desc_chain: DescriptorChain<M>,
+    ) -> Result<Reader<'a, MS<'a, M::Target>>>
     where
-        F: FnOnce(&[FileVolatileSlice]) -> io::Result<usize>,
-    {
-        self.consume(true, count, f)
-    }
+        M: Deref,
+        M::Target: GuestMemory + Sized;
 }
 
-impl<'a> Reader<'a> {
-    /// Construct a new Reader wrapper over `desc_chain`.
-    pub fn from_descriptor_chain<M>(
+impl<'a> VirtioFsReaderExt<'a> for Reader<'a> {
+    fn from_descriptor_chain<M>(
         mem: &'a M::Target,
         desc_chain: DescriptorChain<M>,
     ) -> Result<Reader<'a, MS<'a, M::Target>>>
@@ -97,12 +107,7 @@ impl<'a> Reader<'a> {
             );
         }
 
-        Ok(Reader {
-            buffers: IoBuffers {
-                buffers,
-                bytes_consumed: 0,
-            },
-        })
+        Ok(Reader::from_volatile_slices(buffers.into()))
     }
 }
 
@@ -156,10 +161,7 @@ impl<'a> VirtioFsWriter<'a> {
         }
 
         Ok(VirtioFsWriter {
-            buffers: IoBuffers {
-                buffers,
-                bytes_consumed: 0,
-            },
+            buffers: IoBuffers::new(buffers.into()),
         })
     }
 }
@@ -247,7 +249,7 @@ impl<'a, S: BitmapSlice> VirtioFsWriter<'a, S> {
     /// Commit all internal buffers of self and others
     ///
     /// This is provided just to be compatible with fusedev
-    pub fn commit(&mut self, _other: Option<&Writer<'a, S>>) -> io::Result<usize> {
+    pub fn commit(&mut self, _other: Option<&VirtioFsWriter<'a, S>>) -> io::Result<usize> {
         Ok(0)
     }
 
@@ -310,12 +312,79 @@ impl<S: BitmapSlice> io::Write for VirtioFsWriter<'_, S> {
     }
 }
 
+#[cfg_attr(feature = "async-io", async_trait::async_trait(?Send))]
+impl<'a, S: BitmapSlice> Writer for VirtioFsWriter<'a, S> {
+    // All methods forward to the inherent methods of the same name; the
+    // explicit `VirtioFsWriter::` prefix keeps the forwarding unambiguous and
+    // makes removing an inherent method a compile error instead of silent
+    // infinite recursion.
+    fn write_from_at<F: FileReadWriteVolatile>(
+        &mut self,
+        src: F,
+        count: usize,
+        off: u64,
+    ) -> io::Result<usize> {
+        VirtioFsWriter::write_from_at(self, src, count, off)
+    }
+
+    fn split_at(&mut self, offset: usize) -> Result<Self> {
+        VirtioFsWriter::split_at(self, offset)
+    }
+
+    fn available_bytes(&self) -> usize {
+        VirtioFsWriter::available_bytes(self)
+    }
+
+    fn bytes_written(&self) -> usize {
+        VirtioFsWriter::bytes_written(self)
+    }
+
+    fn commit(&mut self, other: Option<&Self>) -> io::Result<usize> {
+        VirtioFsWriter::commit(self, other)
+    }
+
+    #[cfg(feature = "async-io")]
+    async fn async_write(&mut self, data: &[u8]) -> io::Result<usize> {
+        VirtioFsWriter::async_write(self, data).await
+    }
+
+    #[cfg(feature = "async-io")]
+    async fn async_write2(&mut self, data: &[u8], data2: &[u8]) -> io::Result<usize> {
+        VirtioFsWriter::async_write2(self, data, data2).await
+    }
+
+    #[cfg(feature = "async-io")]
+    async fn async_write3(&mut self, data: &[u8], data2: &[u8], data3: &[u8]) -> io::Result<usize> {
+        VirtioFsWriter::async_write3(self, data, data2, data3).await
+    }
+
+    #[cfg(feature = "async-io")]
+    async fn async_write_all(&mut self, buf: &[u8]) -> io::Result<()> {
+        VirtioFsWriter::async_write_all(self, buf).await
+    }
+
+    #[cfg(feature = "async-io")]
+    async fn async_write_from_at<F: AsyncFileReadWriteVolatile>(
+        &mut self,
+        src: &F,
+        count: usize,
+        off: u64,
+    ) -> io::Result<usize> {
+        VirtioFsWriter::async_write_from_at(self, src, count, off).await
+    }
+
+    #[cfg(feature = "async-io")]
+    async fn async_commit(&mut self, other: Option<&Self>) -> io::Result<usize> {
+        VirtioFsWriter::async_commit(self, other).await
+    }
+}
+
 // For Virtio-fs, the output is written to memory buffer, so no need for async io at all.
 // Just relay the operation to corresponding sync io handler.
 #[cfg(feature = "async-io")]
 mod async_io {
     use super::*;
-    use crate::transport::AsyncFileReadWriteVolatile;
+    use crate::file_traits::AsyncFileReadWriteVolatile;
 
     impl<'a, S: BitmapSlice> VirtioFsWriter<'a, S> {
         /// Write data from a buffer into this writer in asynchronous mode.
@@ -380,7 +449,10 @@ mod async_io {
 
         /// Commit all internal buffers of self and others
         /// We need this because the lifetime of others is usually shorter than self.
-        pub async fn async_commit(&mut self, other: Option<&Writer<'a, S>>) -> io::Result<usize> {
+        pub async fn async_commit(
+            &mut self,
+            other: Option<&VirtioFsWriter<'a, S>>,
+        ) -> io::Result<usize> {
             self.commit(other)
         }
     }
