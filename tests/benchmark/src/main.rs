@@ -138,10 +138,7 @@ mod daemon {
                     .get_request()
                     .map_err(|_| std::io::Error::from_raw_os_error(libc::EINVAL))?
                 {
-                    if let Err(e) = self
-                        .server
-                        .handle_message(reader, writer.into(), None, None)
-                    {
+                    if let Err(e) = self.server.handle_message(reader, writer, None, None) {
                         match e {
                             fuse_backend_rs::Error::EncodeMessage(_ebadf) => {
                                 break;

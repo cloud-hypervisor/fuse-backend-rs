@@ -128,10 +128,7 @@ impl<C: FuseChannelExt> FuseServer<C> {
                 .next_request()
                 .map_err(|_| std::io::Error::from_raw_os_error(libc::EINVAL))?
             {
-                if let Err(e) = self
-                    .server
-                    .handle_message(reader, writer.into(), None, None)
-                {
+                if let Err(e) = self.server.handle_message(reader, writer, None, None) {
                     match e {
                         // EncodeMessage means the kernel has shut down the session.
                         fuse_backend_rs::Error::EncodeMessage(_) => break,

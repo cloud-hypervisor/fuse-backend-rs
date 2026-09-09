@@ -7,7 +7,6 @@
 //! With fusedev transport driver, requests received from `/dev/fuse` will be stored in an internal
 //! buffer and the whole reply message must be written all at once.
 
-use std::collections::VecDeque;
 use std::io::{self, IoSlice, Write};
 use std::marker::PhantomData;
 use std::mem::ManuallyDrop;
@@ -16,10 +15,16 @@ use std::os::unix::io::RawFd;
 
 use nix::sys::uio::writev;
 use nix::unistd::write;
-use vm_memory::{ByteValued, VolatileSlice};
+use vm_memory::ByteValued;
+#[cfg(all(target_os = "linux", feature = "fusedev-uring"))]
+use vm_memory::VolatileSlice;
 
-use super::{Error, FileReadWriteVolatile, IoBuffers, Reader, Result, Writer};
+use super::Writer;
+use crate::buffer::{Error, Reader, Result};
 use crate::file_buf::FileVolatileSlice;
+#[cfg(feature = "async-io")]
+use crate::file_traits::AsyncFileReadWriteVolatile;
+use crate::file_traits::FileReadWriteVolatile;
 use crate::BitmapSlice;
 
 #[cfg(target_os = "linux")]
@@ -61,24 +66,16 @@ impl<'a> FuseBuf<'a> {
     }
 }
 
-impl<'a, S: BitmapSlice + Default> Reader<'a, S> {
-    /// Construct a new Reader wrapper over `desc_chain`.
+/// Extension trait for constructing core `Reader`s over fusedev buffers.
+///
+/// Defined as a trait (rather than inherent methods on [`Reader`]) because
+/// `Reader` is defined by the transport-neutral buffer layer, and inherent
+/// impls are only allowed in the defining crate.
+pub trait FuseDevReaderExt<'a, S: BitmapSlice + Default> {
+    /// Construct a new Reader wrapper over a fuse request buffer.
     ///
     /// 'request`: Fuse request from clients read from /dev/fuse
-    pub fn from_fuse_buffer(buf: FuseBuf<'a>) -> Result<Reader<'a, S>> {
-        let mut buffers: VecDeque<VolatileSlice<'a, S>> = VecDeque::new();
-        // Safe because Reader has the same lifetime with buf.
-        buffers.push_back(unsafe {
-            VolatileSlice::with_bitmap(buf.mem.as_mut_ptr(), buf.mem.len(), S::default(), None)
-        });
-
-        Ok(Reader {
-            buffers: IoBuffers {
-                buffers,
-                bytes_consumed: 0,
-            },
-        })
-    }
+    fn from_fuse_buffer(buf: FuseBuf<'a>) -> Result<Reader<'a, S>>;
 
     /// Construct a scatter Reader spanning two non-contiguous buffers: a
     /// header/args region followed by a separate payload region.
@@ -87,26 +84,27 @@ impl<'a, S: BitmapSlice + Default> Reader<'a, S> {
     /// payload (e.g. WRITE data) from the ring entry into a scratch buffer —
     /// the Reader reads directly from the entry's payload area instead.
     #[cfg(all(target_os = "linux", feature = "fusedev-uring"))]
-    pub fn from_uring_buffers(
-        header: &'a mut [u8],
-        payload: &'a mut [u8],
-    ) -> Result<Reader<'a, S>> {
-        let mut buffers: VecDeque<VolatileSlice<'a, S>> = VecDeque::new();
+    fn from_uring_buffers(header: &'a mut [u8], payload: &'a mut [u8]) -> Result<Reader<'a, S>>;
+}
+
+impl<'a, S: BitmapSlice + Default> FuseDevReaderExt<'a, S> for Reader<'a, S> {
+    fn from_fuse_buffer(buf: FuseBuf<'a>) -> Result<Reader<'a, S>> {
+        Ok(Reader::from_slice(buf.mem))
+    }
+
+    #[cfg(all(target_os = "linux", feature = "fusedev-uring"))]
+    fn from_uring_buffers(header: &'a mut [u8], payload: &'a mut [u8]) -> Result<Reader<'a, S>> {
+        let mut slices = Vec::with_capacity(2);
         // Safe because Reader has the same lifetime as the input slices.
-        buffers.push_back(unsafe {
+        slices.push(unsafe {
             VolatileSlice::with_bitmap(header.as_mut_ptr(), header.len(), S::default(), None)
         });
         if !payload.is_empty() {
-            buffers.push_back(unsafe {
+            slices.push(unsafe {
                 VolatileSlice::with_bitmap(payload.as_mut_ptr(), payload.len(), S::default(), None)
             });
         }
-        Ok(Reader {
-            buffers: IoBuffers {
-                buffers,
-                bytes_consumed: 0,
-            },
-        })
+        Ok(Reader::from_volatile_slices(slices))
     }
 }
 
@@ -174,15 +172,12 @@ impl<'a, S: BitmapSlice> FuseDevWriter<'a, S> {
     }
 
     /// Compose the FUSE reply message and send the message to `/dev/fuse`.
-    pub fn commit(&mut self, other: Option<&Writer<'a, S>>) -> io::Result<usize> {
+    pub fn commit(&mut self, other: Option<&FuseDevWriter<'a, S>>) -> io::Result<usize> {
         if !self.buffered {
             return Ok(0);
         }
 
-        let o = match other {
-            Some(Writer::FuseDev(w)) => w.buf.as_slice(),
-            _ => &[],
-        };
+        let o = other.map(|w| w.buf.as_slice()).unwrap_or(&[]);
         let res = match (self.buf.len(), o.len()) {
             (0, 0) => Ok(0),
             (0, _) => write(self.fd, o),
@@ -366,6 +361,73 @@ impl<S: BitmapSlice> Write for FuseDevWriter<'_, S> {
     /// flush them all. Disable it!
     fn flush(&mut self) -> io::Result<()> {
         Err(io::Error::other("Writer does not support flush buffer."))
+    }
+}
+
+#[cfg_attr(feature = "async-io", async_trait::async_trait(?Send))]
+impl<'a, S: BitmapSlice> Writer for FuseDevWriter<'a, S> {
+    // All methods forward to the inherent methods of the same name; the
+    // explicit `FuseDevWriter::` prefix keeps the forwarding unambiguous and
+    // makes removing an inherent method a compile error instead of silent
+    // infinite recursion.
+    fn write_from_at<F: FileReadWriteVolatile>(
+        &mut self,
+        src: F,
+        count: usize,
+        off: u64,
+    ) -> io::Result<usize> {
+        FuseDevWriter::write_from_at(self, src, count, off)
+    }
+
+    fn split_at(&mut self, offset: usize) -> Result<Self> {
+        FuseDevWriter::split_at(self, offset)
+    }
+
+    fn available_bytes(&self) -> usize {
+        FuseDevWriter::available_bytes(self)
+    }
+
+    fn bytes_written(&self) -> usize {
+        FuseDevWriter::bytes_written(self)
+    }
+
+    fn commit(&mut self, other: Option<&Self>) -> io::Result<usize> {
+        FuseDevWriter::commit(self, other)
+    }
+
+    #[cfg(feature = "async-io")]
+    async fn async_write(&mut self, data: &[u8]) -> io::Result<usize> {
+        FuseDevWriter::async_write(self, data).await
+    }
+
+    #[cfg(feature = "async-io")]
+    async fn async_write2(&mut self, data: &[u8], data2: &[u8]) -> io::Result<usize> {
+        FuseDevWriter::async_write2(self, data, data2).await
+    }
+
+    #[cfg(feature = "async-io")]
+    async fn async_write3(&mut self, data: &[u8], data2: &[u8], data3: &[u8]) -> io::Result<usize> {
+        FuseDevWriter::async_write3(self, data, data2, data3).await
+    }
+
+    #[cfg(feature = "async-io")]
+    async fn async_write_all(&mut self, buf: &[u8]) -> io::Result<()> {
+        FuseDevWriter::async_write_all(self, buf).await
+    }
+
+    #[cfg(feature = "async-io")]
+    async fn async_write_from_at<F: AsyncFileReadWriteVolatile>(
+        &mut self,
+        src: &F,
+        count: usize,
+        off: u64,
+    ) -> io::Result<usize> {
+        FuseDevWriter::async_write_from_at(self, src, count, off).await
+    }
+
+    #[cfg(feature = "async-io")]
+    async fn async_commit(&mut self, other: Option<&Self>) -> io::Result<usize> {
+        FuseDevWriter::async_commit(self, other).await
     }
 }
 
@@ -567,17 +629,17 @@ mod async_io {
         /// Commit all internal buffers of the writer and others.
         ///
         /// We need this because the lifetime of others is usually shorter than self.
-        pub async fn async_commit(&mut self, other: Option<&Writer<'a, S>>) -> io::Result<usize> {
+        pub async fn async_commit(
+            &mut self,
+            other: Option<&FuseDevWriter<'a, S>>,
+        ) -> io::Result<usize> {
             if !self.buffered {
                 // In non-buffered mode, all data has been written to the fuse device
                 // synchronously by the write methods, so there's nothing to commit.
                 return Ok(0);
             }
 
-            let o = match other {
-                Some(Writer::FuseDev(w)) => w.buf.as_slice(),
-                _ => &[],
-            };
+            let o = other.map(|w| w.buf.as_slice()).unwrap_or(&[]);
 
             let res = match (self.buf.len(), o.len()) {
                 (0, 0) => Ok(0),
@@ -821,7 +883,7 @@ mod tests {
             64
         );
 
-        writer.commit(Some(&other.into())).unwrap();
+        writer.commit(Some(&other)).unwrap();
     }
 
     #[test]
@@ -1150,8 +1212,7 @@ mod tests {
                 64
             );
 
-            let res =
-                async_runtime::block_on(async { writer.async_commit(Some(&other.into())).await });
+            let res = async_runtime::block_on(async { writer.async_commit(Some(&other)).await });
             let _ = res.unwrap();
         }
     }

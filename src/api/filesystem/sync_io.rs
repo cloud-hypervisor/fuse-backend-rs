@@ -10,6 +10,8 @@ use std::ops::Deref;
 use std::sync::Arc;
 use std::time::Duration;
 
+#[cfg(feature = "virtiofs")]
+use super::FsCacheReqHandler;
 use super::{
     Context, DirEntry, Entry, FileLock, GetxattrReply, IoctlData, ListxattrReply, ZeroCopyReader,
     ZeroCopyWriter,
@@ -17,8 +19,6 @@ use super::{
 use crate::abi::fuse_abi::{stat64, statvfs64, CreateIn, FsOptions, OpenOptions, SetattrValid};
 #[cfg(feature = "virtiofs")]
 pub use crate::abi::virtio_fs::RemovemappingOne;
-#[cfg(feature = "virtiofs")]
-use crate::transport::FsCacheReqHandler;
 
 /// The main trait that connects a file system with a transport.
 #[allow(unused_variables)]

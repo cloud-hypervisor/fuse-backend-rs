@@ -3,7 +3,7 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE-BSD-3-Clause file.
 
-use std::io::{self, IoSlice, Read, Write};
+use std::io::{self, IoSlice, Read};
 use std::mem::size_of;
 use std::sync::Arc;
 use std::time::Duration;
@@ -16,20 +16,19 @@ use super::{
 use crate::abi::fuse_abi::*;
 #[cfg(feature = "virtiofs")]
 use crate::abi::virtio_fs::{RemovemappingIn, RemovemappingOne, SetupmappingIn};
+use crate::api::filesystem::FsCacheReqHandler;
 use crate::api::filesystem::{
     DirEntry, Entry, FileSystem, GetxattrReply, IoctlData, ListxattrReply,
 };
-#[cfg(feature = "fusedev")]
-use crate::transport::FuseDevWriter;
-use crate::transport::{pagesize, FsCacheReqHandler, Reader, Writer};
+use crate::buffer::{pagesize, Reader, Writer};
 use crate::{bytes_to_cstr, encode_io_error_kind, BitmapSlice, Error, Result};
 
 impl<F: FileSystem + Sync> Server<F> {
     #[cfg(feature = "fusedev")]
     /// Use to send notify msg to kernel fuse
-    pub fn notify_inval_entry<S: BitmapSlice>(
+    pub fn notify_inval_entry<W: Writer>(
         &self,
-        mut w: FuseDevWriter<'_, S>,
+        mut w: W,
         parent: u64,
         name: &std::ffi::CStr,
     ) -> Result<usize> {
@@ -59,9 +58,9 @@ impl<F: FileSystem + Sync> Server<F> {
     }
     /// Notify the kernel that an inode's data has been invalidated.
     #[cfg(feature = "fusedev")]
-    pub fn notify_inval_inode<S: BitmapSlice>(
+    pub fn notify_inval_inode<W: Writer>(
         &self,
-        mut w: FuseDevWriter<'_, S>,
+        mut w: W,
         ino: u64,
         off: u64,
         len: u64,
@@ -92,7 +91,7 @@ impl<F: FileSystem + Sync> Server<F> {
     /// the crash recovery routine. Given that FUSE initialization does not occur again during recovery,
     /// the capability to support resend notifications may not be automatically detected. It is the responsibility
     /// of the upper layers to verify and persist the kernel's support for this feature upon the initial FUSE setup.
-    pub fn notify_resend<S: BitmapSlice>(&self, mut w: FuseDevWriter<'_, S>) -> Result<()> {
+    pub fn notify_resend<W: Writer>(&self, mut w: W) -> Result<()> {
         let mut buffer_writer = w.split_at(0).map_err(Error::FailedToSplitWriter)?;
         let header = {
             OutHeader {
@@ -114,15 +113,15 @@ impl<F: FileSystem + Sync> Server<F> {
     /// invokes filesystem drivers to server the requests, and eventually send back the result to
     /// the transport layer.
     #[allow(unused_variables)]
-    pub fn handle_message<S: BitmapSlice>(
+    pub fn handle_message<S: BitmapSlice, W: Writer>(
         &self,
         mut r: Reader<'_, S>,
-        w: Writer<'_, S>,
+        w: W,
         vu_req: Option<&mut dyn FsCacheReqHandler>,
         hook: Option<&dyn MetricsHook>,
     ) -> Result<usize> {
         let in_header: InHeader = r.read_obj().map_err(Error::DecodeMessage)?;
-        let mut ctx = SrvContext::<F, S>::new(in_header, r, w);
+        let mut ctx = SrvContext::<F, S, W>::new(in_header, r, w);
         self.remap_ctx_ids(&mut ctx)?;
         if ctx.in_header.len > (MAX_BUFFER_SIZE + BUFFER_HEADER_SIZE) {
             if in_header.opcode == Opcode::Forget as u32
@@ -224,7 +223,7 @@ impl<F: FileSystem + Sync> Server<F> {
         res
     }
 
-    fn lookup<S: BitmapSlice>(&self, mut ctx: SrvContext<'_, F, S>) -> Result<usize> {
+    fn lookup<S: BitmapSlice, W: Writer>(&self, mut ctx: SrvContext<'_, F, S, W>) -> Result<usize> {
         let buf = ServerUtil::get_message_body(&mut ctx.r, &ctx.in_header, 0)?;
         let name = bytes_to_cstr(buf.as_ref()).map_err(|e| {
             let _ = ctx.reply_error_explicit(io::Error::from_raw_os_error(libc::EINVAL));
@@ -258,7 +257,10 @@ impl<F: FileSystem + Sync> Server<F> {
         }
     }
 
-    pub(super) fn forget<S: BitmapSlice>(&self, mut ctx: SrvContext<'_, F, S>) -> Result<usize> {
+    pub(super) fn forget<S: BitmapSlice, W: Writer>(
+        &self,
+        mut ctx: SrvContext<'_, F, S, W>,
+    ) -> Result<usize> {
         let ForgetIn { nlookup } = ctx.r.read_obj().map_err(Error::DecodeMessage)?;
 
         self.fs.forget(ctx.context(), ctx.nodeid(), nlookup);
@@ -267,7 +269,10 @@ impl<F: FileSystem + Sync> Server<F> {
         Ok(0)
     }
 
-    fn getattr<S: BitmapSlice>(&self, mut ctx: SrvContext<'_, F, S>) -> Result<usize> {
+    fn getattr<S: BitmapSlice, W: Writer>(
+        &self,
+        mut ctx: SrvContext<'_, F, S, W>,
+    ) -> Result<usize> {
         let GetattrIn { flags, fh, .. } = ctx.r.read_obj().map_err(Error::DecodeMessage)?;
         let handle = if (flags & GETATTR_FH) != 0 {
             Some(fh.into())
@@ -279,7 +284,10 @@ impl<F: FileSystem + Sync> Server<F> {
         ctx.handle_attr_result(result)
     }
 
-    fn setattr<S: BitmapSlice>(&self, mut ctx: SrvContext<'_, F, S>) -> Result<usize> {
+    fn setattr<S: BitmapSlice, W: Writer>(
+        &self,
+        mut ctx: SrvContext<'_, F, S, W>,
+    ) -> Result<usize> {
         let setattr_in: SetattrIn = ctx.r.read_obj().map_err(Error::DecodeMessage)?;
         let handle = if setattr_in.valid & FATTR_FH != 0 {
             Some(setattr_in.fh.into())
@@ -295,7 +303,10 @@ impl<F: FileSystem + Sync> Server<F> {
         ctx.handle_attr_result(result)
     }
 
-    pub(super) fn readlink<S: BitmapSlice>(&self, mut ctx: SrvContext<'_, F, S>) -> Result<usize> {
+    pub(super) fn readlink<S: BitmapSlice, W: Writer>(
+        &self,
+        mut ctx: SrvContext<'_, F, S, W>,
+    ) -> Result<usize> {
         match self.fs.readlink(ctx.context(), ctx.nodeid()) {
             Ok(linkname) => {
                 // We need to disambiguate the option type here even though it is `None`.
@@ -305,7 +316,10 @@ impl<F: FileSystem + Sync> Server<F> {
         }
     }
 
-    pub(super) fn symlink<S: BitmapSlice>(&self, mut ctx: SrvContext<'_, F, S>) -> Result<usize> {
+    pub(super) fn symlink<S: BitmapSlice, W: Writer>(
+        &self,
+        mut ctx: SrvContext<'_, F, S, W>,
+    ) -> Result<usize> {
         let buf = ServerUtil::get_message_body(&mut ctx.r, &ctx.in_header, 0)?;
         // The name and linkname are encoded one after another and separated by a nul character.
         let (name, linkname) = ServerUtil::extract_two_cstrs(&buf)?;
@@ -316,7 +330,10 @@ impl<F: FileSystem + Sync> Server<F> {
         }
     }
 
-    pub(super) fn mknod<S: BitmapSlice>(&self, mut ctx: SrvContext<'_, F, S>) -> Result<usize> {
+    pub(super) fn mknod<S: BitmapSlice, W: Writer>(
+        &self,
+        mut ctx: SrvContext<'_, F, S, W>,
+    ) -> Result<usize> {
         let MknodIn {
             mode, rdev, umask, ..
         } = ctx.r.read_obj().map_err(Error::DecodeMessage)?;
@@ -336,7 +353,10 @@ impl<F: FileSystem + Sync> Server<F> {
         }
     }
 
-    pub(super) fn mkdir<S: BitmapSlice>(&self, mut ctx: SrvContext<'_, F, S>) -> Result<usize> {
+    pub(super) fn mkdir<S: BitmapSlice, W: Writer>(
+        &self,
+        mut ctx: SrvContext<'_, F, S, W>,
+    ) -> Result<usize> {
         let MkdirIn { mode, umask } = ctx.r.read_obj().map_err(Error::DecodeMessage)?;
         let buf = ServerUtil::get_message_body(&mut ctx.r, &ctx.in_header, size_of::<MkdirIn>())?;
         let name = bytes_to_cstr(buf.as_ref()).map_err(|e| {
@@ -354,7 +374,10 @@ impl<F: FileSystem + Sync> Server<F> {
         }
     }
 
-    pub(super) fn unlink<S: BitmapSlice>(&self, mut ctx: SrvContext<'_, F, S>) -> Result<usize> {
+    pub(super) fn unlink<S: BitmapSlice, W: Writer>(
+        &self,
+        mut ctx: SrvContext<'_, F, S, W>,
+    ) -> Result<usize> {
         let buf = ServerUtil::get_message_body(&mut ctx.r, &ctx.in_header, 0)?;
         let name = bytes_to_cstr(buf.as_ref()).map_err(|e| {
             let _ = ctx.reply_error_explicit(io::Error::from_raw_os_error(libc::EINVAL));
@@ -368,7 +391,10 @@ impl<F: FileSystem + Sync> Server<F> {
         }
     }
 
-    pub(super) fn rmdir<S: BitmapSlice>(&self, mut ctx: SrvContext<'_, F, S>) -> Result<usize> {
+    pub(super) fn rmdir<S: BitmapSlice, W: Writer>(
+        &self,
+        mut ctx: SrvContext<'_, F, S, W>,
+    ) -> Result<usize> {
         let buf = ServerUtil::get_message_body(&mut ctx.r, &ctx.in_header, 0)?;
         let name = bytes_to_cstr(buf.as_ref()).map_err(|e| {
             let _ = ctx.reply_error_explicit(io::Error::from_raw_os_error(libc::EINVAL));
@@ -382,9 +408,9 @@ impl<F: FileSystem + Sync> Server<F> {
         }
     }
 
-    pub(super) fn do_rename<S: BitmapSlice>(
+    pub(super) fn do_rename<S: BitmapSlice, W: Writer>(
         &self,
-        mut ctx: SrvContext<'_, F, S>,
+        mut ctx: SrvContext<'_, F, S, W>,
         msg_size: usize,
         newdir: u64,
         flags: u32,
@@ -405,14 +431,20 @@ impl<F: FileSystem + Sync> Server<F> {
         }
     }
 
-    pub(super) fn rename<S: BitmapSlice>(&self, mut ctx: SrvContext<'_, F, S>) -> Result<usize> {
+    pub(super) fn rename<S: BitmapSlice, W: Writer>(
+        &self,
+        mut ctx: SrvContext<'_, F, S, W>,
+    ) -> Result<usize> {
         let RenameIn { newdir, .. } = ctx.r.read_obj().map_err(Error::DecodeMessage)?;
 
         self.do_rename(ctx, size_of::<RenameIn>(), newdir, 0)
     }
 
     #[cfg(target_os = "linux")]
-    pub(super) fn rename2<S: BitmapSlice>(&self, mut ctx: SrvContext<'_, F, S>) -> Result<usize> {
+    pub(super) fn rename2<S: BitmapSlice, W: Writer>(
+        &self,
+        mut ctx: SrvContext<'_, F, S, W>,
+    ) -> Result<usize> {
         let Rename2In { newdir, flags, .. } = ctx.r.read_obj().map_err(Error::DecodeMessage)?;
 
         let flags =
@@ -421,7 +453,10 @@ impl<F: FileSystem + Sync> Server<F> {
         self.do_rename(ctx, size_of::<Rename2In>(), newdir, flags)
     }
 
-    pub(super) fn link<S: BitmapSlice>(&self, mut ctx: SrvContext<'_, F, S>) -> Result<usize> {
+    pub(super) fn link<S: BitmapSlice, W: Writer>(
+        &self,
+        mut ctx: SrvContext<'_, F, S, W>,
+    ) -> Result<usize> {
         let LinkIn { oldnodeid } = ctx.r.read_obj().map_err(Error::DecodeMessage)?;
         let buf = ServerUtil::get_message_body(&mut ctx.r, &ctx.in_header, size_of::<LinkIn>())?;
         let name = bytes_to_cstr(buf.as_ref()).map_err(|e| {
@@ -439,7 +474,7 @@ impl<F: FileSystem + Sync> Server<F> {
         }
     }
 
-    fn open<S: BitmapSlice>(&self, mut ctx: SrvContext<'_, F, S>) -> Result<usize> {
+    fn open<S: BitmapSlice, W: Writer>(&self, mut ctx: SrvContext<'_, F, S, W>) -> Result<usize> {
         let OpenIn { flags, fuse_flags } = ctx.r.read_obj().map_err(Error::DecodeMessage)?;
 
         match self.fs.open(ctx.context(), ctx.nodeid(), flags, fuse_flags) {
@@ -456,7 +491,7 @@ impl<F: FileSystem + Sync> Server<F> {
         }
     }
 
-    fn read<S: BitmapSlice>(&self, mut ctx: SrvContext<'_, F, S>) -> Result<usize> {
+    fn read<S: BitmapSlice, W: Writer>(&self, mut ctx: SrvContext<'_, F, S, W>) -> Result<usize> {
         let ReadIn {
             fh,
             offset,
@@ -511,7 +546,7 @@ impl<F: FileSystem + Sync> Server<F> {
         }
     }
 
-    fn write<S: BitmapSlice>(&self, mut ctx: SrvContext<'_, F, S>) -> Result<usize> {
+    fn write<S: BitmapSlice, W: Writer>(&self, mut ctx: SrvContext<'_, F, S, W>) -> Result<usize> {
         let WriteIn {
             fh,
             offset,
@@ -556,14 +591,20 @@ impl<F: FileSystem + Sync> Server<F> {
         }
     }
 
-    pub(super) fn statfs<S: BitmapSlice>(&self, mut ctx: SrvContext<'_, F, S>) -> Result<usize> {
+    pub(super) fn statfs<S: BitmapSlice, W: Writer>(
+        &self,
+        mut ctx: SrvContext<'_, F, S, W>,
+    ) -> Result<usize> {
         match self.fs.statfs(ctx.context(), ctx.nodeid()) {
             Ok(st) => ctx.reply_ok(Some(Kstatfs::from(st)), None),
             Err(e) => ctx.reply_error(e),
         }
     }
 
-    pub(super) fn release<S: BitmapSlice>(&self, mut ctx: SrvContext<'_, F, S>) -> Result<usize> {
+    pub(super) fn release<S: BitmapSlice, W: Writer>(
+        &self,
+        mut ctx: SrvContext<'_, F, S, W>,
+    ) -> Result<usize> {
         let ReleaseIn {
             fh,
             flags,
@@ -593,7 +634,7 @@ impl<F: FileSystem + Sync> Server<F> {
         }
     }
 
-    fn fsync<S: BitmapSlice>(&self, mut ctx: SrvContext<'_, F, S>) -> Result<usize> {
+    fn fsync<S: BitmapSlice, W: Writer>(&self, mut ctx: SrvContext<'_, F, S, W>) -> Result<usize> {
         let FsyncIn {
             fh, fsync_flags, ..
         } = ctx.r.read_obj().map_err(Error::DecodeMessage)?;
@@ -608,7 +649,10 @@ impl<F: FileSystem + Sync> Server<F> {
         }
     }
 
-    pub(super) fn setxattr<S: BitmapSlice>(&self, mut ctx: SrvContext<'_, F, S>) -> Result<usize> {
+    pub(super) fn setxattr<S: BitmapSlice, W: Writer>(
+        &self,
+        mut ctx: SrvContext<'_, F, S, W>,
+    ) -> Result<usize> {
         let SetxattrIn { size, flags } = ctx.r.read_obj().map_err(Error::DecodeMessage)?;
         let buf =
             ServerUtil::get_message_body(&mut ctx.r, &ctx.in_header, size_of::<SetxattrIn>())?;
@@ -639,7 +683,10 @@ impl<F: FileSystem + Sync> Server<F> {
         }
     }
 
-    pub(super) fn getxattr<S: BitmapSlice>(&self, mut ctx: SrvContext<'_, F, S>) -> Result<usize> {
+    pub(super) fn getxattr<S: BitmapSlice, W: Writer>(
+        &self,
+        mut ctx: SrvContext<'_, F, S, W>,
+    ) -> Result<usize> {
         let GetxattrIn { size, .. } = ctx.r.read_obj().map_err(Error::DecodeMessage)?;
 
         let buf =
@@ -664,7 +711,10 @@ impl<F: FileSystem + Sync> Server<F> {
         }
     }
 
-    pub(super) fn listxattr<S: BitmapSlice>(&self, mut ctx: SrvContext<'_, F, S>) -> Result<usize> {
+    pub(super) fn listxattr<S: BitmapSlice, W: Writer>(
+        &self,
+        mut ctx: SrvContext<'_, F, S, W>,
+    ) -> Result<usize> {
         let GetxattrIn { size, .. } = ctx.r.read_obj().map_err(Error::DecodeMessage)?;
 
         match self.fs.listxattr(ctx.context(), ctx.nodeid(), size) {
@@ -681,9 +731,9 @@ impl<F: FileSystem + Sync> Server<F> {
         }
     }
 
-    pub(super) fn removexattr<S: BitmapSlice>(
+    pub(super) fn removexattr<S: BitmapSlice, W: Writer>(
         &self,
-        mut ctx: SrvContext<'_, F, S>,
+        mut ctx: SrvContext<'_, F, S, W>,
     ) -> Result<usize> {
         let buf = ServerUtil::get_message_body(&mut ctx.r, &ctx.in_header, 0)?;
         let name = bytes_to_cstr(buf.as_ref()).map_err(|e| {
@@ -698,7 +748,10 @@ impl<F: FileSystem + Sync> Server<F> {
         }
     }
 
-    pub(super) fn flush<S: BitmapSlice>(&self, mut ctx: SrvContext<'_, F, S>) -> Result<usize> {
+    pub(super) fn flush<S: BitmapSlice, W: Writer>(
+        &self,
+        mut ctx: SrvContext<'_, F, S, W>,
+    ) -> Result<usize> {
         let FlushIn { fh, lock_owner, .. } = ctx.r.read_obj().map_err(Error::DecodeMessage)?;
 
         match self
@@ -710,9 +763,9 @@ impl<F: FileSystem + Sync> Server<F> {
         }
     }
 
-    pub(super) fn init<S: BitmapSlice>(
+    pub(super) fn init<S: BitmapSlice, W: Writer>(
         &self,
-        mut ctx: SrvContext<'_, F, S>,
+        mut ctx: SrvContext<'_, F, S, W>,
         mut on_init_params: impl FnMut(&InitParams),
     ) -> Result<usize> {
         let InitIn {
@@ -824,7 +877,10 @@ impl<F: FileSystem + Sync> Server<F> {
         }
     }
 
-    pub(super) fn opendir<S: BitmapSlice>(&self, mut ctx: SrvContext<'_, F, S>) -> Result<usize> {
+    pub(super) fn opendir<S: BitmapSlice, W: Writer>(
+        &self,
+        mut ctx: SrvContext<'_, F, S, W>,
+    ) -> Result<usize> {
         let OpenIn { flags, .. } = ctx.r.read_obj().map_err(Error::DecodeMessage)?;
 
         match self.fs.opendir(ctx.context(), ctx.nodeid(), flags) {
@@ -841,9 +897,9 @@ impl<F: FileSystem + Sync> Server<F> {
         }
     }
 
-    fn do_readdir<S: BitmapSlice>(
+    fn do_readdir<S: BitmapSlice, W: Writer>(
         &self,
-        mut ctx: SrvContext<'_, F, S>,
+        mut ctx: SrvContext<'_, F, S, W>,
         plus: bool,
     ) -> Result<usize> {
         let ReadIn {
@@ -900,18 +956,24 @@ impl<F: FileSystem + Sync> Server<F> {
         }
     }
 
-    pub(super) fn readdir<S: BitmapSlice>(&self, ctx: SrvContext<'_, F, S>) -> Result<usize> {
+    pub(super) fn readdir<S: BitmapSlice, W: Writer>(
+        &self,
+        ctx: SrvContext<'_, F, S, W>,
+    ) -> Result<usize> {
         self.do_readdir(ctx, false)
     }
 
     #[cfg(target_os = "linux")]
-    pub(super) fn readdirplus<S: BitmapSlice>(&self, ctx: SrvContext<'_, F, S>) -> Result<usize> {
+    pub(super) fn readdirplus<S: BitmapSlice, W: Writer>(
+        &self,
+        ctx: SrvContext<'_, F, S, W>,
+    ) -> Result<usize> {
         self.do_readdir(ctx, true)
     }
 
-    pub(super) fn releasedir<S: BitmapSlice>(
+    pub(super) fn releasedir<S: BitmapSlice, W: Writer>(
         &self,
-        mut ctx: SrvContext<'_, F, S>,
+        mut ctx: SrvContext<'_, F, S, W>,
     ) -> Result<usize> {
         let ReleaseIn { fh, flags, .. } = ctx.r.read_obj().map_err(Error::DecodeMessage)?;
 
@@ -924,7 +986,10 @@ impl<F: FileSystem + Sync> Server<F> {
         }
     }
 
-    fn fsyncdir<S: BitmapSlice>(&self, mut ctx: SrvContext<'_, F, S>) -> Result<usize> {
+    fn fsyncdir<S: BitmapSlice, W: Writer>(
+        &self,
+        mut ctx: SrvContext<'_, F, S, W>,
+    ) -> Result<usize> {
         let FsyncIn {
             fh, fsync_flags, ..
         } = ctx.r.read_obj().map_err(Error::DecodeMessage)?;
@@ -939,7 +1004,10 @@ impl<F: FileSystem + Sync> Server<F> {
         }
     }
 
-    pub(super) fn getlk<S: BitmapSlice>(&self, mut ctx: SrvContext<'_, F, S>) -> Result<usize> {
+    pub(super) fn getlk<S: BitmapSlice, W: Writer>(
+        &self,
+        mut ctx: SrvContext<'_, F, S, W>,
+    ) -> Result<usize> {
         let LkIn {
             fh,
             owner,
@@ -960,7 +1028,10 @@ impl<F: FileSystem + Sync> Server<F> {
         }
     }
 
-    pub(super) fn setlk<S: BitmapSlice>(&self, mut ctx: SrvContext<'_, F, S>) -> Result<usize> {
+    pub(super) fn setlk<S: BitmapSlice, W: Writer>(
+        &self,
+        mut ctx: SrvContext<'_, F, S, W>,
+    ) -> Result<usize> {
         let LkIn {
             fh,
             owner,
@@ -981,7 +1052,10 @@ impl<F: FileSystem + Sync> Server<F> {
         }
     }
 
-    pub(super) fn setlkw<S: BitmapSlice>(&self, mut ctx: SrvContext<'_, F, S>) -> Result<usize> {
+    pub(super) fn setlkw<S: BitmapSlice, W: Writer>(
+        &self,
+        mut ctx: SrvContext<'_, F, S, W>,
+    ) -> Result<usize> {
         let LkIn {
             fh,
             owner,
@@ -1002,7 +1076,10 @@ impl<F: FileSystem + Sync> Server<F> {
         }
     }
 
-    pub(super) fn access<S: BitmapSlice>(&self, mut ctx: SrvContext<'_, F, S>) -> Result<usize> {
+    pub(super) fn access<S: BitmapSlice, W: Writer>(
+        &self,
+        mut ctx: SrvContext<'_, F, S, W>,
+    ) -> Result<usize> {
         let AccessIn { mask, .. } = ctx.r.read_obj().map_err(Error::DecodeMessage)?;
 
         match self.fs.access(ctx.context(), ctx.nodeid(), mask) {
@@ -1011,7 +1088,7 @@ impl<F: FileSystem + Sync> Server<F> {
         }
     }
 
-    fn create<S: BitmapSlice>(&self, mut ctx: SrvContext<'_, F, S>) -> Result<usize> {
+    fn create<S: BitmapSlice, W: Writer>(&self, mut ctx: SrvContext<'_, F, S, W>) -> Result<usize> {
         let args: CreateIn = ctx.r.read_obj().map_err(Error::DecodeMessage)?;
         let buf = ServerUtil::get_message_body(&mut ctx.r, &ctx.in_header, size_of::<CreateIn>())?;
         let name = bytes_to_cstr(buf.as_ref()).map_err(|e| {
@@ -1045,9 +1122,12 @@ impl<F: FileSystem + Sync> Server<F> {
         }
     }
 
-    pub(super) fn interrupt<S: BitmapSlice>(&self, _ctx: SrvContext<'_, F, S>) {}
+    pub(super) fn interrupt<S: BitmapSlice, W: Writer>(&self, _ctx: SrvContext<'_, F, S, W>) {}
 
-    pub(super) fn bmap<S: BitmapSlice>(&self, mut ctx: SrvContext<'_, F, S>) -> Result<usize> {
+    pub(super) fn bmap<S: BitmapSlice, W: Writer>(
+        &self,
+        mut ctx: SrvContext<'_, F, S, W>,
+    ) -> Result<usize> {
         let BmapIn {
             block, blocksize, ..
         } = ctx.r.read_obj().map_err(Error::DecodeMessage)?;
@@ -1058,14 +1138,17 @@ impl<F: FileSystem + Sync> Server<F> {
         }
     }
 
-    pub(super) fn destroy<S: BitmapSlice>(&self, mut ctx: SrvContext<'_, F, S>) {
+    pub(super) fn destroy<S: BitmapSlice, W: Writer>(&self, mut ctx: SrvContext<'_, F, S, W>) {
         self.fs.destroy();
         if let Err(e) = ctx.reply_ok(None::<u8>, None) {
             warn!("fuse channel reply destroy failed {:?}", e);
         }
     }
 
-    pub(super) fn ioctl<S: BitmapSlice>(&self, mut ctx: SrvContext<'_, F, S>) -> Result<usize> {
+    pub(super) fn ioctl<S: BitmapSlice, W: Writer>(
+        &self,
+        mut ctx: SrvContext<'_, F, S, W>,
+    ) -> Result<usize> {
         let IoctlIn {
             fh,
             flags,
@@ -1110,7 +1193,10 @@ impl<F: FileSystem + Sync> Server<F> {
         }
     }
 
-    pub(super) fn poll<S: BitmapSlice>(&self, mut ctx: SrvContext<'_, F, S>) -> Result<usize> {
+    pub(super) fn poll<S: BitmapSlice, W: Writer>(
+        &self,
+        mut ctx: SrvContext<'_, F, S, W>,
+    ) -> Result<usize> {
         let PollIn {
             fh,
             kh,
@@ -1137,9 +1223,9 @@ impl<F: FileSystem + Sync> Server<F> {
         }
     }
 
-    pub(super) fn notify_reply<S: BitmapSlice>(
+    pub(super) fn notify_reply<S: BitmapSlice, W: Writer>(
         &self,
-        mut ctx: SrvContext<'_, F, S>,
+        mut ctx: SrvContext<'_, F, S, W>,
     ) -> Result<usize> {
         if let Err(e) = self.fs.notify_reply() {
             ctx.reply_error(e)
@@ -1148,9 +1234,9 @@ impl<F: FileSystem + Sync> Server<F> {
         }
     }
 
-    pub(super) fn batch_forget<S: BitmapSlice>(
+    pub(super) fn batch_forget<S: BitmapSlice, W: Writer>(
         &self,
-        mut ctx: SrvContext<'_, F, S>,
+        mut ctx: SrvContext<'_, F, S, W>,
     ) -> Result<usize> {
         let BatchForgetIn { count, .. } = ctx.r.read_obj().map_err(Error::DecodeMessage)?;
 
@@ -1186,7 +1272,10 @@ impl<F: FileSystem + Sync> Server<F> {
         Ok(0)
     }
 
-    fn fallocate<S: BitmapSlice>(&self, mut ctx: SrvContext<'_, F, S>) -> Result<usize> {
+    fn fallocate<S: BitmapSlice, W: Writer>(
+        &self,
+        mut ctx: SrvContext<'_, F, S, W>,
+    ) -> Result<usize> {
         let FallocateIn {
             fh,
             offset,
@@ -1205,7 +1294,10 @@ impl<F: FileSystem + Sync> Server<F> {
     }
 
     #[cfg(target_os = "linux")]
-    pub(super) fn lseek<S: BitmapSlice>(&self, mut ctx: SrvContext<'_, F, S>) -> Result<usize> {
+    pub(super) fn lseek<S: BitmapSlice, W: Writer>(
+        &self,
+        mut ctx: SrvContext<'_, F, S, W>,
+    ) -> Result<usize> {
         let LseekIn {
             fh, offset, whence, ..
         } = ctx.r.read_obj().map_err(Error::DecodeMessage)?;
@@ -1226,9 +1318,9 @@ impl<F: FileSystem + Sync> Server<F> {
 
 #[cfg(feature = "virtiofs")]
 impl<F: FileSystem + Sync> Server<F> {
-    pub(super) fn setupmapping<S: BitmapSlice>(
+    pub(super) fn setupmapping<S: BitmapSlice, W: Writer>(
         &self,
-        mut ctx: SrvContext<'_, F, S>,
+        mut ctx: SrvContext<'_, F, S, W>,
         vu_req: Option<&mut dyn FsCacheReqHandler>,
     ) -> Result<usize> {
         if let Some(req) = vu_req {
@@ -1258,9 +1350,9 @@ impl<F: FileSystem + Sync> Server<F> {
         }
     }
 
-    pub(super) fn removemapping<S: BitmapSlice>(
+    pub(super) fn removemapping<S: BitmapSlice, W: Writer>(
         &self,
-        mut ctx: SrvContext<'_, F, S>,
+        mut ctx: SrvContext<'_, F, S, W>,
         vu_req: Option<&mut dyn FsCacheReqHandler>,
     ) -> Result<usize> {
         if let Some(req) = vu_req {
@@ -1296,7 +1388,7 @@ impl<F: FileSystem + Sync> Server<F> {
     }
 }
 
-impl<F: FileSystem, S: BitmapSlice> SrvContext<'_, F, S> {
+impl<F: FileSystem, S: BitmapSlice, W: Writer> SrvContext<'_, F, S, W> {
     fn reply_ok<T: ByteValued>(&mut self, out: Option<T>, data: Option<&[u8]>) -> Result<usize> {
         let data2 = out.as_ref().map(|v| v.as_slice()).unwrap_or(&[]);
         let data3 = data.unwrap_or(&[]);
@@ -1389,8 +1481,8 @@ impl<F: FileSystem, S: BitmapSlice> SrvContext<'_, F, S> {
     }
 }
 
-fn add_dirent<S: BitmapSlice>(
-    cursor: &mut Writer<'_, S>,
+fn add_dirent<W: Writer>(
+    cursor: &mut W,
     max: u32,
     d: DirEntry,
     entry: Option<Entry>,
@@ -1447,251 +1539,231 @@ fn add_dirent<S: BitmapSlice>(
     }
 }
 
-#[cfg(test)]
+// The server operation tests only exercise the server side request parsing
+// and reply encoding logic, so they run against an empty mock filesystem and
+// a writer capturing replies into a plain byte buffer instead of a real
+// filesystem driver and transport.
+#[cfg(all(test, target_os = "linux"))]
 mod tests {
+    use super::super::test_util::{MockFS, TestWriter};
+    use super::*;
 
-    #[cfg(all(feature = "fusedev", target_os = "linux"))]
-    mod tests_fusedev {
-        use super::super::*;
-        use crate::passthrough::{Config, PassthroughFs};
-        use crate::transport::FuseBuf;
+    fn prepare_srvcontext<'a>(
+        read_buf: &'a mut [u8],
+        write_buf: &'a mut [u8],
+    ) -> SrvContext<'a, MockFS, (), TestWriter<'a>> {
+        let reader = Reader::<()>::from_slice(read_buf);
+        let writer = TestWriter::new(write_buf);
+        let in_header = InHeader::default();
+        SrvContext::new(in_header, reader, writer)
+    }
 
-        use std::fs::File;
-        use std::os::unix::io::AsRawFd;
-        use vmm_sys_util::tempfile::TempFile;
+    #[test]
+    fn test_server_init() {
+        let server = Server::new(MockFS);
 
-        fn prepare_srvcontext<'a>(
-            read_buf: &'a mut [u8],
-            write_buf: &'a mut [u8],
-        ) -> (SrvContext<'a, PassthroughFs>, File) {
-            let file = TempFile::new().unwrap().into_file();
-            let reader = Reader::<()>::from_fuse_buffer(FuseBuf::new(read_buf)).unwrap();
-            let writer = FuseDevWriter::<()>::new(file.as_raw_fd(), write_buf).unwrap();
-            let in_header = InHeader::default();
-            (
-                SrvContext::<PassthroughFs>::new(in_header, reader, writer.into()),
-                file,
-            )
-        }
+        let mut read_buf = [
+            0x8u8, 0x0, 0x0, 0x0, // major = 0x0008
+            0x0u8, 0x0, 0x0, 0x0, // minor = 0x0008
+            0x0, 0x0, 0x0, 0x0, // max_readahead = 0x0000
+            0x0, 0x0, 0x0, 0x0, // flags = 0x0000
+        ];
+        let mut write_buf = [0u8; 4096];
+        let ctx = prepare_srvcontext(&mut read_buf, &mut write_buf);
 
-        #[test]
-        fn test_server_init() {
-            let fs = PassthroughFs::<()>::new(Config::default()).unwrap();
-            let server = Server::new(fs);
+        let res = server
+            .init(ctx, |_| unreachable!("shouldn't be called"))
+            .unwrap();
+        assert_eq!(res, 80);
 
-            let mut read_buf = [
-                0x8u8, 0x0, 0x0, 0x0, // major = 0x0008
-                0x0u8, 0x0, 0x0, 0x0, // minor = 0x0008
-                0x0, 0x0, 0x0, 0x0, // max_readahead = 0x0000
-                0x0, 0x0, 0x0, 0x0, // flags = 0x0000
-            ];
-            let mut write_buf = [0u8; 4096];
-            let (ctx, _file) = prepare_srvcontext(&mut read_buf, &mut write_buf);
+        let mut read_buf1 = [
+            0x7u8, 0x0, 0x0, 0x0, // major = 0x0007
+            0x0u8, 0x0, 0x0, 0x0, // minor = 0x0000
+            0x0, 0x0, 0x0, 0x0, // max_readahead = 0x0000
+            0x0, 0x0, 0x0, 0x0, // flags = 0x0000
+        ];
+        let mut write_buf1 = [0u8; 4096];
+        let ctx1 = prepare_srvcontext(&mut read_buf1, &mut write_buf1);
 
-            let res = server
-                .init(ctx, |_| unreachable!("shouldn't be called"))
-                .unwrap();
-            assert_eq!(res, 80);
+        let mut init_params_called = false;
+        let res = server
+            .init(ctx1, |init_params| {
+                assert_eq!(init_params.version.major, 0x0007);
+                assert_eq!(init_params.version.minor, 0x0000);
+                init_params_called = true
+            })
+            .unwrap();
+        assert!(init_params_called);
 
-            let mut read_buf1 = [
-                0x7u8, 0x0, 0x0, 0x0, // major = 0x0007
-                0x0u8, 0x0, 0x0, 0x0, // minor = 0x0000
-                0x0, 0x0, 0x0, 0x0, // max_readahead = 0x0000
-                0x0, 0x0, 0x0, 0x0, // flags = 0x0000
-            ];
-            let mut write_buf1 = [0u8; 4096];
-            let (ctx1, _file) = prepare_srvcontext(&mut read_buf1, &mut write_buf1);
+        assert_eq!(res, 24);
+    }
 
-            let mut init_params_called = false;
-            let res = server
-                .init(ctx1, |init_params| {
-                    assert_eq!(init_params.version.major, 0x0007);
-                    assert_eq!(init_params.version.minor, 0x0000);
-                    init_params_called = true
-                })
-                .unwrap();
-            assert!(init_params_called);
+    #[test]
+    fn test_server_init_ext_without_payload() {
+        let server = Server::new(MockFS);
 
-            assert_eq!(res, 24);
-        }
+        let mut read_buf = [
+            0x7u8, 0x0, 0x0, 0x0, // major = 0x0007
+            0x24u8, 0x0, 0x0, 0x0, // minor = 0x0024
+            0x0, 0x0, 0x0, 0x0, // max_readahead = 0x0000
+            0x0, 0x0, 0x0, 0x40, // flags = INIT_EXT
+        ];
+        let mut write_buf = [0u8; 4096];
+        let ctx = prepare_srvcontext(&mut read_buf, &mut write_buf);
 
-        #[test]
-        fn test_server_init_ext_without_payload() {
-            let fs = PassthroughFs::<()>::new(Config::default()).unwrap();
-            let server = Server::new(fs);
+        let mut init_params_called = false;
+        let res = server
+            .init(ctx, |init_params| {
+                assert_eq!(init_params.version.major, 0x0007);
+                assert_eq!(init_params.version.minor, 0x0024);
+                assert!(!init_params.capable.contains(FsOptions::INIT_EXT));
+                init_params_called = true;
+            })
+            .unwrap();
 
-            let mut read_buf = [
-                0x7u8, 0x0, 0x0, 0x0, // major = 0x0007
-                0x24u8, 0x0, 0x0, 0x0, // minor = 0x0024
-                0x0, 0x0, 0x0, 0x0, // max_readahead = 0x0000
-                0x0, 0x0, 0x0, 0x40, // flags = INIT_EXT
-            ];
-            let mut write_buf = [0u8; 4096];
-            let (ctx, _file) = prepare_srvcontext(&mut read_buf, &mut write_buf);
+        assert!(init_params_called);
+        assert_eq!(res, 80);
+    }
 
-            let mut init_params_called = false;
-            let res = server
-                .init(ctx, |init_params| {
-                    assert_eq!(init_params.version.major, 0x0007);
-                    assert_eq!(init_params.version.minor, 0x0024);
-                    assert!(!init_params.capable.contains(FsOptions::INIT_EXT));
-                    init_params_called = true;
-                })
-                .unwrap();
+    #[cfg(feature = "fusedev-uring")]
+    #[test]
+    fn test_server_init_uring_negotiation() {
+        // Kernel capability set carrying INIT_EXT plus FUSE_OVER_IO_URING
+        // (bit 41, i.e. bit 9 of flags2), as sent by kernels >= 6.14:
+        // fuse_init_in followed by the full fuse_init_in2.
+        let mut read_buf = [0u8; size_of::<InitIn>() + size_of::<InitIn2>()];
+        let init_in = InitIn {
+            major: KERNEL_VERSION,
+            minor: KERNEL_MINOR_VERSION,
+            max_readahead: 0,
+            flags: (FsOptions::DO_READDIRPLUS | FsOptions::INIT_EXT).bits() as u32,
+        };
+        read_buf[..size_of::<InitIn>()].copy_from_slice(init_in.as_slice());
+        let init_in2 = InitIn2 {
+            flags2: (FsOptions::OVER_IO_URING.bits() >> 32) as u32,
+            unused: [0; 11],
+        };
+        read_buf[size_of::<InitIn>()..].copy_from_slice(init_in2.as_slice());
 
-            assert!(init_params_called);
-            assert_eq!(res, 80);
-        }
+        // With set_uring() the reply must echo FUSE_OVER_IO_URING in
+        // flags2 and set FUSE_INIT_EXT in flags, since kernels >= 6.13
+        // apply flags2 only when FUSE_INIT_EXT is present.
+        let server = Server::new(MockFS);
+        server.set_uring(true);
+        let mut write_buf = [0u8; 4096];
+        let res = {
+            let ctx = prepare_srvcontext(&mut read_buf, &mut write_buf);
+            server.init(ctx, |_| {}).unwrap()
+        };
+        assert_eq!(res, size_of::<OutHeader>() + size_of::<InitOut>());
+        // The reply lands directly in the writer buffer.
+        let mut out = InitOut::default();
+        out.as_mut_slice()
+            .copy_from_slice(&write_buf[size_of::<OutHeader>()..res]);
+        assert_ne!(out.flags & FsOptions::INIT_EXT.bits() as u32, 0);
+        assert_ne!(
+            out.flags2 & (FsOptions::OVER_IO_URING.bits() >> 32) as u32,
+            0
+        );
+        assert!(server.uring_enabled());
 
-        #[cfg(feature = "fusedev-uring")]
-        #[test]
-        fn test_server_init_uring_negotiation() {
-            // Kernel capability set carrying INIT_EXT plus FUSE_OVER_IO_URING
-            // (bit 41, i.e. bit 9 of flags2), as sent by kernels >= 6.14:
-            // fuse_init_in followed by the full fuse_init_in2.
-            let mut read_buf = [0u8; size_of::<InitIn>() + size_of::<InitIn2>()];
-            let init_in = InitIn {
-                major: KERNEL_VERSION,
-                minor: KERNEL_MINOR_VERSION,
-                max_readahead: 0,
-                flags: (FsOptions::DO_READDIRPLUS | FsOptions::INIT_EXT).bits() as u32,
-            };
-            read_buf[..size_of::<InitIn>()].copy_from_slice(init_in.as_slice());
-            let init_in2 = InitIn2 {
-                flags2: (FsOptions::OVER_IO_URING.bits() >> 32) as u32,
-                unused: [0; 11],
-            };
-            read_buf[size_of::<InitIn>()..].copy_from_slice(init_in2.as_slice());
+        // Without set_uring() the capability stays off and no upper bit
+        // is enabled, so INIT_EXT must not be advertised either.
+        let server = Server::new(MockFS);
+        let mut write_buf = [0u8; 4096];
+        let res = {
+            let ctx = prepare_srvcontext(&mut read_buf, &mut write_buf);
+            server.init(ctx, |_| {}).unwrap()
+        };
+        let mut out = InitOut::default();
+        out.as_mut_slice()
+            .copy_from_slice(&write_buf[size_of::<OutHeader>()..res]);
+        assert_eq!(out.flags & FsOptions::INIT_EXT.bits() as u32, 0);
+        assert_eq!(out.flags2, 0);
+        assert!(!server.uring_enabled());
+    }
 
-            // With set_uring() the reply must echo FUSE_OVER_IO_URING in
-            // flags2 and set FUSE_INIT_EXT in flags, since kernels >= 6.13
-            // apply flags2 only when FUSE_INIT_EXT is present.
-            let fs = PassthroughFs::<()>::new(Config::default()).unwrap();
-            let server = Server::new(fs);
-            server.set_uring(true);
-            let mut write_buf = [0u8; 4096];
-            let (ctx, file) = prepare_srvcontext(&mut read_buf, &mut write_buf);
-            let res = server.init(ctx, |_| {}).unwrap();
-            assert_eq!(res, size_of::<OutHeader>() + size_of::<InitOut>());
-            // The reply is committed to the writer fd, not kept in the
-            // staging buffer.
-            let mut reply = vec![0u8; res];
-            std::os::unix::fs::FileExt::read_at(&file, &mut reply, 0).unwrap();
-            let mut out = InitOut::default();
-            out.as_mut_slice()
-                .copy_from_slice(&reply[size_of::<OutHeader>()..]);
-            assert_ne!(out.flags & FsOptions::INIT_EXT.bits() as u32, 0);
-            assert_ne!(
-                out.flags2 & (FsOptions::OVER_IO_URING.bits() >> 32) as u32,
-                0
-            );
-            assert!(server.uring_enabled());
+    #[test]
+    fn test_server_write() {
+        let server = Server::new(MockFS);
 
-            // Without set_uring() the capability stays off and no upper bit
-            // is enabled, so INIT_EXT must not be advertised either.
-            let fs = PassthroughFs::<()>::new(Config::default()).unwrap();
-            let server = Server::new(fs);
-            let mut write_buf = [0u8; 4096];
-            let (ctx, file) = prepare_srvcontext(&mut read_buf, &mut write_buf);
-            let res = server.init(ctx, |_| {}).unwrap();
-            let mut reply = vec![0u8; res];
-            std::os::unix::fs::FileExt::read_at(&file, &mut reply, 0).unwrap();
-            let mut out = InitOut::default();
-            out.as_mut_slice()
-                .copy_from_slice(&reply[size_of::<OutHeader>()..]);
-            assert_eq!(out.flags & FsOptions::INIT_EXT.bits() as u32, 0);
-            assert_eq!(out.flags2, 0);
-            assert!(!server.uring_enabled());
-        }
+        let mut read_buf = [0u8; 4096];
+        let mut write_buf = [0u8; 4096];
+        let ctx = prepare_srvcontext(&mut read_buf, &mut write_buf);
 
-        #[test]
-        fn test_server_write() {
-            let fs = PassthroughFs::<()>::new(Config::default()).unwrap();
-            let server = Server::new(fs);
+        let res = server.write(ctx).unwrap();
+        assert_eq!(res, 16);
+    }
 
-            let mut read_buf = [0u8; 4096];
-            let mut write_buf = [0u8; 4096];
-            let (ctx, _file) = prepare_srvcontext(&mut read_buf, &mut write_buf);
+    #[test]
+    fn test_server_read() {
+        let server = Server::new(MockFS);
 
-            let res = server.write(ctx).unwrap();
-            assert_eq!(res, 16);
-        }
+        let mut read_buf = [0u8; 4096];
+        let mut write_buf = [0u8; 4096];
+        let ctx = prepare_srvcontext(&mut read_buf, &mut write_buf);
 
-        #[test]
-        fn test_server_read() {
-            let fs = PassthroughFs::<()>::new(Config::default()).unwrap();
-            let server = Server::new(fs);
+        let res = server.read(ctx).unwrap();
+        assert_eq!(res, 16);
+    }
 
-            let mut read_buf = [0u8; 4096];
-            let mut write_buf = [0u8; 4096];
-            let (ctx, _file) = prepare_srvcontext(&mut read_buf, &mut write_buf);
+    #[test]
+    fn test_server_readdir() {
+        let server = Server::new(MockFS);
 
-            let res = server.read(ctx).unwrap();
-            assert_eq!(res, 16);
-        }
+        let mut read_buf = [0u8; 4096];
+        let mut write_buf = [0u8; 4096];
+        let ctx = prepare_srvcontext(&mut read_buf, &mut write_buf);
 
-        #[test]
-        fn test_server_readdir() {
-            let fs = PassthroughFs::<()>::new(Config::default()).unwrap();
-            let server = Server::new(fs);
+        let res = server.do_readdir(ctx, true).unwrap();
+        assert_eq!(res, 16);
+    }
 
-            let mut read_buf = [0u8; 4096];
-            let mut write_buf = [0u8; 4096];
-            let (ctx, _file) = prepare_srvcontext(&mut read_buf, &mut write_buf);
+    #[test]
+    fn test_server_ioctl() {
+        let server = Server::new(MockFS);
 
-            let res = server.do_readdir(ctx, true).unwrap();
-            assert_eq!(res, 16);
-        }
+        let mut read_buf = [0u8; 4096];
+        let mut write_buf = [0u8; 4096];
+        let ctx = prepare_srvcontext(&mut read_buf, &mut write_buf);
 
-        #[test]
-        fn test_server_ioctl() {
-            let fs = PassthroughFs::<()>::new(Config::default()).unwrap();
-            let server = Server::new(fs);
+        let res = server.ioctl(ctx).unwrap();
+        assert!(res > 0);
 
-            let mut read_buf = [0u8; 4096];
-            let mut write_buf = [0u8; 4096];
-            let (ctx, _file) = prepare_srvcontext(&mut read_buf, &mut write_buf);
+        // construct IoctlIn with invalid in_size
+        let mut read_buf_fail = [
+            0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, //fh = 0
+            0x0, 0x0, 0x0, 0x0, //flags = 0
+            0x0, 0x0, 0x0, 0x0, //cmd = 0
+            0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, //arg = 0
+            0x7u8, 0x3u8, 0x0, 0x0, //in_size = 0x307
+            0x0, 0x0, 0x0, 0x0, //out_size = 0
+        ];
+        let mut write_buf_fail = [0u8; 48];
+        let ctx_fail = prepare_srvcontext(&mut read_buf_fail, &mut write_buf_fail);
+        let res = server.ioctl(ctx_fail).unwrap();
+        assert!(res > 0);
+    }
 
-            let res = server.ioctl(ctx).unwrap();
-            assert!(res > 0);
+    #[test]
+    fn test_server_batch_forget() {
+        let server = Server::new(MockFS);
 
-            // construct IoctlIn with invalid in_size
-            let mut read_buf_fail = [
-                0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, //fh = 0
-                0x0, 0x0, 0x0, 0x0, //flags = 0
-                0x0, 0x0, 0x0, 0x0, //cmd = 0
-                0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, //arg = 0
-                0x7u8, 0x3u8, 0x0, 0x0, //in_size = 0x307
-                0x0, 0x0, 0x0, 0x0, //out_size = 0
-            ];
-            let mut write_buf_fail = [0u8; 48];
-            let (ctx_fail, _file) = prepare_srvcontext(&mut read_buf_fail, &mut write_buf_fail);
-            let res = server.ioctl(ctx_fail).unwrap();
-            assert!(res > 0);
-        }
+        let mut read_buf = [0u8; 4096];
+        let mut write_buf = [0u8; 4096];
+        let ctx = prepare_srvcontext(&mut read_buf, &mut write_buf);
+        // forget should return 0 anyway
+        assert_eq!(server.batch_forget(ctx).unwrap(), 0);
+    }
 
-        #[test]
-        fn test_server_batch_forget() {
-            let fs = PassthroughFs::<()>::new(Config::default()).unwrap();
-            let server = Server::new(fs);
+    #[test]
+    fn test_server_forget() {
+        let server = Server::new(MockFS);
 
-            let mut read_buf = [0u8; 4096];
-            let mut write_buf = [0u8; 4096];
-            let (ctx, _file) = prepare_srvcontext(&mut read_buf, &mut write_buf);
-            // forget should return 0 anyway
-            assert_eq!(server.batch_forget(ctx).unwrap(), 0);
-        }
+        let mut read_buf = [0x1u8, 0x2u8, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0];
+        let mut write_buf = [0u8; 4096];
+        let ctx = prepare_srvcontext(&mut read_buf, &mut write_buf);
 
-        #[test]
-        fn test_server_forget() {
-            let fs = PassthroughFs::<()>::new(Config::default()).unwrap();
-            let server = Server::new(fs);
-
-            let mut read_buf = [0x1u8, 0x2u8, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0];
-            let mut write_buf = [0u8; 4096];
-            let (ctx, _file) = prepare_srvcontext(&mut read_buf, &mut write_buf);
-
-            assert_eq!(server.forget(ctx).unwrap(), 0);
-        }
+        assert_eq!(server.forget(ctx).unwrap(), 0);
     }
 }
