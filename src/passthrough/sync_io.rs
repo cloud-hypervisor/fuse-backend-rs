@@ -237,8 +237,11 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
         let mut target_reclen: usize = 0;
         while cur + size_of::<LinuxDirent64>() <= buf.len() {
             let front = &buf[cur..cur + size_of::<LinuxDirent64>()];
-            let dirent64 = LinuxDirent64::from_slice(front)
-                .expect("fuse: unable to get LinuxDirent64 from slice");
+            let dirent64 = match LinuxDirent64::from_slice(front) {
+                Some(d) => d,
+                // Defend against a malformed getdents64 buffer.
+                None => break,
+            };
             let reclen = dirent64.d_reclen as usize;
             // Defend against a malformed getdents64 buffer: a record shorter
             // than the header would loop forever.
@@ -265,8 +268,11 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
     fn last_cookie_in_buf(mut buf: &[u8]) -> Option<u64> {
         let mut last = None;
         while buf.len() >= size_of::<LinuxDirent64>() {
-            let dirent64 = LinuxDirent64::from_slice(&buf[..size_of::<LinuxDirent64>()])
-                .expect("fuse: unable to get LinuxDirent64 from slice");
+            let dirent64 = match LinuxDirent64::from_slice(&buf[..size_of::<LinuxDirent64>()]) {
+                Some(d) => d,
+                // Defend against a malformed getdents64 buffer.
+                None => break,
+            };
             let reclen = dirent64.d_reclen as usize;
             // Defend against a malformed getdents64 buffer: a record shorter
             // than the header would loop forever and an oversized one would
@@ -460,8 +466,7 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
 
             let (front, back) = rem.split_at(size_of::<LinuxDirent64>());
 
-            let dirent64 = LinuxDirent64::from_slice(front)
-                .expect("fuse: unable to get LinuxDirent64 from slice");
+            let dirent64 = LinuxDirent64::from_slice(front).ok_or_else(einval)?;
 
             let namelen = dirent64.d_reclen as usize - size_of::<LinuxDirent64>();
             debug_assert!(
