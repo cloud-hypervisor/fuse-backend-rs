@@ -905,17 +905,17 @@ pub mod persist {
         /// use std::any::Any;
         /// use std::io;
         ///
-        /// use fuse_backend_rs::api::filesystem::{Entry, FileSystem};
-        /// use fuse_backend_rs::api::vfs::BackendFileSystem;
-        /// use fuse_backend_rs::api::{Vfs, VfsIndex, VfsOptions};
+        /// use fuse_backend_core::api::filesystem::{Entry, FileSystem};
+        /// use fuse_backend_core::api::vfs::BackendFileSystem;
+        /// use fuse_backend_core::api::{Vfs, VfsIndex, VfsOptions};
         /// # #[cfg(feature = "async-io")]
         /// # use std::ffi::CStr;
         /// # #[cfg(feature = "async-io")]
         /// # use std::time::Duration;
         /// # #[cfg(feature = "async-io")]
-        /// # use fuse_backend_rs::abi::fuse_abi::{CreateIn, stat64};
+        /// # use fuse_backend_core::abi::fuse_abi::{CreateIn, stat64};
         /// # #[cfg(feature = "async-io")]
-        /// # use fuse_backend_rs::api::filesystem::{
+        /// # use fuse_backend_core::api::filesystem::{
         /// #     AsyncFileSystem, AsyncZeroCopyReader, AsyncZeroCopyWriter, Context, OpenOptions,
         /// #     SetattrValid,
         /// # };

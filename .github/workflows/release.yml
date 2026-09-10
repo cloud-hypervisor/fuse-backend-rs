@@ -18,7 +18,14 @@ jobs:
         run: |
           sudo apt-get update && sudo apt-get install --yes sed
           VERSION=$(sed --regexp-extended --silent 's/^version = \"(.*)"$/\1/p' Cargo.toml)
+          CORE_VERSION=$(sed --regexp-extended --silent 's/^version = \"(.*)"$/\1/p' crates/fuse-backend-core/Cargo.toml)
           [ "$GITHUB_REF_NAME" == "v$VERSION" ]
+          # Both crates are published from one tag; fail early if the two
+          # manifests drift apart.
+          [ "$VERSION" == "$CORE_VERSION" ]
+          # fuse-backend-rs depends on fuse-backend-core by path, so core
+          # must be published first.
+          cargo publish --token ${{ secrets.CRATES_IO_TOKEN }} -p fuse-backend-core
           cargo publish --token ${{ secrets.CRATES_IO_TOKEN }}
       - name: Release
         uses: softprops/action-gh-release@v1

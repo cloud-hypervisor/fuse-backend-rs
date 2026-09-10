@@ -49,78 +49,32 @@
 //! * Async IO (Experimental). An optional `async-io` cargo feature adds an asynchronous IO
 //!   path based on tokio-uring/io_uring, which is only available on Linux and may change
 //!   in future releases.
+//!
+//! The ABI, API, buffer and common layers are implemented by the [`fuse-backend-core`] crate
+//! and re-exported here, so all historical `fuse_backend_rs::{abi, api, buffer, common}`
+//! paths keep resolving.
 
 extern crate bitflags;
 extern crate libc;
+// The log macros and the BitmapSlice alias are only referenced by the
+// transport and driver modules below, so they go unused when all cargo
+// features are disabled.
+#[allow(unused_imports)]
 #[macro_use]
 extern crate log;
 extern crate vm_memory;
 
-use std::ffi::{CStr, FromBytesWithNulError};
-use std::io::ErrorKind;
-use std::{error, fmt, io};
-
+#[allow(unused_imports)]
 use vm_memory::bitmap::BitmapSlice;
 
-/// Error codes for Fuse related operations.
-#[derive(Debug)]
-pub enum Error {
-    /// Failed to decode protocol messages.
-    DecodeMessage(io::Error),
-    /// Failed to encode protocol messages.
-    EncodeMessage(io::Error),
-    /// One or more parameters are missing.
-    MissingParameter,
-    /// A C string parameter is invalid.
-    InvalidCString(FromBytesWithNulError),
-    /// The `len` field of the header is too small.
-    InvalidHeaderLength,
-    /// The `size` field of the `SetxattrIn` message does not match the length
-    /// of the decoded value.
-    InvalidXattrSize((u32, usize)),
-    /// Invalid message that the server cannot handle properly.
-    InvalidMessage(io::Error),
-    /// Failed to write buffer to writer.
-    FailedToWrite(io::Error),
-    /// Failed to split a writer.
-    FailedToSplitWriter(transport::Error),
-    /// Failed to remap uid/gid.
-    FailedToRemapID((u32, u32)),
-}
+// The transport-neutral layers (ABI, API, buffers, common utilities) live in
+// fuse-backend-core; re-export them so in-crate `crate::api` style paths and
+// the historical public paths keep resolving.
+pub use fuse_backend_core::{abi, api, buffer, common};
 
-impl error::Error for Error {}
+pub use fuse_backend_core::{bytes_to_cstr, encode_io_error_kind, Error, Result};
 
-impl fmt::Display for Error {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        use Error::*;
-        match self {
-            DecodeMessage(err) => write!(f, "failed to decode fuse message: {err}"),
-            EncodeMessage(err) => write!(f, "failed to encode fuse message: {err}"),
-            MissingParameter => write!(f, "one or more parameters are missing"),
-            InvalidHeaderLength => write!(f, "the `len` field of the header is too small"),
-            InvalidCString(err) => write!(f, "a c string parameter is invalid: {err}"),
-            InvalidXattrSize((size, len)) => write!(
-                f,
-                "The `size` field of the `SetxattrIn` message does not match the length of the \
-                 decoded value: size = {size}, value.len() = {len}"
-            ),
-            InvalidMessage(err) => write!(f, "cannot process fuse message: {err}"),
-            FailedToWrite(err) => write!(f, "cannot write to buffer: {err}"),
-            FailedToSplitWriter(err) => write!(f, "cannot split a writer: {err}"),
-            FailedToRemapID((uid, gid)) => write!(
-                f,
-                "failed to remap the context of user (uid={uid}, gid={gid})."
-            ),
-        }
-    }
-}
-
-/// Result for Fuse related operations.
-pub type Result<T> = ::std::result::Result<T, Error>;
-
-pub mod abi;
-pub mod api;
-pub mod buffer;
+pub use self::common::*;
 
 #[cfg(all(any(feature = "fusedev", feature = "virtiofs"), target_os = "linux"))]
 pub mod overlayfs;
@@ -128,104 +82,8 @@ pub mod overlayfs;
 pub mod passthrough;
 pub mod transport;
 
-pub mod common;
-pub use self::common::*;
-
 // Tests exercising the Vfs layer together with real filesystem drivers from
 // this crate. They stay here — instead of next to the `api` modules — so the
 // `api` layer remains independent of filesystem drivers.
 #[cfg(test)]
 mod driver_tests;
-
-/// Convert io::ErrorKind to OS error code.
-/// Reference to libstd/sys/unix/mod.rs => decode_error_kind.
-pub fn encode_io_error_kind(kind: ErrorKind) -> i32 {
-    match kind {
-        //ErrorKind::ConnectionRefused => libc::ECONNREFUSED,
-        //ErrorKind::ConnectionReset => libc::ECONNRESET,
-        ErrorKind::PermissionDenied => libc::EPERM | libc::EACCES,
-        //ErrorKind::BrokenPipe => libc::EPIPE,
-        //ErrorKind::NotConnected => libc::ENOTCONN,
-        //ErrorKind::ConnectionAborted => libc::ECONNABORTED,
-        //ErrorKind::AddrNotAvailable => libc::EADDRNOTAVAIL,
-        //ErrorKind::AddrInUse => libc::EADDRINUSE,
-        ErrorKind::NotFound => libc::ENOENT,
-        ErrorKind::Interrupted => libc::EINTR,
-        //ErrorKind::InvalidInput => libc::EINVAL,
-        //ErrorKind::TimedOut => libc::ETIMEDOUT,
-        ErrorKind::AlreadyExists => libc::EEXIST,
-        ErrorKind::WouldBlock => libc::EWOULDBLOCK,
-        _ => libc::EIO,
-    }
-}
-
-/// trim all trailing nul terminators.
-pub fn bytes_to_cstr(buf: &[u8]) -> Result<&CStr> {
-    // There might be multiple 0s at the end of buf, find & use the first one and trim other zeros.
-    match buf.iter().position(|x| *x == 0) {
-        // Convert to a `CStr` so that we can drop the '\0' byte at the end and make sure
-        // there are no interior '\0' bytes.
-        Some(pos) => CStr::from_bytes_with_nul(&buf[0..=pos]).map_err(Error::InvalidCString),
-        None => {
-            // Invalid input, just call CStr::from_bytes_with_nul() for suitable error code
-            CStr::from_bytes_with_nul(buf).map_err(Error::InvalidCString)
-        }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_bytes_to_cstr() {
-        assert_eq!(
-            bytes_to_cstr(&[0x1u8, 0x2u8, 0x0]).unwrap(),
-            CStr::from_bytes_with_nul(&[0x1u8, 0x2u8, 0x0]).unwrap()
-        );
-        assert_eq!(
-            bytes_to_cstr(&[0x1u8, 0x2u8, 0x0, 0x0]).unwrap(),
-            CStr::from_bytes_with_nul(&[0x1u8, 0x2u8, 0x0]).unwrap()
-        );
-        assert_eq!(
-            bytes_to_cstr(&[0x1u8, 0x2u8, 0x0, 0x1]).unwrap(),
-            CStr::from_bytes_with_nul(&[0x1u8, 0x2u8, 0x0]).unwrap()
-        );
-        assert_eq!(
-            bytes_to_cstr(&[0x1u8, 0x2u8, 0x0, 0x0, 0x1]).unwrap(),
-            CStr::from_bytes_with_nul(&[0x1u8, 0x2u8, 0x0]).unwrap()
-        );
-        assert_eq!(
-            bytes_to_cstr(&[0x1u8, 0x2u8, 0x0, 0x1, 0x0]).unwrap(),
-            CStr::from_bytes_with_nul(&[0x1u8, 0x2u8, 0x0]).unwrap()
-        );
-
-        assert_eq!(
-            bytes_to_cstr(&[0x0u8, 0x2u8, 0x0]).unwrap(),
-            CStr::from_bytes_with_nul(&[0x0u8]).unwrap()
-        );
-        assert_eq!(
-            bytes_to_cstr(&[0x0u8, 0x0]).unwrap(),
-            CStr::from_bytes_with_nul(&[0x0u8]).unwrap()
-        );
-        assert_eq!(
-            bytes_to_cstr(&[0x0u8]).unwrap(),
-            CStr::from_bytes_with_nul(&[0x0u8]).unwrap()
-        );
-
-        bytes_to_cstr(&[0x1u8]).unwrap_err();
-        bytes_to_cstr(&[0x1u8, 0x1]).unwrap_err();
-    }
-
-    #[test]
-    fn test_encode_io_error_kind() {
-        assert_eq!(encode_io_error_kind(ErrorKind::NotFound), libc::ENOENT);
-        assert_eq!(encode_io_error_kind(ErrorKind::Interrupted), libc::EINTR);
-        assert_eq!(encode_io_error_kind(ErrorKind::AlreadyExists), libc::EEXIST);
-        assert_eq!(
-            encode_io_error_kind(ErrorKind::WouldBlock),
-            libc::EWOULDBLOCK
-        );
-        assert_eq!(encode_io_error_kind(ErrorKind::TimedOut), libc::EIO);
-    }
-}
