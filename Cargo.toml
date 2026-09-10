@@ -18,6 +18,7 @@ build = "build.rs"
 
 [workspace]
 members = [
+    "crates/fuse-backend-core",
     "tests/passthrough",
     "tests/overlay",
     "tests/benchmark",
@@ -32,13 +33,13 @@ vm-memory = "=0.17.1"
 vmm-sys-util = "0.15.0"
 
 [dependencies]
-arc-swap = "1.5"
 async-trait = { version = "0.1.42", optional = true }
 bitflags = "1.1"
-dbs-snapshot = { version = "1.5.2", optional = true }
+# The version is required so the umbrella crate can be packaged and
+# published against the registry copy once core is released.
+fuse-backend-core = { path = "crates/fuse-backend-core", version = "0.14.0" }
 futures-util = { version = "0.3", optional = true, default-features = false, features = ["alloc"] }
 io-uring = { version = "0.5.8", optional = true }
-lazy_static = "1.4"
 libc = "0.2.68"
 log = "0.4.6"
 mio = { version = "0.8", features = ["os-poll", "os-ext"] }
@@ -50,8 +51,6 @@ vm-memory = { workspace = true, features = ["backend-mmap"] }
 virtio-bindings = { workspace = true, optional = true }
 virtio-queue = { workspace = true, optional = true }
 vhost = { workspace = true, features = ["vhost-user","vhost-user-backend"], optional = true }
-versionize_derive = { version = "0.1.6", optional = true }
-versionize = { version = "0.2.0", optional = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 core-foundation-sys = { version = ">=0.8", optional = true }
@@ -68,6 +67,7 @@ vm-memory = { version = "=0.17.1", features = ["backend-mmap", "backend-bitmap"]
 [features]
 default = ["fusedev"]
 async-io = [
+    "fuse-backend-core/async-io",
     "async-trait",
     "futures-util",
     "tokio-uring",
@@ -77,15 +77,15 @@ async-io = [
     "tokio/macros",
     "io-uring",
 ]
-fusedev = ["vmm-sys-util", "caps", "core-foundation-sys"]
-virtiofs = ["virtio-queue", "caps", "vmm-sys-util"]
-vhost-user-fs = ["virtiofs", "vhost", "caps"]
-persist = ["dbs-snapshot", "versionize", "versionize_derive"]
-fuse-t = []
+fusedev = ["fuse-backend-core/fusedev", "vmm-sys-util", "caps", "core-foundation-sys"]
+virtiofs = ["fuse-backend-core/virtiofs", "virtio-queue", "caps", "vmm-sys-util"]
+vhost-user-fs = ["virtiofs", "fuse-backend-core/vhost-user-fs", "vhost", "caps"]
+persist = ["fuse-backend-core/persist"]
+fuse-t = ["fuse-backend-core/fuse-t"]
 # Experimental: FUSE-over-io_uring transport (kernel >= 6.14, protocol 7.42).
 # The kernel interface is still evolving (queue-count reduction, bufpool
 # extensions); the API and ABI target may change between releases.
-fusedev-uring = ["fusedev", "io-uring"]
+fusedev-uring = ["fusedev", "io-uring", "fuse-backend-core/fusedev-uring"]
 
 [package.metadata.docs.rs]
 all-features = true

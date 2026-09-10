@@ -10,21 +10,16 @@ mod utils;
 use core::panic;
 use std::collections::HashMap;
 use std::ffi::{CStr, CString};
-use std::fs::File;
 use std::io::{Error, ErrorKind, Result, Seek, SeekFrom};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock, Weak};
 
 use crate::abi::fuse_abi::{stat64, statvfs64, CreateIn, ROOT_ID as FUSE_ROOT_ID};
-use crate::api::filesystem::{
-    Context, DirEntry, Entry, Layer, OpenOptions, ZeroCopyReader, ZeroCopyWriter,
-};
+use crate::api::filesystem::{Context, DirEntry, Entry, Layer, OpenOptions};
 #[cfg(not(feature = "async-io"))]
 use crate::api::BackendFileSystem;
 use crate::api::{SLASH_ASCII, VFS_MAX_INO};
 
-use crate::common::file_buf::FileVolatileSlice;
-use crate::common::file_traits::FileReadWriteVolatile;
 use vmm_sys_util::tempfile::TempFile;
 
 use self::config::Config;
@@ -2132,59 +2127,6 @@ impl OverlayFs {
         }
 
         Err(Error::from_raw_os_error(libc::ENOENT))
-    }
-}
-
-impl ZeroCopyReader for File {
-    // Copies at most count bytes from self directly into f at offset off
-    // without storing it in any intermediate buffers.
-    fn read_to(
-        &mut self,
-        f: &mut dyn FileReadWriteVolatile,
-        count: usize,
-        off: u64,
-    ) -> Result<usize> {
-        let mut buf = vec![0_u8; count];
-        let slice = unsafe { FileVolatileSlice::from_raw_ptr(buf.as_mut_ptr(), count) };
-
-        // Read from self to slice.
-        let ret = self.read_volatile(slice)?;
-        if ret > 0 {
-            let slice = unsafe { FileVolatileSlice::from_raw_ptr(buf.as_mut_ptr(), ret) };
-            // Write from slice to f at offset off.
-            f.write_at_volatile(slice, off)
-        } else {
-            Ok(0)
-        }
-    }
-}
-
-impl ZeroCopyWriter for File {
-    // Copies at most count bytes from f at offset off directly into self
-    // without storing it in any intermediate buffers.
-    fn write_from(
-        &mut self,
-        f: &mut dyn FileReadWriteVolatile,
-        count: usize,
-        off: u64,
-    ) -> Result<usize> {
-        let mut buf = vec![0_u8; count];
-        let slice = unsafe { FileVolatileSlice::from_raw_ptr(buf.as_mut_ptr(), count) };
-        // Read from f at offset off to slice.
-        let ret = f.read_at_volatile(slice, off)?;
-
-        if ret > 0 {
-            let slice = unsafe { FileVolatileSlice::from_raw_ptr(buf.as_mut_ptr(), ret) };
-            // Write from slice to self.
-            self.write_volatile(slice)
-        } else {
-            Ok(0)
-        }
-    }
-
-    fn available_bytes(&self) -> usize {
-        // Max usize
-        usize::MAX
     }
 }
 

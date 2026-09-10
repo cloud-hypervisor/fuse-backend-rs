@@ -87,7 +87,7 @@ impl<'a> FileVolatileSlice<'a> {
     ///
     /// ### Example
     /// ```rust
-    /// # use fuse_backend_rs::file_buf::FileVolatileSlice;
+    /// # use fuse_backend_core::file_buf::FileVolatileSlice;
     /// # use vm_memory::bytes::Bytes;
     /// # use std::sync::atomic::Ordering;
     /// let mut buffer = [0u8; 1024];
