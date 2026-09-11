@@ -26,6 +26,43 @@ So the fuse-rs crate is a library to communicate with the Linux FUSE clients, wh
 
 ![arch](docs/images/fuse-backend-architecture.svg)
 
+## Crate layout
+
+The library is a Cargo workspace. The `fuse-backend-rs` crate at the root is a
+thin facade that re-exports the sub-crates under `crates/`, so every historical
+`fuse_backend_rs::{abi, api, buffer, common, transport, passthrough, overlayfs}`
+path and every historical cargo feature (`fusedev`, `virtiofs`, `vhost-user-fs`,
+`async-io`, `persist`, `fuse-t`, `fusedev-uring`) keeps resolving unchanged.
+
+| Crate | Contents |
+| --- | --- |
+| [`fuse-backend-core`](crates/fuse-backend-core) | The transport-neutral layers: Fuse ABI, API/server, VFS, buffers and common utilities. |
+| [`fuse-backend-fusedev`](crates/fuse-backend-fusedev) | The /dev/fuse transport, plus FUSE-over-io_uring and the macFUSE/fuse-t transports. |
+| [`fuse-backend-virtiofs`](crates/fuse-backend-virtiofs) | The virtio-fs transport, carrying Fuse requests over virtio descriptor chains. |
+| [`fuse-backend-passthrough`](crates/fuse-backend-passthrough) | The passthrough filesystem driver (Linux-only). |
+| [`fuse-backend-overlayfs`](crates/fuse-backend-overlayfs) | The overlay filesystem driver stacking read-only layers under a writable one (Linux-only). |
+
+Most users should keep depending on the umbrella crate, which bundles each
+transport with the drivers it has always shipped with:
+
+```toml
+[dependencies]
+fuse-backend-rs = { git = "https://github.com/cloud-hypervisor/fuse-backend-rs", features = ["fusedev"] }
+```
+
+Downstream crates that only need one layer can depend on a sub-crate directly
+and skip the rest of the workspace. For example, a filesystem built on the core
+ABI/API and the passthrough driver:
+
+```toml
+[dependencies]
+fuse-backend-core = { git = "https://github.com/cloud-hypervisor/fuse-backend-rs" }
+fuse-backend-passthrough = { git = "https://github.com/cloud-hypervisor/fuse-backend-rs" }
+```
+
+The sub-crates are not published to crates.io yet, so depend on the git
+repository directly for now.
+
 ## Async IO (Experimental)
 
 Besides the traditional synchronous IO path, an asynchronous IO path is provided
@@ -54,11 +91,11 @@ To serve requests asynchronously, mount the filesystem through `Vfs` and drive a
 ## Examples
 
 ### Filesystem Drivers
-- [Virtual File System](https://github.com/cloud-hypervisor/fuse-backend-rs/tree/master/src/api/vfs)
+- [Virtual File System](https://github.com/cloud-hypervisor/fuse-backend-rs/tree/master/crates/fuse-backend-core/src/api/vfs)
   for an example of union file system.
-- [Pseudo File System](https://github.com/cloud-hypervisor/fuse-backend-rs/blob/master/src/api/pseudo_fs.rs)
+- [Pseudo File System](https://github.com/cloud-hypervisor/fuse-backend-rs/blob/master/crates/fuse-backend-core/src/api/pseudo_fs.rs)
   for an example of pseudo file system.
-- [Passthrough File System](https://github.com/cloud-hypervisor/fuse-backend-rs/tree/master/src/passthrough)
+- [Passthrough File System](https://github.com/cloud-hypervisor/fuse-backend-rs/tree/master/crates/fuse-backend-passthrough/src)
   for an example of passthrough(stacked) file system.
 - [Registry Accelerated File System](https://github.com/dragonflyoss/image-service/tree/master/rafs)
   for an example of readonly file system for container images.
