@@ -5,9 +5,9 @@ use std::sync::Arc;
 
 use super::*;
 use crate::abi::fuse_abi::{stat64, statvfs64};
-#[cfg(any(feature = "vhost-user-fs", feature = "virtiofs"))]
+#[cfg(feature = "virtiofs")]
 use crate::abi::virtio_fs;
-#[cfg(any(feature = "vhost-user-fs", feature = "virtiofs"))]
+#[cfg(feature = "virtiofs")]
 use crate::api::filesystem::FsCacheReqHandler;
 
 impl FileSystem for Vfs {
@@ -648,7 +648,7 @@ impl FileSystem for Vfs {
         self.remap_ctx_ids(ctx, self.get_effective_id_mapping(nodeid.fs_idx()))
     }
 
-    #[cfg(any(feature = "vhost-user-fs", feature = "virtiofs"))]
+    #[cfg(feature = "virtiofs")]
     fn setupmapping(
         &self,
         ctx: &Context,
@@ -670,7 +670,7 @@ impl FileSystem for Vfs {
         }
     }
 
-    #[cfg(any(feature = "vhost-user-fs", feature = "virtiofs"))]
+    #[cfg(feature = "virtiofs")]
     fn removemapping(
         &self,
         ctx: &Context,

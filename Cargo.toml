@@ -86,7 +86,11 @@ virtiofs = [
     "fuse-backend-passthrough/virtiofs",
     "dep:fuse-backend-overlayfs",
 ]
-vhost-user-fs = ["virtiofs", "fuse-backend-virtiofs/vhost-user-fs"]
+# Historical name: a vhost-user-fs server is a virtio-fs device served over
+# vhost-user, so the feature maps onto exactly the virtiofs build. The
+# pre-split `vhost` dependency it once pulled was never referenced by code
+# and was dropped in the crate split.
+vhost-user-fs = ["virtiofs"]
 # Driver-only builds, without any of the bundled transports.
 passthrough = ["dep:fuse-backend-passthrough"]
 overlayfs = ["dep:fuse-backend-overlayfs"]
