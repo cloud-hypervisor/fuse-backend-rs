@@ -14,8 +14,8 @@ use std::sync::{Mutex, RwLockReadGuard, RwLockWriteGuard};
 
 use super::inode_store::InodeId;
 use super::MAX_HOST_INO;
-use crate::abi::fuse_abi as fuse;
-use crate::api::EMPTY_CSTR;
+use fuse_backend_core::abi::fuse_abi as fuse;
+use fuse_backend_core::api::EMPTY_CSTR;
 
 /// the 56th bit used to set the inode to 1 indicates virtual inode
 const VIRTUAL_INODE_FLAG: u64 = 1 << 55;
@@ -82,10 +82,14 @@ impl UniqueInodeGenerator {
 
     #[cfg(test)]
     fn decode_unique_inode(&self, inode: libc::ino64_t) -> io::Result<InodeId> {
-        if inode > crate::api::VFS_MAX_INO {
+        if inode > fuse_backend_core::api::VFS_MAX_INO {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                format!("the inode {} excess {}", inode, crate::api::VFS_MAX_INO),
+                format!(
+                    "the inode {} excess {}",
+                    inode,
+                    fuse_backend_core::api::VFS_MAX_INO
+                ),
             ));
         }
 
@@ -407,7 +411,7 @@ mod tests {
     fn test_stat_fd() {
         let topdir = env!("CARGO_MANIFEST_DIR");
         let dir = File::open(topdir).unwrap();
-        let filename = CString::new("build.rs").unwrap();
+        let filename = CString::new("Cargo.toml").unwrap();
 
         let st1 = stat_fd(&dir, None).unwrap();
         let st2 = stat_fd(&dir, Some(&filename)).unwrap();

@@ -14,8 +14,8 @@ use std::io;
 use async_trait::async_trait;
 
 use super::*;
-use crate::abi::fuse_abi::{CreateIn, OpenOptions, SetattrValid};
-use crate::api::filesystem::{
+use fuse_backend_core::abi::fuse_abi::{CreateIn, OpenOptions, SetattrValid};
+use fuse_backend_core::api::filesystem::{
     AsyncFileSystem, AsyncZeroCopyReader, AsyncZeroCopyWriter, Context, FileSystem,
 };
 
@@ -165,11 +165,11 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
-    use crate::abi::fuse_abi::ROOT_ID;
-    use crate::api::filesystem::{FsOptions, ZeroCopyReader, ZeroCopyWriter};
-    use crate::async_runtime;
-    use crate::file_buf::FileVolatileSlice;
-    use crate::file_traits::{AsyncFileReadWriteVolatile, FileReadWriteVolatile};
+    use fuse_backend_core::abi::fuse_abi::ROOT_ID;
+    use fuse_backend_core::api::filesystem::{FsOptions, ZeroCopyReader, ZeroCopyWriter};
+    use fuse_backend_core::async_runtime;
+    use fuse_backend_core::file_buf::FileVolatileSlice;
+    use fuse_backend_core::file_traits::{AsyncFileReadWriteVolatile, FileReadWriteVolatile};
     use vmm_sys_util::tempdir::TempDir;
 
     /// An in-memory sink implementing `AsyncZeroCopyWriter`, to receive data

@@ -16,7 +16,7 @@ use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use crate::transport::fusedev::{FuseChannelExt, FuseDevReaderExt, FuseSessionExt};
+use crate::{FuseChannelExt, FuseDevReaderExt, FuseSessionExt};
 use mio::{Events, Poll, Token, Waker};
 use nix::errno::Errno;
 use nix::fcntl::{fcntl, FcntlArg, FdFlag, OFlag};
@@ -26,7 +26,7 @@ use nix::sys::epoll::{epoll_ctl, EpollEvent, EpollFlags, EpollOp};
 use nix::unistd::{getgid, getuid, read};
 
 use super::{
-    super::pagesize,
+    pagesize,
     Error::{IoError, SessionFailure},
     FuseBuf, FuseDevWriter, Reader, Result, FUSE_HEADER_SIZE, FUSE_KERN_BUF_PAGES,
 };
@@ -924,11 +924,13 @@ mod asyncio {
     use futures_util::stream::{FuturesUnordered, StreamExt};
     use nix::fcntl::{fcntl, FcntlArg, OFlag};
 
-    use crate::api::filesystem::AsyncFileSystem;
-    use crate::api::server::Server;
-    use crate::async_file::File as AsyncFile;
-    use crate::file_buf::FileVolatileBuf;
-    use crate::transport::{FuseBuf, FuseDevReaderExt, FuseDevWriter, Reader};
+    use fuse_backend_core::api::filesystem::AsyncFileSystem;
+    use fuse_backend_core::api::server::Server;
+    use fuse_backend_core::async_file::File as AsyncFile;
+    use fuse_backend_core::buffer::Reader;
+    use fuse_backend_core::file_buf::FileVolatileBuf;
+
+    use crate::{FuseBuf, FuseDevReaderExt, FuseDevWriter};
 
     /// Default limit on the number of concurrently processed requests.
     ///
@@ -991,7 +993,7 @@ mod asyncio {
     ///
     /// ## Examples
     /// ```text
-    /// let buf_size = (crate::api::server::MAX_BUFFER_SIZE + 0x1000) as usize;
+    /// let buf_size = (fuse_backend_core::api::server::MAX_BUFFER_SIZE + 0x1000) as usize;
     /// let file = session.clone_fuse_file().unwrap();
     /// let state = Arc::new(AtomicBool::new(false));
     /// let mut task = FuseDevTask::new(buf_size, file, fs_server, state.clone());
@@ -1020,7 +1022,7 @@ mod asyncio {
         /// # Parameters
         /// - buf_size: size of buffer to receive requests from/send reply to the fuse fd.
         ///   It must be big enough to hold any request, at least
-        ///   `crate::api::server::MAX_BUFFER_SIZE + 0x1000`, otherwise the kernel rejects
+        ///   `fuse_backend_core::api::server::MAX_BUFFER_SIZE + 0x1000`, otherwise the kernel rejects
         ///   reads from the fuse device with `EINVAL` once the INIT handshake is done.
         ///   Note that requests are processed concurrently, each with its own buffer of
         ///   this size.
@@ -1266,8 +1268,8 @@ mod asyncio {
     #[cfg(test)]
     mod tests {
         use super::*;
-        use crate::async_runtime;
-        use crate::passthrough::{Config, PassthroughFs};
+        use fuse_backend_core::async_runtime;
+        use fuse_backend_passthrough::{Config, PassthroughFs};
         use vmm_sys_util::tempfile::TempFile;
 
         #[test]

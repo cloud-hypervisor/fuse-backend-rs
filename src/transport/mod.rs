@@ -1,6 +1,7 @@
 // Copyright (C) 2020 Alibaba Cloud. All rights reserved.
 //
 // Copyright 2019 The Chromium OS Authors. All rights reserved.
+//
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE-BSD-3-Clause file.
 //
@@ -13,6 +14,11 @@
 //! to support Virtio-fs device. So there are two transport layers supported:
 //! - fusedev: communicate with the FUSE driver through `/dev/fuse`
 //! - virtiofs: communicate with the virtiofsd on host side by using virtio descriptors.
+//!
+//! The transports are implemented by the `fuse-backend-fusedev` and
+//! `fuse-backend-virtiofs` crates and re-exported here, so both the flat
+//! `transport::{FuseSession, ...}` paths and the `transport::fusedev::*`
+//! paths keep resolving.
 
 // Re-export the transport-neutral buffer types so that existing
 // `transport::{pagesize, Error, Reader, Result, Writer}` paths keep
@@ -20,9 +26,9 @@
 pub use crate::buffer::{pagesize, Error, Reader, Result, Writer};
 
 #[cfg(feature = "fusedev")]
-mod fusedev;
+pub use fuse_backend_fusedev as fusedev;
 #[cfg(feature = "virtiofs")]
-mod virtiofs;
+pub use fuse_backend_virtiofs as virtiofs;
 
 #[cfg(all(target_os = "linux", feature = "fusedev"))]
 pub use self::fusedev::BlockingFuseChannel;

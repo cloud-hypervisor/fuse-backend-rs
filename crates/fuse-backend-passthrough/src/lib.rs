@@ -11,6 +11,9 @@
 //! [CrosVM](https://chromium.googlesource.com/chromiumos/platform/crosvm/) project,
 //! with heavy modification/enhancements from Alibaba Cloud OS team.
 
+#[macro_use]
+extern crate log;
+
 use std::any::Any;
 use std::collections::{btree_map, BTreeMap, HashMap};
 use std::ffi::{CStr, CString, OsString};
@@ -37,10 +40,10 @@ use self::util::{
     ebadf, einval, enosys, eperm, is_dir, is_safe_inode, openat, reopen_fd_through_proc, stat_fd,
     FileFlagGuard, UniqueInodeGenerator,
 };
-use crate::abi::fuse_abi as fuse;
-use crate::abi::fuse_abi::Opcode;
-use crate::api::filesystem::Entry;
-use crate::api::{
+use fuse_backend_core::abi::fuse_abi as fuse;
+use fuse_backend_core::abi::fuse_abi::Opcode;
+use fuse_backend_core::api::filesystem::Entry;
+use fuse_backend_core::api::{
     validate_path_component, BackendFileSystem, CURRENT_DIR_CSTR, EMPTY_CSTR, PARENT_DIR_CSTR,
     PROC_SELF_FD_CSTR, SLASH_ASCII, VFS_MAX_INO,
 };
@@ -1002,10 +1005,10 @@ fn drop_cap_fsetid() -> io::Result<Option<CapFsetid>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::abi::fuse_abi::CreateIn;
-    use crate::api::filesystem::*;
-    use crate::api::{Vfs, VfsOptions};
     use caps::{CapSet, Capability};
+    use fuse_backend_core::abi::fuse_abi::CreateIn;
+    use fuse_backend_core::api::filesystem::*;
+    use fuse_backend_core::api::{Vfs, VfsOptions};
     use log;
     use std::io::{Read, Seek, SeekFrom, Write};
     use std::ops::Deref;

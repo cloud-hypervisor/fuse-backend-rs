@@ -2,8 +2,8 @@
 // found in the LICENSE-BSD-3-Clause file.
 
 use super::PassthroughFs;
-use crate::abi::fuse_abi;
-use crate::api::filesystem::Layer;
+use fuse_backend_core::abi::fuse_abi;
+use fuse_backend_core::api::filesystem::Layer;
 
 // Implment Layer trait for PassthroughFs.
 impl Layer for PassthroughFs {

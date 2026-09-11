@@ -17,17 +17,17 @@ use std::time::Duration;
 use super::os_compat::LinuxDirent64;
 use super::util::{stat_fd, sync_fd};
 use super::*;
-use crate::abi::fuse_abi::{CreateIn, Opcode, FOPEN_IN_KILL_SUIDGID, WRITE_KILL_PRIV};
+use fuse_backend_core::abi::fuse_abi::{CreateIn, Opcode, FOPEN_IN_KILL_SUIDGID, WRITE_KILL_PRIV};
 #[cfg(any(feature = "vhost-user-fs", feature = "virtiofs"))]
-use crate::abi::virtio_fs;
+use fuse_backend_core::abi::virtio_fs;
 #[cfg(any(feature = "vhost-user-fs", feature = "virtiofs"))]
-use crate::api::filesystem::FsCacheReqHandler;
-use crate::api::filesystem::{
+use fuse_backend_core::api::filesystem::FsCacheReqHandler;
+use fuse_backend_core::api::filesystem::{
     Context, DirEntry, Entry, FileSystem, FsOptions, GetxattrReply, ListxattrReply, OpenOptions,
     SetattrValid, ZeroCopyReader, ZeroCopyWriter,
 };
-use crate::buffer::pagesize;
-use crate::bytes_to_cstr;
+use fuse_backend_core::buffer::pagesize;
+use fuse_backend_core::bytes_to_cstr;
 
 /// A byte buffer allocated by `posix_memalign()` and freed with `libc::free()`
 /// on drop.
@@ -1713,9 +1713,9 @@ mod tests {
     use std::convert::TryInto;
 
     use super::*;
-    use crate::abi::fuse_abi::ROOT_ID;
-    use crate::file_buf::FileVolatileSlice;
-    use crate::file_traits::FileReadWriteVolatile;
+    use fuse_backend_core::abi::fuse_abi::ROOT_ID;
+    use fuse_backend_core::file_buf::FileVolatileSlice;
+    use fuse_backend_core::file_traits::FileReadWriteVolatile;
     use std::path::Path;
     use vmm_sys_util::{tempdir::TempDir, tempfile::TempFile};
 

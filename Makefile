@@ -61,6 +61,24 @@ test:
 	${CARGO} test ${TARGET} -p fuse-backend-core --no-default-features --features="persist" -- --nocapture --skip integration
 	${CARGO} test ${TARGET} -p fuse-backend-core --no-default-features --features="fusedev-uring" -- --nocapture --skip integration
 	${CARGO} test ${TARGET} -p fuse-backend-core --all-features -- --nocapture --skip integration
+	# `cargo test --features=X` only builds the test targets of the selected
+	# package, so the umbrella rows above never reach the unit tests living in
+	# the other workspace members. Each member owning tests needs its own rows.
+	# Their features are spelled `pkg/feature` because with `-p` a bare
+	# `--features=X` is validated against the workspace root package as well,
+	# which does not define the sub-crate-only names (`uring`).
+	${CARGO} test ${TARGET} -p fuse-backend-fusedev --no-default-features -- --nocapture --skip integration
+	${CARGO} test ${TARGET} -p fuse-backend-fusedev --features="fuse-backend-fusedev/async-io" -- --nocapture --skip integration
+	${CARGO} test ${TARGET} -p fuse-backend-fusedev --features="fuse-backend-fusedev/uring" -- --nocapture --skip integration
+	${CARGO} test ${TARGET} -p fuse-backend-fusedev --all-features -- --nocapture --skip integration
+	${CARGO} test ${TARGET} -p fuse-backend-virtiofs --no-default-features -- --nocapture --skip integration
+	${CARGO} test ${TARGET} -p fuse-backend-virtiofs --all-features -- --nocapture --skip integration
+	${CARGO} test ${TARGET} -p fuse-backend-passthrough --no-default-features -- --nocapture --skip integration
+	${CARGO} test ${TARGET} -p fuse-backend-passthrough --features="fuse-backend-passthrough/async-io" -- --nocapture --skip integration
+	${CARGO} test ${TARGET} -p fuse-backend-passthrough --features="fuse-backend-passthrough/virtiofs" -- --nocapture --skip integration
+	${CARGO} test ${TARGET} -p fuse-backend-passthrough --all-features -- --nocapture --skip integration
+	${CARGO} test ${TARGET} -p fuse-backend-overlayfs --no-default-features -- --nocapture --skip integration
+	${CARGO} test ${TARGET} -p fuse-backend-overlayfs --all-features -- --nocapture --skip integration
 
 smoke:
 	${CARGO} test ${TARGET} --features="fusedev,persist" -- --nocapture
@@ -84,6 +102,13 @@ check-macos: build-macos
 	${CARGO} clippy -p fuse-backend-core --no-default-features -- -Dwarnings
 	${CARGO} test -p fuse-backend-core --no-default-features -- --nocapture --skip integration
 	${CARGO} test -p fuse-backend-core --no-default-features --features="persist" -- --nocapture --skip integration
+	# The fusedev crate owns the macOS session tests; the umbrella rows above
+	# only build it as a dependency and never run its test target. virtiofs,
+	# passthrough and overlayfs are deliberately absent: virtiofs cannot build
+	# on macOS (core's Opcode::SetupMapping/RemoveMapping are Linux-only) and
+	# the two filesystem drivers are Linux-only crates.
+	${CARGO} test -p fuse-backend-fusedev --no-default-features -- --nocapture --skip integration
+	${CARGO} test -p fuse-backend-fusedev --features="fuse-backend-fusedev/fuse-t" -- --nocapture --skip integration
 
 smoke-macos: check-macos
 	${CARGO} test --features="fusedev,fuse-t" -- --nocapture
@@ -92,7 +117,7 @@ docker-smoke:
 	docker run --env RUST_BACKTRACE=1 --rm --privileged --volume ${current_dir}:/fuse-rs rust:1.68 sh -c "rustup component add clippy rustfmt; cd /fuse-rs; make smoke-all"
 
 testoverlay:
-	cd tests/testoverlay && ${CARGO} build
+	${CARGO} build -p overlay
 
 # Setup xfstests env and run.
 xfstests:

@@ -13,6 +13,8 @@ license = "Apache-2.0 AND BSD-3-Clause"
 edition = "2018"
 repository = "https://github.com/cloud-hypervisor/fuse-backend-rs"
 homepage = "https://github.com/cloud-hypervisor/"
+readme = "README.md"
+documentation = "https://docs.rs/fuse-backend-core"
 
 [dependencies]
 arc-swap = "1.5"
@@ -48,10 +50,11 @@ async-io = [
 ]
 persist = ["dbs-snapshot", "versionize", "versionize_derive"]
 # The features below carry no dependencies of their own. They are forwarded
-# from the umbrella `fuse-backend-rs` crate so that code historically written
-# in one crate and cfg-gated on these names keeps compiling with identical
-# semantics (buffer Error variants, server notify/uring/DAX handlers, the
-# `Layer` trait export, and macFUSE reply quirks).
+# from the umbrella `fuse-backend-rs` crate (and enabled directly by the
+# transport crates) so that code historically written in one crate and
+# cfg-gated on these names keeps compiling with identical semantics
+# (buffer Error variants, server notify/uring/DAX handlers, and macFUSE
+# reply quirks).
 fusedev = []
 virtiofs = []
 vhost-user-fs = ["virtiofs"]

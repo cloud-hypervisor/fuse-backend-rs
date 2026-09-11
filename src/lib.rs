@@ -50,36 +50,25 @@
 //!   path based on tokio-uring/io_uring, which is only available on Linux and may change
 //!   in future releases.
 //!
-//! The ABI, API, buffer and common layers are implemented by the [`fuse-backend-core`] crate
-//! and re-exported here, so all historical `fuse_backend_rs::{abi, api, buffer, common}`
-//! paths keep resolving.
+//! The transport-neutral layers (ABI, API, buffers, common utilities) are
+//! implemented by the [`fuse-backend-core`] crate, the transports by the
+//! [`fuse-backend-fusedev`] and [`fuse-backend-virtiofs`] crates, and the
+//! filesystem drivers by the [`fuse-backend-passthrough`] and
+//! [`fuse-backend-overlayfs`] crates. They are all re-exported here, so every
+//! historical `fuse_backend_rs::{abi, api, buffer, common, transport,
+//! passthrough, overlayfs}` path keeps resolving.
 
-extern crate bitflags;
-extern crate libc;
-// The log macros and the BitmapSlice alias are only referenced by the
-// transport and driver modules below, so they go unused when all cargo
-// features are disabled.
-#[allow(unused_imports)]
-#[macro_use]
-extern crate log;
-extern crate vm_memory;
-
-#[allow(unused_imports)]
-use vm_memory::bitmap::BitmapSlice;
-
-// The transport-neutral layers (ABI, API, buffers, common utilities) live in
-// fuse-backend-core; re-export them so in-crate `crate::api` style paths and
-// the historical public paths keep resolving.
 pub use fuse_backend_core::{abi, api, buffer, common};
 
 pub use fuse_backend_core::{bytes_to_cstr, encode_io_error_kind, Error, Result};
 
 pub use self::common::*;
 
+// The drivers are Linux-only, exactly like the in-crate modules they replace.
 #[cfg(all(any(feature = "fusedev", feature = "virtiofs"), target_os = "linux"))]
-pub mod overlayfs;
+pub use fuse_backend_overlayfs as overlayfs;
 #[cfg(all(any(feature = "fusedev", feature = "virtiofs"), target_os = "linux"))]
-pub mod passthrough;
+pub use fuse_backend_passthrough as passthrough;
 pub mod transport;
 
 // Tests exercising the Vfs layer together with real filesystem drivers from

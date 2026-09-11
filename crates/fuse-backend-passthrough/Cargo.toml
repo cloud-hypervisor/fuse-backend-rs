@@ -1,0 +1,47 @@
+[package]
+name = "fuse-backend-passthrough"
+version = "0.14.0"
+keywords = ["fuse", "passthrough", "filesystem"]
+categories = ["filesystem", "os::linux-apis"]
+description = "A passthrough FUSE filesystem driver forwarding requests to the host filesystem (Linux-only)"
+authors = [
+    "Liu Bo <bo.liu@linux.alibaba.com>",
+    "Liu Jiang <gerry@linux.alibaba.com>",
+    "Peng Tao <bergwolf@hyper.sh>",
+]
+license = "Apache-2.0 AND BSD-3-Clause"
+edition = "2018"
+repository = "https://github.com/cloud-hypervisor/fuse-backend-rs"
+homepage = "https://github.com/cloud-hypervisor/"
+readme = "README.md"
+documentation = "https://docs.rs/fuse-backend-passthrough"
+
+[dependencies]
+fuse-backend-core = { path = "../fuse-backend-core", version = "0.14.0" }
+async-trait = { version = "0.1.42", optional = true }
+bitflags = "1.1"
+libc = "0.2.68"
+log = "0.4.6"
+vm-memory = { workspace = true }
+vmm-sys-util = { workspace = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+caps = "0.5"
+
+[features]
+default = []
+async-io = ["async-trait", "fuse-backend-core/async-io"]
+# The DAX window callbacks (`setupmapping`/`removemapping`) operate on
+# `fuse_backend_core::abi::virtio_fs` types, which are gated on core's
+# `virtiofs` cfg. The two features are forwarded from the umbrella
+# `fuse-backend-rs` crate so the callbacks stay compiled under exactly the
+# same conditions as before the crate split.
+virtiofs = ["fuse-backend-core/virtiofs"]
+vhost-user-fs = ["virtiofs"]
+
+[package.metadata.docs.rs]
+all-features = true
+targets = [
+    "x86_64-unknown-linux-gnu",
+    "aarch64-unknown-linux-gnu",
+]
