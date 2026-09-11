@@ -1066,8 +1066,8 @@ pub mod persist {
         }
 
         // Note: the save/restore tests with real `PassthroughFs` backends
-        // live in `crate::driver_tests`, since they depend on a filesystem
-        // driver and the public crate API only.
+        // live in the umbrella crate's `tests/driver_tests.rs`, since they
+        // depend on a filesystem driver and the public crate API only.
 
         // Per-mount id_mappings must survive a save/restore roundtrip so that
         // `restore_mount` does not need the mapping passed in again.

@@ -258,6 +258,7 @@ mod tests {
     }
 
     // Note: the passthrough integration test driving async requests through
-    // the Vfs layer down to a real `PassthroughFs` instance lives in
-    // `crate::driver_tests`, since it depends on a filesystem driver.
+    // the Vfs layer down to a real `PassthroughFs` instance lives in the
+    // umbrella crate's `tests/driver_tests.rs`, since it depends on a
+    // filesystem driver.
 }
