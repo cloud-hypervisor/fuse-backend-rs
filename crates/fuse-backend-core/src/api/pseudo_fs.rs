@@ -478,10 +478,7 @@ pub mod persist {
             let mut s = Snapshot::new(vm, target_version);
             let mut buf = Vec::new();
             s.save(&mut buf, &state).map_err(|e| {
-                IoError::new(
-                    ErrorKind::Other,
-                    format!("Failed to save PseudoFs to bytes: {:?}", e),
-                )
+                IoError::other(format!("Failed to save PseudoFs to bytes: {:?}", e))
             })?;
 
             Ok(buf)
@@ -492,10 +489,7 @@ pub mod persist {
             let state: PseudoFsState =
                 Snapshot::load(&mut buf.as_slice(), buf.len(), PseudoFs::get_version_map())
                     .map_err(|e| {
-                        IoError::new(
-                            ErrorKind::Other,
-                            format!("Failed to load PseudoFs from bytes: {:?}", e),
-                        )
+                        IoError::other(format!("Failed to load PseudoFs from bytes: {:?}", e))
                     })?
                     .0;
             self.restore_from_state(&state)
@@ -518,7 +512,7 @@ pub mod persist {
             inode_map.insert(self.root_inode.ino, self.root_inode.clone());
 
             // then, connect the inodes
-            state_inodes.sort_by(|a, b| a.ino.cmp(&b.ino));
+            state_inodes.sort_by_key(|a| a.ino);
             for inode in state_inodes.iter() {
                 let inode = inode_map
                     .get(&inode.ino)
