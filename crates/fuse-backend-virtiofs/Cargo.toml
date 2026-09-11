@@ -1,0 +1,44 @@
+[package]
+name = "fuse-backend-virtiofs"
+version = "0.14.0"
+keywords = ["virtio", "virtio-fs", "vhost-user-fs"]
+categories = ["filesystem", "os::linux-apis"]
+description = "The virtio-fs transport for FUSE servers, carrying FUSE requests over virtio descriptor chains"
+authors = [
+    "Liu Bo <bo.liu@linux.alibaba.com>",
+    "Liu Jiang <gerry@linux.alibaba.com>",
+    "Peng Tao <bergwolf@hyper.sh>",
+]
+license = "Apache-2.0 AND BSD-3-Clause"
+edition = "2018"
+repository = "https://github.com/cloud-hypervisor/fuse-backend-rs"
+homepage = "https://github.com/cloud-hypervisor/"
+readme = "README.md"
+documentation = "https://docs.rs/fuse-backend-virtiofs"
+
+[dependencies]
+# `features = ["virtiofs"]` is not optional: this transport unconditionally
+# constructs the virtiofs-gated `buffer::Error` variants
+# (FindMemoryRegion/InvalidChain/GuestMemoryError).
+fuse-backend-core = { path = "../fuse-backend-core", version = "0.14.0", features = ["virtiofs"] }
+async-trait = { version = "0.1.42", optional = true }
+vm-memory = { workspace = true }
+virtio-queue = { workspace = true }
+
+[features]
+default = []
+async-io = ["async-trait", "fuse-backend-core/async-io"]
+# vhost-user-fs is a serving mode on top of virtiofs rather than a transport
+# of its own. The feature currently carries no virtiofs-specific code; it is
+# forwarded to core (and from the umbrella crate) so `FileSystem`
+# implementations gated on it (the DAX setup/removemapping callbacks) keep
+# their existing semantics.
+vhost-user-fs = ["fuse-backend-core/vhost-user-fs"]
+
+[package.metadata.docs.rs]
+all-features = true
+targets = [
+    "x86_64-unknown-linux-gnu",
+    "aarch64-unknown-linux-gnu",
+    "aarch64-apple-darwin",
+]

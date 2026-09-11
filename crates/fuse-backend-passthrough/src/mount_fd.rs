@@ -440,13 +440,13 @@ impl std::error::Error for MPRError {}
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::passthrough::file_handle::FileHandle;
+    use crate::file_handle::FileHandle;
 
     #[test]
     fn test_mount_fd_get() {
         let topdir = env!("CARGO_MANIFEST_DIR");
         let dir = File::open(topdir).unwrap();
-        let filename = CString::new("build.rs").unwrap();
+        let filename = CString::new("Cargo.toml").unwrap();
         let mount_fds = MountFds::new(None).unwrap();
         let handle = FileHandle::from_name_at(&dir, &filename).unwrap().unwrap();
 

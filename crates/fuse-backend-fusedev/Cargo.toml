@@ -1,0 +1,72 @@
+[package]
+name = "fuse-backend-fusedev"
+version = "0.14.0"
+keywords = ["fuse", "fusedev", "fuse-t"]
+categories = ["filesystem", "os::linux-apis"]
+description = "The /dev/fuse and FUSE-over-io_uring transport for FUSE servers, and the macFUSE/fuse-t transport for macOS"
+authors = [
+    "Liu Bo <bo.liu@linux.alibaba.com>",
+    "Liu Jiang <gerry@linux.alibaba.com>",
+    "Peng Tao <bergwolf@hyper.sh>",
+]
+license = "Apache-2.0 AND BSD-3-Clause"
+edition = "2018"
+repository = "https://github.com/cloud-hypervisor/fuse-backend-rs"
+homepage = "https://github.com/cloud-hypervisor/"
+readme = "README.md"
+documentation = "https://docs.rs/fuse-backend-fusedev"
+build = "build.rs"
+
+[dependencies]
+# `features = ["fusedev"]` is not optional: this transport unconditionally
+# constructs `buffer::Error::SessionFailure` and serves through the core
+# server methods that are gated on the `fusedev` cfg in core.
+fuse-backend-core = { path = "../fuse-backend-core", version = "0.14.0", features = ["fusedev"] }
+async-trait = { version = "0.1.42", optional = true }
+futures-util = { version = "0.3", optional = true, default-features = false, features = ["alloc"] }
+io-uring = { version = "0.5.8", optional = true }
+libc = "0.2.68"
+log = "0.4.6"
+mio = { version = "0.8", features = ["os-poll", "os-ext"] }
+nix = "0.24"
+tokio = { version = "1", optional = true }
+vm-memory = { workspace = true }
+vmm-sys-util = { workspace = true }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+core-foundation-sys = ">=0.8"
+
+# The tests exercising a live session against a real filesystem driver use
+# `PassthroughFs`, which lives in its own crate.
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+fuse-backend-passthrough = { path = "../fuse-backend-passthrough", version = "0.14.0" }
+
+[features]
+default = []
+async-io = [
+    "async-trait",
+    "futures-util",
+    "tokio/rt",
+    "tokio/macros",
+    "fuse-backend-core/async-io",
+    # The session tests mount a real `PassthroughFs`, and core's
+    # `BackendFileSystem` requires `AsyncFileSystem` once core's `async-io`
+    # is on, so the dev-dependency must be unified with this feature.
+    "fuse-backend-passthrough/async-io",
+]
+# Experimental: FUSE-over-io_uring transport (kernel >= 6.14, protocol 7.42).
+# The kernel interface is still evolving (queue-count reduction, bufpool
+# extensions); the API and ABI target may change between releases.
+uring = ["io-uring", "fuse-backend-core/fusedev-uring"]
+# Serve through the fuse-t library (https://github.com/macos-fuse-t/fuse-t)
+# instead of macFUSE on macOS. Core applies fuse-t specific reply quirks
+# under its own `fuse-t` cfg.
+fuse-t = ["fuse-backend-core/fuse-t"]
+
+[package.metadata.docs.rs]
+all-features = true
+targets = [
+    "x86_64-unknown-linux-gnu",
+    "aarch64-unknown-linux-gnu",
+    "aarch64-apple-darwin",
+]

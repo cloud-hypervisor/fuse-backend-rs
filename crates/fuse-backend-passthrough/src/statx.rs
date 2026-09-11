@@ -9,7 +9,7 @@ use std::os::unix::io::AsRawFd;
 
 use super::os_compat::{statx_st, STATX_BASIC_STATS, STATX_MNT_ID};
 use super::FileHandle;
-use crate::api::EMPTY_CSTR;
+use fuse_backend_core::api::EMPTY_CSTR;
 
 pub type MountId = u64;
 
@@ -154,7 +154,7 @@ mod tests {
     fn test_statx() {
         let topdir = env!("CARGO_MANIFEST_DIR");
         let dir = File::open(topdir).unwrap();
-        let filename = CString::new("build.rs").unwrap();
+        let filename = CString::new("Cargo.toml").unwrap();
 
         let st1 = statx(&dir, None).unwrap();
         let st2 = statx(&dir, Some(&filename)).unwrap();

@@ -28,20 +28,19 @@ use std::thread::{self, JoinHandle};
 use io_uring::{cqueue, opcode, squeue, types, IoUring};
 use vm_memory::ByteValued;
 
-use crate::abi::fuse_abi::{InHeader, OutHeader};
-use crate::abi::fuse_uring::{
+use fuse_backend_core::abi::fuse_abi::{InHeader, OutHeader};
+use fuse_backend_core::abi::fuse_uring::{
     FuseUringCmdReq, FuseUringEntInOut, FuseUringReqHeader, FUSE_IO_URING_CMD_COMMIT_AND_FETCH,
     FUSE_IO_URING_CMD_REGISTER, FUSE_URING_IN_OUT_HEADER_SZ, FUSE_URING_IOV_SEGS,
 };
-use crate::api::filesystem::FileSystem;
-use crate::api::server::Server;
-use crate::file_buf::FileVolatileSlice;
-use crate::file_traits::FileReadWriteVolatile;
-use crate::transport::fusedev::{
-    FuseBuf, FuseChannel, FuseDevReaderExt, FuseSession, FUSE_HEADER_SIZE,
-};
-use crate::transport::{Error::*, Reader, Result, Writer};
-use crate::BitmapSlice;
+use fuse_backend_core::api::filesystem::FileSystem;
+use fuse_backend_core::api::server::Server;
+use fuse_backend_core::buffer::{Error::*, Reader, Result, Writer};
+use fuse_backend_core::file_buf::FileVolatileSlice;
+use fuse_backend_core::file_traits::FileReadWriteVolatile;
+use vm_memory::bitmap::BitmapSlice;
+
+use crate::{FuseBuf, FuseChannel, FuseDevReaderExt, FuseSession, FUSE_HEADER_SIZE};
 
 /// Size of `fuse_in_header`/`fuse_out_header` on the wire.
 const IN_HEADER_SIZE: usize = 40;
@@ -941,7 +940,7 @@ impl<F: FileSystem + Send + Sync + 'static> UringFuseServing<F> {
                     if let Err(e) = server.handle_message(reader, writer, None, None) {
                         match e {
                             // The kernel has shut down this session.
-                            crate::Error::EncodeMessage(ref err)
+                            fuse_backend_core::Error::EncodeMessage(ref err)
                                 if err.raw_os_error() == Some(libc::EBADF) =>
                             {
                                 break
@@ -985,14 +984,14 @@ mod tests {
 
     use vmm_sys_util::tempdir::TempDir;
 
-    use crate::abi::fuse_abi::{
+    use fuse_backend_core::abi::fuse_abi::{
         AccessIn, AttrOut, BatchForgetIn, BmapIn, CopyFileRangeIn, CreateIn, EntryOut, FallocateIn,
         FlushIn, ForgetIn, FsyncIn, GetattrIn, GetxattrIn, InHeader, InitIn, InterruptIn, IoctlIn,
         LinkIn, LkIn, LseekIn, MkdirIn, MknodIn, Opcode, OpenIn, OutHeader, PollIn, ReadIn,
         ReleaseIn, Rename2In, RenameIn, SetattrIn, SetxattrIn, WriteIn, ROOT_ID,
     };
-    use crate::api::filesystem::FsOptions;
-    use crate::passthrough::{Config, PassthroughFs};
+    use fuse_backend_core::api::filesystem::FsOptions;
+    use fuse_backend_passthrough::{Config, PassthroughFs};
 
     #[test]
     fn test_parse_cpu_mask() {

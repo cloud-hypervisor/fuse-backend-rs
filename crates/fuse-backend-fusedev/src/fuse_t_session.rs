@@ -29,8 +29,8 @@ use super::{
     Error::IoError, Error::SessionFailure, FuseBuf, FuseDevWriter, Reader, Result,
     FUSE_HEADER_SIZE, FUSE_KERN_BUF_PAGES,
 };
-use crate::transport::fusedev::{FuseChannelExt, FuseDevReaderExt};
-use crate::transport::pagesize;
+use crate::pagesize;
+use crate::{FuseChannelExt, FuseDevReaderExt};
 
 // These follows definition from libfuse.
 const FS_SND_SIZE: usize = 4 * 1024 * 1024;
@@ -488,4 +488,4 @@ mod tests {
     }
 }
 
-use crate::abi::fuse_abi::InHeader;
+use fuse_backend_core::abi::fuse_abi::InHeader;

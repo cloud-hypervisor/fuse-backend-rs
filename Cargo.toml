@@ -14,11 +14,14 @@ license = "Apache-2.0 AND BSD-3-Clause"
 edition = "2018"
 repository = "https://github.com/cloud-hypervisor/fuse-backend-rs"
 homepage = "https://github.com/cloud-hypervisor/"
-build = "build.rs"
 
 [workspace]
 members = [
     "crates/fuse-backend-core",
+    "crates/fuse-backend-fusedev",
+    "crates/fuse-backend-virtiofs",
+    "crates/fuse-backend-passthrough",
+    "crates/fuse-backend-overlayfs",
     "tests/passthrough",
     "tests/overlay",
     "tests/benchmark",
@@ -26,66 +29,55 @@ members = [
 
 [workspace.dependencies]
 # rust-vmm crates
-vhost = "0.15.0"
-virtio-bindings = "0.2.7"
 virtio-queue = "0.17.0"
 vm-memory = "=0.17.1"
 vmm-sys-util = "0.15.0"
 
 [dependencies]
-async-trait = { version = "0.1.42", optional = true }
-bitflags = "1.1"
-# The version is required so the umbrella crate can be packaged and
-# published against the registry copy once core is released.
+# The versions are required so the umbrella crate can be packaged and
+# published against the registry copies once the sub-crates are released.
 fuse-backend-core = { path = "crates/fuse-backend-core", version = "0.14.0" }
-futures-util = { version = "0.3", optional = true, default-features = false, features = ["alloc"] }
-io-uring = { version = "0.5.8", optional = true }
-libc = "0.2.68"
-log = "0.4.6"
-mio = { version = "0.8", features = ["os-poll", "os-ext"] }
-nix = "0.24"
-radix_trie = "0.2.1"
-tokio = { version = "1", optional = true }
-vmm-sys-util = { workspace = true, optional = true }
-vm-memory = { workspace = true, features = ["backend-mmap"] }
-virtio-bindings = { workspace = true, optional = true }
-virtio-queue = { workspace = true, optional = true }
-vhost = { workspace = true, features = ["vhost-user","vhost-user-backend"], optional = true }
+fuse-backend-fusedev = { path = "crates/fuse-backend-fusedev", version = "0.14.0", optional = true }
+fuse-backend-virtiofs = { path = "crates/fuse-backend-virtiofs", version = "0.14.0", optional = true }
 
-[target.'cfg(target_os = "macos")'.dependencies]
-core-foundation-sys = { version = ">=0.8", optional = true }
-
+# The filesystem drivers are Linux-only.
 [target.'cfg(target_os = "linux")'.dependencies]
-caps = { version = "0.5", optional = true }
-tokio-uring = { version = "0.4.0", optional = true }
+fuse-backend-passthrough = { path = "crates/fuse-backend-passthrough", version = "0.14.0", optional = true }
+fuse-backend-overlayfs = { path = "crates/fuse-backend-overlayfs", version = "0.14.0", optional = true }
 
 [dev-dependencies]
-vmm-sys-util = "0.15.0"
+async-trait = "0.1.42"
+libc = "0.2.68"
+log = "0.4.6"
+nix = "0.24"
 tempfile = "3"
-vm-memory = { version = "=0.17.1", features = ["backend-mmap", "backend-bitmap"] }
+tokio = { version = "1", features = ["rt", "macros", "sync"] }
+vmm-sys-util = "0.15.0"
 
 [features]
 default = ["fusedev"]
+# Forwarding `async-io` to the sub-crates with the `pkg/feature` syntax also
+# activates those optional dependencies, so an async-io-only build compiles
+# the sub-crates even when no transport feature is selected. The umbrella's
+# own re-exports stay gated on the transport features below, so its public
+# surface is unchanged; resolver-level weak dependencies would avoid the
+# extra compilation but require `resolver = "2"`.
 async-io = [
     "fuse-backend-core/async-io",
-    "async-trait",
-    "futures-util",
-    "tokio-uring",
-    "tokio/fs",
-    "tokio/sync",
-    "tokio/rt",
-    "tokio/macros",
-    "io-uring",
+    "fuse-backend-fusedev/async-io",
+    "fuse-backend-virtiofs/async-io",
+    "fuse-backend-passthrough/async-io",
+    "fuse-backend-overlayfs/async-io",
 ]
-fusedev = ["fuse-backend-core/fusedev", "vmm-sys-util", "caps", "core-foundation-sys"]
-virtiofs = ["fuse-backend-core/virtiofs", "virtio-queue", "caps", "vmm-sys-util"]
-vhost-user-fs = ["virtiofs", "fuse-backend-core/vhost-user-fs", "vhost", "caps"]
+fusedev = ["fuse-backend-fusedev", "fuse-backend-passthrough", "fuse-backend-overlayfs"]
+virtiofs = ["fuse-backend-virtiofs", "fuse-backend-passthrough/virtiofs", "fuse-backend-overlayfs"]
+vhost-user-fs = ["virtiofs", "fuse-backend-virtiofs/vhost-user-fs"]
 persist = ["fuse-backend-core/persist"]
-fuse-t = ["fuse-backend-core/fuse-t"]
+fuse-t = ["fuse-backend-fusedev/fuse-t"]
 # Experimental: FUSE-over-io_uring transport (kernel >= 6.14, protocol 7.42).
 # The kernel interface is still evolving (queue-count reduction, bufpool
 # extensions); the API and ABI target may change between releases.
-fusedev-uring = ["fusedev", "io-uring", "fuse-backend-core/fusedev-uring"]
+fusedev-uring = ["fusedev", "fuse-backend-fusedev/uring"]
 
 [package.metadata.docs.rs]
 all-features = true

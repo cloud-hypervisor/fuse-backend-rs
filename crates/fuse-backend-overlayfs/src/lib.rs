@@ -2,6 +2,10 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #![allow(missing_docs)]
+
+#[macro_use]
+extern crate log;
+
 pub mod config;
 mod inode_store;
 pub mod sync_io;
@@ -14,11 +18,11 @@ use std::io::{Error, ErrorKind, Result, Seek, SeekFrom};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock, Weak};
 
-use crate::abi::fuse_abi::{stat64, statvfs64, CreateIn, ROOT_ID as FUSE_ROOT_ID};
-use crate::api::filesystem::{Context, DirEntry, Entry, Layer, OpenOptions};
+use fuse_backend_core::abi::fuse_abi::{stat64, statvfs64, CreateIn, ROOT_ID as FUSE_ROOT_ID};
+use fuse_backend_core::api::filesystem::{Context, DirEntry, Entry, Layer, OpenOptions};
 #[cfg(not(feature = "async-io"))]
-use crate::api::BackendFileSystem;
-use crate::api::{SLASH_ASCII, VFS_MAX_INO};
+use fuse_backend_core::api::BackendFileSystem;
+use fuse_backend_core::api::{SLASH_ASCII, VFS_MAX_INO};
 
 use vmm_sys_util::tempfile::TempFile;
 

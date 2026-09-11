@@ -17,15 +17,24 @@ jobs:
       - name: Publish
         run: |
           sudo apt-get update && sudo apt-get install --yes sed
+          CRATES="core passthrough overlayfs virtiofs fusedev"
           VERSION=$(sed --regexp-extended --silent 's/^version = \"(.*)"$/\1/p' Cargo.toml)
-          CORE_VERSION=$(sed --regexp-extended --silent 's/^version = \"(.*)"$/\1/p' crates/fuse-backend-core/Cargo.toml)
           [ "$GITHUB_REF_NAME" == "v$VERSION" ]
-          # Both crates are published from one tag; fail early if the two
-          # manifests drift apart.
-          [ "$VERSION" == "$CORE_VERSION" ]
-          # fuse-backend-rs depends on fuse-backend-core by path, so core
-          # must be published first.
-          cargo publish --token ${{ secrets.CRATES_IO_TOKEN }} -p fuse-backend-core
+          # All six crates are published from one tag; fail early if any
+          # manifest drifts apart.
+          for CRATE in $CRATES; do
+            CRATE_VERSION=$(sed --regexp-extended --silent 's/^version = \"(.*)"$/\1/p' crates/fuse-backend-$CRATE/Cargo.toml)
+            [ "$VERSION" == "$CRATE_VERSION" ]
+          done
+          # The workspace crates depend on each other by path, and `cargo
+          # publish` resolves those dependencies against the registry, so
+          # publish bottom-up: core first (everything depends on it),
+          # passthrough before fusedev (fusedev's Linux dev-dependency on
+          # passthrough is resolved from the registry as well), and the
+          # umbrella last (it depends on all five sub-crates).
+          for CRATE in $CRATES; do
+            cargo publish --token ${{ secrets.CRATES_IO_TOKEN }} -p fuse-backend-$CRATE
+          done
           cargo publish --token ${{ secrets.CRATES_IO_TOKEN }}
       - name: Release
         uses: softprops/action-gh-release@v1

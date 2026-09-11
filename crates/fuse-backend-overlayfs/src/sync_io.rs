@@ -9,8 +9,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::abi::fuse_abi::{stat64, statvfs64, CreateIn};
-use crate::api::filesystem::{
+use fuse_backend_core::abi::fuse_abi::{stat64, statvfs64, CreateIn};
+use fuse_backend_core::api::filesystem::{
     Context, DirEntry, Entry, FileSystem, FsOptions, GetxattrReply, ListxattrReply, OpenOptions,
     SetattrValid, ZeroCopyReader, ZeroCopyWriter,
 };

@@ -15,7 +15,7 @@ use std::sync::Arc;
 use vmm_sys_util::fam::{FamStruct, FamStructWrapper};
 
 use super::mount_fd::{MPRResult, MountFd, MountFds, MountId};
-use crate::api::EMPTY_CSTR;
+use fuse_backend_core::api::EMPTY_CSTR;
 
 /// An arbitrary maximum size for CFileHandle::f_handle.
 ///
@@ -415,7 +415,7 @@ mod tests {
     fn test_file_handle_from_name_at() {
         let topdir = env!("CARGO_MANIFEST_DIR");
         let dir = File::open(topdir).unwrap();
-        let filename = CString::new("build.rs").unwrap();
+        let filename = CString::new("Cargo.toml").unwrap();
 
         let dir_handle = FileHandle::from_name_at(&dir, &CString::new("").unwrap())
             .unwrap()

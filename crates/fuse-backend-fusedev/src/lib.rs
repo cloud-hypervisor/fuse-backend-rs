@@ -7,6 +7,9 @@
 //! With fusedev transport driver, requests received from `/dev/fuse` will be stored in an internal
 //! buffer and the whole reply message must be written all at once.
 
+#[macro_use]
+extern crate log;
+
 use std::io::{self, IoSlice, Write};
 use std::marker::PhantomData;
 use std::mem::ManuallyDrop;
@@ -15,17 +18,20 @@ use std::os::unix::io::RawFd;
 
 use nix::sys::uio::writev;
 use nix::unistd::write;
+use vm_memory::bitmap::BitmapSlice;
 use vm_memory::ByteValued;
-#[cfg(all(target_os = "linux", feature = "fusedev-uring"))]
+#[cfg(all(target_os = "linux", feature = "uring"))]
 use vm_memory::VolatileSlice;
 
-use super::Writer;
-use crate::buffer::{Error, Reader, Result};
-use crate::file_buf::FileVolatileSlice;
+use fuse_backend_core::file_buf::FileVolatileSlice;
 #[cfg(feature = "async-io")]
-use crate::file_traits::AsyncFileReadWriteVolatile;
-use crate::file_traits::FileReadWriteVolatile;
-use crate::BitmapSlice;
+use fuse_backend_core::file_traits::AsyncFileReadWriteVolatile;
+use fuse_backend_core::file_traits::FileReadWriteVolatile;
+
+// Re-export the transport-neutral buffer types so the session backends below
+// can keep using `super::{Error::IoError, ...}` style imports, and so users
+// of this crate get the buffer surface it builds on from one place.
+pub use fuse_backend_core::buffer::{pagesize, Error, Reader, Result, Writer};
 
 #[cfg(target_os = "linux")]
 mod linux_session;
@@ -42,9 +48,9 @@ mod fuse_t_session;
 #[cfg(all(target_os = "macos", feature = "fuse-t"))]
 pub use fuse_t_session::*;
 
-#[cfg(all(target_os = "linux", feature = "fusedev-uring"))]
+#[cfg(all(target_os = "linux", feature = "uring"))]
 mod uring_session;
-#[cfg(all(target_os = "linux", feature = "fusedev-uring"))]
+#[cfg(all(target_os = "linux", feature = "uring"))]
 pub use uring_session::*;
 
 // These follow the definition from libfuse.
@@ -83,7 +89,7 @@ pub trait FuseDevReaderExt<'a, S: BitmapSlice + Default> {
     /// Used by the FUSE-over-io_uring transport to avoid copying the request
     /// payload (e.g. WRITE data) from the ring entry into a scratch buffer —
     /// the Reader reads directly from the entry's payload area instead.
-    #[cfg(all(target_os = "linux", feature = "fusedev-uring"))]
+    #[cfg(all(target_os = "linux", feature = "uring"))]
     fn from_uring_buffers(header: &'a mut [u8], payload: &'a mut [u8]) -> Result<Reader<'a, S>>;
 }
 
@@ -92,7 +98,7 @@ impl<'a, S: BitmapSlice + Default> FuseDevReaderExt<'a, S> for Reader<'a, S> {
         Ok(Reader::from_slice(buf.mem))
     }
 
-    #[cfg(all(target_os = "linux", feature = "fusedev-uring"))]
+    #[cfg(all(target_os = "linux", feature = "uring"))]
     fn from_uring_buffers(header: &'a mut [u8], payload: &'a mut [u8]) -> Result<Reader<'a, S>> {
         let mut slices = Vec::with_capacity(2);
         // Safe because Reader has the same lifetime as the input slices.
@@ -501,8 +507,8 @@ pub trait FuseChannelExt {
 #[cfg(feature = "async-io")]
 mod async_io {
     use super::*;
-    use crate::file_buf::FileVolatileBuf;
-    use crate::file_traits::AsyncFileReadWriteVolatile;
+    use fuse_backend_core::file_buf::FileVolatileBuf;
+    use fuse_backend_core::file_traits::AsyncFileReadWriteVolatile;
 
     impl<'a, S: BitmapSlice> FuseDevWriter<'a, S> {
         /// Write data from a buffer into this writer in asynchronous mode.
@@ -1092,8 +1098,8 @@ mod tests {
     mod async_io {
         use vmm_sys_util::tempdir::TempDir;
 
-        use crate::async_file::File;
-        use crate::async_runtime;
+        use fuse_backend_core::async_file::File;
+        use fuse_backend_core::async_runtime;
 
         use super::*;
 
