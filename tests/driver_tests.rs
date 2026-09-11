@@ -4,22 +4,22 @@
 
 //! Tests exercising the Vfs layer together with real filesystem drivers.
 //!
-//! Unlike the unit tests embedded in the `api` modules, these tests depend on
-//! concrete drivers from the `passthrough` module, so they stay in the
-//! umbrella crate instead of moving into `fuse-backend-core`. They only use
-//! the public crate API.
+//! Unlike the unit tests embedded in the `api` modules of `fuse-backend-core`,
+//! these tests depend on a concrete driver, so they live in the umbrella
+//! crate's integration tests — the only place where both the Vfs API and the
+//! `passthrough` driver are visible. They only use the public crate API.
 
 /// Vfs save/restore round trips with real `PassthroughFs` backends mounted,
 /// including index allocation state and per-mount restore.
 #[cfg(all(
     target_os = "linux",
     feature = "persist",
-    any(feature = "fusedev", feature = "virtiofs")
+    any(feature = "fusedev", feature = "virtiofs", feature = "passthrough")
 ))]
 mod vfs_persist {
-    use crate::api::filesystem::{FileSystem, FsOptions};
-    use crate::api::{Vfs, VfsIndex, VfsOptions};
-    use crate::passthrough::{Config, PassthroughFs};
+    use fuse_backend_rs::api::filesystem::{FileSystem, FsOptions};
+    use fuse_backend_rs::api::{Vfs, VfsIndex, VfsOptions};
+    use fuse_backend_rs::passthrough::{Config, PassthroughFs};
 
     fn new_backend_fs() -> Box<PassthroughFs<()>> {
         let fs_cfg = Config::default();
@@ -32,7 +32,7 @@ mod vfs_persist {
     fn test_vfs_save_restore_with_backend_fs() {
         // create new vfs
         let vfs = &Vfs::new(VfsOptions::default());
-        let paths = vec!["/a", "/a/b", "/a/b/c", "/b", "/b/a/c", "/d"];
+        let paths = ["/a", "/a/b", "/a/b/c", "/b", "/b/a/c", "/d"];
         // record the backend fs and their VfsIndexes
         let backend_fs_list: Vec<(&str, VfsIndex)> = paths
             .iter()
@@ -76,7 +76,7 @@ mod vfs_persist {
     fn test_vfs_save_restore_with_backend_fs_with_initialized() {
         // create new vfs
         let vfs = &Vfs::new(VfsOptions::default());
-        let paths = vec!["/a", "/a/b", "/a/b/c", "/b", "/b/a/c", "/d"];
+        let paths = ["/a", "/a/b", "/a/b/c", "/b", "/b/a/c", "/d"];
         let backend_fs_list: Vec<(&str, VfsIndex)> = paths
             .iter()
             .map(|path| {
@@ -122,7 +122,7 @@ mod vfs_persist {
 #[cfg(all(
     target_os = "linux",
     feature = "async-io",
-    any(feature = "fusedev", feature = "virtiofs")
+    any(feature = "fusedev", feature = "virtiofs", feature = "passthrough")
 ))]
 mod vfs_async {
     use std::ffi::CString;
@@ -131,14 +131,14 @@ mod vfs_async {
 
     use async_trait::async_trait;
 
-    use crate::api::filesystem::{
+    use fuse_backend_rs::api::filesystem::{
         AsyncFileSystem, AsyncZeroCopyWriter, Context, FileSystem, FsOptions, ZeroCopyWriter,
         ROOT_ID,
     };
-    use crate::api::{Vfs, VfsOptions};
-    use crate::file_buf::FileVolatileSlice;
-    use crate::file_traits::{AsyncFileReadWriteVolatile, FileReadWriteVolatile};
-    use crate::passthrough::{Config, PassthroughFs};
+    use fuse_backend_rs::api::{Vfs, VfsOptions};
+    use fuse_backend_rs::file_buf::FileVolatileSlice;
+    use fuse_backend_rs::file_traits::{AsyncFileReadWriteVolatile, FileReadWriteVolatile};
+    use fuse_backend_rs::passthrough::{Config, PassthroughFs};
 
     /// An in-memory sink implementing `AsyncZeroCopyWriter`, to receive data
     /// from `async_read()`.

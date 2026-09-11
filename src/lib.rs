@@ -85,9 +85,3 @@ pub use fuse_backend_overlayfs as overlayfs;
 ))]
 pub use fuse_backend_passthrough as passthrough;
 pub mod transport;
-
-// Tests exercising the Vfs layer together with real filesystem drivers from
-// this crate. They stay here — instead of next to the `api` modules — so the
-// `api` layer remains independent of filesystem drivers.
-#[cfg(test)]
-mod driver_tests;
