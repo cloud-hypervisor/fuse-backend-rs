@@ -57,6 +57,13 @@
 //! [`fuse-backend-overlayfs`] crates. They are all re-exported here, so every
 //! historical `fuse_backend_rs::{abi, api, buffer, common, transport,
 //! passthrough, overlayfs}` path keeps resolving.
+//!
+//! The historical cargo feature names keep working too: `fusedev`,
+//! `virtiofs`, `vhost-user-fs`, `async-io`, `persist`, `fuse-t` and
+//! `fusedev-uring` are forwarded onto the sub-crates, and each transport
+//! still bundles the drivers it has always shipped with. The additional
+//! `passthrough` and `overlayfs` features select a driver on its own,
+//! without any transport.
 
 pub use fuse_backend_core::{abi, api, buffer, common};
 
@@ -65,9 +72,17 @@ pub use fuse_backend_core::{bytes_to_cstr, encode_io_error_kind, Error, Result};
 pub use self::common::*;
 
 // The drivers are Linux-only, exactly like the in-crate modules they replace.
-#[cfg(all(any(feature = "fusedev", feature = "virtiofs"), target_os = "linux"))]
+// They are bundled with the `fusedev`/`virtiofs` transports and can also be
+// selected on their own via the `passthrough`/`overlayfs` features.
+#[cfg(all(
+    any(feature = "fusedev", feature = "virtiofs", feature = "overlayfs"),
+    target_os = "linux"
+))]
 pub use fuse_backend_overlayfs as overlayfs;
-#[cfg(all(any(feature = "fusedev", feature = "virtiofs"), target_os = "linux"))]
+#[cfg(all(
+    any(feature = "fusedev", feature = "virtiofs", feature = "passthrough"),
+    target_os = "linux"
+))]
 pub use fuse_backend_passthrough as passthrough;
 pub mod transport;
 

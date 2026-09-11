@@ -56,6 +56,13 @@ vmm-sys-util = "0.15.0"
 
 [features]
 default = ["fusedev"]
+# Facade feature mapping: each historical feature name is forwarded onto the
+# sub-crate dependencies. The transports keep pulling in the drivers they have
+# always been bundled with, so historical builds see the same modules; the
+# `passthrough`/`overlayfs` features additionally allow selecting a driver on
+# its own. The `dep:` prefix keeps the dependency crate names themselves out of
+# the public feature list.
+#
 # Forwarding `async-io` to the sub-crates with the `pkg/feature` syntax also
 # activates those optional dependencies, so an async-io-only build compiles
 # the sub-crates even when no transport feature is selected. The umbrella's
@@ -69,9 +76,20 @@ async-io = [
     "fuse-backend-passthrough/async-io",
     "fuse-backend-overlayfs/async-io",
 ]
-fusedev = ["fuse-backend-fusedev", "fuse-backend-passthrough", "fuse-backend-overlayfs"]
-virtiofs = ["fuse-backend-virtiofs", "fuse-backend-passthrough/virtiofs", "fuse-backend-overlayfs"]
+fusedev = [
+    "dep:fuse-backend-fusedev",
+    "dep:fuse-backend-passthrough",
+    "dep:fuse-backend-overlayfs",
+]
+virtiofs = [
+    "dep:fuse-backend-virtiofs",
+    "fuse-backend-passthrough/virtiofs",
+    "dep:fuse-backend-overlayfs",
+]
 vhost-user-fs = ["virtiofs", "fuse-backend-virtiofs/vhost-user-fs"]
+# Driver-only builds, without any of the bundled transports.
+passthrough = ["dep:fuse-backend-passthrough"]
+overlayfs = ["dep:fuse-backend-overlayfs"]
 persist = ["fuse-backend-core/persist"]
 fuse-t = ["fuse-backend-fusedev/fuse-t"]
 # Experimental: FUSE-over-io_uring transport (kernel >= 6.14, protocol 7.42).
