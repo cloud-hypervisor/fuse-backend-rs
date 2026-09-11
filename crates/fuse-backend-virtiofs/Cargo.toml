@@ -28,12 +28,6 @@ virtio-queue = { workspace = true }
 [features]
 default = []
 async-io = ["async-trait", "fuse-backend-core/async-io"]
-# vhost-user-fs is a serving mode on top of virtiofs rather than a transport
-# of its own. The feature currently carries no virtiofs-specific code; it is
-# forwarded to core (and from the umbrella crate) so `FileSystem`
-# implementations gated on it (the DAX setup/removemapping callbacks) keep
-# their existing semantics.
-vhost-user-fs = ["fuse-backend-core/vhost-user-fs"]
 
 [package.metadata.docs.rs]
 all-features = true

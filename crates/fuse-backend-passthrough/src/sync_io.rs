@@ -18,9 +18,9 @@ use super::os_compat::LinuxDirent64;
 use super::util::{stat_fd, sync_fd};
 use super::*;
 use fuse_backend_core::abi::fuse_abi::{CreateIn, Opcode, FOPEN_IN_KILL_SUIDGID, WRITE_KILL_PRIV};
-#[cfg(any(feature = "vhost-user-fs", feature = "virtiofs"))]
+#[cfg(feature = "virtiofs")]
 use fuse_backend_core::abi::virtio_fs;
-#[cfg(any(feature = "vhost-user-fs", feature = "virtiofs"))]
+#[cfg(feature = "virtiofs")]
 use fuse_backend_core::api::filesystem::FsCacheReqHandler;
 use fuse_backend_core::api::filesystem::{
     Context, DirEntry, Entry, FileSystem, FsOptions, GetxattrReply, ListxattrReply, OpenOptions,
@@ -972,7 +972,7 @@ impl<S: BitmapSlice + Send + Sync> FileSystem for PassthroughFs<S> {
         self.do_unlink(parent, name, 0)
     }
 
-    #[cfg(any(feature = "vhost-user-fs", feature = "virtiofs"))]
+    #[cfg(feature = "virtiofs")]
     fn setupmapping(
         &self,
         _ctx: &Context,
@@ -999,7 +999,7 @@ impl<S: BitmapSlice + Send + Sync> FileSystem for PassthroughFs<S> {
         (*vu_req).map(foffset, moffset, len, flags, file.as_raw_fd())
     }
 
-    #[cfg(any(feature = "vhost-user-fs", feature = "virtiofs"))]
+    #[cfg(feature = "virtiofs")]
     fn removemapping(
         &self,
         _ctx: &Context,

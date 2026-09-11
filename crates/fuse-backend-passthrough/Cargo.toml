@@ -33,11 +33,10 @@ default = []
 async-io = ["async-trait", "fuse-backend-core/async-io"]
 # The DAX window callbacks (`setupmapping`/`removemapping`) operate on
 # `fuse_backend_core::abi::virtio_fs` types, which are gated on core's
-# `virtiofs` cfg. The two features are forwarded from the umbrella
+# `virtiofs` cfg. The feature is forwarded from the umbrella
 # `fuse-backend-rs` crate so the callbacks stay compiled under exactly the
 # same conditions as before the crate split.
 virtiofs = ["fuse-backend-core/virtiofs"]
-vhost-user-fs = ["virtiofs"]
 
 [package.metadata.docs.rs]
 all-features = true
