@@ -1,7 +1,33 @@
 # Changelog
 ## [Unreleased]
 ### Added
+- [#NNN](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/NNN): Split the library into a layered Cargo workspace and break the layers out into
+  their own crates — `fuse-backend-core` (ABI, API/server, VFS, buffers),
+  `fuse-backend-fusedev` and `fuse-backend-virtiofs` (transports), and
+  `fuse-backend-passthrough` and `fuse-backend-overlayfs` (filesystem drivers) —
+  so they can be depended on directly instead of only through the umbrella crate.
+- [#NNN](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/NNN): Add standalone `passthrough` and `overlayfs` cargo features that select a
+  filesystem driver on its own, without any transport.
 - [188](https://github.com/cloud-hypervisor/fuse-backend-rs/issues/188): docs: document the experimental status of async-io support.
+
+### Changed
+- [#NNN](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/NNN): `fuse-backend-rs` is now a thin facade re-exporting the sub-crates. Every
+  historical `fuse_backend_rs::{abi, api, buffer, common, transport, passthrough,
+  overlayfs}` import path and cargo feature name (`fusedev`, `virtiofs`,
+  `vhost-user-fs`, `async-io`, `persist`, `fuse-t`, `fusedev-uring`) still
+  resolves to the same types, so existing dependency lines are unchanged.
+- [#NNN](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/NNN): Small breaking surface from the layering fix (a 0.x release may break API):
+  `transport::Writer` is a trait now instead of an enum, so code naming its
+  variants must adapt; the transport-specific `Reader` constructors
+  (`from_fuse_buffer`, `from_descriptor_chain`) moved onto the `FuseDevReaderExt`
+  and `VirtioFsReaderExt` extension traits and need that trait in scope (the
+  `Reader::from_…` spelling is otherwise unchanged); and the virtio-specific
+  `transport::Error` variants moved onto the virtiofs error type.
+
+### Removed
+- [#NNN](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/NNN): Drop the vestigial `vhost` and `virtio-bindings` dependencies that the
+  pre-split `vhost-user-fs` build carried but never referenced; `vhost-user-fs`
+  is now an alias for the `virtiofs` build.
 
 ## [0.14.0]
 ### Added
