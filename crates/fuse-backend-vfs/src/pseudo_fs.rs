@@ -19,8 +19,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
-use crate::abi::fuse_abi::{stat64, Attr};
-use crate::api::filesystem::*;
+use fuse_backend_core::abi::fuse_abi::{stat64, Attr};
+use fuse_backend_core::api::filesystem::*;
 
 // ID 0 is reserved for invalid entry, and ID 1 is used for ROOT_ID.
 const PSEUDOFS_NEXT_INODE: u64 = 2;
@@ -426,7 +426,7 @@ pub mod persist {
     use versionize_derive::Versionize;
 
     use super::{PseudoFs, PseudoInode};
-    use crate::api::filesystem::ROOT_ID;
+    use fuse_backend_core::api::filesystem::ROOT_ID;
 
     #[derive(Versionize, PartialEq, Debug, Default, Clone)]
     struct PseudoInodeState {
@@ -547,7 +547,7 @@ pub mod persist {
 
         #[test]
         fn save_restore_test() {
-            use crate::api::pseudo_fs::PseudoFs;
+            use crate::pseudo_fs::PseudoFs;
 
             let fs = &PseudoFs::new();
             let paths = vec!["/a", "/a/b", "/a/b/c", "/b", "/b/a/c", "/d"];

@@ -1,0 +1,54 @@
+[package]
+name = "fuse-backend-vfs"
+version = "0.14.0"
+keywords = ["fuse", "vfs", "union-filesystem"]
+categories = ["filesystem", "os::linux-apis"]
+description = "A union FUSE filesystem multiplexer that mounts several backend filesystems under one inode namespace"
+authors = [
+    "Liu Bo <bo.liu@linux.alibaba.com>",
+    "Liu Jiang <gerry@linux.alibaba.com>",
+    "Peng Tao <bergwolf@hyper.sh>",
+]
+license = "Apache-2.0 AND BSD-3-Clause"
+edition = "2018"
+rust-version = "1.80"
+repository = "https://github.com/cloud-hypervisor/fuse-backend-rs"
+homepage = "https://github.com/cloud-hypervisor/"
+readme = "README.md"
+documentation = "https://docs.rs/fuse-backend-vfs"
+
+[dependencies]
+fuse-backend-core = { path = "../fuse-backend-core", version = "0.14.0" }
+arc-swap = "1.5"
+libc = "0.2.68"
+log = "0.4.6"
+async-trait = { version = "0.1.42", optional = true }
+dbs-snapshot = { version = "1.5.2", optional = true }
+versionize = { version = "0.2.0", optional = true }
+versionize_derive = { version = "0.1.6", optional = true }
+
+[dev-dependencies]
+# The async unit tests drive `Vfs` (and, for the relocated server test,
+# `Server<Vfs>`) on a tokio runtime via `#[tokio::test]`.
+tokio = { version = "1", features = ["rt", "macros", "sync", "fs"] }
+
+[features]
+default = []
+# The async serving path (`impl AsyncFileSystem for Vfs`) mirrors core's
+# `async-io` feature and needs `async-trait` for the async trait methods.
+async-io = ["fuse-backend-core/async-io", "async-trait"]
+# The DAX `setupmapping`/`removemapping` handlers only make sense for a virtio-fs
+# device, so they stay gated behind the same `virtiofs` feature core uses (which
+# is what exposes `abi::virtio_fs` and the `FsCacheReqHandler` mount contract).
+virtiofs = ["fuse-backend-core/virtiofs"]
+# Snapshot/restore of the mount table (`VfsState`/`PseudoFsState`), the state
+# that used to live behind core's `persist` feature.
+persist = ["dbs-snapshot", "versionize", "versionize_derive"]
+
+[package.metadata.docs.rs]
+all-features = true
+targets = [
+    "x86_64-unknown-linux-gnu",
+    "aarch64-unknown-linux-gnu",
+    "aarch64-apple-darwin",
+]

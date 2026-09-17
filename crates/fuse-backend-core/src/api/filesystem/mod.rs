@@ -48,9 +48,10 @@ pub use overlay::Layer;
 
 // The path/inode helpers and the `BackendFileSystem` mount contract below are
 // multiplexer-neutral: filesystem drivers (passthrough, overlayfs) depend on
-// them unconditionally, whether or not the `Vfs` union filesystem is used.
-// They live here in the always-compiled `api::filesystem` layer and are
-// re-exported from `api::vfs` to preserve the historical `api::vfs::*` paths.
+// them unconditionally, whether or not the `fuse-backend-vfs` union filesystem
+// is used. They live here in the always-compiled `api::filesystem` layer, and
+// the `fuse-backend-vfs` crate re-exports them to preserve the historical
+// `api::vfs::*` paths.
 
 /// Current directory
 pub const CURRENT_DIR_CSTR: &[u8] = b".\0";

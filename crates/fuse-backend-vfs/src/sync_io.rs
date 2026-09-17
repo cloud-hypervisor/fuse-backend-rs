@@ -4,11 +4,11 @@
 use std::sync::Arc;
 
 use super::*;
-use crate::abi::fuse_abi::{stat64, statvfs64};
+use fuse_backend_core::abi::fuse_abi::{stat64, statvfs64};
 #[cfg(feature = "virtiofs")]
-use crate::abi::virtio_fs;
+use fuse_backend_core::abi::virtio_fs;
 #[cfg(feature = "virtiofs")]
-use crate::api::filesystem::FsCacheReqHandler;
+use fuse_backend_core::api::filesystem::FsCacheReqHandler;
 
 impl FileSystem for Vfs {
     type Inode = VfsInode;

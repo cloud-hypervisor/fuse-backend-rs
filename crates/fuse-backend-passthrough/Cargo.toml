@@ -29,6 +29,11 @@ vmm-sys-util = { workspace = true }
 [target.'cfg(target_os = "linux")'.dependencies]
 caps = "0.5"
 
+[dev-dependencies]
+# The unit tests mount a `PassthroughFs` into a `Vfs` union to check option
+# propagation (e.g. `no_open`); `Vfs` now lives in the `fuse-backend-vfs` crate.
+fuse-backend-vfs = { path = "../fuse-backend-vfs", version = "0.14.0" }
+
 [features]
 default = []
 async-io = ["async-trait", "fuse-backend-core/async-io"]

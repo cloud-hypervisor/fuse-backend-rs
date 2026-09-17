@@ -643,25 +643,3 @@ impl<'a, F: AsyncFileSystem, S: BitmapSlice, W: Writer> SrvContext<'a, F, S, W> 
         }
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::super::test_util::TestWriter;
-    use super::*;
-    use crate::api::Vfs;
-
-    #[test]
-    fn test_vfs_async_invalid_header() {
-        let vfs = Vfs::default();
-        let server = Server::new(vfs);
-        let mut r_buf = [0u8];
-        let r = Reader::<()>::from_slice(&mut r_buf);
-        let mut w_buf = vec![0x0u8; 1000];
-        let w = TestWriter::new(&mut w_buf);
-
-        let result = crate::async_runtime::block_on(async {
-            unsafe { server.async_handle_message(r, w, None, None).await }
-        });
-        assert!(result.is_err());
-    }
-}
