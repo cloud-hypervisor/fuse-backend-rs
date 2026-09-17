@@ -21,8 +21,12 @@
   variants must adapt; the transport-specific `Reader` constructors
   (`from_fuse_buffer`, `from_descriptor_chain`) moved onto the `FuseDevReaderExt`
   and `VirtioFsReaderExt` extension traits and need that trait in scope (the
-  `Reader::from_…` spelling is otherwise unchanged); and the virtio-specific
-  `transport::Error` variants moved onto the virtiofs error type.
+  `Reader::from_…` spelling is otherwise unchanged); and on `transport::Error`
+  the never-constructed `ConvertIndirectDescriptor` variant was removed, while
+  `FindMemoryRegion` and `InvalidChain` are now gated behind the `virtiofs`
+  feature. Those variants stay on the same `transport::Error` type (there is no
+  separate virtiofs error type), so a `virtiofs` build matching them is
+  unaffected.
 
 ### Removed
 - [#NNN](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/NNN): Drop the vestigial `vhost` and `virtio-bindings` dependencies that the
