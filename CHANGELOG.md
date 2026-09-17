@@ -1,22 +1,26 @@
 # Changelog
 ## [Unreleased]
 ### Added
-- [#NNN](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/NNN): Split the library into a layered Cargo workspace and break the layers out into
-  their own crates — `fuse-backend-core` (ABI, API/server, VFS, buffers),
+- [254](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/254): Split the library into a layered Cargo workspace and break the layers out into
+  their own crates — `fuse-backend-core` (ABI, API/server, buffers),
   `fuse-backend-fusedev` and `fuse-backend-virtiofs` (transports), and
   `fuse-backend-passthrough` and `fuse-backend-overlayfs` (filesystem drivers) —
   so they can be depended on directly instead of only through the umbrella crate.
-- [#NNN](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/NNN): Add standalone `passthrough` and `overlayfs` cargo features that select a
+- [254](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/254): Add standalone `passthrough` and `overlayfs` cargo features that select a
   filesystem driver on its own, without any transport.
+- [252](https://github.com/cloud-hypervisor/fuse-backend-rs/issues/252): Extract the `Vfs` union multiplexer (with its `pseudo_fs` backing store) into
+  a seventh crate, `fuse-backend-vfs`, resolving RFC open question 3. It sits
+  between the facade and `fuse-backend-core` and carries the `arc-swap` and
+  `persist` (`versionize`/`dbs-snapshot`) stack that the multiplexer needs.
 - [188](https://github.com/cloud-hypervisor/fuse-backend-rs/issues/188): docs: document the experimental status of async-io support.
 
 ### Changed
-- [#NNN](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/NNN): `fuse-backend-rs` is now a thin facade re-exporting the sub-crates. Every
+- [254](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/254): `fuse-backend-rs` is now a thin facade re-exporting the sub-crates. Every
   historical `fuse_backend_rs::{abi, api, buffer, common, transport, passthrough,
   overlayfs}` import path and cargo feature name (`fusedev`, `virtiofs`,
   `vhost-user-fs`, `async-io`, `persist`, `fuse-t`, `fusedev-uring`) still
   resolves to the same types, so existing dependency lines are unchanged.
-- [#NNN](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/NNN): Small breaking surface from the layering fix (a 0.x release may break API):
+- [254](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/254): Small breaking surface from the layering fix (a 0.x release may break API):
   `transport::Writer` is a trait now instead of an enum, so code naming its
   variants must adapt; the transport-specific `Reader` constructors
   (`from_fuse_buffer`, `from_descriptor_chain`) moved onto the `FuseDevReaderExt`
@@ -27,13 +31,24 @@
   feature. Those variants stay on the same `transport::Error` type (there is no
   separate virtiofs error type), so a `virtiofs` build matching them is
   unaffected.
-- [#NNN](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/NNN): Replace the `lazy_static` dependency with `std::sync::LazyLock` and declare
+- [252](https://github.com/cloud-hypervisor/fuse-backend-rs/issues/252): Replace the `lazy_static` dependency with `std::sync::LazyLock` and declare
   an explicit MSRV of Rust 1.80 (`rust-version = "1.80"`) on every published
   crate. No API change; this drops one dependency and formalizes the minimum
   toolchain, which was previously undeclared (CI builds on `stable`).
+- [252](https://github.com/cloud-hypervisor/fuse-backend-rs/issues/252): `Vfs`, `arc-swap` and the `persist` snapshot stack
+  (`versionize`/`dbs-snapshot`) move out of `fuse-backend-core` into
+  `fuse-backend-vfs`, so a consumer that brings its own `FileSystem` and does
+  not need the multiplexer can depend on `fuse-backend-core` directly and skip
+  `arc-swap` entirely (`cargo tree -p fuse-backend-core --all-features` shows no
+  `arc-swap` or `dbs-snapshot`). The umbrella crate depends on
+  `fuse-backend-vfs` unconditionally and still re-exports the historical
+  `api::vfs::*` and flat `api::Vfs` paths under every feature combination
+  (guarded by `tests/legacy_paths.rs`), so existing imports and the
+  `persist`/`async-io` feature names are unchanged, and snapshots stay
+  byte-compatible.
 
 ### Removed
-- [#NNN](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/NNN): Drop the vestigial `vhost` and `virtio-bindings` dependencies that the
+- [254](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/254): Drop the vestigial `vhost` and `virtio-bindings` dependencies that the
   pre-split `vhost-user-fs` build carried but never referenced; `vhost-user-fs`
   is now an alias for the `virtiofs` build.
 
