@@ -19,9 +19,9 @@ use std::collections::VecDeque;
 use std::io::{self, Read};
 use std::mem::{size_of, MaybeUninit};
 use std::ptr::copy_nonoverlapping;
+use std::sync::LazyLock;
 use std::{cmp, fmt};
 
-use lazy_static::lazy_static;
 use libc::{sysconf, _SC_PAGESIZE};
 use vm_memory::{ByteValued, VolatileSlice};
 
@@ -697,9 +697,7 @@ mod async_io {
     }
 }
 
-lazy_static! {
-    static ref PAGESIZE: usize = unsafe { sysconf(_SC_PAGESIZE) as usize };
-}
+static PAGESIZE: LazyLock<usize> = LazyLock::new(|| unsafe { sysconf(_SC_PAGESIZE) as usize });
 
 /// Safe wrapper for `sysconf(_SC_PAGESIZE)`.
 #[inline(always)]

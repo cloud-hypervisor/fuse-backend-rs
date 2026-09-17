@@ -12,4 +12,3 @@ vmm-sys-util = { workspace = true }
 libc = ">=0.2.68"
 simple_logger = ">=1.13.0"
 signal-hook = ">=0.3.10"
-lazy_static = ">=1.4.0"
