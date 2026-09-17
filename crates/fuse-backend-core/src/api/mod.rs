@@ -14,11 +14,16 @@
 
 mod pseudo_fs;
 
-pub mod vfs;
-pub use vfs::{
-    validate_path_component, BackFileSystem, BackendFileSystem, Vfs, VfsIndex, VfsOptions,
-    CURRENT_DIR_CSTR, EMPTY_CSTR, PARENT_DIR_CSTR, PROC_SELF_FD_CSTR, SLASH_ASCII, VFS_MAX_INO,
-};
-
 pub mod filesystem;
 pub mod server;
+pub mod vfs;
+
+// The multiplexer-neutral helpers are re-exported from `filesystem` (their
+// definition site); only the union-filesystem multiplexer itself comes from
+// `vfs`. Both sets keep resolving at the flat `api::*` paths, and the
+// `api::vfs::*` module paths are preserved by a shim inside `vfs`.
+pub use filesystem::{
+    validate_path_component, BackFileSystem, BackendFileSystem, CURRENT_DIR_CSTR, EMPTY_CSTR,
+    PARENT_DIR_CSTR, PROC_SELF_FD_CSTR, SLASH_ASCII, VFS_MAX_INO,
+};
+pub use vfs::{Vfs, VfsIndex, VfsOptions};

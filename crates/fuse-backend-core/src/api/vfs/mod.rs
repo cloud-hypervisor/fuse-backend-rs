@@ -15,7 +15,6 @@
 //! a new backend file system could be mounted onto a subdirectory, instead of hot-adding
 //! another virtio-fs device. This is very convenient to manage container images at runtime.
 
-use std::any::Any;
 use std::collections::HashMap;
 use std::ffi::CStr;
 use std::fmt;
@@ -36,19 +35,15 @@ use crate::api::pseudo_fs::PseudoFs;
 mod async_io;
 mod sync_io;
 
-/// Current directory
-pub const CURRENT_DIR_CSTR: &[u8] = b".\0";
-/// Parent directory
-pub const PARENT_DIR_CSTR: &[u8] = b"..\0";
-/// Emptry CSTR
-pub const EMPTY_CSTR: &[u8] = b"\0";
-/// Proc fd directory
-pub const PROC_SELF_FD_CSTR: &[u8] = b"/proc/self/fd\0";
-/// ASCII for slash('/')
-pub const SLASH_ASCII: u8 = 47;
-
-/// Maximum inode number supported by the VFS for backend file system
-pub const VFS_MAX_INO: u64 = 0xff_ffff_ffff_ffff;
+// The multiplexer-neutral path/inode helpers and the `BackendFileSystem` mount
+// contract now live in the always-compiled `api::filesystem` layer, so they
+// stay available to filesystem drivers even when the `Vfs` union filesystem is
+// not used. They are re-exported here to preserve the historical `api::vfs::*`
+// import paths.
+pub use crate::api::filesystem::{
+    validate_path_component, BackFileSystem, BackendFileSystem, CURRENT_DIR_CSTR, EMPTY_CSTR,
+    PARENT_DIR_CSTR, PROC_SELF_FD_CSTR, SLASH_ASCII, VFS_MAX_INO,
+};
 
 // The 64bit inode number for VFS is divided into two parts:
 // 1. an 8-bit file-system index, to identify mounted backend file systems.
@@ -116,12 +111,6 @@ impl std::error::Error for VfsError {}
 /// Vfs result
 pub type VfsResult<T> = std::result::Result<T, VfsError>;
 
-#[inline]
-fn is_dot_or_dotdot(name: &CStr) -> bool {
-    let bytes = name.to_bytes_with_nul();
-    bytes.starts_with(CURRENT_DIR_CSTR) || bytes.starts_with(PARENT_DIR_CSTR)
-}
-
 /// Remaps `value` from a source range beginning at `from_base` to a target
 /// range beginning at `to_base`. Returns `value` unchanged if it falls
 /// outside the source range.
@@ -131,27 +120,6 @@ fn remap_id(value: u32, from_base: u32, to_base: u32, range: u32) -> u32 {
         value - from_base + to_base
     } else {
         value
-    }
-}
-
-// Is `path` a single path component that is not "." or ".."?
-fn is_safe_path_component(name: &CStr) -> bool {
-    let bytes = name.to_bytes_with_nul();
-
-    if bytes.contains(&SLASH_ASCII) {
-        return false;
-    }
-    !is_dot_or_dotdot(name)
-}
-
-/// Validate a path component. A well behaved FUSE client should never send dot, dotdot and path
-/// components containing slash ('/'). The only exception is that LOOKUP might contain dot and
-/// dotdot to support NFS export.
-#[inline]
-pub fn validate_path_component(name: &CStr) -> io::Result<()> {
-    match is_safe_path_component(name) {
-        true => Ok(()),
-        false => Err(io::Error::from_raw_os_error(libc::EINVAL)),
     }
 }
 
@@ -194,39 +162,6 @@ enum Either<A, B> {
     Right(B),
 }
 use Either::*;
-
-/// Type that implements BackendFileSystem and Sync and Send
-pub type BackFileSystem = Box<dyn BackendFileSystem<Inode = u64, Handle = u64> + Sync + Send>;
-
-#[cfg(not(feature = "async-io"))]
-/// BackendFileSystem abstracts all backend file systems under vfs
-pub trait BackendFileSystem: FileSystem {
-    /// mount returns the backend file system root inode entry and
-    /// the largest inode number it has.
-    fn mount(&self) -> Result<(Entry, u64)> {
-        Err(Error::from_raw_os_error(libc::ENOSYS))
-    }
-
-    /// Provides a reference to the Any trait. This is useful to let
-    /// the caller have access to the underlying type behind the
-    /// trait.
-    fn as_any(&self) -> &dyn Any;
-}
-
-#[cfg(feature = "async-io")]
-/// BackendFileSystem abstracts all backend file systems under vfs
-pub trait BackendFileSystem: AsyncFileSystem {
-    /// mount returns the backend file system root inode entry and
-    /// the largest inode number it has.
-    fn mount(&self) -> Result<(Entry, u64)> {
-        Err(Error::from_raw_os_error(libc::ENOSYS))
-    }
-
-    /// Provides a reference to the Any trait. This is useful to let
-    /// the caller have access to the underlying type behind the
-    /// trait.
-    fn as_any(&self) -> &dyn Any;
-}
 
 struct MountPointData {
     fs_idx: VfsIndex,
@@ -1153,6 +1088,7 @@ pub mod persist {
 mod tests {
     use super::*;
     use crate::api::Vfs;
+    use std::any::Any;
     use std::ffi::CString;
     use std::io::{Error, ErrorKind};
 
@@ -1187,69 +1123,6 @@ mod tests {
                 ..Default::default()
             })
         }
-    }
-
-    #[test]
-    fn test_is_safe_path_component() {
-        let name = CStr::from_bytes_with_nul(b"normal\0").unwrap();
-        assert!(is_safe_path_component(name), "\"{:?}\"", name);
-
-        let name = CStr::from_bytes_with_nul(b".a\0").unwrap();
-        assert!(is_safe_path_component(name));
-
-        let name = CStr::from_bytes_with_nul(b"a.a\0").unwrap();
-        assert!(is_safe_path_component(name));
-
-        let name = CStr::from_bytes_with_nul(b"a.a\0").unwrap();
-        assert!(is_safe_path_component(name));
-
-        let name = CStr::from_bytes_with_nul(b"/\0").unwrap();
-        assert!(!is_safe_path_component(name));
-
-        let name = CStr::from_bytes_with_nul(b"/a\0").unwrap();
-        assert!(!is_safe_path_component(name));
-
-        let name = CStr::from_bytes_with_nul(b".\0").unwrap();
-        assert!(!is_safe_path_component(name));
-
-        let name = CStr::from_bytes_with_nul(b"..\0").unwrap();
-        assert!(!is_safe_path_component(name));
-
-        let name = CStr::from_bytes_with_nul(b"../.\0").unwrap();
-        assert!(!is_safe_path_component(name));
-
-        let name = CStr::from_bytes_with_nul(b"a/b\0").unwrap();
-        assert!(!is_safe_path_component(name));
-
-        let name = CStr::from_bytes_with_nul(b"./../a\0").unwrap();
-        assert!(!is_safe_path_component(name));
-    }
-
-    #[test]
-    fn test_is_dot_or_dotdot() {
-        let name = CStr::from_bytes_with_nul(b"..\0").unwrap();
-        assert!(is_dot_or_dotdot(name));
-
-        let name = CStr::from_bytes_with_nul(b".\0").unwrap();
-        assert!(is_dot_or_dotdot(name));
-
-        let name = CStr::from_bytes_with_nul(b"...\0").unwrap();
-        assert!(!is_dot_or_dotdot(name));
-
-        let name = CStr::from_bytes_with_nul(b"./.\0").unwrap();
-        assert!(!is_dot_or_dotdot(name));
-
-        let name = CStr::from_bytes_with_nul(b"a\0").unwrap();
-        assert!(!is_dot_or_dotdot(name));
-
-        let name = CStr::from_bytes_with_nul(b"aa\0").unwrap();
-        assert!(!is_dot_or_dotdot(name));
-
-        let name = CStr::from_bytes_with_nul(b"/a\0").unwrap();
-        assert!(!is_dot_or_dotdot(name));
-
-        let name = CStr::from_bytes_with_nul(b"a/\0").unwrap();
-        assert!(!is_dot_or_dotdot(name));
     }
 
     #[cfg(feature = "async-io")]

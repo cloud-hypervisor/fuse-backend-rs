@@ -8,7 +8,9 @@
 //! The [FileSystem](trait.FileSystem.html) trait is the connection between the transport layer
 //! and the backend filesystem server. Other structs are used to pass information from the
 
+use std::any::Any;
 use std::convert::TryInto;
+use std::ffi::CStr;
 use std::fs::File;
 use std::io;
 use std::time::Duration;
@@ -43,6 +45,86 @@ pub use sync_io::FileSystem;
 mod overlay;
 #[cfg(target_os = "linux")]
 pub use overlay::Layer;
+
+// The path/inode helpers and the `BackendFileSystem` mount contract below are
+// multiplexer-neutral: filesystem drivers (passthrough, overlayfs) depend on
+// them unconditionally, whether or not the `Vfs` union filesystem is used.
+// They live here in the always-compiled `api::filesystem` layer and are
+// re-exported from `api::vfs` to preserve the historical `api::vfs::*` paths.
+
+/// Current directory
+pub const CURRENT_DIR_CSTR: &[u8] = b".\0";
+/// Parent directory
+pub const PARENT_DIR_CSTR: &[u8] = b"..\0";
+/// Emptry CSTR
+pub const EMPTY_CSTR: &[u8] = b"\0";
+/// Proc fd directory
+pub const PROC_SELF_FD_CSTR: &[u8] = b"/proc/self/fd\0";
+/// ASCII for slash('/')
+pub const SLASH_ASCII: u8 = 47;
+
+/// Maximum inode number supported by the VFS for backend file system
+pub const VFS_MAX_INO: u64 = 0xff_ffff_ffff_ffff;
+
+#[inline]
+fn is_dot_or_dotdot(name: &CStr) -> bool {
+    let bytes = name.to_bytes_with_nul();
+    bytes.starts_with(CURRENT_DIR_CSTR) || bytes.starts_with(PARENT_DIR_CSTR)
+}
+
+// Is `path` a single path component that is not "." or ".."?
+fn is_safe_path_component(name: &CStr) -> bool {
+    let bytes = name.to_bytes_with_nul();
+
+    if bytes.contains(&SLASH_ASCII) {
+        return false;
+    }
+    !is_dot_or_dotdot(name)
+}
+
+/// Validate a path component. A well behaved FUSE client should never send dot, dotdot and path
+/// components containing slash ('/'). The only exception is that LOOKUP might contain dot and
+/// dotdot to support NFS export.
+#[inline]
+pub fn validate_path_component(name: &CStr) -> io::Result<()> {
+    match is_safe_path_component(name) {
+        true => Ok(()),
+        false => Err(io::Error::from_raw_os_error(libc::EINVAL)),
+    }
+}
+
+/// Type that implements BackendFileSystem and Sync and Send
+pub type BackFileSystem = Box<dyn BackendFileSystem<Inode = u64, Handle = u64> + Sync + Send>;
+
+#[cfg(not(feature = "async-io"))]
+/// BackendFileSystem abstracts all backend file systems under vfs
+pub trait BackendFileSystem: FileSystem {
+    /// mount returns the backend file system root inode entry and
+    /// the largest inode number it has.
+    fn mount(&self) -> io::Result<(Entry, u64)> {
+        Err(io::Error::from_raw_os_error(libc::ENOSYS))
+    }
+
+    /// Provides a reference to the Any trait. This is useful to let
+    /// the caller have access to the underlying type behind the
+    /// trait.
+    fn as_any(&self) -> &dyn Any;
+}
+
+#[cfg(feature = "async-io")]
+/// BackendFileSystem abstracts all backend file systems under vfs
+pub trait BackendFileSystem: AsyncFileSystem {
+    /// mount returns the backend file system root inode entry and
+    /// the largest inode number it has.
+    fn mount(&self) -> io::Result<(Entry, u64)> {
+        Err(io::Error::from_raw_os_error(libc::ENOSYS))
+    }
+
+    /// Provides a reference to the Any trait. This is useful to let
+    /// the caller have access to the underlying type behind the
+    /// trait.
+    fn as_any(&self) -> &dyn Any;
+}
 
 /// Information about a path in the filesystem.
 #[derive(Copy, Clone, Debug)]
@@ -517,5 +599,68 @@ mod tests {
 
         assert_eq!(fuse_entry.nodeid, 1);
         assert_eq!(fuse_entry.generation, 2);
+    }
+
+    #[test]
+    fn test_is_safe_path_component() {
+        let name = CStr::from_bytes_with_nul(b"normal\0").unwrap();
+        assert!(is_safe_path_component(name), "\"{:?}\"", name);
+
+        let name = CStr::from_bytes_with_nul(b".a\0").unwrap();
+        assert!(is_safe_path_component(name));
+
+        let name = CStr::from_bytes_with_nul(b"a.a\0").unwrap();
+        assert!(is_safe_path_component(name));
+
+        let name = CStr::from_bytes_with_nul(b"a.a\0").unwrap();
+        assert!(is_safe_path_component(name));
+
+        let name = CStr::from_bytes_with_nul(b"/\0").unwrap();
+        assert!(!is_safe_path_component(name));
+
+        let name = CStr::from_bytes_with_nul(b"/a\0").unwrap();
+        assert!(!is_safe_path_component(name));
+
+        let name = CStr::from_bytes_with_nul(b".\0").unwrap();
+        assert!(!is_safe_path_component(name));
+
+        let name = CStr::from_bytes_with_nul(b"..\0").unwrap();
+        assert!(!is_safe_path_component(name));
+
+        let name = CStr::from_bytes_with_nul(b"../.\0").unwrap();
+        assert!(!is_safe_path_component(name));
+
+        let name = CStr::from_bytes_with_nul(b"a/b\0").unwrap();
+        assert!(!is_safe_path_component(name));
+
+        let name = CStr::from_bytes_with_nul(b"./../a\0").unwrap();
+        assert!(!is_safe_path_component(name));
+    }
+
+    #[test]
+    fn test_is_dot_or_dotdot() {
+        let name = CStr::from_bytes_with_nul(b"..\0").unwrap();
+        assert!(is_dot_or_dotdot(name));
+
+        let name = CStr::from_bytes_with_nul(b".\0").unwrap();
+        assert!(is_dot_or_dotdot(name));
+
+        let name = CStr::from_bytes_with_nul(b"...\0").unwrap();
+        assert!(!is_dot_or_dotdot(name));
+
+        let name = CStr::from_bytes_with_nul(b"./.\0").unwrap();
+        assert!(!is_dot_or_dotdot(name));
+
+        let name = CStr::from_bytes_with_nul(b"a\0").unwrap();
+        assert!(!is_dot_or_dotdot(name));
+
+        let name = CStr::from_bytes_with_nul(b"aa\0").unwrap();
+        assert!(!is_dot_or_dotdot(name));
+
+        let name = CStr::from_bytes_with_nul(b"/a\0").unwrap();
+        assert!(!is_dot_or_dotdot(name));
+
+        let name = CStr::from_bytes_with_nul(b"a/\0").unwrap();
+        assert!(!is_dot_or_dotdot(name));
     }
 }
