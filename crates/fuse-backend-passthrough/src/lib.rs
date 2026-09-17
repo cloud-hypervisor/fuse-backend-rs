@@ -1008,7 +1008,7 @@ mod tests {
     use caps::{CapSet, Capability};
     use fuse_backend_core::abi::fuse_abi::CreateIn;
     use fuse_backend_core::api::filesystem::*;
-    use fuse_backend_core::api::{Vfs, VfsOptions};
+    use fuse_backend_vfs::{Vfs, VfsOptions};
     use log;
     use std::io::{Read, Seek, SeekFrom, Write};
     use std::ops::Deref;

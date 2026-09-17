@@ -51,7 +51,8 @@
 //!   in future releases.
 //!
 //! The transport-neutral layers (ABI, API, buffers, common utilities) are
-//! implemented by the [`fuse-backend-core`] crate, the transports by the
+//! implemented by the [`fuse-backend-core`] crate, the `Vfs` union multiplexer
+//! by the [`fuse-backend-vfs`] crate, the transports by the
 //! [`fuse-backend-fusedev`] and [`fuse-backend-virtiofs`] crates, and the
 //! filesystem drivers by the [`fuse-backend-passthrough`] and
 //! [`fuse-backend-overlayfs`] crates. They are all re-exported here, so every
@@ -65,7 +66,27 @@
 //! `passthrough` and `overlayfs` features select a driver on its own,
 //! without any transport.
 
-pub use fuse_backend_core::{abi, api, buffer, common};
+pub use fuse_backend_core::{abi, buffer, common};
+
+/// Fuse Application Programming Interfaces (API).
+///
+/// The transport-neutral `api` layer comes from [`fuse-backend-core`]; the `Vfs`
+/// union multiplexer now lives in the [`fuse-backend-vfs`] crate and is stitched
+/// back in here, so the historical `api::vfs::*`, flat `api::Vfs` and other
+/// `api::*` paths all keep resolving through the facade.
+pub mod api {
+    pub use fuse_backend_core::api::*;
+    pub use fuse_backend_vfs::{Vfs, VfsIndex, VfsOptions};
+
+    /// The union-filesystem multiplexer, re-exported from [`fuse-backend-vfs`].
+    ///
+    /// That crate also re-exports the multiplexer-neutral helpers
+    /// (`validate_path_component`, `BackendFileSystem`, `VFS_MAX_INO`, ...), so
+    /// the full historical `api::vfs::*` surface is preserved.
+    pub mod vfs {
+        pub use fuse_backend_vfs::*;
+    }
+}
 
 pub use fuse_backend_core::{bytes_to_cstr, encode_io_error_kind, Error, Result};
 

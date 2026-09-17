@@ -1,6 +1,9 @@
 // Copyright 2020 Ant Financial. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+#![deny(missing_docs)]
+#![allow(unexpected_cfgs)]
+
 //! A union file system which combines multiple backend file systems into one.
 //!
 //! A simple union file system with limited functionality, which
@@ -15,6 +18,9 @@
 //! a new backend file system could be mounted onto a subdirectory, instead of hot-adding
 //! another virtio-fs device. This is very convenient to manage container images at runtime.
 
+#[macro_use]
+extern crate log;
+
 use std::collections::HashMap;
 use std::ffi::CStr;
 use std::fmt;
@@ -27,12 +33,14 @@ use std::time::Duration;
 
 use arc_swap::ArcSwap;
 
-use crate::abi::fuse_abi::*;
-use crate::api::filesystem::*;
-use crate::api::pseudo_fs::PseudoFs;
+use fuse_backend_core::abi::fuse_abi::*;
+use fuse_backend_core::api::filesystem::*;
+
+use crate::pseudo_fs::PseudoFs;
 
 #[cfg(feature = "async-io")]
 mod async_io;
+mod pseudo_fs;
 mod sync_io;
 
 // The multiplexer-neutral path/inode helpers and the `BackendFileSystem` mount
@@ -40,7 +48,7 @@ mod sync_io;
 // stay available to filesystem drivers even when the `Vfs` union filesystem is
 // not used. They are re-exported here to preserve the historical `api::vfs::*`
 // import paths.
-pub use crate::api::filesystem::{
+pub use fuse_backend_core::api::filesystem::{
     validate_path_component, BackFileSystem, BackendFileSystem, CURRENT_DIR_CSTR, EMPTY_CSTR,
     PARENT_DIR_CSTR, PROC_SELF_FD_CSTR, SLASH_ASCII, VFS_MAX_INO,
 };
@@ -692,12 +700,10 @@ pub mod persist {
     use versionize::{VersionMap, Versionize, VersionizeResult};
     use versionize_derive::Versionize;
 
-    use crate::api::{
-        filesystem::FsOptions,
-        pseudo_fs::persist::PseudoFsState,
-        vfs::{VfsError, VfsResult},
-        Vfs, VfsOptions,
-    };
+    use fuse_backend_core::api::filesystem::FsOptions;
+
+    use crate::pseudo_fs::persist::PseudoFsState;
+    use crate::{Vfs, VfsError, VfsOptions, VfsResult};
 
     /// Serializable form of a per-mount id_mapping entry.
     #[derive(Versionize, Debug, Default, Clone, Copy)]
@@ -840,9 +846,8 @@ pub mod persist {
         /// use std::any::Any;
         /// use std::io;
         ///
-        /// use fuse_backend_core::api::filesystem::{Entry, FileSystem};
-        /// use fuse_backend_core::api::vfs::BackendFileSystem;
-        /// use fuse_backend_core::api::{Vfs, VfsIndex, VfsOptions};
+        /// use fuse_backend_core::api::filesystem::{BackendFileSystem, Entry, FileSystem};
+        /// use fuse_backend_vfs::{Vfs, VfsIndex, VfsOptions};
         /// # #[cfg(feature = "async-io")]
         /// # use std::ffi::CStr;
         /// # #[cfg(feature = "async-io")]
@@ -986,7 +991,7 @@ pub mod persist {
         // This test is to make sure that VfsState can be serialized and deserialized
         #[test]
         fn test_vfs_save_restore_simple() {
-            use crate::api::{Vfs, VfsOptions};
+            use crate::{Vfs, VfsOptions};
 
             // create new vfs
             let vfs = &Vfs::new(VfsOptions::default());
@@ -1008,8 +1013,8 @@ pub mod persist {
         // `restore_mount` does not need the mapping passed in again.
         #[test]
         fn test_vfs_save_restore_mount_id_mappings() {
-            use crate::api::vfs::tests::{FakeFileSystemOne, FakeFileSystemTwo};
-            use crate::api::{Vfs, VfsOptions};
+            use crate::tests::{FakeFileSystemOne, FakeFileSystemTwo};
+            use crate::{Vfs, VfsOptions};
 
             let vfs = &Vfs::new(VfsOptions::default());
             let idx1 = vfs
@@ -1044,8 +1049,8 @@ pub mod persist {
                 Deref, Ordering, PseudoFsState, Snapshot, VersionMap, Versionize, VfsOptionsState,
                 VfsState,
             };
-            use crate::api::vfs::tests::FakeFileSystemOne;
-            use crate::api::{Vfs, VfsOptions};
+            use crate::tests::FakeFileSystemOne;
+            use crate::{Vfs, VfsOptions};
 
             let vfs = &Vfs::new(VfsOptions::default());
             let idx = vfs
@@ -1087,7 +1092,7 @@ pub mod persist {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::api::Vfs;
+    use crate::Vfs;
     use std::any::Any;
     use std::ffi::CString;
     use std::io::{Error, ErrorKind};
@@ -1128,8 +1133,8 @@ mod tests {
     #[cfg(feature = "async-io")]
     mod async_io {
         use super::*;
-        use crate::abi::fuse_abi::{OpenOptions, SetattrValid};
         use async_trait::async_trait;
+        use fuse_backend_core::abi::fuse_abi::{OpenOptions, SetattrValid};
 
         #[allow(unused_variables)]
         #[async_trait]

@@ -9,21 +9,21 @@
 //!   transport layer.
 //! - [trait FileSystem](filesystem/trait.FileSystem.html) for backend file system drivers to
 //!   implement fs operations.
-//! - [struct Vfs](vfs/struct.Vfs.html), a simple union file system to help organize multiple
-//!   backend file systems.
-
-mod pseudo_fs;
+//!
+//! The `Vfs` union file system that used to live here is now the separate
+//! `fuse-backend-vfs` crate. The umbrella `fuse-backend-rs` crate re-exports it
+//! at the historical `api::vfs`/`api::Vfs` paths; a consumer that brings its own
+//! `FileSystem` can depend on `fuse-backend-core` alone and skip it (and its
+//! `arc-swap` dependency).
 
 pub mod filesystem;
 pub mod server;
-pub mod vfs;
 
-// The multiplexer-neutral helpers are re-exported from `filesystem` (their
-// definition site); only the union-filesystem multiplexer itself comes from
-// `vfs`. Both sets keep resolving at the flat `api::*` paths, and the
-// `api::vfs::*` module paths are preserved by a shim inside `vfs`.
+// The multiplexer-neutral path/inode helpers and the `BackendFileSystem` mount
+// contract live in `filesystem` (their definition site) and are re-exported at
+// the flat `api::*` paths, so filesystem drivers can use them without pulling in
+// the `fuse-backend-vfs` union multiplexer.
 pub use filesystem::{
     validate_path_component, BackFileSystem, BackendFileSystem, CURRENT_DIR_CSTR, EMPTY_CSTR,
     PARENT_DIR_CSTR, PROC_SELF_FD_CSTR, SLASH_ASCII, VFS_MAX_INO,
 };
-pub use vfs::{Vfs, VfsIndex, VfsOptions};

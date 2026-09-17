@@ -207,9 +207,14 @@ impl AsyncFileSystem for Vfs {
 
 #[cfg(test)]
 mod tests {
+    use async_trait::async_trait;
+    use fuse_backend_core::api::server::Server;
+    use fuse_backend_core::buffer::{Reader, Writer};
+    use fuse_backend_core::file_traits::FileReadWriteVolatile;
+
     use super::super::tests::FakeFileSystemOne;
     use super::*;
-    use crate::api::Vfs;
+    use crate::Vfs;
 
     use std::ffi::CString;
 
@@ -261,4 +266,62 @@ mod tests {
     // the Vfs layer down to a real `PassthroughFs` instance lives in the
     // umbrella crate's `tests/driver_tests.rs`, since it depends on a
     // filesystem driver.
+
+    // A `Writer` that only has to exist: `test_vfs_async_invalid_header` feeds a
+    // one-byte reader buffer, so `async_handle_message` fails while decoding the
+    // in-header and never writes a reply. Every method is therefore unreachable.
+    struct NullWriter;
+
+    impl io::Write for NullWriter {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[async_trait(?Send)]
+    impl Writer for NullWriter {
+        fn write_from_at<F: FileReadWriteVolatile>(
+            &mut self,
+            _src: F,
+            count: usize,
+            _off: u64,
+        ) -> io::Result<usize> {
+            Ok(count)
+        }
+
+        fn split_at(&mut self, _offset: usize) -> fuse_backend_core::buffer::Result<Self> {
+            Ok(NullWriter)
+        }
+
+        fn available_bytes(&self) -> usize {
+            usize::MAX
+        }
+
+        fn bytes_written(&self) -> usize {
+            0
+        }
+
+        fn commit(&mut self, _other: Option<&Self>) -> io::Result<usize> {
+            Ok(0)
+        }
+    }
+
+    // Relocated from core's `api::server::async_io` unit tests. It exercises the
+    // async server entry point rejecting a malformed header, which needs a
+    // concrete `FileSystem` to instantiate `Server`; `Vfs` now lives in this
+    // crate, so the test follows it here.
+    #[tokio::test]
+    async fn test_vfs_async_invalid_header() {
+        let vfs = Vfs::default();
+        let server = Server::new(vfs);
+        let mut r_buf = [0u8];
+        let r = Reader::<()>::from_slice(&mut r_buf);
+        let w = NullWriter;
+
+        let result = unsafe { server.async_handle_message(r, w, None, None).await };
+        assert!(result.is_err());
+    }
 }

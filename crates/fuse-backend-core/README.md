@@ -1,10 +1,11 @@
 # fuse-backend-core
 
 The transport-neutral core of the fuse-backend-rs library: the FUSE **ABI**, the
-**API/server** layer, the **VFS** multiplexer and pseudo-fs, the **buffer**
-abstractions (`Reader`, `Writer`, `IoBuffers`) and the shared **common**
-utilities. Every other crate in the workspace builds on this one; it contains no
-transport and no filesystem driver.
+**API/server** layer, the **buffer** abstractions (`Reader`, `Writer`,
+`IoBuffers`) and the shared **common** utilities. Every other crate in the
+workspace builds on this one; it contains no transport and no filesystem driver.
+(The `Vfs` union multiplexer, its pseudo-fs backing store, and the `persist`
+snapshot feature now live in [`fuse-backend-vfs`](../fuse-backend-vfs).)
 
 Most applications want the umbrella [`fuse-backend-rs`] crate, which re-exports
 this crate under the historical `fuse_backend_rs::{abi, api, buffer, common}`
@@ -16,7 +17,6 @@ without any transport or driver.
 | Feature | Effect |
 | --- | --- |
 | `async-io` | Experimental asynchronous IO path (tokio-uring / io_uring; Linux-only). |
-| `persist` | Snapshot/restore of the VFS and pseudo-fs state (`versionize` + `dbs-snapshot`). |
 | `fusedev`, `virtiofs`, `fusedev-uring`, `fuse-t` | Dependency-free cfg flags forwarded from the umbrella and transport crates so code historically gated on those names keeps compiling. Enable them through the transport crates, not directly. |
 
 ## Usage

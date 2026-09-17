@@ -23,6 +23,7 @@ members = [
     "crates/fuse-backend-virtiofs",
     "crates/fuse-backend-passthrough",
     "crates/fuse-backend-overlayfs",
+    "crates/fuse-backend-vfs",
     "tests/passthrough",
     "tests/overlay",
     "tests/benchmark",
@@ -38,6 +39,10 @@ vmm-sys-util = "0.15.0"
 # The versions are required so the umbrella crate can be packaged and
 # published against the registry copies once the sub-crates are released.
 fuse-backend-core = { path = "crates/fuse-backend-core", version = "0.14.0" }
+# Not optional: the facade has always bundled `Vfs`, and `tests/legacy_paths.rs`
+# resolves `api::vfs::Vfs` under every feature combination. A consumer that wants
+# to skip it (and `arc-swap`) depends on `fuse-backend-core` directly.
+fuse-backend-vfs = { path = "crates/fuse-backend-vfs", version = "0.14.0" }
 fuse-backend-fusedev = { path = "crates/fuse-backend-fusedev", version = "0.14.0", optional = true }
 fuse-backend-virtiofs = { path = "crates/fuse-backend-virtiofs", version = "0.14.0", optional = true }
 
@@ -72,6 +77,7 @@ default = ["fusedev"]
 # extra compilation but require `resolver = "2"`.
 async-io = [
     "fuse-backend-core/async-io",
+    "fuse-backend-vfs/async-io",
     "fuse-backend-fusedev/async-io",
     "fuse-backend-virtiofs/async-io",
     "fuse-backend-passthrough/async-io",
@@ -84,6 +90,7 @@ fusedev = [
 ]
 virtiofs = [
     "dep:fuse-backend-virtiofs",
+    "fuse-backend-vfs/virtiofs",
     "fuse-backend-passthrough/virtiofs",
     "dep:fuse-backend-overlayfs",
 ]
@@ -95,7 +102,7 @@ vhost-user-fs = ["virtiofs"]
 # Driver-only builds, without any of the bundled transports.
 passthrough = ["dep:fuse-backend-passthrough"]
 overlayfs = ["dep:fuse-backend-overlayfs"]
-persist = ["fuse-backend-core/persist"]
+persist = ["fuse-backend-vfs/persist"]
 fuse-t = ["fuse-backend-fusedev/fuse-t"]
 # Experimental: FUSE-over-io_uring transport (kernel >= 6.14, protocol 7.42).
 # The kernel interface is still evolving (queue-count reduction, bufpool

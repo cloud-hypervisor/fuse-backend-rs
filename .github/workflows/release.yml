@@ -17,10 +17,10 @@ jobs:
       - name: Publish
         run: |
           sudo apt-get update && sudo apt-get install --yes sed
-          CRATES="core passthrough overlayfs virtiofs fusedev"
+          CRATES="core vfs passthrough overlayfs virtiofs fusedev"
           VERSION=$(sed --regexp-extended --silent 's/^version = \"(.*)"$/\1/p' Cargo.toml)
           [ "$GITHUB_REF_NAME" == "v$VERSION" ]
-          # All six crates are published from one tag; fail early if any
+          # All seven crates are published from one tag; fail early if any
           # manifest drifts apart.
           for CRATE in $CRATES; do
             CRATE_VERSION=$(sed --regexp-extended --silent 's/^version = \"(.*)"$/\1/p' crates/fuse-backend-$CRATE/Cargo.toml)
@@ -28,10 +28,11 @@ jobs:
           done
           # The workspace crates depend on each other by path, and `cargo
           # publish` resolves those dependencies against the registry, so
-          # publish bottom-up: core first (everything depends on it),
-          # passthrough before fusedev (fusedev's Linux dev-dependency on
-          # passthrough is resolved from the registry as well), and the
-          # umbrella last (it depends on all five sub-crates).
+          # publish bottom-up: core first (everything depends on it), vfs next
+          # (it depends only on core, and passthrough's dev-dependency on vfs is
+          # resolved from the registry), passthrough before fusedev (fusedev's
+          # Linux dev-dependency on passthrough is resolved from the registry as
+          # well), and the umbrella last (it depends on all six sub-crates).
           for CRATE in $CRATES; do
             cargo publish --token ${{ secrets.CRATES_IO_TOKEN }} -p fuse-backend-$CRATE
           done

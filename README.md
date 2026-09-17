@@ -36,7 +36,8 @@ path and every historical cargo feature (`fusedev`, `virtiofs`, `vhost-user-fs`,
 
 | Crate | Contents |
 | --- | --- |
-| [`fuse-backend-core`](crates/fuse-backend-core) | The transport-neutral layers: Fuse ABI, API/server, VFS, buffers and common utilities. |
+| [`fuse-backend-core`](crates/fuse-backend-core) | The transport-neutral layers: Fuse ABI, API/server, buffers and common utilities. |
+| [`fuse-backend-vfs`](crates/fuse-backend-vfs) | The `Vfs` union multiplexer and its pseudo-fs backing store, plus the `persist` snapshot stack. |
 | [`fuse-backend-fusedev`](crates/fuse-backend-fusedev) | The /dev/fuse transport, plus FUSE-over-io_uring and the macFUSE/fuse-t transports. |
 | [`fuse-backend-virtiofs`](crates/fuse-backend-virtiofs) | The virtio-fs transport, carrying Fuse requests over virtio descriptor chains. |
 | [`fuse-backend-passthrough`](crates/fuse-backend-passthrough) | The passthrough filesystem driver (Linux-only). |
@@ -91,9 +92,9 @@ To serve requests asynchronously, mount the filesystem through `Vfs` and drive a
 ## Examples
 
 ### Filesystem Drivers
-- [Virtual File System](https://github.com/cloud-hypervisor/fuse-backend-rs/tree/master/crates/fuse-backend-core/src/api/vfs)
+- [Virtual File System](https://github.com/cloud-hypervisor/fuse-backend-rs/tree/master/crates/fuse-backend-vfs/src)
   for an example of union file system.
-- [Pseudo File System](https://github.com/cloud-hypervisor/fuse-backend-rs/blob/master/crates/fuse-backend-core/src/api/pseudo_fs.rs)
+- [Pseudo File System](https://github.com/cloud-hypervisor/fuse-backend-rs/blob/master/crates/fuse-backend-vfs/src/pseudo_fs.rs)
   for an example of pseudo file system.
 - [Passthrough File System](https://github.com/cloud-hypervisor/fuse-backend-rs/tree/master/crates/fuse-backend-passthrough/src)
   for an example of passthrough(stacked) file system.
