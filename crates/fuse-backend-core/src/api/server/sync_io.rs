@@ -5,13 +5,14 @@
 
 use std::io::{self, IoSlice, Read};
 use std::mem::size_of;
-use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 use vm_memory::ByteValued;
 
 use super::{
-    InitParams, MetricsHook, Server, ServerUtil, ServerVersion, SrvContext, ZcReader, ZcWriter,
-    BUFFER_HEADER_SIZE, DIRENT_PADDING, MAX_BUFFER_SIZE, MAX_REQ_PAGES, MIN_READ_BUFFER,
+    encode_version, InitParams, MetricsHook, Server, ServerUtil, ServerVersion, SrvContext,
+    ZcReader, ZcWriter, BUFFER_HEADER_SIZE, DIRENT_PADDING, MAX_BUFFER_SIZE, MAX_REQ_PAGES,
+    MIN_READ_BUFFER,
 };
 use crate::abi::fuse_abi::*;
 #[cfg(feature = "virtiofs")]
@@ -232,7 +233,7 @@ impl<F: FileSystem + Sync> Server<F> {
         })?;
 
         #[cfg(not(feature = "fuse-t"))]
-        let version = self.vers.load();
+        let version = super::decode_version(self.vers.load(Ordering::Acquire));
         let result = self.fs.lookup(ctx.context(), ctx.nodeid(), name);
 
         match result {
@@ -848,7 +849,10 @@ impl<F: FileSystem + Sync> Server<F> {
                     out.max_pages = MAX_REQ_PAGES;
                     out.max_write = MAX_REQ_PAGES as u32 * pagesize() as u32; // 1MB
                 }
-                self.vers.store(Arc::new(version));
+                self.vers.store(
+                    encode_version(version.major, version.minor),
+                    Ordering::Release,
+                );
                 if minor < KERNEL_MINOR_VERSION_INIT_OUT_SIZE {
                     ctx.reply_ok(
                         Some(
