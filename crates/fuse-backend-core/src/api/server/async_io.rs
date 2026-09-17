@@ -3,6 +3,7 @@
 
 use std::io;
 use std::mem::size_of;
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -19,7 +20,8 @@ use crate::api::filesystem::{
     AsyncFileSystem, AsyncZeroCopyReader, AsyncZeroCopyWriter, ZeroCopyReader, ZeroCopyWriter,
 };
 use crate::api::server::{
-    InitParams, MetricsHook, Server, ServerUtil, SrvContext, BUFFER_HEADER_SIZE, MAX_BUFFER_SIZE,
+    decode_version, InitParams, MetricsHook, Server, ServerUtil, SrvContext, BUFFER_HEADER_SIZE,
+    MAX_BUFFER_SIZE,
 };
 use crate::buffer::{Reader, Writer};
 use crate::file_traits::{AsyncFileReadWriteVolatile, FileReadWriteVolatile};
@@ -244,7 +246,7 @@ impl<F: AsyncFileSystem + Sync> Server<F> {
             }
         };
 
-        let version = self.vers.load();
+        let version = decode_version(self.vers.load(Ordering::Acquire));
         let result = self
             .fs
             .async_lookup(ctx.context(), ctx.nodeid(), name)

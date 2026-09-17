@@ -14,15 +14,13 @@
 //! * Invoke file system driver handler to serve each request and send the reply.
 //!
 //! The Fuse API server is performance critical, so it's designed to support multi-threading by
-//! adopting interior-mutability. And the arcswap crate is used to implement interior-mutability.
+//! adopting interior-mutability. And atomic operations are used to implement interior-mutability.
 
 use std::ffi::CStr;
 use std::io::{self, Read};
 use std::marker::PhantomData;
 use std::mem::size_of;
-use std::sync::Arc;
-
-use arc_swap::ArcSwap;
+use std::sync::atomic::AtomicU64;
 
 use crate::abi::fuse_abi::*;
 use crate::api::filesystem::{Context, FileSystem, ZeroCopyReader, ZeroCopyWriter};
@@ -30,7 +28,7 @@ use crate::buffer::{Reader, Writer};
 use crate::file_traits::FileReadWriteVolatile;
 use crate::{bytes_to_cstr, BitmapSlice, Error, Result};
 #[cfg(all(target_os = "linux", feature = "fusedev-uring"))]
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::Ordering;
 
 #[cfg(feature = "async-io")]
 mod async_io;
@@ -57,7 +55,7 @@ pub const MAX_REQ_PAGES: u16 = 256; // 1MB
 /// Fuse Server to handle requests from the Fuse client and vhost user master.
 pub struct Server<F: FileSystem + Sync> {
     fs: F,
-    vers: ArcSwap<ServerVersion>,
+    vers: AtomicU64,
     /// Extra capability flags to advertise in the INIT reply, requested
     /// through `set_uring()` (experimental fusedev-uring transport).
     #[cfg(all(target_os = "linux", feature = "fusedev-uring"))]
@@ -72,10 +70,7 @@ impl<F: FileSystem + Sync> Server<F> {
     pub fn new(fs: F) -> Server<F> {
         Server {
             fs,
-            vers: ArcSwap::new(Arc::new(ServerVersion {
-                major: KERNEL_VERSION,
-                minor: KERNEL_MINOR_VERSION,
-            })),
+            vers: AtomicU64::new(encode_version(KERNEL_VERSION, KERNEL_MINOR_VERSION)),
             #[cfg(all(target_os = "linux", feature = "fusedev-uring"))]
             extra_init_flags: AtomicU64::new(0),
             #[cfg(all(target_os = "linux", feature = "fusedev-uring"))]
@@ -192,6 +187,27 @@ pub struct ServerVersion {
     pub major: u32,
     /// The minor version number of the FUSE ABI
     pub minor: u32,
+}
+
+/// Pack a `(major, minor)` FUSE ABI version pair into a single `u64`, so the
+/// server can publish it with one lock-free atomic store instead of an
+/// `ArcSwap`.
+#[inline]
+fn encode_version(major: u32, minor: u32) -> u64 {
+    ((major as u64) << 32) | (minor as u64)
+}
+
+/// Unpack a `u64` produced by [`encode_version`] back into a [`ServerVersion`].
+///
+/// Only read on the LOOKUP hot path, which the sync handler compiles out under
+/// `fuse-t`; without `async-io` some feature combinations never call it.
+#[allow(dead_code)]
+#[inline]
+fn decode_version(v: u64) -> ServerVersion {
+    ServerVersion {
+        major: (v >> 32) as u32,
+        minor: (v & 0xffff_ffff) as u32,
+    }
 }
 
 struct ServerUtil();
