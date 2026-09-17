@@ -18,8 +18,7 @@
 //! runtime with `FUSE_BACKEND_RS_ASYNC_RUNTIME=tokio` instead.
 
 use std::future::Future;
-
-use lazy_static::lazy_static;
+use std::sync::LazyLock;
 
 /// Environment variable to select the asynchronous runtime type, `tokio` or `uring`.
 pub const RUNTIME_TYPE_ENV: &str = "FUSE_BACKEND_RS_ASYNC_RUNTIME";
@@ -32,9 +31,7 @@ pub const RUNTIME_TYPE_ENV: &str = "FUSE_BACKEND_RS_ASYNC_RUNTIME";
 #[cfg(target_os = "linux")]
 const RING_ENTRIES: u32 = 256;
 
-lazy_static! {
-    pub(crate) static ref RUNTIME_TYPE: RuntimeType = RuntimeType::new();
-}
+pub(crate) static RUNTIME_TYPE: LazyLock<RuntimeType> = LazyLock::new(RuntimeType::new);
 
 pub(crate) enum RuntimeType {
     Tokio,

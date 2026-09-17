@@ -27,6 +27,10 @@
   feature. Those variants stay on the same `transport::Error` type (there is no
   separate virtiofs error type), so a `virtiofs` build matching them is
   unaffected.
+- [#NNN](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/NNN): Replace the `lazy_static` dependency with `std::sync::LazyLock` and declare
+  an explicit MSRV of Rust 1.80 (`rust-version = "1.80"`) on every published
+  crate. No API change; this drops one dependency and formalizes the minimum
+  toolchain, which was previously undeclared (CI builds on `stable`).
 
 ### Removed
 - [#NNN](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/NNN): Drop the vestigial `vhost` and `virtio-bindings` dependencies that the

@@ -1,5 +1,4 @@
 extern crate fuse_backend_rs;
-extern crate lazy_static;
 extern crate libc;
 extern crate log;
 extern crate signal_hook;
