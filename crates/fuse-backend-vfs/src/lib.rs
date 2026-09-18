@@ -239,6 +239,7 @@ impl Default for VfsOptions {
             | FsOptions::EXPLICIT_INVAL_DATA
             | FsOptions::ZERO_MESSAGE_OPENDIR
             | FsOptions::HANDLE_KILLPRIV_V2
+            | FsOptions::CREATE_SUPP_GROUP
             | FsOptions::PERFILE_DAX;
         VfsOptions {
             no_open: true,
@@ -600,6 +601,29 @@ impl Vfs {
             ctx.gid = remap_id(ctx.gid, external_id, internal_id, range);
         }
         Ok(())
+    }
+
+    /// Remap `ctx.supp_gid` from the external (guest) namespace to the
+    /// internal (host) namespace, using the id mapping of the filesystem
+    /// that owns `fs_idx`.
+    ///
+    /// The FUSE_EXT_GROUPS extension is parsed by the server after the
+    /// request-wide remap has already run (see `id_remap_with_nodeid()`),
+    /// so the supplementary group must be translated separately at the
+    /// create-family entry points, where the target mount is known.  A
+    /// gid outside the mapped range has no legitimate host counterpart
+    /// and is dropped: a guest must never be able to make the daemon
+    /// adopt an arbitrary host supplementary group.
+    fn remap_ctx_supp_gid(&self, ctx: &mut Context, fs_idx: VfsIndex) {
+        if let (Some(gid), Some((internal_id, external_id, range))) =
+            (ctx.supp_gid, self.get_effective_id_mapping(fs_idx))
+        {
+            ctx.supp_gid = if gid >= external_id && gid - external_id < range {
+                Some(gid - external_id + internal_id)
+            } else {
+                None
+            };
+        }
     }
 
     fn allocate_fs_idx(&self) -> Result<VfsIndex> {
