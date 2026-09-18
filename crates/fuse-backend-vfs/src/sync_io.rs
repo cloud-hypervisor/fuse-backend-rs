@@ -700,6 +700,7 @@ mod tests {
             uid: 100000,
             gid: 100123,
             pid: 1,
+            supp_gid: None,
         };
 
         vfs.id_remap(&mut ctx).unwrap();
@@ -719,6 +720,7 @@ mod tests {
             uid: 100000,
             gid: 100123,
             pid: 1,
+            supp_gid: None,
         };
 
         // fs_idx == 0 (pseudo fs) falls back to global mapping
