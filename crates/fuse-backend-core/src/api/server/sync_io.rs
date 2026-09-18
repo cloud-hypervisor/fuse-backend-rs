@@ -219,7 +219,7 @@ impl<F: FileSystem + Sync> Server<F> {
                     libc::EOVERFLOW,
                 )));
             }
-            return ctx.reply_error_explicit(io::Error::from_raw_os_error(libc::ENOMEM));
+            return ctx.reply_error(io::Error::from_raw_os_error(libc::ENOMEM));
         }
 
         trace!(
@@ -313,8 +313,8 @@ impl<F: FileSystem + Sync> Server<F> {
     fn lookup<S: BitmapSlice, W: Writer>(&self, mut ctx: SrvContext<'_, F, S, W>) -> Result<usize> {
         let buf = ServerUtil::get_message_body(&mut ctx.r, &ctx.in_header, 0)?;
         let name = bytes_to_cstr(buf.as_ref()).map_err(|e| {
-            let _ = ctx.reply_error_explicit(io::Error::from_raw_os_error(libc::EINVAL));
-            error!("fuse: bytes to cstr error: {:?}, {:?}", buf, e);
+            let _ = ctx.reply_error(io::Error::from_raw_os_error(libc::EINVAL));
+            debug!("fuse: bytes to cstr error: {:?}, {:?}", buf, e);
             e
         })?;
 
@@ -434,8 +434,8 @@ impl<F: FileSystem + Sync> Server<F> {
         } = ctx.r.read_obj().map_err(Error::DecodeMessage)?;
         let buf = ServerUtil::get_message_body(&mut ctx.r, &ctx.in_header, size_of::<MknodIn>())?;
         let name = bytes_to_cstr(buf.as_ref()).map_err(|e| {
-            let _ = ctx.reply_error_explicit(io::Error::from_raw_os_error(libc::EINVAL));
-            error!("fuse: bytes to cstr error: {:?}, {:?}", buf, e);
+            let _ = ctx.reply_error(io::Error::from_raw_os_error(libc::EINVAL));
+            debug!("fuse: bytes to cstr error: {:?}, {:?}", buf, e);
             e
         })?;
         let supp_gid = parse_create_extensions(
@@ -463,8 +463,8 @@ impl<F: FileSystem + Sync> Server<F> {
         let MkdirIn { mode, umask } = ctx.r.read_obj().map_err(Error::DecodeMessage)?;
         let buf = ServerUtil::get_message_body(&mut ctx.r, &ctx.in_header, size_of::<MkdirIn>())?;
         let name = bytes_to_cstr(buf.as_ref()).map_err(|e| {
-            let _ = ctx.reply_error_explicit(io::Error::from_raw_os_error(libc::EINVAL));
-            error!("fuse: bytes to cstr error: {:?}, {:?}", buf, e);
+            let _ = ctx.reply_error(io::Error::from_raw_os_error(libc::EINVAL));
+            debug!("fuse: bytes to cstr error: {:?}, {:?}", buf, e);
             e
         })?;
         let supp_gid = parse_create_extensions(
@@ -491,8 +491,8 @@ impl<F: FileSystem + Sync> Server<F> {
     ) -> Result<usize> {
         let buf = ServerUtil::get_message_body(&mut ctx.r, &ctx.in_header, 0)?;
         let name = bytes_to_cstr(buf.as_ref()).map_err(|e| {
-            let _ = ctx.reply_error_explicit(io::Error::from_raw_os_error(libc::EINVAL));
-            error!("fuse: bytes to cstr error: {:?}, {:?}", buf, e);
+            let _ = ctx.reply_error(io::Error::from_raw_os_error(libc::EINVAL));
+            debug!("fuse: bytes to cstr error: {:?}, {:?}", buf, e);
             e
         })?;
 
@@ -508,8 +508,8 @@ impl<F: FileSystem + Sync> Server<F> {
     ) -> Result<usize> {
         let buf = ServerUtil::get_message_body(&mut ctx.r, &ctx.in_header, 0)?;
         let name = bytes_to_cstr(buf.as_ref()).map_err(|e| {
-            let _ = ctx.reply_error_explicit(io::Error::from_raw_os_error(libc::EINVAL));
-            error!("fuse: bytes to cstr error: {:?}, {:?}", buf, e);
+            let _ = ctx.reply_error(io::Error::from_raw_os_error(libc::EINVAL));
+            debug!("fuse: bytes to cstr error: {:?}, {:?}", buf, e);
             e
         })?;
 
@@ -571,8 +571,8 @@ impl<F: FileSystem + Sync> Server<F> {
         let LinkIn { oldnodeid } = ctx.r.read_obj().map_err(Error::DecodeMessage)?;
         let buf = ServerUtil::get_message_body(&mut ctx.r, &ctx.in_header, size_of::<LinkIn>())?;
         let name = bytes_to_cstr(buf.as_ref()).map_err(|e| {
-            let _ = ctx.reply_error_explicit(io::Error::from_raw_os_error(libc::EINVAL));
-            error!("fuse: bytes to cstr error: {:?}, {:?}", buf, e);
+            let _ = ctx.reply_error(io::Error::from_raw_os_error(libc::EINVAL));
+            debug!("fuse: bytes to cstr error: {:?}, {:?}", buf, e);
             e
         })?;
 
@@ -780,8 +780,8 @@ impl<F: FileSystem + Sync> Server<F> {
             return Err(Error::InvalidXattrSize((size, value.len())));
         }
         let name = bytes_to_cstr(name).map_err(|e| {
-            let _ = ctx.reply_error_explicit(io::Error::from_raw_os_error(libc::EINVAL));
-            error!("fuse: bytes to cstr error: {:?}, {:?}", buf, e);
+            let _ = ctx.reply_error(io::Error::from_raw_os_error(libc::EINVAL));
+            debug!("fuse: bytes to cstr error: {:?}, {:?}", buf, e);
             e
         })?;
 
@@ -803,8 +803,8 @@ impl<F: FileSystem + Sync> Server<F> {
         let buf =
             ServerUtil::get_message_body(&mut ctx.r, &ctx.in_header, size_of::<GetxattrIn>())?;
         let name = bytes_to_cstr(buf.as_ref()).map_err(|e| {
-            let _ = ctx.reply_error_explicit(io::Error::from_raw_os_error(libc::EINVAL));
-            error!("fuse: bytes to cstr error: {:?}, {:?}", buf, e);
+            let _ = ctx.reply_error(io::Error::from_raw_os_error(libc::EINVAL));
+            debug!("fuse: bytes to cstr error: {:?}, {:?}", buf, e);
             e
         })?;
 
@@ -848,8 +848,8 @@ impl<F: FileSystem + Sync> Server<F> {
     ) -> Result<usize> {
         let buf = ServerUtil::get_message_body(&mut ctx.r, &ctx.in_header, 0)?;
         let name = bytes_to_cstr(buf.as_ref()).map_err(|e| {
-            let _ = ctx.reply_error_explicit(io::Error::from_raw_os_error(libc::EINVAL));
-            error!("fuse: bytes to cstr error: {:?}, {:?}", buf, e);
+            let _ = ctx.reply_error(io::Error::from_raw_os_error(libc::EINVAL));
+            debug!("fuse: bytes to cstr error: {:?}, {:?}", buf, e);
             e
         })?;
 
@@ -887,8 +887,8 @@ impl<F: FileSystem + Sync> Server<F> {
         } = ctx.r.read_obj().map_err(Error::DecodeMessage)?;
 
         if major < KERNEL_VERSION {
-            error!("Unsupported fuse protocol version: {}.{}", major, minor);
-            return ctx.reply_error_explicit(io::Error::from_raw_os_error(libc::EPROTO));
+            debug!("Unsupported fuse protocol version: {}.{}", major, minor);
+            return ctx.reply_error(io::Error::from_raw_os_error(libc::EPROTO));
         }
 
         if major > KERNEL_VERSION {
@@ -1023,7 +1023,7 @@ impl<F: FileSystem + Sync> Server<F> {
 
         let available_bytes = ctx.w.available_bytes();
         if available_bytes < size as usize {
-            return ctx.reply_error_explicit(io::Error::from_raw_os_error(libc::ENOMEM));
+            return ctx.reply_error(io::Error::from_raw_os_error(libc::ENOMEM));
         }
 
         // Skip over enough bytes for the header.
@@ -1207,8 +1207,8 @@ impl<F: FileSystem + Sync> Server<F> {
         let args: CreateIn = ctx.r.read_obj().map_err(Error::DecodeMessage)?;
         let buf = ServerUtil::get_message_body(&mut ctx.r, &ctx.in_header, size_of::<CreateIn>())?;
         let name = bytes_to_cstr(buf.as_ref()).map_err(|e| {
-            let _ = ctx.reply_error_explicit(io::Error::from_raw_os_error(libc::EINVAL));
-            error!("fuse: bytes to cstr error: {:?}, {:?}", buf, e);
+            let _ = ctx.reply_error(io::Error::from_raw_os_error(libc::EINVAL));
+            debug!("fuse: bytes to cstr error: {:?}, {:?}", buf, e);
             e
         })?;
         let supp_gid = parse_create_extensions(
@@ -1469,7 +1469,7 @@ impl<F: FileSystem + Sync> Server<F> {
                 Err(e) => ctx.reply_error(e),
             }
         } else {
-            ctx.reply_error_explicit(io::Error::from_raw_os_error(libc::EINVAL))
+            ctx.reply_error(io::Error::from_raw_os_error(libc::EINVAL))
         }
     }
 
@@ -1483,10 +1483,10 @@ impl<F: FileSystem + Sync> Server<F> {
 
             if let Some(size) = (count as usize).checked_mul(size_of::<RemovemappingOne>()) {
                 if size > MAX_BUFFER_SIZE as usize {
-                    return ctx.reply_error_explicit(io::Error::from_raw_os_error(libc::ENOMEM));
+                    return ctx.reply_error(io::Error::from_raw_os_error(libc::ENOMEM));
                 }
             } else {
-                return ctx.reply_error_explicit(io::Error::from_raw_os_error(libc::EOVERFLOW));
+                return ctx.reply_error(io::Error::from_raw_os_error(libc::EOVERFLOW));
             }
 
             let mut requests = Vec::with_capacity(count as usize);
@@ -1506,7 +1506,7 @@ impl<F: FileSystem + Sync> Server<F> {
                 Err(e) => ctx.reply_error(e),
             }
         } else {
-            ctx.reply_error_explicit(io::Error::from_raw_os_error(libc::EINVAL))
+            ctx.reply_error(io::Error::from_raw_os_error(libc::EINVAL))
         }
     }
 }
