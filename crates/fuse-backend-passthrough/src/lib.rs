@@ -977,6 +977,86 @@ fn set_creds(
     ScopedGid::new(gid).and_then(|gid| Ok((ScopedUid::new(uid)?, gid)))
 }
 
+/// RAII guard that temporarily adds a supplementary group to the current
+/// thread's group list.
+///
+/// The FUSE_CREATE_SUPP_GROUP extension tells the server which supplementary
+/// group of the caller matches the parent directory's group, so that objects
+/// created in setgid directories get the correct group ownership.
+#[cfg(target_os = "linux")]
+#[derive(Debug)]
+pub(crate) struct ScopedSuppGroups {
+    old_groups: Vec<libc::gid_t>,
+}
+
+#[cfg(target_os = "linux")]
+impl ScopedSuppGroups {
+    /// Add `supp_gid` to the supplementary group list of the current thread.
+    /// Does nothing and returns `None` if `supp_gid` is `None`.  The original
+    /// group list is restored when the returned guard is dropped.
+    fn new(supp_gid: Option<libc::gid_t>) -> io::Result<Option<Self>> {
+        let gid = match supp_gid {
+            Some(gid) => gid,
+            None => return Ok(None),
+        };
+
+        // Save the current supplementary group list.
+        let count = unsafe { libc::getgroups(0, std::ptr::null_mut()) };
+        if count < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let mut old_groups = vec![0 as libc::gid_t; count as usize];
+        if count > 0 {
+            let res = unsafe { libc::getgroups(count, old_groups.as_mut_ptr()) };
+            if res < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            old_groups.truncate(res as usize);
+        }
+
+        // Like scoped_cred!, invoke the syscall directly so that only the
+        // calling thread's credentials are changed.  And setgroups() needs
+        // CAP_SETGID, so this must run before set_creds() drops privileges.
+        let res = unsafe { libc::syscall(libc::SYS_setgroups, 1, [gid].as_ptr()) };
+        if res < 0 {
+            return Err(io::Error::last_os_error());
+        }
+
+        Ok(Some(ScopedSuppGroups { old_groups }))
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for ScopedSuppGroups {
+    fn drop(&mut self) {
+        let res = unsafe {
+            libc::syscall(
+                libc::SYS_setgroups,
+                self.old_groups.len(),
+                self.old_groups.as_ptr(),
+            )
+        };
+        if res < 0 {
+            error!(
+                "fuse: failed to restore supplementary groups: {}",
+                io::Error::last_os_error(),
+            );
+        }
+    }
+}
+
+// The macOS kernel never sends the FUSE_EXT_GROUPS extension.
+#[cfg(not(target_os = "linux"))]
+#[derive(Debug)]
+pub(crate) struct ScopedSuppGroups;
+
+#[cfg(not(target_os = "linux"))]
+impl ScopedSuppGroups {
+    fn new(_supp_gid: Option<libc::gid_t>) -> io::Result<Option<Self>> {
+        Ok(None)
+    }
+}
+
 struct CapFsetid {}
 
 impl Drop for CapFsetid {
@@ -1603,5 +1683,135 @@ mod tests {
         let mut newbuf = Vec::new();
         read_buffer_file.read_to_end(&mut newbuf).unwrap();
         assert_eq!(newbuf, data);
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn test_scoped_supp_groups() {
+        fn current_groups() -> Vec<libc::gid_t> {
+            let count = unsafe { libc::getgroups(0, std::ptr::null_mut()) };
+            assert!(count >= 0);
+            let mut groups = vec![0 as libc::gid_t; count as usize];
+            if count > 0 {
+                let count = unsafe { libc::getgroups(count, groups.as_mut_ptr()) };
+                assert_eq!(count as usize, groups.len());
+            }
+            groups
+        }
+
+        // Passing None must be a no-op.
+        assert!(ScopedSuppGroups::new(None).unwrap().is_none());
+
+        // The guard replaces the current thread's supplementary group list
+        // with the given group and restores the original list when dropped.
+        // setgroups(2) requires CAP_SETGID, so the full round trip only runs
+        // when sufficiently privileged, e.g. as root in the CI test job.
+        let gid = 12345;
+        let old_groups = current_groups();
+        let groups = match ScopedSuppGroups::new(Some(gid)) {
+            Ok(groups) => groups.expect("creating the guard should succeed"),
+            Err(ref e) if e.kind() == io::ErrorKind::PermissionDenied => {
+                eprintln!("skipping test_scoped_supp_groups: {}", e);
+                return;
+            }
+            Err(e) => panic!("failed to set supplementary groups: {}", e),
+        };
+
+        assert_eq!(current_groups(), vec![gid]);
+        drop(groups);
+        assert_eq!(current_groups(), old_groups);
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn test_vfs_remaps_supp_gid_for_mkdir() {
+        use std::os::unix::fs::PermissionsExt;
+
+        // Drive Vfs::mkdir down to a real PassthroughFs with an id mapping
+        // configured, and check that the supplementary group carried in
+        // Context.supp_gid (external namespace) is translated to the host
+        // group and actually adopted by the create path.  Needs root:
+        // CAP_SETGID for ScopedSuppGroups and CAP_CHOWN for the fixture.
+        if unsafe { libc::geteuid() } != 0 {
+            eprintln!("skipping test_vfs_remaps_supp_gid_for_mkdir: not running as root");
+            return;
+        }
+
+        let gid: libc::gid_t = 12345; // internal (host) group of the setgid dir
+        let uid: libc::uid_t = 65534; // unprivileged creator
+
+        let source = TempDir::new().expect("Cannot create temporary directory.");
+        let setgid_dir = source.as_path().join("setgid-dir");
+        std::fs::create_dir(&setgid_dir).unwrap();
+        std::os::unix::fs::chown(&setgid_dir, Some(0), Some(gid)).unwrap();
+        std::fs::set_permissions(&setgid_dir, std::fs::Permissions::from_mode(0o2770)).unwrap();
+
+        let fs_cfg = Config {
+            do_import: false,
+            root_dir: source
+                .as_path()
+                .to_str()
+                .expect("source path to string")
+                .to_string(),
+            ..Default::default()
+        };
+        let fs = PassthroughFs::<()>::new(fs_cfg).unwrap();
+        fs.import().unwrap();
+
+        // External (guest) ids 100000..=165535 map to internal (host) 0..=65535.
+        let vfs = Vfs::new(VfsOptions {
+            id_mapping: (0, 100000, 65536),
+            ..Default::default()
+        });
+        vfs.mount(Box::new(fs), "/").unwrap();
+
+        let ctx = Context {
+            uid,
+            gid: uid,
+            pid: 1,
+            supp_gid: Some(100000 + gid),
+        };
+        let parent = vfs
+            .lookup(
+                &ctx,
+                fuse::ROOT_ID.into(),
+                &CString::new("setgid-dir").unwrap(),
+            )
+            .unwrap()
+            .inode;
+
+        // Without the supplementary group the create must fail: the daemon
+        // switches to the caller's credentials, which lack `gid`.
+        let ctx_no_group = Context {
+            supp_gid: None,
+            ..ctx
+        };
+        let err = vfs
+            .mkdir(
+                &ctx_no_group,
+                parent.into(),
+                CString::new("no-group").unwrap().as_c_str(),
+                0o770,
+                0,
+            )
+            .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
+
+        // With it, the group is translated to the host namespace, adopted
+        // for the create, and the new directory inherits the group of the
+        // setgid directory.
+        let entry = vfs
+            .mkdir(
+                &ctx,
+                parent.into(),
+                CString::new("with-group").unwrap().as_c_str(),
+                0o770,
+                0,
+            )
+            .unwrap();
+        assert_ne!(entry.inode, 0);
+
+        let md = std::fs::metadata(setgid_dir.join("with-group")).unwrap();
+        assert_eq!(md.gid(), gid);
     }
 }
