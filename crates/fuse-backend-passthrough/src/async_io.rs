@@ -292,6 +292,7 @@ mod tests {
             uid: unsafe { libc::getuid() },
             gid: unsafe { libc::getgid() },
             pid: unsafe { libc::getpid() },
+            ..Default::default()
         }
     }
 

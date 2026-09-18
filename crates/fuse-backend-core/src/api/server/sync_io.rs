@@ -24,6 +24,92 @@ use crate::api::filesystem::{
 use crate::buffer::{pagesize, Reader, Writer};
 use crate::{bytes_to_cstr, encode_io_error_kind, BitmapSlice, Error, Result};
 
+/// Parse the request extensions appended by the kernel after the
+/// NUL-terminated name(s) of create/mkdir/symlink/mknod requests, and return
+/// the first supplementary group carried by a FUSE_EXT_GROUPS extension.
+///
+/// The kernel sends that extension only when FUSE_CREATE_SUPP_GROUP has been
+/// negotiated and one of the caller's supplementary groups matches the parent
+/// directory's group, so that objects created in setgid directories can get
+/// the correct group ownership.  See `get_create_supp_group()` and
+/// `fuse_ext_size()` in `fs/fuse/dir.c` of the Linux kernel.
+///
+/// The whole extension chain is validated: unknown extension types are
+/// skipped, but truncated, inconsistent, unaligned or trailing-garbage
+/// payloads are rejected with EINVAL.
+#[cfg(target_os = "linux")]
+pub(super) fn parse_create_extensions(options: &FsOptions, mut tail: &[u8]) -> Result<Option<u32>> {
+    const LINUX_NRGROUPS_MAX: u32 = 65536;
+
+    let einval = || Error::DecodeMessage(io::Error::from_raw_os_error(libc::EINVAL));
+    let read_u32 = |buf: &[u8]| {
+        let mut bytes = [0u8; 4];
+        bytes.copy_from_slice(&buf[0..4]);
+        u32::from_ne_bytes(bytes)
+    };
+
+    // The first group carried by a FUSE_EXT_GROUPS extension; the upstream
+    // kernel currently sends a single one.
+    let mut supp_gid = None;
+
+    while tail.len() >= size_of::<ExtHeader>() {
+        // struct fuse_ext_header { u32 size; u32 type; }.  The extension may
+        // start at an unaligned offset, so read the fields manually.
+        let size = read_u32(tail) as usize;
+        let ext_type = read_u32(&tail[size_of::<u32>()..]);
+        if size < size_of::<ExtHeader>() || size > tail.len() {
+            return Err(einval());
+        }
+        // Extensions are padded to an 8-byte boundary, see FUSE_REC_ALIGN
+        // and fuse_ext_size() in the kernel.
+        if size & 7 != 0 {
+            return Err(einval());
+        }
+
+        if ext_type == FUSE_EXT_GROUPS {
+            // The kernel only appends this extension when FUSE_CREATE_SUPP_GROUP
+            // has been negotiated through INIT; reject it otherwise.
+            if !options.contains(FsOptions::CREATE_SUPP_GROUP) {
+                return Err(einval());
+            }
+
+            let body = &tail[size_of::<ExtHeader>()..size];
+            // struct fuse_supp_groups { u32 nr_groups; u32 groups[]; }
+            if body.len() < size_of::<SuppGroups>() {
+                return Err(einval());
+            }
+            let nr_groups = read_u32(body);
+            if nr_groups == 0 || nr_groups > LINUX_NRGROUPS_MAX {
+                return Err(einval());
+            }
+            // Extensions are padded to an 8-byte boundary, see FUSE_REC_ALIGN
+            // and fuse_ext_size() in the kernel.
+            let expected = size_of::<SuppGroups>() + size_of::<u32>() * nr_groups as usize;
+            if body.len() != ((expected + 7) & !7) {
+                return Err(einval());
+            }
+            if supp_gid.is_none() {
+                supp_gid = Some(read_u32(&body[size_of::<SuppGroups>()..]));
+            }
+        }
+
+        tail = &tail[size..];
+    }
+
+    // A trailing chunk shorter than an extension header is a protocol violation.
+    if !tail.is_empty() {
+        return Err(einval());
+    }
+
+    Ok(supp_gid)
+}
+
+// The macOS kernel doesn't support request extensions.
+#[cfg(not(target_os = "linux"))]
+pub(super) fn parse_create_extensions(_options: &FsOptions, _tail: &[u8]) -> Result<Option<u32>> {
+    Ok(None)
+}
+
 impl<F: FileSystem + Sync> Server<F> {
     #[cfg(feature = "fusedev")]
     /// Use to send notify msg to kernel fuse
@@ -324,6 +410,14 @@ impl<F: FileSystem + Sync> Server<F> {
         let buf = ServerUtil::get_message_body(&mut ctx.r, &ctx.in_header, 0)?;
         // The name and linkname are encoded one after another and separated by a nul character.
         let (name, linkname) = ServerUtil::extract_two_cstrs(&buf)?;
+        let supp_gid = parse_create_extensions(
+            &FsOptions::from_bits_truncate(self.options.load(Ordering::Acquire)),
+            &buf[name.to_bytes_with_nul().len() + linkname.to_bytes_with_nul().len()..],
+        )
+        .inspect_err(|_| {
+            let _ = ctx.reply_error(io::Error::from_raw_os_error(libc::EINVAL));
+        })?;
+        ctx.context.supp_gid = supp_gid;
 
         match self.fs.symlink(ctx.context(), linkname, ctx.nodeid(), name) {
             Ok(entry) => ctx.reply_ok(Some(EntryOut::from(entry)), None),
@@ -344,6 +438,14 @@ impl<F: FileSystem + Sync> Server<F> {
             error!("fuse: bytes to cstr error: {:?}, {:?}", buf, e);
             e
         })?;
+        let supp_gid = parse_create_extensions(
+            &FsOptions::from_bits_truncate(self.options.load(Ordering::Acquire)),
+            &buf[name.to_bytes_with_nul().len()..],
+        )
+        .inspect_err(|_| {
+            let _ = ctx.reply_error(io::Error::from_raw_os_error(libc::EINVAL));
+        })?;
+        ctx.context.supp_gid = supp_gid;
 
         match self
             .fs
@@ -365,6 +467,14 @@ impl<F: FileSystem + Sync> Server<F> {
             error!("fuse: bytes to cstr error: {:?}, {:?}", buf, e);
             e
         })?;
+        let supp_gid = parse_create_extensions(
+            &FsOptions::from_bits_truncate(self.options.load(Ordering::Acquire)),
+            &buf[name.to_bytes_with_nul().len()..],
+        )
+        .inspect_err(|_| {
+            let _ = ctx.reply_error(io::Error::from_raw_os_error(libc::EINVAL));
+        })?;
+        ctx.context.supp_gid = supp_gid;
 
         match self
             .fs
@@ -828,6 +938,7 @@ impl<F: FileSystem + Sync> Server<F> {
                 let enabled = capable & want;
                 #[cfg(all(target_os = "linux", feature = "fusedev-uring"))]
                 let enabled = self.apply_extra_init_flags(capable, enabled);
+                self.options.store(enabled.bits(), Ordering::Release);
                 let enabled_flags = enabled.bits();
                 let mut out = InitOut {
                     major: KERNEL_VERSION,
@@ -1100,6 +1211,14 @@ impl<F: FileSystem + Sync> Server<F> {
             error!("fuse: bytes to cstr error: {:?}, {:?}", buf, e);
             e
         })?;
+        let supp_gid = parse_create_extensions(
+            &FsOptions::from_bits_truncate(self.options.load(Ordering::Acquire)),
+            &buf[name.to_bytes_with_nul().len()..],
+        )
+        .inspect_err(|_| {
+            let _ = ctx.reply_error(io::Error::from_raw_os_error(libc::EINVAL));
+        })?;
+        ctx.context.supp_gid = supp_gid;
 
         match self.fs.create(ctx.context(), ctx.nodeid(), name, args) {
             Ok((entry, handle, opts, passthrough)) => {
@@ -1560,6 +1679,166 @@ mod tests {
         let writer = TestWriter::new(write_buf);
         let in_header = InHeader::default();
         SrvContext::new(in_header, reader, writer)
+    }
+
+    #[cfg(target_os = "linux")]
+    mod tests_parse_extensions {
+        use super::super::*;
+
+        fn build_supp_groups_ext(gid: u32) -> Vec<u8> {
+            let mut buf = Vec::new();
+            let size = (size_of::<ExtHeader>() + size_of::<SuppGroups>() + size_of::<u32>()) as u32;
+            buf.extend_from_slice(&size.to_ne_bytes());
+            buf.extend_from_slice(&FUSE_EXT_GROUPS.to_ne_bytes());
+            buf.extend_from_slice(&1u32.to_ne_bytes());
+            buf.extend_from_slice(&gid.to_ne_bytes());
+            buf
+        }
+
+        fn assert_einval(res: Result<Option<u32>>) {
+            match res {
+                Err(Error::DecodeMessage(e)) => {
+                    assert_eq!(e.raw_os_error(), Some(libc::EINVAL));
+                }
+                other => panic!("unexpected result: {:?}", other),
+            }
+        }
+
+        #[test]
+        fn test_parse_create_extensions_empty() {
+            assert_eq!(
+                parse_create_extensions(&FsOptions::CREATE_SUPP_GROUP, &[]).unwrap(),
+                None
+            );
+        }
+
+        #[test]
+        fn test_parse_create_extensions_supp_group() {
+            let buf = build_supp_groups_ext(1000);
+            assert_eq!(
+                parse_create_extensions(&FsOptions::CREATE_SUPP_GROUP, &buf).unwrap(),
+                Some(1000)
+            );
+        }
+
+        #[test]
+        fn test_parse_create_extensions_skip_unknown() {
+            // An unknown extension followed by the supp group extension:
+            // extensions are padded to 8 bytes (fuse_ext_size()).
+            let mut buf = Vec::new();
+            let size = (size_of::<ExtHeader>() + 8) as u32;
+            buf.extend_from_slice(&size.to_ne_bytes());
+            buf.extend_from_slice(&0u32.to_ne_bytes());
+            buf.extend_from_slice(&[0u8; 8]);
+            buf.extend_from_slice(&build_supp_groups_ext(1000));
+
+            assert_eq!(
+                parse_create_extensions(&FsOptions::CREATE_SUPP_GROUP, &buf).unwrap(),
+                Some(1000)
+            );
+        }
+
+        #[test]
+        fn test_parse_create_extensions_truncated_header() {
+            assert_einval(parse_create_extensions(
+                &FsOptions::CREATE_SUPP_GROUP,
+                &[0u8; 4],
+            ));
+        }
+
+        #[test]
+        fn test_parse_create_extensions_bad_size() {
+            // Extension size smaller than the header.
+            let mut buf = Vec::new();
+            buf.extend_from_slice(&4u32.to_ne_bytes());
+            buf.extend_from_slice(&FUSE_EXT_GROUPS.to_ne_bytes());
+            assert_einval(parse_create_extensions(&FsOptions::CREATE_SUPP_GROUP, &buf));
+
+            // Extension size exceeding the payload.
+            let mut buf = build_supp_groups_ext(1000);
+            buf.truncate(8);
+            buf[0..4].copy_from_slice(&100u32.to_ne_bytes());
+            assert_einval(parse_create_extensions(&FsOptions::CREATE_SUPP_GROUP, &buf));
+        }
+
+        #[test]
+        fn test_parse_create_extensions_bad_nr_groups() {
+            // nr_groups is zero.
+            let mut buf = build_supp_groups_ext(1000);
+            buf[8..12].copy_from_slice(&0u32.to_ne_bytes());
+            assert_einval(parse_create_extensions(&FsOptions::CREATE_SUPP_GROUP, &buf));
+
+            // Payload size doesn't match nr_groups.
+            let mut buf = build_supp_groups_ext(1000);
+            buf[8..12].copy_from_slice(&2u32.to_ne_bytes());
+            assert_einval(parse_create_extensions(&FsOptions::CREATE_SUPP_GROUP, &buf));
+        }
+
+        #[test]
+        fn test_parse_create_extensions_multi_groups() {
+            // A well-formed extension carrying several groups: only the
+            // first one is consumed, mirroring virtiofsd.  The kernel
+            // currently sends a single matching group.
+            let mut buf = Vec::new();
+            // ExtHeader plus a body of nr_groups and two gids, padded to
+            // a multiple of 8 (FUSE_REC_ALIGN).
+            let size = (size_of::<ExtHeader>() + 16) as u32;
+            buf.extend_from_slice(&size.to_ne_bytes());
+            buf.extend_from_slice(&FUSE_EXT_GROUPS.to_ne_bytes());
+            buf.extend_from_slice(&2u32.to_ne_bytes());
+            buf.extend_from_slice(&1000u32.to_ne_bytes());
+            buf.extend_from_slice(&2000u32.to_ne_bytes());
+            buf.extend_from_slice(&[0u8; 4]); // padding
+            assert_eq!(
+                parse_create_extensions(&FsOptions::CREATE_SUPP_GROUP, &buf).unwrap(),
+                Some(1000)
+            );
+        }
+
+        #[test]
+        fn test_parse_create_extensions_too_many_groups() {
+            // nr_groups exceeding LINUX_NRGROUPS_MAX (65536) is rejected
+            // before the payload size is validated.
+            let mut buf = Vec::new();
+            let size = (size_of::<ExtHeader>() + size_of::<SuppGroups>()) as u32;
+            buf.extend_from_slice(&size.to_ne_bytes());
+            buf.extend_from_slice(&FUSE_EXT_GROUPS.to_ne_bytes());
+            buf.extend_from_slice(&65537u32.to_ne_bytes());
+            assert_einval(parse_create_extensions(&FsOptions::CREATE_SUPP_GROUP, &buf));
+        }
+
+        #[test]
+        fn test_parse_create_extensions_not_negotiated() {
+            // The supp group extension must be rejected when
+            // FUSE_CREATE_SUPP_GROUP hasn't been negotiated.
+            let buf = build_supp_groups_ext(1000);
+            assert_einval(parse_create_extensions(&FsOptions::empty(), &buf));
+            // An empty tail is still fine.
+            assert_eq!(
+                parse_create_extensions(&FsOptions::empty(), &[]).unwrap(),
+                None
+            );
+        }
+
+        #[test]
+        fn test_parse_create_extensions_garbage_after_supp_group() {
+            // The whole extension chain is validated: garbage appended
+            // after a valid supp group extension is rejected.
+            let mut buf = build_supp_groups_ext(1000);
+            buf.extend_from_slice(&[0u8; 4]);
+            assert_einval(parse_create_extensions(&FsOptions::CREATE_SUPP_GROUP, &buf));
+        }
+
+        #[test]
+        fn test_parse_create_extensions_unaligned_size() {
+            // Extension sizes must be multiples of 8 (FUSE_REC_ALIGN),
+            // even for unknown extension types.
+            let mut buf = Vec::new();
+            buf.extend_from_slice(&9u32.to_ne_bytes());
+            buf.extend_from_slice(&0u32.to_ne_bytes());
+            buf.extend_from_slice(&[0u8; 1]);
+            assert_einval(parse_create_extensions(&FsOptions::CREATE_SUPP_GROUP, &buf));
+        }
     }
 
     #[test]

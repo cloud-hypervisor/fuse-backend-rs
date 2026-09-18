@@ -218,6 +218,7 @@ mod vfs_async {
             uid: unsafe { libc::getuid() },
             gid: unsafe { libc::getgid() },
             pid: unsafe { libc::getpid() },
+            ..Default::default()
         };
 
         // Lookup the file through the Vfs layer.
