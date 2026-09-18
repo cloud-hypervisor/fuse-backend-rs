@@ -10,10 +10,12 @@ use std::time::Duration;
 use async_trait::async_trait;
 use vm_memory::ByteValued;
 
+use super::sync_io::parse_create_extensions;
 use crate::abi::fuse_abi::{
-    stat64, AttrOut, CreateIn, EntryOut, FallocateIn, FsyncIn, GetattrIn, Opcode, OpenIn, OpenOut,
-    OutHeader, ReadIn, SetattrIn, SetattrValid, WriteIn, WriteOut, FATTR_FH, GETATTR_FH,
-    KERNEL_MINOR_VERSION_LOOKUP_NEGATIVE_ENTRY_ZERO, READ_LOCKOWNER, WRITE_CACHE, WRITE_LOCKOWNER,
+    stat64, AttrOut, CreateIn, EntryOut, FallocateIn, FsOptions, FsyncIn, GetattrIn, Opcode,
+    OpenIn, OpenOut, OutHeader, ReadIn, SetattrIn, SetattrValid, WriteIn, WriteOut, FATTR_FH,
+    GETATTR_FH, KERNEL_MINOR_VERSION_LOOKUP_NEGATIVE_ENTRY_ZERO, READ_LOCKOWNER, WRITE_CACHE,
+    WRITE_LOCKOWNER,
 };
 use crate::api::filesystem::FsCacheReqHandler;
 use crate::api::filesystem::{
@@ -134,7 +136,7 @@ impl<F: AsyncFileSystem + Sync> Server<F> {
             || ctx.w.available_bytes() < size_of::<OutHeader>()
         {
             return ctx
-                .async_do_reply_error(io::Error::from_raw_os_error(libc::ENOMEM), true)
+                .async_reply_error(io::Error::from_raw_os_error(libc::ENOMEM))
                 .await;
         }
         let in_header = &ctx.in_header;
@@ -238,7 +240,7 @@ impl<F: AsyncFileSystem + Sync> Server<F> {
         let name = match bytes_to_cstr(buf.as_ref()) {
             Ok(name) => name,
             Err(e) => {
-                error!("fuse: bytes to cstr error: {:?}, {:?}", buf, e);
+                debug!("fuse: bytes to cstr error: {:?}, {:?}", buf, e);
                 let _ = ctx
                     .async_reply_error(io::Error::from_raw_os_error(libc::EINVAL))
                     .await;
@@ -411,7 +413,7 @@ impl<F: AsyncFileSystem + Sync> Server<F> {
 
         if size > MAX_BUFFER_SIZE {
             return ctx
-                .async_reply_error_explicit(io::Error::from_raw_os_error(libc::ENOMEM))
+                .async_reply_error(io::Error::from_raw_os_error(libc::ENOMEM))
                 .await;
         }
 
@@ -497,13 +499,27 @@ impl<F: AsyncFileSystem + Sync> Server<F> {
         let name = match bytes_to_cstr(buf.as_ref()) {
             Ok(name) => name,
             Err(e) => {
-                error!("fuse: bytes to cstr error: {:?}, {:?}", buf, e);
+                debug!("fuse: bytes to cstr error: {:?}, {:?}", buf, e);
                 let _ = ctx
                     .async_reply_error(io::Error::from_raw_os_error(libc::EINVAL))
                     .await;
                 return Err(e);
             }
         };
+
+        let supp_gid = match parse_create_extensions(
+            &FsOptions::from_bits_truncate(self.options.load(Ordering::Acquire)),
+            &buf[name.to_bytes_with_nul().len()..],
+        ) {
+            Ok(supp_gid) => supp_gid,
+            Err(e) => {
+                let _ = ctx
+                    .async_reply_error(io::Error::from_raw_os_error(libc::EINVAL))
+                    .await;
+                return Err(e);
+            }
+        };
+        ctx.context.supp_gid = supp_gid;
 
         let result = self
             .fs

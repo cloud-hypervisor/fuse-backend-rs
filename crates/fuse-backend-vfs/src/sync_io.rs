@@ -158,10 +158,15 @@ impl FileSystem for Vfs {
     ) -> Result<Entry> {
         validate_path_component(name)?;
 
+        // The supp gid is parsed after the request-wide id remap, so
+        // translate it here, where the target mount is known.
+        let mut ctx = *ctx;
+        self.remap_ctx_supp_gid(&mut ctx, parent.fs_idx());
+
         match self.get_real_rootfs(parent)? {
-            (Left(fs), idata) => fs.symlink(ctx, linkname, idata.ino(), name),
+            (Left(fs), idata) => fs.symlink(&ctx, linkname, idata.ino(), name),
             (Right(fs), idata) => fs
-                .symlink(ctx, linkname, idata.ino(), name)
+                .symlink(&ctx, linkname, idata.ino(), name)
                 .and_then(|e| self.convert_backend_entry(idata, e)),
         }
     }
@@ -177,10 +182,15 @@ impl FileSystem for Vfs {
     ) -> Result<Entry> {
         validate_path_component(name)?;
 
+        // The supp gid is parsed after the request-wide id remap, so
+        // translate it here, where the target mount is known.
+        let mut ctx = *ctx;
+        self.remap_ctx_supp_gid(&mut ctx, inode.fs_idx());
+
         match self.get_real_rootfs(inode)? {
-            (Left(fs), idata) => fs.mknod(ctx, idata.ino(), name, mode, rdev, umask),
+            (Left(fs), idata) => fs.mknod(&ctx, idata.ino(), name, mode, rdev, umask),
             (Right(fs), idata) => fs
-                .mknod(ctx, idata.ino(), name, mode, rdev, umask)
+                .mknod(&ctx, idata.ino(), name, mode, rdev, umask)
                 .and_then(|e| self.convert_backend_entry(idata, e)),
         }
     }
@@ -195,10 +205,15 @@ impl FileSystem for Vfs {
     ) -> Result<Entry> {
         validate_path_component(name)?;
 
+        // The supp gid is parsed after the request-wide id remap, so
+        // translate it here, where the target mount is known.
+        let mut ctx = *ctx;
+        self.remap_ctx_supp_gid(&mut ctx, parent.fs_idx());
+
         match self.get_real_rootfs(parent)? {
-            (Left(fs), idata) => fs.mkdir(ctx, idata.ino(), name, mode, umask),
+            (Left(fs), idata) => fs.mkdir(&ctx, idata.ino(), name, mode, umask),
             (Right(fs), idata) => fs
-                .mkdir(ctx, idata.ino(), name, mode, umask)
+                .mkdir(&ctx, idata.ino(), name, mode, umask)
                 .and_then(|e| self.convert_backend_entry(idata, e)),
         }
     }
@@ -310,10 +325,15 @@ impl FileSystem for Vfs {
     ) -> Result<(Entry, Option<u64>, OpenOptions, Option<u32>)> {
         validate_path_component(name)?;
 
+        // The supp gid is parsed after the request-wide id remap, so
+        // translate it here, where the target mount is known.
+        let mut ctx = *ctx;
+        self.remap_ctx_supp_gid(&mut ctx, parent.fs_idx());
+
         match self.get_real_rootfs(parent)? {
-            (Left(fs), idata) => fs.create(ctx, idata.ino(), name, args),
+            (Left(fs), idata) => fs.create(&ctx, idata.ino(), name, args),
             (Right(fs), idata) => {
-                fs.create(ctx, idata.ino(), name, args)
+                fs.create(&ctx, idata.ino(), name, args)
                     .and_then(|(a, b, c, d)| {
                         self.convert_backend_entry(idata, a).map(|a| (a, b, c, d))
                     })
@@ -700,6 +720,7 @@ mod tests {
             uid: 100000,
             gid: 100123,
             pid: 1,
+            supp_gid: None,
         };
 
         vfs.id_remap(&mut ctx).unwrap();
@@ -719,6 +740,7 @@ mod tests {
             uid: 100000,
             gid: 100123,
             pid: 1,
+            supp_gid: None,
         };
 
         // fs_idx == 0 (pseudo fs) falls back to global mapping
@@ -727,5 +749,47 @@ mod tests {
 
         assert_eq!(ctx.uid, 0);
         assert_eq!(ctx.gid, 123);
+    }
+
+    #[test]
+    fn test_remap_ctx_supp_gid() {
+        let vfs = Vfs::new(VfsOptions {
+            id_mapping: (0, 100000, 65536),
+            ..Default::default()
+        });
+
+        // An external gid inside the mapped range is translated to the
+        // internal (host) namespace.  fs_idx 0 (pseudo fs) falls back to
+        // the global mapping.
+        let mut ctx = Context {
+            uid: 100000,
+            gid: 100123,
+            pid: 1,
+            supp_gid: Some(100123),
+        };
+        vfs.remap_ctx_supp_gid(&mut ctx, 0);
+        assert_eq!(ctx.supp_gid, Some(123));
+
+        // An external gid outside the mapped range has no host counterpart
+        // and is dropped instead of being adopted untranslated.
+        ctx = Context {
+            uid: 100000,
+            gid: 100123,
+            pid: 1,
+            supp_gid: Some(5),
+        };
+        vfs.remap_ctx_supp_gid(&mut ctx, 0);
+        assert_eq!(ctx.supp_gid, None);
+
+        // Without an id mapping the gid passes through unchanged.
+        let vfs = Vfs::new(VfsOptions::default());
+        ctx = Context {
+            uid: 0,
+            gid: 0,
+            pid: 1,
+            supp_gid: Some(123),
+        };
+        vfs.remap_ctx_supp_gid(&mut ctx, 0);
+        assert_eq!(ctx.supp_gid, Some(123));
     }
 }

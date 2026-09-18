@@ -160,6 +160,7 @@ fn prepare_context() -> Context {
         uid: unsafe { libc::getuid() },
         gid: unsafe { libc::getgid() },
         pid: unsafe { libc::getpid() },
+        ..Default::default()
     }
 }
 

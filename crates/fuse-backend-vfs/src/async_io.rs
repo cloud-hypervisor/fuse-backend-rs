@@ -94,12 +94,17 @@ impl AsyncFileSystem for Vfs {
     ) -> Result<(Entry, Option<<Self as FileSystem>::Handle>, OpenOptions)> {
         validate_path_component(name)?;
 
+        // The supp gid is parsed after the request-wide id remap, so
+        // translate it here, where the target mount is known.
+        let mut ctx = *ctx;
+        self.remap_ctx_supp_gid(&mut ctx, parent.fs_idx());
+
         match self.get_real_rootfs(parent)? {
             (Left(fs), idata) => fs
-                .create(ctx, idata.ino(), name, args)
+                .create(&ctx, idata.ino(), name, args)
                 .map(|(a, b, c, _)| (a, b, c)),
             (Right(fs), idata) => fs
-                .async_create(ctx, idata.ino(), name, args)
+                .async_create(&ctx, idata.ino(), name, args)
                 .await
                 .and_then(|(a, b, c)| self.convert_backend_entry(idata, a).map(|a| (a, b, c))),
         }
@@ -226,6 +231,7 @@ mod tests {
             uid: 0,
             gid: 0,
             pid: 0,
+            supp_gid: None,
         };
 
         assert!(vfs.mount(Box::new(fs), "/x/y").is_ok());
