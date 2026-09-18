@@ -11,7 +11,12 @@ mod example;
 
 #[cfg(all(feature = "fusedev", target_os = "linux"))]
 mod fusedev_tests {
+    use std::ffi::CString;
     use std::io::Result;
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::MetadataExt;
+    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::process::CommandExt;
     use std::path::Path;
     use std::process::Command;
 
@@ -132,6 +137,28 @@ mod fusedev_tests {
         result
     }
 
+    fn running_as_root() -> bool {
+        unsafe { libc::geteuid() == 0 }
+    }
+
+    fn kernel_release() -> String {
+        std::fs::read_to_string("/proc/sys/kernel/osrelease")
+            .map(|release| release.trim().to_string())
+            .unwrap_or_else(|_| "unknown".to_string())
+    }
+
+    fn kernel_at_least(major: u32, minor: u32) -> bool {
+        let release = kernel_release();
+        let mut fields = release.split('.');
+        match (
+            fields.next().and_then(|f| f.parse::<u32>().ok()),
+            fields.next().and_then(|f| f.parse::<u32>().ok()),
+        ) {
+            (Some(kmaj), Some(kmin)) => (kmaj, kmin) >= (major, minor),
+            _ => false,
+        }
+    }
+
     #[test]
     #[ignore] // it depends on privileged mode to pass through /dev/fuse
     fn integration_test_tree_gitrepo() -> Result<()> {
@@ -183,6 +210,101 @@ mod fusedev_tests {
         // Unmount the filesystem
         daemon.umount().unwrap();
 
+        Ok(())
+    }
+
+    #[test]
+    #[ignore] // it depends on privileged mode to pass through /dev/fuse
+    fn integration_test_create_supp_group() -> Result<()> {
+        // End-to-end test for FUSE_CREATE_SUPP_GROUP: an unprivileged
+        // process creates a file through the FUSE mount inside a setgid
+        // directory whose group is only in the creator's supplementary
+        // groups.  The kernel (>= 6.3) sends that group in a
+        // FUSE_EXT_GROUPS extension, and the server must temporarily
+        // adopt it, so that the create succeeds and the new file inherits
+        // the group of the setgid directory.  Without the extension the
+        // server-side create fails with EACCES, since the server adopts
+        // the creator's credentials, which lack the directory's group.
+        //
+        // It needs root (CAP_SETGID/CAP_CHOWN) and a kernel >= 6.3, both
+        // of which the GitHub CI runners provide.
+        if !running_as_root() {
+            eprintln!("skipping integration_test_create_supp_group: not running as root");
+            return Ok(());
+        }
+        if !kernel_at_least(6, 3) {
+            eprintln!(
+                "skipping integration_test_create_supp_group: kernel {} does not support FUSE_CREATE_SUPP_GROUP (needs >= 6.3)",
+                kernel_release()
+            );
+            return Ok(());
+        }
+
+        // Group of the setgid directory, used as a supplementary group of
+        // the unprivileged creator.  It must not be a group of the daemon
+        // itself, otherwise the create would succeed without the extension.
+        let gid: libc::gid_t = 12345;
+        // An unprivileged uid whose primary group differs from `gid`.
+        let uid: libc::uid_t = 65534;
+
+        let src_dir = TempDir::new().unwrap();
+        let mnt_dir = TempDir::new().unwrap();
+        let src = src_dir.as_path().to_str().unwrap().to_string();
+        let mnt = mnt_dir.as_path().to_str().unwrap().to_string();
+
+        // Setgid directory owned by root:`gid` with mode 2770: only group
+        // members may create entries in it.
+        let setgid_dir = src_dir.as_path().join("setgid-dir");
+        std::fs::create_dir(&setgid_dir).unwrap();
+        let setgid_dir_c = CString::new(setgid_dir.as_os_str().as_bytes()).unwrap();
+        assert_eq!(
+            unsafe { libc::chown(setgid_dir_c.as_ptr(), 0, gid) },
+            0,
+            "failed to chown the setgid directory"
+        );
+        std::fs::set_permissions(&setgid_dir, std::fs::Permissions::from_mode(0o2770)).unwrap();
+        // Let the unprivileged creator traverse the mount root.
+        std::fs::set_permissions(src_dir.as_path(), std::fs::Permissions::from_mode(0o755))
+            .unwrap();
+
+        let mut daemon = passthroughfs::Daemon::new(&src, &mnt, 1).unwrap();
+        daemon.mount().unwrap();
+
+        // The creator has `gid` as its only supplementary group and nobody's
+        // uid and primary gid, and creates a file in the setgid directory
+        // through the FUSE mount.
+        let mut cmd = Command::new("touch");
+        cmd.arg(format!("{}/setgid-dir/file", mnt));
+        unsafe {
+            cmd.pre_exec(move || {
+                // Add `gid` to the supplementary groups while the process
+                // still has CAP_SETGID, then drop all privileges.
+                let groups = [gid];
+                if libc::setgroups(1, groups.as_ptr()) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                if libc::setresgid(uid, uid, uid) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                if libc::setresuid(uid, uid, uid) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let status = cmd.status().unwrap();
+        assert!(
+            status.success(),
+            "create through the FUSE mount failed: {}",
+            status
+        );
+
+        // The file must have been created on the source side with the group
+        // of the setgid directory.
+        let md = std::fs::metadata(src_dir.as_path().join("setgid-dir/file")).unwrap();
+        assert_eq!(md.gid(), gid);
+
+        daemon.umount().unwrap();
         Ok(())
     }
 }
