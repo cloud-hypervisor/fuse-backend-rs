@@ -691,6 +691,13 @@ impl<S: BitmapSlice + Send + Sync> FileSystem for PassthroughFs<S> {
             opts |= FsOptions::HANDLE_KILLPRIV_V2;
             self.killpriv_v2.store(true, Ordering::Relaxed);
         }
+        // No config option is needed: the handlers unconditionally honor
+        // Context.supp_gid, so just mirror what the kernel offers.  This
+        // also covers standalone mounts not sitting behind a Vfs, which
+        // negotiates the flag on its own.
+        if capable.contains(FsOptions::CREATE_SUPP_GROUP) {
+            opts |= FsOptions::CREATE_SUPP_GROUP;
+        }
 
         if capable.contains(FsOptions::PERFILE_DAX) {
             opts |= FsOptions::PERFILE_DAX;
@@ -787,6 +794,7 @@ impl<S: BitmapSlice + Send + Sync> FileSystem for PassthroughFs<S> {
         let data = self.inode_map.get(parent)?;
 
         let res = {
+            let _groups = ScopedSuppGroups::new(ctx.supp_gid)?;
             let (_uid, _gid) = set_creds(ctx.uid, ctx.gid)?;
 
             let file = data.get_file()?;
@@ -919,6 +927,7 @@ impl<S: BitmapSlice + Send + Sync> FileSystem for PassthroughFs<S> {
         let dir_file = dir.get_file()?;
 
         let new_file = {
+            let _groups = ScopedSuppGroups::new(ctx.supp_gid)?;
             let (_uid, _gid) = set_creds(ctx.uid, ctx.gid)?;
 
             let flags = self.get_writeback_open_flags(args.flags as i32);
@@ -1303,6 +1312,7 @@ impl<S: BitmapSlice + Send + Sync> FileSystem for PassthroughFs<S> {
         let file = data.get_file()?;
 
         let res = {
+            let _groups = ScopedSuppGroups::new(ctx.supp_gid)?;
             let (_uid, _gid) = set_creds(ctx.uid, ctx.gid)?;
 
             // Safe because this doesn't modify any memory and we check the return value.
@@ -1368,6 +1378,7 @@ impl<S: BitmapSlice + Send + Sync> FileSystem for PassthroughFs<S> {
         let data = self.inode_map.get(parent)?;
 
         let res = {
+            let _groups = ScopedSuppGroups::new(ctx.supp_gid)?;
             let (_uid, _gid) = set_creds(ctx.uid, ctx.gid)?;
 
             let file = data.get_file()?;
