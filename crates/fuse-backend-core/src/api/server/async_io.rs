@@ -136,7 +136,7 @@ impl<F: AsyncFileSystem + Sync> Server<F> {
             || ctx.w.available_bytes() < size_of::<OutHeader>()
         {
             return ctx
-                .async_do_reply_error(io::Error::from_raw_os_error(libc::ENOMEM), true)
+                .async_reply_error(io::Error::from_raw_os_error(libc::ENOMEM))
                 .await;
         }
         let in_header = &ctx.in_header;
@@ -240,7 +240,7 @@ impl<F: AsyncFileSystem + Sync> Server<F> {
         let name = match bytes_to_cstr(buf.as_ref()) {
             Ok(name) => name,
             Err(e) => {
-                error!("fuse: bytes to cstr error: {:?}, {:?}", buf, e);
+                debug!("fuse: bytes to cstr error: {:?}, {:?}", buf, e);
                 let _ = ctx
                     .async_reply_error(io::Error::from_raw_os_error(libc::EINVAL))
                     .await;
@@ -413,7 +413,7 @@ impl<F: AsyncFileSystem + Sync> Server<F> {
 
         if size > MAX_BUFFER_SIZE {
             return ctx
-                .async_reply_error_explicit(io::Error::from_raw_os_error(libc::ENOMEM))
+                .async_reply_error(io::Error::from_raw_os_error(libc::ENOMEM))
                 .await;
         }
 
@@ -499,7 +499,7 @@ impl<F: AsyncFileSystem + Sync> Server<F> {
         let name = match bytes_to_cstr(buf.as_ref()) {
             Ok(name) => name,
             Err(e) => {
-                error!("fuse: bytes to cstr error: {:?}, {:?}", buf, e);
+                debug!("fuse: bytes to cstr error: {:?}, {:?}", buf, e);
                 let _ = ctx
                     .async_reply_error(io::Error::from_raw_os_error(libc::EINVAL))
                     .await;
