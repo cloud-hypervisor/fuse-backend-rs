@@ -938,6 +938,21 @@ impl<F: FileSystem + Sync> Server<F> {
                 let enabled = capable & want;
                 #[cfg(all(target_os = "linux", feature = "fusedev-uring"))]
                 let enabled = self.apply_extra_init_flags(capable, enabled);
+                // Capability bits 32 and above (FUSE_SECURITY_CTX,
+                // FUSE_CREATE_SUPP_GROUP, ...) travel in flags2 of the reply,
+                // and the kernel applies flags2 only when the daemon also sets
+                // FUSE_INIT_EXT in flags (see process_init_reply() in
+                // fs/fuse/inode.c).  Echo the flag whenever any upper bit is
+                // enabled, or the kernel would silently drop the whole flags2
+                // set.  The extended flag set only exists in the Linux ABI:
+                // macFUSE carries no capability bits above 32, so there is
+                // nothing to echo there.
+                #[cfg(target_os = "linux")]
+                let enabled = if enabled.bits() >> 32 != 0 {
+                    enabled | FsOptions::INIT_EXT
+                } else {
+                    enabled
+                };
                 self.options.store(enabled.bits(), Ordering::Release);
                 let enabled_flags = enabled.bits();
                 let mut out = InitOut {
@@ -1906,6 +1921,62 @@ mod tests {
 
         assert!(init_params_called);
         assert_eq!(res, 80);
+    }
+
+    #[test]
+    fn test_server_init_echoes_init_ext_for_64bit_caps() {
+        // A file system negotiating FUSE_CREATE_SUPP_GROUP (bit 34) when the
+        // kernel offers it, like Vfs and PassthroughFs do.  Its other
+        // operations keep the default implementations.
+        struct SuppGroupFs;
+        impl FileSystem for SuppGroupFs {
+            type Inode = u64;
+            type Handle = u64;
+
+            fn init(&self, capable: FsOptions) -> io::Result<FsOptions> {
+                Ok(capable & FsOptions::CREATE_SUPP_GROUP)
+            }
+        }
+
+        // A kernel >= 6.3 sends the full 64-byte fuse_init_in: INIT_EXT in
+        // flags and FUSE_CREATE_SUPP_GROUP in flags2.
+        let mut read_buf = [0u8; size_of::<InitIn>() + size_of::<InitIn2>()];
+        let init_in = InitIn {
+            major: KERNEL_VERSION,
+            minor: KERNEL_MINOR_VERSION,
+            max_readahead: 0,
+            flags: FsOptions::INIT_EXT.bits() as u32,
+        };
+        read_buf[..size_of::<InitIn>()].copy_from_slice(init_in.as_slice());
+        let init_in2 = InitIn2 {
+            flags2: (FsOptions::CREATE_SUPP_GROUP.bits() >> 32) as u32,
+            unused: [0; 11],
+        };
+        read_buf[size_of::<InitIn>()..].copy_from_slice(init_in2.as_slice());
+
+        let server = Server::new(SuppGroupFs);
+        let mut write_buf = [0u8; 4096];
+        let ctx = {
+            let reader = Reader::<()>::from_slice(&mut read_buf);
+            let writer = TestWriter::new(&mut write_buf);
+            SrvContext::new(InHeader::default(), reader, writer)
+        };
+        let res = server.init(ctx, |_| {}).unwrap();
+        assert_eq!(res, size_of::<OutHeader>() + size_of::<InitOut>());
+
+        // The reply must carry FUSE_CREATE_SUPP_GROUP in flags2 and echo
+        // FUSE_INIT_EXT in flags: the kernel applies flags2 only when the
+        // echo is present, so without it the capability would be silently
+        // dropped and the kernel would never send FUSE_EXT_GROUPS
+        // extensions.
+        let mut out = InitOut::default();
+        out.as_mut_slice()
+            .copy_from_slice(&write_buf[size_of::<OutHeader>()..res]);
+        assert_ne!(out.flags & FsOptions::INIT_EXT.bits() as u32, 0);
+        assert_ne!(
+            out.flags2 & (FsOptions::CREATE_SUPP_GROUP.bits() >> 32) as u32,
+            0
+        );
     }
 
     #[cfg(feature = "fusedev-uring")]
