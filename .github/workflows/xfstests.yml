@@ -70,3 +70,31 @@ jobs:
       run: |
         cd $GITHUB_WORKSPACE
         sudo ./tests/scripts/unionmount_test_overlay.sh
+
+  hardlink_e2e_on_overlayfs:
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+    - name: Install Rust
+      uses: actions-rs/toolchain@v1
+      with:
+        profile: minimal
+        toolchain: stable
+        override: true
+    # Nothing to install: the runner image ships fuse3, which provides
+    # fusermount/fusermount3 and on Ubuntu 24.04 conflicts with fuse
+    # (fuse3 Breaks: fuse), so the two packages can never coexist.
+    - name: Build overlay binary
+      run: cargo build --release -p overlay
+    # Run as root like the sibling suites: the unprivileged mode the
+    # script also supports needs user_allow_other in /etc/fuse.conf
+    # (fusermount3 rejects allow_other for non-root without it) and a
+    # kernel permitting unprivileged 0/0 char-device mknod, and stock
+    # runners provide neither. Under root the passthrough
+    # /proc/self/fd link() fallback is not exercised
+    # (CAP_DAC_READ_SEARCH makes the first linkat attempt succeed).
+    - name: Run hardlink e2e
+      run: |
+        cd $GITHUB_WORKSPACE
+        sudo ./tests/scripts/hardlink_e2e.sh ./target/release/overlay
