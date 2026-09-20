@@ -1362,7 +1362,39 @@ impl<S: BitmapSlice + Send + Sync> FileSystem for PassthroughFs<S> {
         if res == 0 {
             self.do_lookup(newparent, newname)
         } else {
-            Err(io::Error::last_os_error())
+            let err = io::Error::last_os_error();
+            // linkat() with AT_EMPTY_PATH requires CAP_DAC_READ_SEARCH,
+            // which unprivileged daemons don't have, and the kernel reports
+            // the missing capability as ENOENT. Retry through /proc/self/fd,
+            // following the magic symlink to the file the fd refers to.
+            if err.raw_os_error() == Some(libc::ENOENT) {
+                // The retry cannot link a symlink itself: following the
+                // magic symlink resolves to the link target, so the new
+                // name would point at the target instead of the symlink.
+                // Report the missing capability instead of linking the
+                // wrong file. The file type cannot change for a live
+                // inode, so the cached mode is reliable here.
+                if (data.mode & libc::S_IFMT) == libc::S_IFLNK {
+                    return Err(io::Error::from_raw_os_error(libc::EPERM));
+                }
+                let oldpath = CString::new(format!("{}", file.as_raw_fd()))
+                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+                // Safe because this doesn't modify any memory and we check the return value.
+                let res = unsafe {
+                    libc::linkat(
+                        self.proc_self_fd.as_raw_fd(),
+                        oldpath.as_ptr(),
+                        new_file.as_raw_fd(),
+                        newname.as_ptr(),
+                        libc::AT_SYMLINK_FOLLOW,
+                    )
+                };
+                if res == 0 {
+                    return self.do_lookup(newparent, newname);
+                }
+                return Err(io::Error::last_os_error());
+            }
+            Err(err)
         }
     }
 
@@ -1975,6 +2007,119 @@ mod tests {
         let link_entry = fs.lookup(&ctx, ROOT_ID, &new_name).unwrap();
 
         assert_eq!(link_entry.inode, test_entry.inode);
+    }
+
+    // Hard-linking a symlink exercises the privilege split of link():
+    // with CAP_DAC_READ_SEARCH the first linkat() succeeds and links the
+    // symlink itself, while without it the kernel answers ENOENT and the
+    // /proc/self/fd fallback refuses to follow the magic symlink -- it
+    // would link the target instead of the symlink -- so the documented
+    // EPERM surfaces. Both outcomes are correct; anything else is a bug.
+    // The regular-file variant is covered by test_link_rename()
+    // (privileged only) and test_link_regular().
+    //
+    // Unlike prepare_fs_tmpdir(), this builds the fs without inode file
+    // handles: open_by_handle_at() needs CAP_DAC_READ_SEARCH as well, and
+    // its EPERM would shadow the very code under test here.
+    #[test]
+    fn test_link_symlink() {
+        let source = TempDir::new().expect("Cannot create temporary directory.");
+        let fs_cfg = Config {
+            root_dir: source
+                .as_path()
+                .to_str()
+                .expect("source path to string")
+                .to_string(),
+            ..Default::default()
+        };
+        let fs = PassthroughFs::<()>::new(fs_cfg).unwrap();
+        fs.import().unwrap();
+        fs.init(FsOptions::all()).unwrap();
+        let ctx = prepare_context();
+
+        let target = TempFile::new_in(source.as_path()).expect("Cannot create temporary file.");
+        let target_name = target
+            .as_path()
+            .file_name()
+            .unwrap()
+            .to_str()
+            .expect("path to string");
+        let target_c = CString::new(target_name).unwrap();
+        let link_name = CString::new("test_symlink_link").unwrap();
+        fs.symlink(&ctx, &target_c, ROOT_ID, &link_name).unwrap();
+
+        let sym_entry = fs.lookup(&ctx, ROOT_ID, &link_name).unwrap();
+        assert_eq!(sym_entry.attr.st_mode & libc::S_IFMT, libc::S_IFLNK);
+
+        let hard_name = CString::new("test_symlink_hard").unwrap();
+        match fs.link(&ctx, sym_entry.inode, ROOT_ID, &hard_name) {
+            Ok(entry) => {
+                // Privileged: the hard link is the symlink itself, so it
+                // shares the inode and still points at the target.
+                assert_eq!(entry.inode, sym_entry.inode);
+                assert_eq!(entry.attr.st_mode & libc::S_IFMT, libc::S_IFLNK);
+                assert_eq!(
+                    std::fs::read_link(source.as_path().join("test_symlink_hard")).unwrap(),
+                    Path::new(target_name)
+                );
+            }
+            Err(e) => {
+                // Unprivileged: a symlink cannot be linked without
+                // following it, so the missing capability is reported.
+                assert_eq!(e.raw_os_error(), Some(libc::EPERM));
+            }
+        }
+    }
+
+    // Hard-linking a regular file exercises both paths of link(): with
+    // CAP_DAC_READ_SEARCH the first linkat() succeeds directly, while
+    // without it the kernel answers ENOENT and the retry through
+    // /proc/self/fd links the same inode. Either way the new name must
+    // be a working hard link of the file; anything else is a bug.
+    //
+    // Built without inode file handles for the same reason as
+    // test_link_symlink(): open_by_handle_at() would fail EPERM first
+    // and shadow the code under test.
+    #[test]
+    fn test_link_regular() {
+        let source = TempDir::new().expect("Cannot create temporary directory.");
+        let fs_cfg = Config {
+            root_dir: source
+                .as_path()
+                .to_str()
+                .expect("source path to string")
+                .to_string(),
+            ..Default::default()
+        };
+        let fs = PassthroughFs::<()>::new(fs_cfg).unwrap();
+        fs.import().unwrap();
+        fs.init(FsOptions::all()).unwrap();
+        let ctx = prepare_context();
+
+        let file = TempFile::new_in(source.as_path()).expect("Cannot create temporary file.");
+        let file_name = file
+            .as_path()
+            .file_name()
+            .unwrap()
+            .to_str()
+            .expect("path to string");
+        let file_c = CString::new(file_name).unwrap();
+        let entry = fs.lookup(&ctx, ROOT_ID, &file_c).unwrap();
+        assert_eq!(entry.attr.st_mode & libc::S_IFMT, libc::S_IFREG);
+
+        let link_name = CString::new("test_regular_link").unwrap();
+        let link_entry = fs.link(&ctx, entry.inode, ROOT_ID, &link_name).unwrap();
+        assert_eq!(link_entry.inode, entry.inode);
+
+        // The link must be real: both names resolve to the same file
+        // with the link counted.
+        use std::os::unix::fs::MetadataExt;
+        let link_path = source.as_path().join("test_regular_link");
+        assert_eq!(
+            std::fs::metadata(&link_path).unwrap().ino(),
+            std::fs::metadata(file.as_path()).unwrap().ino()
+        );
+        assert_eq!(std::fs::metadata(&link_path).unwrap().nlink(), 2);
     }
 
     #[test]
