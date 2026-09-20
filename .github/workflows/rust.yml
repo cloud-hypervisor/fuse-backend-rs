@@ -45,6 +45,11 @@ jobs:
         echo user_allow_other | sudo tee --append /etc/fuse.conf
         CARGO_HOME=${HOME}/.cargo
         CARGO_BIN=$(which cargo)
+        # The passthrough link() /proc/self/fd fallback only runs without
+        # CAP_DAC_READ_SEARCH, so run the two link tests built for it
+        # unprivileged before the privileged rows below re-run the whole
+        # suite as root (the other link tests need open_by_handle_at()).
+        ${CARGO_BIN} test -p fuse-backend-passthrough --no-default-features -- --nocapture test_link_symlink test_link_regular
         sudo -E CARGO=${CARGO_BIN} make test
         sudo -E CARGO=${CARGO_BIN} make smoke-all
         sudo chown -R $(id -u):$(id -g) "${HOME}/.cargo"
