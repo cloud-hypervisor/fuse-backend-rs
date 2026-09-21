@@ -32,7 +32,7 @@ if mountpoint -q "$T/mnt" 2>/dev/null; then
     fusermount -u "$T/mnt"
 fi
 rm -rf "$T"
-mkdir -p "$T/lower/a" "$T/lower/b" "$T/upper" "$T/work" "$T/mnt"
+mkdir -p "$T/lower/a" "$T/lower/b" "$T/lower/c" "$T/upper" "$T/work" "$T/mnt"
 
 # lower-layer hard links
 echo hello > "$T/lower/a/f"
@@ -45,6 +45,15 @@ ln "$T/lower/a/c" "$T/lower/b/c"
 # lower-layer hard links for the last-upper-entry removal scenario
 echo data > "$T/lower/a/d"
 ln "$T/lower/a/d" "$T/lower/b/d"
+
+# single-link lower file for the copied-up removal scenario
+echo single > "$T/lower/a/single"
+
+# lower-layer hard links for the materialization scenario: the third
+# link's directory is read only after the file was copied up
+echo late > "$T/lower/a/late1"
+ln "$T/lower/a/late1" "$T/lower/a/late2"
+ln "$T/lower/a/late1" "$T/lower/c/late3"
 
 FAILED=0
 DPID=
@@ -191,6 +200,33 @@ stop_daemon
 start_daemon
 [ ! -e "$T/mnt/a/d" ]; check "no resurrection after remount" $?
 [ "$(cat "$T/mnt/b/d")" = "$(printf 'data\nx')" ]; check "copied-up data survives remount" $?
+
+echo "== 11. rm a copied-up single-link file; whiteout must shadow the lower entry =="
+echo x >> "$T/mnt/a/single"   # copies the file up
+[ -f "$T/upper/a/single" ]; check "single-link file copied up through write" $?
+rm "$T/mnt/a/single"
+check "rm copied-up single-link file" $?
+[ -c "$T/upper/a/single" ]; check "whiteout created for the removed name" $?
+[ ! -e "$T/mnt/a/single" ]; check "removed file is gone" $?
+stop_daemon
+start_daemon
+[ ! -e "$T/mnt/a/single" ]; check "no resurrection after remount" $?
+
+echo "== 12. unlink materializes lower-only links of a copied-up file =="
+stop_daemon
+start_daemon
+stat "$T/mnt/a/late1" "$T/mnt/a/late2" > /dev/null  # load a; c stays unread
+echo x >> "$T/mnt/a/late1"                          # copy-up: only this entry goes upper
+ln "$T/mnt/a/late1" "$T/mnt/a/late4"                # a second upper-layer entry
+ls "$T/mnt/c" > /dev/null                           # registers c's link as lower-only
+rm "$T/mnt/a/late1"
+check "rm one link of the copied-up file" $?
+[ "$(cat "$T/mnt/a/late2")" = "$(printf 'late\nx')" ]; check "loaded link sees copied-up data" $?
+stop_daemon
+start_daemon
+[ "$(cat "$T/mnt/c/late3")" = "$(printf 'late\nx')" ]; check "lower-only link serves copied-up data" $?
+[ "$(stat -c %i "$T/mnt/a/late4")" = "$(stat -c %i "$T/mnt/c/late3")" ]; check "remaining links share the inode" $?
+[ ! -e "$T/mnt/a/late1" ]; check "removed link stays gone after remount" $?
 
 stop_daemon
 
