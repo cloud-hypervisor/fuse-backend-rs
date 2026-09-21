@@ -2275,7 +2275,12 @@ impl OverlayFs {
         let pnode = self.copy_node_up(ctx, Arc::clone(&pnode))?;
 
         if node.upper_layer_only() {
-            need_whiteout = false;
+            // An upper-only file may still shadow a lower-layer entry:
+            // file copy-up drops the lower RealInodes, and replacing a
+            // whiteout with a new file never records any. Create the
+            // whiteout when the name still exists below, or the entry
+            // would reappear after a remount.
+            need_whiteout = self.lower_entry_exists(ctx, &pnode, &sname)?;
         }
 
         // With one overlay inode shared by all hard links of a file, the
