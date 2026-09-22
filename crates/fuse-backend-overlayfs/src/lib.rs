@@ -2503,6 +2503,18 @@ impl OverlayFs {
                     }
                 }
 
+                // The entry dies with the directory. Release its
+                // lookups reference like do_rm() does for an unlink:
+                // the kernel may forget the dentry later, or may never
+                // have looked it up at all (whiteout placeholders can
+                // never be looked up), and without this the birth
+                // reference would strand the child on the deleted list.
+                let _ = child
+                    .lookups
+                    .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |l| {
+                        Some(l.saturating_sub(1))
+                    });
+
                 // Delete the child. If it still has other hard links in
                 // other directories, keep the overlay inode alive and
                 // only drop this path.
