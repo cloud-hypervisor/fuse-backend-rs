@@ -55,6 +55,10 @@ echo late > "$T/lower/a/late1"
 ln "$T/lower/a/late1" "$T/lower/a/late2"
 ln "$T/lower/a/late1" "$T/lower/c/late3"
 
+# lower-layer directory for the rmdir-with-whiteout scenario
+mkdir -p "$T/lower/e"
+echo f1content > "$T/lower/e/f1"
+
 FAILED=0
 DPID=
 check() { # check <description> <condition-result>
@@ -227,6 +231,20 @@ start_daemon
 [ "$(cat "$T/mnt/c/late3")" = "$(printf 'late\nx')" ]; check "lower-only link serves copied-up data" $?
 [ "$(stat -c %i "$T/mnt/a/late4")" = "$(stat -c %i "$T/mnt/c/late3")" ]; check "remaining links share the inode" $?
 [ ! -e "$T/mnt/a/late1" ]; check "removed link stays gone after remount" $?
+
+echo "== 13. rmdir a directory whose last entry is a whiteout =="
+stop_daemon
+start_daemon
+touch "$T/mnt/e/new"          # copies e up; e/f1 stays a lower-only entry
+rm "$T/mnt/e/f1"              # a whiteout placeholder replaces the entry
+rm "$T/mnt/e/new"
+sleep 1                       # let the kernel settle the unlink forgets
+rmdir "$T/mnt/e"
+check "rmdir a directory holding only a whiteout" $?
+[ ! -e "$T/mnt/e" ]; check "directory is gone" $?
+stop_daemon
+start_daemon
+[ ! -e "$T/mnt/e" ]; check "no resurrection after remount" $?
 
 stop_daemon
 

@@ -1262,8 +1262,20 @@ impl OverlayFs {
             let parent = v.parent.lock().unwrap();
 
             if let Some(p) = parent.upgrade() {
-                // remove it from hashmap
-                p.remove_child(v.name.as_str());
+                // Detach the inode from its parent only while the
+                // directory entry is still its own: after an unlink the
+                // name may already be occupied by the whiteout
+                // placeholder do_rm() installed, and detaching that
+                // would hide the whiteout from a following rmdir, which
+                // then fails with ENOTEMPTY on the upper directory.
+                let node_ptr = Arc::as_ptr(&v);
+                let is_own_entry = p
+                    .child(v.name.as_str())
+                    .map(|c| Arc::as_ptr(&c) == node_ptr)
+                    .unwrap_or(false);
+                if is_own_entry {
+                    p.remove_child(v.name.as_str());
+                }
             }
         }
     }
