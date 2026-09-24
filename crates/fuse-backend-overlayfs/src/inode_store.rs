@@ -67,7 +67,21 @@ impl InodeStore {
     pub(crate) fn alloc_inode(&mut self, path: &String) -> Result<Inode> {
         match self.path_mapping.get(path) {
             // If the path is already in the mapping, return the reserved inode number.
-            Some(v) => Ok(*v),
+            Some(v) => {
+                // Unless the number still belongs to a deferred inode:
+                // the kernel keeps references to it with FORGETs still
+                // pending, and handing the number to a new node, e.g. the
+                // whiteout placeholder do_rm() installs for the removed
+                // name, would let those forgets tear the new node down.
+                // A number owned by a live inode is still returned:
+                // reloading a hard link relies on it to find the inode
+                // shared with its other links.
+                if self.deleted.contains_key(v) {
+                    self.alloc_unique_inode()
+                } else {
+                    Ok(*v)
+                }
+            }
             // Or allocate a new inode number.
             None => self.alloc_unique_inode(),
         }
@@ -515,6 +529,44 @@ mod test {
         assert!(store.get_deleted_inode(1).is_some());
         assert_eq!(store.get_real_inode(&(0x1000, 42)), None);
         assert!(store.get_links(1).is_none());
+    }
+
+    #[test]
+    fn test_alloc_deferred_path() {
+        let mut store = InodeStore::new();
+        let mut node_a = OverlayInode::new();
+        node_a.inode = 1;
+        node_a.path = "/a".to_string();
+        node_a.lookups.fetch_add(1, Ordering::Relaxed);
+        store.insert_inode(1, Arc::new(node_a));
+
+        // The inode is deferred with pending kernel references, but the
+        // path reservation survives the deferral.
+        assert!(store.remove_inode(1, None).is_none());
+        assert!(store.get_deleted_inode(1).is_some());
+        assert!(store.path_mapping.get(&"/a".to_string()).is_some());
+
+        // A new node for the same path, e.g. the whiteout placeholder
+        // do_rm() installs for the removed name, must not reuse the
+        // deferred number: the pending FORGETs would tear it down.
+        let inode = store.alloc_inode(&"/a".to_string()).unwrap();
+        assert_eq!(inode, 2);
+
+        // A number owned by a live inode is still handed out, so
+        // reloading a hard link finds the inode shared with its other
+        // links.
+        let mut node_b = OverlayInode::new();
+        node_b.path = "/b".to_string();
+        store.insert_inode(3, Arc::new(node_b));
+        store.insert_path("/b2", 3);
+        assert_eq!(store.alloc_inode(&"/b2".to_string()).unwrap(), 3);
+
+        // Once the deferred inode's references settled and it is freed,
+        // the reservation may hand its number out again.
+        let deferred = store.get_deleted_inode(1).unwrap();
+        deferred.lookups.fetch_sub(1, Ordering::Relaxed);
+        assert!(store.remove_inode(1, None).is_some());
+        assert_eq!(store.alloc_inode(&"/a".to_string()).unwrap(), 1);
     }
 
     #[test]
