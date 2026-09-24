@@ -1938,6 +1938,15 @@ impl OverlayFs {
         if let Some(real_inode) = new_upper_real {
             // update upper_inode and first_inode()
             node.add_upper_inode(real_inode, true);
+
+            // Copy-up created the upper entry at one link's name only;
+            // link the copied-up inode at the other live entries of the
+            // file, or they would keep serving data through the lower
+            // inode and a remount would revert them to the stale lower
+            // content and separate overlay inodes.
+            if self.inodes.read().unwrap().get_links(node.inode).is_some() {
+                self.materialize_remaining_links(ctx, &node, None)?;
+            }
         }
 
         Ok(Arc::clone(&node))
@@ -2058,6 +2067,15 @@ impl OverlayFs {
 
             // update upper_inode and first_inode()
             node.add_upper_inode(ri, true);
+
+            // Copy-up created the upper entry at one link's name only;
+            // link the copied-up inode at the other live entries of the
+            // file, or they would keep serving data through the lower
+            // inode and a remount would revert them to the stale lower
+            // content and separate overlay inodes.
+            if self.inodes.read().unwrap().get_links(node.inode).is_some() {
+                self.materialize_remaining_links(ctx, &node, None)?;
+            }
         }
 
         Ok(Arc::clone(&node))
@@ -2152,20 +2170,23 @@ impl OverlayFs {
     }
 
     // Link the copied-up backend inode of `node` at each of its live
-    // directory entries in the upper layer, except the `(parent, name)`
-    // entry being removed.
+    // directory entries missing from the upper layer, except the entry
+    // the caller removes itself, given as `exclude`.
     //
     // All hard links of a file share one overlay inode, so unlinking
     // the inode's last upper-layer entry while other links exist only
     // in lower layers would orphan the copied-up data: the shared node
     // keeps working through the unlinked backend inode, but a remount
     // would revert the remaining links to their stale lower content.
+    // Copy-up through one link has the same effect on the other links,
+    // so it materializes them as well.
     fn materialize_remaining_links(
         &self,
         ctx: &Context,
         node: &Arc<OverlayInode>,
-        parent: &Arc<OverlayInode>,
-        name: &str,
+        // The directory entry to leave alone, e.g. the one the caller
+        // is about to remove.
+        exclude: Option<(&Arc<OverlayInode>, &str)>,
     ) -> Result<()> {
         // Collect the live directory entries of the inode other than
         // the one being removed. The primary link of the node is never
@@ -2186,11 +2207,14 @@ impl OverlayFs {
             }
         }
         let node_ptr = Arc::as_ptr(node);
-        let parent_ptr = Arc::as_ptr(parent);
         entries.retain(|(p, n)| {
-            // The entry being removed is excluded, and an entry counts
-            // only while its parent directory still lists the inode.
-            !(Arc::as_ptr(p) == parent_ptr && n == name)
+            // The excluded entry is skipped, and an entry counts only
+            // while its parent directory still lists the inode.
+            let excluded = match exclude {
+                Some((ep, en)) => Arc::as_ptr(p) == Arc::as_ptr(ep) && n.as_str() == en,
+                None => false,
+            };
+            !excluded
                 && p.child(n)
                     .map(|c| Arc::as_ptr(&c) == node_ptr)
                     .unwrap_or(false)
@@ -2233,15 +2257,20 @@ impl OverlayFs {
                     }
                 };
 
-                // A stale whiteout for the name would shadow the new link.
-                let _ = parent_real_inode.layer.delete_whiteout(
-                    ctx,
-                    parent_real_inode.inode,
-                    utils::to_cstring(n.as_str())?.as_c_str(),
-                );
                 // The lookup reference of the returned entry is dropped:
-                // the node already references the backend inode.
-                parent_real_inode.link(ctx, src_ino, n.as_str())?;
+                // the node already references the backend inode.  A
+                // whiteout is never deleted for the name: a live entry
+                // never has one at its own name, and one showing up
+                // concurrently means do_rm() of this very link is in
+                // flight -- deleting it would resurrect the removed
+                // link.  link() then answers EEXIST, the same outcome as
+                // a concurrent materialization of the entry: the name
+                // existing in the upper layer is reached either way.
+                match parent_real_inode.link(ctx, src_ino, n.as_str()) {
+                    Err(e) if e.raw_os_error() == Some(libc::EEXIST) => {}
+                    Err(e) => return Err(e),
+                    Ok(_) => {}
+                }
                 Ok(false)
             })?;
         }
@@ -2319,15 +2348,22 @@ impl OverlayFs {
         // one hard link of a multi-linked inode.
         let link_path = format!("{}/{}", pnode.path, sname);
         let mut path_removed = None;
-        if entry_in_upper {
-            // Unlinking the inode's last upper-layer entry while other
-            // hard links remain only in lower layers would orphan the
-            // copied-up data; materialize those links in the upper
-            // layer first.
-            if self.inodes.read().unwrap().get_links(node.inode).is_some() {
-                self.materialize_remaining_links(ctx, &node, &pnode, &sname)?;
-            }
 
+        // Unlinking one hard link of a copied-up file must not orphan
+        // the copied-up data of the others: if the inode's last
+        // upper-layer entry goes away while other links remain only in
+        // lower layers, materialize those links in the upper layer
+        // first. The entry being removed may itself be lower-only,
+        // because copy-up creates the upper entry at the primary link's
+        // name, which is not necessarily the link written through, so
+        // gate on the node's own location and not just the entry's.
+        if (entry_in_upper || node.in_upper_layer())
+            && self.inodes.read().unwrap().get_links(node.inode).is_some()
+        {
+            self.materialize_remaining_links(ctx, &node, Some((&pnode, sname.as_str())))?;
+        }
+
+        if entry_in_upper {
             pnode.handle_upper_inode_locked(&mut |parent_upper_inode| -> Result<bool> {
                 let parent_real_inode = parent_upper_inode.ok_or_else(|| {
                     error!(

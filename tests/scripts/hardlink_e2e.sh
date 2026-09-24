@@ -55,6 +55,19 @@ echo late > "$T/lower/a/late1"
 ln "$T/lower/a/late1" "$T/lower/a/late2"
 ln "$T/lower/a/late1" "$T/lower/c/late3"
 
+# lower-layer hard links for the deterministic copy-up scenario: reading
+# b before the others makes b's link the primary link, and links read
+# only after the copy-up stay lower-only entries of the copied-up inode
+echo early > "$T/lower/a/early"
+ln "$T/lower/a/early" "$T/lower/b/early"
+ln "$T/lower/a/early" "$T/lower/c/early"
+
+# lower-layer hard links for the copy-up materialization scenario: both
+# link directories are read before the write, so both links are live and
+# lower-only when the copy-up happens
+echo fresh > "$T/lower/a/fresh"
+ln "$T/lower/a/fresh" "$T/lower/b/fresh"
+
 # lower-layer directory for the rmdir-with-whiteout scenario
 mkdir -p "$T/lower/e"
 echo f1content > "$T/lower/e/f1"
@@ -196,7 +209,7 @@ rm "$T/mnt/a/c"
 
 echo "== 10. rm the copied-up link; remaining link keeps the data =="
 stat "$T/mnt/b/d" > /dev/null   # make sure b/d is loaded and shares the inode
-echo x >> "$T/mnt/a/d"          # copies a/d up; b/d stays a lower-only entry
+echo x >> "$T/mnt/a/d"          # copies the file up; the other live link is materialized with it
 rm "$T/mnt/a/d"
 check "rm copied-up link while a lower link remains" $?
 [ "$(cat "$T/mnt/b/d")" = "$(printf 'data\nx')" ]; check "remaining link sees copied-up data" $?
@@ -220,7 +233,7 @@ echo "== 12. unlink materializes lower-only links of a copied-up file =="
 stop_daemon
 start_daemon
 stat "$T/mnt/a/late1" "$T/mnt/a/late2" > /dev/null  # load a; c stays unread
-echo x >> "$T/mnt/a/late1"                          # copy-up: only this entry goes upper
+echo x >> "$T/mnt/a/late1"                          # copy-up: the live links in a are materialized with it
 ln "$T/mnt/a/late1" "$T/mnt/a/late4"                # a second upper-layer entry
 ls "$T/mnt/c" > /dev/null                           # registers c's link as lower-only
 rm "$T/mnt/a/late1"
@@ -229,6 +242,7 @@ check "rm one link of the copied-up file" $?
 stop_daemon
 start_daemon
 [ "$(cat "$T/mnt/c/late3")" = "$(printf 'late\nx')" ]; check "lower-only link serves copied-up data" $?
+ls "$T/mnt/c" | grep -qx late3; check "directory listing shows the link's own name" $?
 [ "$(stat -c %i "$T/mnt/a/late4")" = "$(stat -c %i "$T/mnt/c/late3")" ]; check "remaining links share the inode" $?
 [ ! -e "$T/mnt/a/late1" ]; check "removed link stays gone after remount" $?
 
@@ -245,6 +259,53 @@ check "rmdir a directory holding only a whiteout" $?
 stop_daemon
 start_daemon
 [ ! -e "$T/mnt/e" ]; check "no resurrection after remount" $?
+
+echo "== 14. rm a lower-only link after copy-up landed at the primary link's name =="
+stop_daemon
+start_daemon
+ls "$T/mnt/b" > /dev/null    # b is read first: b's link becomes the primary link
+echo x >> "$T/mnt/b/early"   # copy-up lands at the primary link's own name
+[ -f "$T/upper/b/early" ]; check "copied up through the primary link" $?
+ls "$T/mnt/a" "$T/mnt/c" > /dev/null  # the other links register as lower-only
+[ ! -e "$T/upper/a/early" ]; check "late-read links stay lower-only" $?
+# Force the kernel to evict its dentry cache where possible (needs
+# root) and let the forgets settle: reloading b afterwards scans its
+# link as upper-first with nlink 1, so only the first_real_key share
+# path keeps it on the live shared inode instead of allocating a
+# second overlay inode for the same file.
+if [ -w /proc/sys/vm/drop_caches ]; then
+    echo 3 > /proc/sys/vm/drop_caches
+    sleep 1
+    stat "$T/mnt/b/early" > /dev/null
+    [ "$(stat -c %i "$T/mnt/b/early")" = "$(stat -c %i "$T/mnt/c/early")" ]
+    check "links share one inode across an eviction" $?
+fi
+rm "$T/mnt/a/early"          # the removed link itself is lower-only
+check "rm the lower-only link of the copied-up file" $?
+[ -f "$T/upper/c/early" ]; check "lower-only link materialized in upper" $?
+[ -c "$T/upper/a/early" ]; check "whiteout created for the removed name" $?
+[ "$(cat "$T/mnt/b/early")" = "$(printf 'early\nx')" ]; check "primary link sees copied-up data" $?
+stop_daemon
+start_daemon
+[ "$(cat "$T/mnt/c/early")" = "$(printf 'early\nx')" ]; check "materialized link serves copied-up data after remount" $?
+[ "$(cat "$T/mnt/b/early")" = "$(printf 'early\nx')" ]; check "primary link serves copied-up data after remount" $?
+[ "$(stat -c %i "$T/mnt/b/early")" = "$(stat -c %i "$T/mnt/c/early")" ]; check "remaining links share the inode after remount" $?
+[ ! -e "$T/mnt/a/early" ]; check "removed link stays gone after remount" $?
+
+echo "== 15. copy-up through one link materializes the other links =="
+stop_daemon
+start_daemon
+stat "$T/mnt/a/fresh" "$T/mnt/b/fresh" > /dev/null  # both links live and lower-only
+echo x >> "$T/mnt/a/fresh"                          # copy-up through one link
+[ -f "$T/upper/a/fresh" ]; check "written link copied up" $?
+[ -f "$T/upper/b/fresh" ]; check "other link materialized at copy-up" $?
+[ "$(cat "$T/mnt/b/fresh")" = "$(printf 'fresh\nx')" ]; check "other link sees copied-up data" $?
+stop_daemon
+start_daemon
+[ "$(cat "$T/mnt/a/fresh")" = "$(printf 'fresh\nx')" ]; check "written link survives remount" $?
+[ "$(cat "$T/mnt/b/fresh")" = "$(printf 'fresh\nx')" ]; check "materialized link serves copied-up data after remount" $?
+[ "$(stat -c %i "$T/mnt/a/fresh")" = "$(stat -c %i "$T/mnt/b/fresh")" ]; check "links share the inode after remount" $?
+[ "$(stat -c %h "$T/mnt/a/fresh")" = "2" ]; check "nlink stays correct after remount" $?
 
 stop_daemon
 
