@@ -68,6 +68,28 @@ ln "$T/lower/a/early" "$T/lower/c/early"
 echo fresh > "$T/lower/a/fresh"
 ln "$T/lower/a/fresh" "$T/lower/b/fresh"
 
+# lower-layer entries for the whiteout-replacement scenarios: unlinking
+# an entry recreated over a whiteout must white it out again, which the
+# daemon decides from a flag persisted at replacement time instead of
+# probing the lower layers on every unlink
+echo repl > "$T/lower/a/repl"
+echo lnkdata > "$T/lower/b/lnk"
+mkdir -p "$T/lower/a/ddir"
+
+# lower-layer entries for the mknod/symlink whiteout-replacement
+# scenarios: every node type created over a whiteout must record the
+# shadowed lower entry
+echo symdata > "$T/lower/a/sym"
+echo fifodata > "$T/lower/a/fifo"
+
+# lower-layer entries for the daemon-restart scenarios: the whiteout
+# decision flag lives in memory only, so a restart between the
+# flag-setting event and the unlink must reconstruct it from the layer
+# scan
+echo single2 > "$T/lower/a/single2"
+echo repl2 > "$T/lower/a/repl2"
+echo lnkdata2 > "$T/lower/b/lnk2"
+
 # lower-layer directory for the rmdir-with-whiteout scenario
 mkdir -p "$T/lower/e"
 echo f1content > "$T/lower/e/f1"
@@ -306,6 +328,140 @@ start_daemon
 [ "$(cat "$T/mnt/b/fresh")" = "$(printf 'fresh\nx')" ]; check "materialized link serves copied-up data after remount" $?
 [ "$(stat -c %i "$T/mnt/a/fresh")" = "$(stat -c %i "$T/mnt/b/fresh")" ]; check "links share the inode after remount" $?
 [ "$(stat -c %h "$T/mnt/a/fresh")" = "2" ]; check "nlink stays correct after remount" $?
+
+echo "== 16. unlink a file recreated over a whiteout =="
+stop_daemon
+start_daemon
+rm "$T/mnt/a/repl"                       # whiteout replaces the lower entry
+echo replacement > "$T/mnt/a/repl"       # recreate the file over the whiteout
+[ "$(cat "$T/mnt/a/repl")" = "replacement" ]; check "recreated file readable" $?
+rm "$T/mnt/a/repl"
+check "unlink the recreated file" $?
+[ -c "$T/upper/a/repl" ]; check "whiteout recreated for the removed name" $?
+[ ! -e "$T/mnt/a/repl" ]; check "recreated file is gone" $?
+stop_daemon
+start_daemon
+[ ! -e "$T/mnt/a/repl" ]; check "lower entry stays shadowed after remount" $?
+
+echo "== 17. unlink a hard link created over a whiteout =="
+stop_daemon
+start_daemon
+echo src > "$T/mnt/a/src"                # a fresh upper-only file
+rm "$T/mnt/b/lnk"                        # whiteout replaces the lower entry
+ln "$T/mnt/a/src" "$T/mnt/b/lnk"         # the link replaces the whiteout
+[ "$(cat "$T/mnt/b/lnk")" = "src" ]; check "link over whiteout readable" $?
+[ "$(stat -c %i "$T/mnt/a/src")" = "$(stat -c %i "$T/mnt/b/lnk")" ]; check "link over whiteout shares inode" $?
+rm "$T/mnt/a/src"
+check "unlink the source link" $?
+[ "$(cat "$T/mnt/b/lnk")" = "src" ]; check "remaining link readable" $?
+rm "$T/mnt/b/lnk"
+check "unlink the link created over the whiteout" $?
+[ -c "$T/upper/b/lnk" ]; check "whiteout recreated for the removed name" $?
+stop_daemon
+start_daemon
+[ ! -e "$T/mnt/b/lnk" ]; check "lower entry stays shadowed after remount" $?
+
+echo "== 18. rmdir a directory recreated over a whiteout =="
+stop_daemon
+start_daemon
+rmdir "$T/mnt/a/ddir"                     # whiteout replaces the lower dir
+mkdir "$T/mnt/a/ddir"                     # recreate the dir over the whiteout
+rmdir "$T/mnt/a/ddir"
+check "rmdir the recreated directory" $?
+[ -c "$T/upper/a/ddir" ]; check "whiteout recreated for the removed name" $?
+stop_daemon
+start_daemon
+[ ! -e "$T/mnt/a/ddir" ]; check "lower dir stays shadowed after remount" $?
+
+echo "== 19. rm a copied-up file after a daemon restart =="
+stop_daemon
+start_daemon
+echo x >> "$T/mnt/a/single2"   # copies the file up and records the shadowed lower entry
+[ -f "$T/upper/a/single2" ]; check "single-link file copied up through write" $?
+stop_daemon
+start_daemon                   # the restart must re-derive the flag from the layer scan
+[ "$(cat "$T/mnt/a/single2")" = "$(printf 'single2\nx')" ]; check "copied-up file readable after restart" $?
+rm "$T/mnt/a/single2"
+check "rm copied-up file after restart" $?
+[ -c "$T/upper/a/single2" ]; check "whiteout created for the removed name" $?
+[ ! -e "$T/mnt/a/single2" ]; check "removed file is gone" $?
+stop_daemon
+start_daemon
+[ ! -e "$T/mnt/a/single2" ]; check "no resurrection after remount" $?
+
+echo "== 20. unlink a file recreated over a whiteout after a daemon restart =="
+stop_daemon
+start_daemon
+rm "$T/mnt/a/repl2"                       # whiteout replaces the lower entry
+echo replacement > "$T/mnt/a/repl2"       # recreate the file over the whiteout
+[ "$(cat "$T/mnt/a/repl2")" = "replacement" ]; check "recreated file readable" $?
+stop_daemon
+start_daemon
+[ "$(cat "$T/mnt/a/repl2")" = "replacement" ]; check "recreated file readable after restart" $?
+rm "$T/mnt/a/repl2"
+check "unlink the recreated file after restart" $?
+[ -c "$T/upper/a/repl2" ]; check "whiteout recreated for the removed name" $?
+[ ! -e "$T/mnt/a/repl2" ]; check "recreated file is gone" $?
+stop_daemon
+start_daemon
+[ ! -e "$T/mnt/a/repl2" ]; check "lower entry stays shadowed after remount" $?
+
+echo "== 21. unlink a hard link created over a whiteout after a daemon restart =="
+stop_daemon
+start_daemon
+echo src2 > "$T/mnt/a/src2"               # a fresh upper-only file
+rm "$T/mnt/b/lnk2"                        # whiteout replaces the lower entry
+ln "$T/mnt/a/src2" "$T/mnt/b/lnk2"        # the link replaces the whiteout
+[ "$(cat "$T/mnt/b/lnk2")" = "src2" ]; check "link over whiteout readable" $?
+[ "$(stat -c %i "$T/mnt/a/src2")" = "$(stat -c %i "$T/mnt/b/lnk2")" ]; check "link over whiteout shares inode" $?
+stop_daemon
+start_daemon                              # rebuilds the shared inode from whichever
+                                          # name is read first, so the link joining it
+                                          # must carry the flag over
+[ "$(cat "$T/mnt/a/src2")" = "src2" ]; check "source link readable after restart" $?
+[ "$(cat "$T/mnt/b/lnk2")" = "src2" ]; check "link over whiteout readable after restart" $?
+[ "$(stat -c %i "$T/mnt/a/src2")" = "$(stat -c %i "$T/mnt/b/lnk2")" ]; check "links share inode after restart" $?
+rm "$T/mnt/a/src2"
+check "unlink the source link after restart" $?
+[ "$(cat "$T/mnt/b/lnk2")" = "src2" ]; check "remaining link readable" $?
+rm "$T/mnt/b/lnk2"
+check "unlink the link created over the whiteout" $?
+[ -c "$T/upper/b/lnk2" ]; check "whiteout recreated for the removed name" $?
+stop_daemon
+start_daemon
+[ ! -e "$T/mnt/b/lnk2" ]; check "lower entry stays shadowed after remount" $?
+
+echo "== 22. unlink a symlink recreated over a whiteout after a daemon restart =="
+stop_daemon
+start_daemon
+rm "$T/mnt/a/sym"                        # whiteout replaces the lower entry
+ln -s target "$T/mnt/a/sym"              # the symlink replaces the whiteout
+[ "$(readlink "$T/mnt/a/sym")" = "target" ]; check "recreated symlink readable" $?
+stop_daemon
+start_daemon
+[ "$(readlink "$T/mnt/a/sym")" = "target" ]; check "recreated symlink readable after restart" $?
+rm "$T/mnt/a/sym"
+check "unlink the recreated symlink after restart" $?
+[ -c "$T/upper/a/sym" ]; check "whiteout recreated for the removed name" $?
+stop_daemon
+start_daemon
+[ ! -e "$T/mnt/a/sym" ]; check "lower entry stays shadowed after remount" $?
+
+echo "== 23. unlink a fifo recreated over a whiteout after a daemon restart =="
+stop_daemon
+start_daemon
+rm "$T/mnt/a/fifo"                       # whiteout replaces the lower entry
+mkfifo "$T/mnt/a/fifo"                   # the fifo replaces the whiteout
+[ -p "$T/mnt/a/fifo" ]; check "recreated fifo exists" $?
+stop_daemon
+start_daemon
+[ -p "$T/mnt/a/fifo" ]; check "recreated fifo exists after restart" $?
+rm "$T/mnt/a/fifo"
+check "unlink the recreated fifo after restart" $?
+[ -c "$T/upper/a/fifo" ]; check "whiteout recreated for the removed name" $?
+stop_daemon
+start_daemon
+[ ! -e "$T/mnt/a/fifo" ]; check "lower entry stays shadowed after remount" $?
 
 stop_daemon
 

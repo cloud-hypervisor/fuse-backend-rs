@@ -70,6 +70,14 @@ pub(crate) struct OverlayInode {
     pub whiteout: AtomicBool,
     // Directory is loaded.
     pub loaded: AtomicBool,
+    // A lower-layer entry exists at this node's name. Copy-up drops the
+    // lower RealInodes that prove it and replacing a whiteout never
+    // records any, so those two moments persist the fact here for
+    // do_rm's whiteout decision. Lower layers are immutable, so the
+    // flag never goes stale once set; it does live in memory only, so
+    // new_from_real_inodes() re-derives it when a daemon restart
+    // rebuilds the node from the layer scan.
+    pub shadowed_lower: AtomicBool,
 }
 
 #[derive(Default)]
@@ -532,6 +540,16 @@ impl OverlayInode {
             return Err(Error::from_raw_os_error(libc::EINVAL));
         }
 
+        // The entries after the first come from lower layers (scan
+        // order) and are shadowed by it; the loop below drops them for
+        // non-directory and opaque-directory nodes. Copy-up leaves
+        // exactly this on-disk state -- the upper entry plus the
+        // immutable lower one -- so whether the tail holds a real
+        // lower-layer entry must reach the rebuilt node's
+        // `shadowed_lower`, or the whiteout decision would be lost to
+        // the daemon restart that triggered this rescan.
+        let shadowed_lower = real_inodes.iter().skip(1).any(|ri| !ri.whiteout);
+
         let mut first = true;
         let mut new = Self::new();
         for ri in real_inodes {
@@ -553,11 +571,17 @@ impl OverlayInode {
 
                 // A non-directory file shadows all lower layers as default.
                 if !utils::is_dir(stat) {
+                    if shadowed_lower {
+                        new.shadowed_lower.store(true, Ordering::Relaxed);
+                    }
                     break;
                 }
 
                 // Opaque directory shadows all lower layers.
                 if opaque {
+                    if shadowed_lower {
+                        new.shadowed_lower.store(true, Ordering::Relaxed);
+                    }
                     break;
                 }
             } else {
@@ -771,6 +795,12 @@ impl OverlayInode {
         if !clear_lowers {
             // If not clear lowers, append them to the end of vector.
             new.extend(lowers);
+        } else if lowers.iter().any(|l| !l.in_upper_layer) {
+            // Copy-up discards the RealInodes proving a lower-layer
+            // entry at this node's name, so persist that fact: the
+            // lower layers are immutable and the entry stays below
+            // forever.
+            self.shadowed_lower.store(true, Ordering::Relaxed);
         }
         inodes.extend(new);
     }
@@ -1146,6 +1176,14 @@ impl OverlayFs {
                             ino,
                             (Arc::downgrade(node), name.clone(), child.path.clone()),
                         );
+                        // The joining link's RealInodes are dropped in
+                        // favor of the shared node's, so a lower entry
+                        // at this link's name must reach the shared
+                        // node's flag or do_rm's whiteout decision
+                        // loses it.
+                        if child.shadowed_lower.load(Ordering::Relaxed) {
+                            existing.shadowed_lower.store(true, Ordering::Relaxed);
+                        }
                         node_children.insert(name, existing);
                         continue;
                     }
@@ -1171,6 +1209,11 @@ impl OverlayFs {
                             ino,
                             (Arc::downgrade(node), name.clone(), child.path.clone()),
                         );
+                        // Same as the multi-link branch above: fold in
+                        // a lower entry at the joining link's name.
+                        if child.shadowed_lower.load(Ordering::Relaxed) {
+                            existing.shadowed_lower.store(true, Ordering::Relaxed);
+                        }
                         node_children.insert(name, existing);
                         continue;
                     }
@@ -1450,6 +1493,7 @@ impl OverlayFs {
 
         let mut delete_whiteout = false;
         let mut set_opaque = false;
+        let mut shadowed_lower = false;
         if let Some(n) = self.lookup_node_ignore_enoent(ctx, parent_node.inode, name)? {
             // Node with same name exists, let's check if it's whiteout.
             if !n.whiteout.load(Ordering::Relaxed) {
@@ -1464,6 +1508,10 @@ impl OverlayFs {
             if !n.upper_layer_only() {
                 set_opaque = true;
             }
+
+            // The whiteout being replaced was created for a name with a
+            // lower-layer entry, so the new directory shadows one.
+            shadowed_lower = true;
         }
 
         // Copy parent node up if necessary.
@@ -1504,6 +1552,9 @@ impl OverlayFs {
 
         // new_node is always 'Some'
         let arc_node = Arc::new(new_node.unwrap());
+        if shadowed_lower {
+            arc_node.shadowed_lower.store(true, Ordering::Relaxed);
+        }
         self.insert_inode(arc_node.inode, arc_node.clone());
         pnode.insert_child(name, arc_node);
         Ok(())
@@ -1557,6 +1608,9 @@ impl OverlayFs {
 
                     // Replace existing real inodes with new one.
                     n.add_upper_inode(child_ri, true);
+                    // The replaced whiteout was created for a name with
+                    // a lower-layer entry, so the new entry shadows one.
+                    n.shadowed_lower.store(true, Ordering::Relaxed);
                     Ok(false)
                 })?;
             }
@@ -1648,6 +1702,9 @@ impl OverlayFs {
 
                     // Replace existing real inodes with new one.
                     n.add_upper_inode(child_ri, true);
+                    // The replaced whiteout was created for a name with
+                    // a lower-layer entry, so the new entry shadows one.
+                    n.shadowed_lower.store(true, Ordering::Relaxed);
                     Ok(false)
                 })?;
                 n.clone()
@@ -1787,6 +1844,10 @@ impl OverlayFs {
                         Some(l.saturating_sub(1))
                     });
                 self.remove_inode(n.inode, Some(n.path.clone()));
+                // The replaced whiteout was created for a name with a
+                // lower-layer entry, so a later unlink of this link has
+                // to white it out again.
+                src_node.shadowed_lower.store(true, Ordering::Relaxed);
                 self.register_link(&new_parent, &src_node, name, n.path.clone());
             }
             None => {
@@ -1863,6 +1924,9 @@ impl OverlayFs {
 
                     // Replace existing real inodes with new one.
                     n.add_upper_inode(child_ri, true);
+                    // The replaced whiteout was created for a name with
+                    // a lower-layer entry, so the new entry shadows one.
+                    n.shadowed_lower.store(true, Ordering::Relaxed);
                     Ok(false)
                 })?;
             }
@@ -2143,32 +2207,6 @@ impl OverlayFs {
         }
     }
 
-    // Whether the directory entry `name` exists in any lower layer under `dir`.
-    fn lower_entry_exists(
-        &self,
-        ctx: &Context,
-        dir: &Arc<OverlayInode>,
-        name: &str,
-    ) -> Result<bool> {
-        let lowers = {
-            let real_inodes = dir.real_inodes.lock().unwrap();
-            real_inodes
-                .iter()
-                .filter(|ri| !ri.in_upper_layer && !ri.whiteout)
-                .map(|ri| (ri.layer.clone(), ri.inode))
-                .collect::<Vec<_>>()
-        };
-
-        for (layer, dir_ino) in lowers {
-            if let Some(entry) = RealInode::lookup_in_layer(&layer, dir_ino, ctx, name)? {
-                // Release the lookup reference acquired in the layer.
-                layer.forget(ctx, entry.inode, 1);
-                return Ok(true);
-            }
-        }
-        Ok(false)
-    }
-
     // Link the copied-up backend inode of `node` at each of its live
     // directory entries missing from the upper layer, except the entry
     // the caller removes itself, given as `exclude`.
@@ -2312,17 +2350,28 @@ impl OverlayFs {
             trace!("whiteouts deleted!\n");
         }
 
-        let mut need_whiteout = true;
-        let pnode = self.copy_node_up(ctx, Arc::clone(&pnode))?;
+        // Whether the removed name has a lower-layer entry that a
+        // whiteout must shadow, or it would reappear after a remount.
+        // Lower layers are immutable, so the answer is settled at the
+        // moment the evidence exists and persisted instead of probing
+        // every lower layer on each unlink: a node still carrying lower
+        // RealInodes has an entry below every live link name by
+        // construction, while an upper-only node has lost the evidence
+        // -- file copy-up drops the lower RealInodes and replacing a
+        // whiteout never records any -- so those two moments record it
+        // in `shadowed_lower`, and new_from_real_inodes() re-derives it
+        // when a daemon restart rebuilds nodes from the layer scan.
+        // The flag is per node, so unlinking a link created fresh in
+        // the upper layer of a node whose other links came from below
+        // may create a whiteout shadowing nothing, which is harmless,
+        // unlike a missing one.
+        let mut need_whiteout = if node.upper_layer_only() {
+            node.shadowed_lower.load(Ordering::Relaxed)
+        } else {
+            true
+        };
 
-        if node.upper_layer_only() {
-            // An upper-only file may still shadow a lower-layer entry:
-            // file copy-up drops the lower RealInodes, and replacing a
-            // whiteout with a new file never records any. Create the
-            // whiteout when the name still exists below, or the entry
-            // would reappear after a remount.
-            need_whiteout = self.lower_entry_exists(ctx, &pnode, &sname)?;
-        }
+        let pnode = self.copy_node_up(ctx, Arc::clone(&pnode))?;
 
         // With one overlay inode shared by all hard links of a file, the
         // directory entry being removed may live in a different layer
@@ -2339,8 +2388,6 @@ impl OverlayFs {
             if upper_whiteout {
                 // Already shadowed in the upper layer.
                 need_whiteout = false;
-            } else if self.lower_entry_exists(ctx, &pnode, &sname)? {
-                need_whiteout = true;
             }
         }
 
