@@ -82,6 +82,19 @@ mkdir -p "$T/lower/a/ddir"
 echo symdata > "$T/lower/a/sym"
 echo fifodata > "$T/lower/a/fifo"
 
+# lower-layer directory with children for the recreate-over-rmdir scenario:
+# the recreated directory must not expose the old lower children again
+mkdir -p "$T/lower/a/resdir"
+echo res1 > "$T/lower/a/resdir/res1"
+echo res2 > "$T/lower/a/resdir/res2"
+
+# second copy for the variant with a daemon restart between the rmdir
+# and the recreate: the layer scan's whiteout flag reconstruction is
+# what carries the opaque decision across that restart
+mkdir -p "$T/lower/a/resdir2"
+echo res1 > "$T/lower/a/resdir2/res1"
+echo res2 > "$T/lower/a/resdir2/res2"
+
 # lower-layer entries for the daemon-restart scenarios: the whiteout
 # decision flag lives in memory only, so a restart between the
 # flag-setting event and the unlink must reconstruct it from the layer
@@ -462,6 +475,44 @@ check "unlink the recreated fifo after restart" $?
 stop_daemon
 start_daemon
 [ ! -e "$T/mnt/a/fifo" ]; check "lower entry stays shadowed after remount" $?
+
+echo "== 24. children stay gone after rmdir and mkdir over a lower directory =="
+stop_daemon
+start_daemon
+rm "$T/mnt/a/resdir/res1" "$T/mnt/a/resdir/res2"
+rmdir "$T/mnt/a/resdir"
+check "rmdir the emptied lower directory" $?
+mkdir "$T/mnt/a/resdir"
+check "recreate the directory over the whiteout" $?
+[ "$(ls "$T/mnt/a/resdir" | wc -l)" = "0" ]; check "recreated directory empty in-session" $?
+stop_daemon
+start_daemon
+[ ! -e "$T/mnt/a/resdir/res1" ]; check "old lower child stays gone after remount" $?
+[ ! -e "$T/mnt/a/resdir/res2" ]; check "second old lower child stays gone after remount" $?
+[ "$(ls "$T/mnt/a/resdir" | wc -l)" = "0" ]; check "recreated directory still empty after remount" $?
+echo new > "$T/mnt/a/resdir/new"
+[ "$(cat "$T/mnt/a/resdir/new")" = "new" ]; check "new child of the recreated directory readable" $?
+rm "$T/mnt/a/resdir/new"
+check "remove the new child of the recreated directory" $?
+rmdir "$T/mnt/a/resdir"
+check "rmdir the recreated opaque directory" $?
+stop_daemon
+start_daemon
+[ ! -e "$T/mnt/a/resdir" ]; check "recreated opaque directory stays gone after remount" $?
+
+echo "== 25. children stay gone when the directory is recreated after a daemon restart =="
+rm "$T/mnt/a/resdir2/res1" "$T/mnt/a/resdir2/res2"
+rmdir "$T/mnt/a/resdir2"
+check "rmdir the second emptied lower directory" $?
+stop_daemon
+start_daemon
+mkdir "$T/mnt/a/resdir2"
+check "recreate the second directory over the scanned whiteout" $?
+stop_daemon
+start_daemon
+[ ! -e "$T/mnt/a/resdir2/res1" ]; check "old lower child of the second directory stays gone after remount" $?
+[ ! -e "$T/mnt/a/resdir2/res2" ]; check "second old lower child of the second directory stays gone after remount" $?
+[ "$(ls "$T/mnt/a/resdir2" | wc -l)" = "0" ]; check "second recreated directory empty after remount" $?
 
 stop_daemon
 

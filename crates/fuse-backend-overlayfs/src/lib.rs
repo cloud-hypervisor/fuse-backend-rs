@@ -73,10 +73,11 @@ pub(crate) struct OverlayInode {
     // A lower-layer entry exists at this node's name. Copy-up drops the
     // lower RealInodes that prove it and replacing a whiteout never
     // records any, so those two moments persist the fact here for
-    // do_rm's whiteout decision. Lower layers are immutable, so the
-    // flag never goes stale once set; it does live in memory only, so
-    // new_from_real_inodes() re-derives it when a daemon restart
-    // rebuilds the node from the layer scan.
+    // do_rm's whiteout decision, and the unlink whiteout placeholder
+    // carries it for do_mkdir's opaque decision. Lower layers are
+    // immutable, so the flag never goes stale once set; it does live in
+    // memory only, so new_from_real_inodes() re-derives it when a
+    // daemon restart rebuilds the node from the layer scan.
     pub shadowed_lower: AtomicBool,
 }
 
@@ -542,8 +543,8 @@ impl OverlayInode {
 
         // The entries after the first come from lower layers (scan
         // order) and are shadowed by it; the loop below drops them for
-        // non-directory and opaque-directory nodes. Copy-up leaves
-        // exactly this on-disk state -- the upper entry plus the
+        // whiteout, non-directory and opaque-directory nodes. Copy-up
+        // leaves exactly this on-disk state -- the upper entry plus the
         // immutable lower one -- so whether the tail holds a real
         // lower-layer entry must reach the rebuilt node's
         // `shadowed_lower`, or the whiteout decision would be lost to
@@ -564,6 +565,13 @@ impl OverlayInode {
                 first = false;
                 new = Self::new_from_real_inode(name, ino, path.clone(), ri);
 
+                // Whiteout, non-directory and opaque-directory nodes all
+                // drop the entries behind them, so the shadowed-lower
+                // fact those entries prove must reach the flag first.
+                if (whiteout || !utils::is_dir(stat) || opaque) && shadowed_lower {
+                    new.shadowed_lower.store(true, Ordering::Relaxed);
+                }
+
                 // This is whiteout, no need to check lower layers.
                 if whiteout {
                     break;
@@ -571,17 +579,11 @@ impl OverlayInode {
 
                 // A non-directory file shadows all lower layers as default.
                 if !utils::is_dir(stat) {
-                    if shadowed_lower {
-                        new.shadowed_lower.store(true, Ordering::Relaxed);
-                    }
                     break;
                 }
 
                 // Opaque directory shadows all lower layers.
                 if opaque {
-                    if shadowed_lower {
-                        new.shadowed_lower.store(true, Ordering::Relaxed);
-                    }
                     break;
                 }
             } else {
@@ -1504,8 +1506,14 @@ impl OverlayFs {
                 delete_whiteout = true;
             }
 
-            // Set opaque if child dir has lower layers.
-            if !n.upper_layer_only() {
+            // Set opaque if the whiteout being replaced shadowed a
+            // lower-layer entry: the recreated directory must not
+            // expose the old lower children again once a restart
+            // rescans the layers. The placeholder's shadowed_lower
+            // flag is the persisted fact -- an upper-only whiteout
+            // node never carries lower RealInodes, so testing its
+            // layer list could never fire here.
+            if n.shadowed_lower.load(Ordering::Relaxed) {
                 set_opaque = true;
             }
 
@@ -1538,9 +1546,17 @@ impl OverlayFs {
             // Allocate inode number.
             let ino = self.alloc_inode(&path)?;
             let child_dir = parent_real_inode.mkdir(ctx, name, mode, umask)?;
-            // Set opaque if child dir has lower layers.
+            // Set opaque if child dir has lower layers. The whiteout
+            // is deleted and the directory created by now, so a failure
+            // must not fail the whole mkdir: the on-disk state is
+            // committed either way and a retry would only hit EEXIST.
+            // Warn instead -- without the xattr just the restart
+            // reconstruction degrades, the in-session view keeps hiding
+            // the shadowed lower children.
             if set_opaque {
-                parent_real_inode.layer.set_opaque(ctx, child_dir.inode)?;
+                if let Err(e) = parent_real_inode.layer.set_opaque(ctx, child_dir.inode) {
+                    warn!("failed to mark '{}' opaque: {}", path, e);
+                }
             }
             let mut ovi = OverlayInode::new_from_real_inode(name, ino, path.clone(), child_dir);
             // Create bi-directional link between parent and child.
@@ -2498,6 +2514,10 @@ impl OverlayFs {
                 let ino = self.alloc_inode(&path)?;
                 let mut new_ovi =
                     OverlayInode::new_from_real_inode(sname.as_str(), ino, path.clone(), child_ri);
+                // A whiteout is only created for a name with a
+                // lower-layer entry to shadow, so the placeholder
+                // carries that fact for whoever replaces it later.
+                new_ovi.shadowed_lower.store(true, Ordering::Relaxed);
                 // Create bi-directional link between parent and child.
                 new_ovi.parent = Mutex::new(Arc::downgrade(&pnode));
                 let ovi = Arc::new(new_ovi);
