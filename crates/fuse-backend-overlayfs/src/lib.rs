@@ -79,6 +79,10 @@ pub(crate) struct OverlayInode {
     // memory only, so new_from_real_inodes() re-derives it when a
     // daemon restart rebuilds the node from the layer scan.
     pub shadowed_lower: AtomicBool,
+    // Copy-up of the node is exclusive: concurrent writers through
+    // different hard links would create several upper inodes for a
+    // file whose node can only carry one.
+    pub copy_up_lock: Mutex<()>,
 }
 
 #[derive(Default)]
@@ -1987,6 +1991,17 @@ impl OverlayFs {
             return Ok(node);
         }
 
+        // Copy-up must be exclusive per node: concurrent writers
+        // through different hard links may resolve different live
+        // links below, and two symlinks() would fork the file into
+        // upper inodes the node can only carry one of. Re-check under
+        // the lock, another thread may have copied up meanwhile.
+        let _copy_up_guard = node.copy_up_lock.lock().unwrap();
+        if node.in_upper_layer() {
+            // Clone, not move: the guard still borrows the node.
+            return Ok(Arc::clone(&node));
+        }
+
         // For multi-linked files the primary link may have been removed,
         // so find a directory entry still pointing to the node.
         let (parent_node, name) = match self.node_active_link(&node) {
@@ -2037,6 +2052,17 @@ impl OverlayFs {
     fn copy_regfile_up(&self, ctx: &Context, node: Arc<OverlayInode>) -> Result<Arc<OverlayInode>> {
         if node.in_upper_layer() {
             return Ok(node);
+        }
+
+        // Copy-up must be exclusive per node: concurrent writers
+        // through different hard links may resolve different live
+        // links below, and two creates() would fork the file into
+        // upper inodes the node can only carry one of. Re-check under
+        // the lock, another thread may have copied up meanwhile.
+        let _copy_up_guard = node.copy_up_lock.lock().unwrap();
+        if node.in_upper_layer() {
+            // Clone, not move: the guard still borrows the node.
+            return Ok(Arc::clone(&node));
         }
 
         // For multi-linked files the primary link may have been removed,
