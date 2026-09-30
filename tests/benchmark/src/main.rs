@@ -10,8 +10,10 @@
 //!
 //! - default (sync) mode: requests are served by `N` worker threads, each
 //!   reading from its own fuse channel (the classic multi-threaded design).
-//! - `--async` mode: requests are served by a single `FuseDevTask` running
-//!   on the async runtime (tokio-uring when io_uring is available).
+//! - `--async` mode: requests are served by `N` asynchronous workers
+//!   (`AsyncFuseServing`), each running a `FuseDevTask` on its own async
+//!   runtime (tokio-uring when io_uring is available) and its own
+//!   `/dev/fuse` file description.
 //! - `--uring` mode: requests are served through the FUSE-over-io_uring
 //!   transport (`UringFuseServing`, experimental, requires kernel 6.14+);
 //!   `N` limits the number of io_uring worker threads.
@@ -22,7 +24,6 @@ mod daemon {
     use std::fs;
     use std::io::{Error, Result};
     use std::path::Path;
-    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
     use std::thread;
 
@@ -30,14 +31,12 @@ mod daemon {
     use signal_hook::{consts::TERM_SIGNALS, iterator::Signals};
     use simple_logger::SimpleLogger;
 
-    use fuse_backend_rs::api::{
-        server::{Server, MAX_BUFFER_SIZE},
-        Vfs, VfsOptions,
-    };
-    use fuse_backend_rs::async_runtime::Runtime;
+    use fuse_backend_rs::api::server::Server;
+    use fuse_backend_rs::api::{Vfs, VfsOptions};
     use fuse_backend_rs::passthrough::{Config, PassthroughFs};
     use fuse_backend_rs::transport::{
-        FuseChannel, FuseDevTask, FuseSession, UringConfig, UringFuseServing,
+        AsyncFuseServing, AsyncServingConfig, FuseChannel, FuseSession, UringConfig,
+        UringFuseServing,
     };
 
     struct Args {
@@ -46,7 +45,6 @@ mod daemon {
         as_async: bool,
         as_uring: bool,
         thread_cnt: u32,
-        threads_set: bool,
     }
 
     fn help() {
@@ -67,7 +65,6 @@ mod daemon {
             as_async: false,
             as_uring: false,
             thread_cnt: 4,
-            threads_set: false,
         };
         let mut idx = 3;
         while idx < args.len() {
@@ -84,7 +81,6 @@ mod daemon {
                         help();
                         Error::from_raw_os_error(libc::EINVAL)
                     })?;
-                    res.threads_set = true;
                 }
                 _ => {
                     help();
@@ -181,40 +177,26 @@ mod daemon {
         se.wake().unwrap();
     }
 
-    /// Serve requests with a single asynchronous `FuseDevTask` until a
+    /// Serve requests with `thread_cnt` asynchronous workers until a
     /// termination signal is received.
-    fn run_async(server: Arc<Server<Arc<Vfs>>>, mut se: FuseSession) {
-        let fuse_file = se.clone_fuse_file().unwrap();
-
-        // The signal handler thread tears the session down: umounting makes
-        // the pending read on the fuse device fail with ENODEV, which
-        // terminates the async task. The thread is detached on purpose:
-        // poll_handler() may return without a signal (e.g. the session is
-        // unmounted externally) while the thread is still waiting for one.
-        let _shutdown = thread::spawn(move || {
-            let mut signals = Signals::new(TERM_SIGNALS).unwrap();
-            signals.forever().next();
-            if let Err(e) = se.umount() {
-                error!("failed to umount fuse session: {}", e);
+    fn run_async(server: Arc<Server<Arc<Vfs>>>, se: FuseSession, thread_cnt: u32) {
+        let cfg = AsyncServingConfig {
+            workers: thread_cnt as usize,
+            ..Default::default()
+        };
+        let serving = match AsyncFuseServing::new(se, server, cfg) {
+            Ok(serving) => serving,
+            Err(e) => {
+                error!("failed to start the async serving layer: {}", e);
+                std::process::exit(1);
             }
-        });
+        };
 
-        let state = Arc::new(AtomicBool::new(false));
-        // The buffer must be able to hold the largest request (the
-        // negotiated `max_write` plus a header), otherwise reads from
-        // /dev/fuse fail with EINVAL once the INIT handshake is done,
-        // see kernel commit "fuse: require /dev/fuse reads to have
-        // enough buffer capacity".
-        let mut task = FuseDevTask::new(
-            (MAX_BUFFER_SIZE + 0x1000) as usize,
-            fuse_file,
-            server,
-            state.clone(),
-        );
-        Runtime::new().block_on(task.poll_handler());
-        info!("async fuse task exited");
-
-        state.store(true, Ordering::Release);
+        let mut signals = Signals::new(TERM_SIGNALS).unwrap();
+        signals.forever().next();
+        // Dropping the serving layer unmounts the session and joins all
+        // serving threads.
+        drop(serving);
     }
 
     /// Serve requests through the FUSE-over-io_uring transport until a
@@ -285,17 +267,10 @@ mod daemon {
         let mut se = FuseSession::new(Path::new(&args.dest), "bench_passthru", "", false).unwrap();
         se.mount().unwrap();
 
-        if args.as_async && args.threads_set {
-            warn!(
-                "--threads {} is ignored in async mode, requests are served by a single task",
-                args.thread_cnt
-            );
-        }
-
         if args.as_uring {
             run_uring(server, se, args.thread_cnt);
         } else if args.as_async {
-            run_async(server, se);
+            run_async(server, se, args.thread_cnt);
         } else {
             run_sync(server, se, args.thread_cnt);
         }

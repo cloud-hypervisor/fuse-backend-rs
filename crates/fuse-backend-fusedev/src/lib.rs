@@ -40,6 +40,11 @@ mod linux_session;
 #[cfg(target_os = "linux")]
 pub use linux_session::*;
 
+#[cfg(all(target_os = "linux", feature = "async-io"))]
+mod async_serving;
+#[cfg(all(target_os = "linux", feature = "async-io"))]
+pub use async_serving::*;
+
 #[cfg(all(target_os = "macos", not(feature = "fuse-t")))]
 mod macos_session;
 #[cfg(all(target_os = "macos", not(feature = "fuse-t")))]
