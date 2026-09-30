@@ -34,7 +34,8 @@ use fuse_backend_core::api::filesystem::{
 };
 use fuse_backend_core::async_file::File as AsyncFile;
 use fuse_backend_core::async_runtime::Runtime;
-use fuse_backend_core::file_traits::AsyncFileReadWriteVolatile;
+use fuse_backend_core::file_buf::FileVolatileSlice;
+use fuse_backend_core::file_traits::{AsyncFileReadWriteVolatile, FileReadWriteVolatile};
 
 impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
     /// Create a Passthrough file system instance shared between threads.
@@ -104,6 +105,65 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
 
         Ok(Arc::new(AsyncFile::borrow_fd(fd, data.clone())))
     }
+
+    /// Try to serve a buffered READ request inline with `preadv2(RWF_NOWAIT)`,
+    /// without going through the asynchronous IO engine.
+    ///
+    /// Returns the number of bytes served inline, and whether the remaining
+    /// bytes need real IO (`true`) or the request is already complete
+    /// (`false`: the whole size was served, EOF was reached, or the size was
+    /// zero). On a miss the writer's position is left exactly after the bytes
+    /// served inline, so the asynchronous fallback can continue from there.
+    ///
+    /// `RWF_NOWAIT` turns the cache-resident case -- the common one -- into a
+    /// single inline syscall, avoiding the asynchronous submission/completion
+    /// round trip that dominates the cost of instantly-completing requests.
+    /// Cache-missing requests fail with `EAGAIN` instead of blocking and are
+    /// handed to the native asynchronous path by the caller. Kernels or
+    /// filesystems without `RWF_NOWAIT` support (`EINVAL`/`ENOSYS`/
+    /// `EOPNOTSUPP`) degrade the same way, so the fast path never breaks
+    /// correctness, it can only fail to engage.
+    fn read_nowait(
+        &self,
+        data: &Arc<HandleData>,
+        w: &mut (dyn AsyncZeroCopyWriter + Send),
+        count: usize,
+        mut offset: u64,
+        flags: u32,
+    ) -> io::Result<(usize, bool)> {
+        let fd = data.borrow_fd();
+
+        // Hold the guard over the inline reads, like the synchronous handler
+        // does, so no other request can flip the O_DIRECT bit meanwhile.
+        let _flags_guard = self.ensure_file_flags(data, &fd, flags)?;
+
+        let mut file = NowaitFile { fd };
+        let mut served = 0usize;
+        while served < count {
+            match w.write_from(&mut file, count - served, offset) {
+                // EOF: the file is shorter than the request, nothing to relay.
+                Ok(0) => return Ok((served, false)),
+                Ok(n) => {
+                    served += n;
+                    offset += n as u64;
+                }
+                Err(e)
+                    if matches!(
+                        e.raw_os_error(),
+                        Some(libc::EAGAIN)
+                            | Some(libc::EINVAL)
+                            | Some(libc::ENOSYS)
+                            | Some(libc::EOPNOTSUPP)
+                    ) =>
+                {
+                    return Ok((served, true));
+                }
+                Err(e) => return Err(e),
+            }
+        }
+
+        Ok((served, false))
+    }
 }
 
 // `BackendFileSystem` is implemented for `Arc<FS>` by a blanket impl in
@@ -146,6 +206,92 @@ impl<F: Future> Future for SendZeroCopyFuture<F> {
     ) -> std::task::Poll<Self::Output> {
         // Safe because `SendZeroCopyFuture` is `repr(transparent)`.
         unsafe { self.map_unchecked_mut(|s: &mut Self| &mut s.0) }.poll(cx)
+    }
+}
+
+/// A read-only view of a handle's fd that serves positioned reads with
+/// `preadv2()` and the `RWF_NOWAIT` flag.
+///
+/// `RWF_NOWAIT` copies whatever the page cache already holds and fails with
+/// `EAGAIN` as soon as the read would have to wait for IO, so an inline read
+/// through this adapter never blocks the runtime thread. Only the positioned
+/// read side of [`FileReadWriteVolatile`] is implemented; the write side is
+/// out of scope for the READ fast path and always fails with `EINVAL`.
+struct NowaitFile<'a> {
+    fd: BorrowedFd<'a>,
+}
+
+impl FileReadWriteVolatile for NowaitFile<'_> {
+    fn read_volatile(&mut self, _slice: FileVolatileSlice) -> io::Result<usize> {
+        Err(io::Error::from_raw_os_error(libc::EINVAL))
+    }
+
+    fn write_volatile(&mut self, _slice: FileVolatileSlice) -> io::Result<usize> {
+        Err(io::Error::from_raw_os_error(libc::EINVAL))
+    }
+
+    fn read_at_volatile(&mut self, slice: FileVolatileSlice, offset: u64) -> io::Result<usize> {
+        let iov = libc::iovec {
+            iov_base: slice.as_ptr() as *mut libc::c_void,
+            iov_len: slice.len(),
+        };
+
+        // Safe: the iovec points into `slice`, which the caller guarantees to
+        // be valid for the duration of the call, and the kernel only writes
+        // within its bounds.
+        let ret = unsafe {
+            libc::preadv2(
+                self.fd.as_raw_fd(),
+                &iov,
+                1,
+                offset as libc::off_t,
+                libc::RWF_NOWAIT,
+            )
+        };
+        if ret >= 0 {
+            Ok(ret as usize)
+        } else {
+            Err(io::Error::last_os_error())
+        }
+    }
+
+    fn read_vectored_at_volatile(
+        &mut self,
+        bufs: &[FileVolatileSlice],
+        offset: u64,
+    ) -> io::Result<usize> {
+        if bufs.len() == 1 {
+            return self.read_at_volatile(bufs[0], offset);
+        }
+
+        let iovecs: Vec<libc::iovec> = bufs
+            .iter()
+            .map(|s| libc::iovec {
+                iov_base: s.as_ptr() as *mut libc::c_void,
+                iov_len: s.len(),
+            })
+            .collect();
+
+        // Safe: the iovecs point into `bufs`, which the caller guarantees to
+        // be valid for the duration of the call.
+        let ret = unsafe {
+            libc::preadv2(
+                self.fd.as_raw_fd(),
+                iovecs.as_ptr(),
+                iovecs.len() as libc::c_int,
+                offset as libc::off_t,
+                libc::RWF_NOWAIT,
+            )
+        };
+        if ret >= 0 {
+            Ok(ret as usize)
+        } else {
+            Err(io::Error::last_os_error())
+        }
+    }
+
+    fn write_at_volatile(&mut self, _slice: FileVolatileSlice, _offset: u64) -> io::Result<usize> {
+        Err(io::Error::from_raw_os_error(libc::EINVAL))
     }
 }
 
@@ -283,6 +429,34 @@ impl<S: BitmapSlice + Send + Sync + 'static> AsyncFileSystem for PassthroughFs<S
         flags: u32,
     ) -> io::Result<usize> {
         let data = self.get_data(handle, inode, libc::O_RDONLY)?;
+
+        // O_DIRECT requests keep the native asynchronous path: the request is
+        // served through a descriptor armed for direct IO (cf.
+        // `ensure_file_flags`), and an inline read on it would block the
+        // runtime thread on device IO, which is exactly what the asynchronous
+        // machinery exists to avoid.
+        if flags & (libc::O_DIRECT as u32) == 0 {
+            // Buffered requests first try an inline non-blocking read: the
+            // page cache serves them without a round trip through the
+            // asynchronous IO engine.
+            let (served, miss) = self.read_nowait(&data, w, size as usize, offset, flags)?;
+            if !miss {
+                return Ok(served);
+            }
+
+            // Cache miss: serve the remainder with native asynchronous IO,
+            // continuing at the writer's position and the file offset where
+            // the inline attempt stopped.
+            let file = self.async_file_from_data(&data, flags)?;
+            let n = SendZeroCopyFuture(w.async_write_from(
+                file,
+                size as usize - served,
+                offset + served as u64,
+            ))
+            .await?;
+            return Ok(served + n);
+        }
+
         let file = self.async_file_from_data(&data, flags)?;
 
         // Serve the request with native asynchronous IO: the transport
@@ -596,6 +770,326 @@ mod tests {
         });
 
         assert_eq!(std::fs::metadata(&path).unwrap().len(), 2);
+    }
+
+    /// A writer double driving the hybrid READ dispatch hermetically: it
+    /// stands in for both the transport writer and the file being read, so
+    /// the tests decide which path serves which chunk instead of depending
+    /// on kernel and filesystem behavior (a real cache miss needs an
+    /// uncached page, and tmpfs fails buffered `RWF_NOWAIT` reads with
+    /// `EOPNOTSUPP`, which would merely exercise the fallback).
+    ///
+    /// `write_from()` serves from `source` at `off`, up to `inline_budget`
+    /// bytes in total, and then fails with `EAGAIN` like a page cache that
+    /// runs dry; `async_write_from()` serves the remainder like the
+    /// asynchronous engine completing real IO. Both append at the current
+    /// position, mirroring the transport writer's continuation semantics
+    /// that the hybrid relies on, and every call is recorded in `events`.
+    struct PathRecorder {
+        /// File content that reads are served from.
+        source: Vec<u8>,
+        /// Total number of bytes `write_from()` serves before failing with
+        /// `EAGAIN`; `usize::MAX` never fails, so the inline path always
+        /// completes.
+        inline_budget: usize,
+        /// Bytes served by `write_from()` so far.
+        inline_served: usize,
+        /// Bytes received so far.
+        data: Vec<u8>,
+        /// (`inline`/`inline-eagain`/`inline-eof`/`async`, count, offset) per call.
+        events: Vec<(&'static str, usize, u64)>,
+    }
+
+    impl PathRecorder {
+        fn new(source: &[u8], inline_budget: usize) -> Self {
+            PathRecorder {
+                source: source.to_vec(),
+                inline_budget,
+                inline_served: 0,
+                data: Vec::new(),
+                events: Vec::new(),
+            }
+        }
+    }
+
+    impl io::Write for PathRecorder {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.data.extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl ZeroCopyWriter for PathRecorder {
+        fn write_from(
+            &mut self,
+            _f: &mut dyn FileReadWriteVolatile,
+            count: usize,
+            off: u64,
+        ) -> io::Result<usize> {
+            let start = off as usize;
+            // Reading past the end of the source is EOF, like a short read
+            // from a file smaller than the request.
+            if start >= self.source.len() {
+                self.events.push(("inline-eof", 0, off));
+                return Ok(0);
+            }
+            // The scripted page cache runs dry after `inline_budget` bytes.
+            if self.inline_served >= self.inline_budget {
+                self.events.push(("inline-eagain", count, off));
+                return Err(io::Error::from_raw_os_error(libc::EAGAIN));
+            }
+            let n = std::cmp::min(count, self.inline_budget - self.inline_served);
+            let n = std::cmp::min(n, self.source.len() - start);
+            self.inline_served += n;
+            self.events.push(("inline", n, off));
+            self.data.extend_from_slice(&self.source[start..start + n]);
+            Ok(n)
+        }
+
+        fn available_bytes(&self) -> usize {
+            usize::MAX
+        }
+    }
+
+    #[async_trait(?Send)]
+    impl AsyncZeroCopyWriter for PathRecorder {
+        async fn async_write_from(
+            &mut self,
+            _f: Arc<dyn AsyncFileReadWriteVolatile>,
+            count: usize,
+            off: u64,
+        ) -> io::Result<usize> {
+            let start = off as usize;
+            let n = std::cmp::min(count, self.source.len() - start);
+            self.events.push(("async", n, off));
+            self.data.extend_from_slice(&self.source[start..start + n]);
+            Ok(n)
+        }
+    }
+
+    #[test]
+    fn test_nowait_file() {
+        let source = TempDir::new().unwrap();
+        let path = source.as_path().join("testfile");
+        std::fs::write(&path, b"hello world").unwrap();
+        let file = std::fs::File::open(&path).unwrap();
+        // Safe: `fd` doesn't out-live `file`.
+        let mut f = NowaitFile {
+            fd: unsafe { BorrowedFd::borrow_raw(file.as_raw_fd()) },
+        };
+        let mut buf = [0u8; 11];
+        // Safe: the slice points into `buf` and doesn't out-live it.
+        let slice = unsafe { FileVolatileSlice::from_raw_ptr(buf.as_mut_ptr(), 11) };
+        match f.read_at_volatile(slice, 0) {
+            // Whether the non-blocking read engages is a filesystem property
+            // (tmpfs fails with EOPNOTSUPP, disk filesystems serve warm
+            // pages), so both outcomes are valid. On success the wrapper must
+            // report the count and deliver the data at the slice.
+            Ok(n) => {
+                assert_eq!(n, 11);
+                assert_eq!(&buf, b"hello world");
+            }
+            Err(e) => assert!(matches!(
+                e.raw_os_error(),
+                Some(libc::EAGAIN)
+                    | Some(libc::EINVAL)
+                    | Some(libc::ENOSYS)
+                    | Some(libc::EOPNOTSUPP)
+            )),
+        }
+    }
+
+    #[test]
+    fn test_async_read_fast_path() {
+        let (fs, source) = prepare_async_fs();
+        let ctx = prepare_context();
+        std::fs::write(source.as_path().join("testfile"), b"hello world").unwrap();
+        let name = CString::new("testfile").unwrap();
+
+        async_runtime::block_on(async {
+            let entry = fs.async_lookup(&ctx, ROOT_ID, &name).await.unwrap();
+            let (handle, _opts) = fs
+                .async_open(&ctx, entry.inode, libc::O_RDONLY as u32, 0)
+                .await
+                .unwrap();
+            let handle = handle.unwrap();
+
+            // A cache-resident read must be served inline in one shot, without
+            // a round trip through the asynchronous IO engine.
+            let mut w = PathRecorder::new(b"hello world", usize::MAX);
+            let n = fs
+                .async_read(
+                    &ctx,
+                    entry.inode,
+                    handle,
+                    &mut w,
+                    11,
+                    0,
+                    None,
+                    libc::O_RDONLY as u32,
+                )
+                .await
+                .unwrap();
+            assert_eq!(n, 11);
+            assert_eq!(w.data, b"hello world");
+            assert_eq!(w.events, [("inline", 11, 0)]);
+        });
+    }
+
+    #[test]
+    fn test_async_read_fast_path_offset() {
+        let (fs, source) = prepare_async_fs();
+        let ctx = prepare_context();
+        std::fs::write(source.as_path().join("testfile"), b"hello world").unwrap();
+        let name = CString::new("testfile").unwrap();
+
+        async_runtime::block_on(async {
+            let entry = fs.async_lookup(&ctx, ROOT_ID, &name).await.unwrap();
+            let (handle, _opts) = fs
+                .async_open(&ctx, entry.inode, libc::O_RDONLY as u32, 0)
+                .await
+                .unwrap();
+            let handle = handle.unwrap();
+
+            let mut w = PathRecorder::new(b"hello world", usize::MAX);
+            let n = fs
+                .async_read(
+                    &ctx,
+                    entry.inode,
+                    handle,
+                    &mut w,
+                    5,
+                    6,
+                    None,
+                    libc::O_RDONLY as u32,
+                )
+                .await
+                .unwrap();
+            assert_eq!(n, 5);
+            assert_eq!(w.data, b"world");
+            assert_eq!(w.events, [("inline", 5, 6)]);
+        });
+    }
+
+    #[test]
+    fn test_async_read_fast_path_eof() {
+        let (fs, source) = prepare_async_fs();
+        let ctx = prepare_context();
+        std::fs::write(source.as_path().join("testfile"), b"hello").unwrap();
+        let name = CString::new("testfile").unwrap();
+
+        async_runtime::block_on(async {
+            let entry = fs.async_lookup(&ctx, ROOT_ID, &name).await.unwrap();
+            let (handle, _opts) = fs
+                .async_open(&ctx, entry.inode, libc::O_RDONLY as u32, 0)
+                .await
+                .unwrap();
+            let handle = handle.unwrap();
+
+            // A request larger than the file is a short read terminated by an
+            // inline EOF, without waking the asynchronous engine: the first
+            // call serves the whole file, the second returns zero.
+            let mut w = PathRecorder::new(b"hello", usize::MAX);
+            let n = fs
+                .async_read(
+                    &ctx,
+                    entry.inode,
+                    handle,
+                    &mut w,
+                    10,
+                    0,
+                    None,
+                    libc::O_RDONLY as u32,
+                )
+                .await
+                .unwrap();
+            assert_eq!(n, 5);
+            assert_eq!(w.data, b"hello");
+            assert_eq!(w.events, [("inline", 5, 0), ("inline-eof", 0, 5)]);
+        });
+    }
+
+    #[test]
+    fn test_async_read_nowait_miss_fallback() {
+        let (fs, source) = prepare_async_fs();
+        let ctx = prepare_context();
+        std::fs::write(source.as_path().join("testfile"), b"abcdefghij").unwrap();
+        let name = CString::new("testfile").unwrap();
+
+        async_runtime::block_on(async {
+            let entry = fs.async_lookup(&ctx, ROOT_ID, &name).await.unwrap();
+            let (handle, _opts) = fs
+                .async_open(&ctx, entry.inode, libc::O_RDONLY as u32, 0)
+                .await
+                .unwrap();
+            let handle = handle.unwrap();
+
+            // The inline path is scripted to fail with EAGAIN right away, so
+            // the whole request is served by the native asynchronous path.
+            let mut w = PathRecorder::new(b"abcdefghij", 0);
+            let n = fs
+                .async_read(
+                    &ctx,
+                    entry.inode,
+                    handle,
+                    &mut w,
+                    10,
+                    0,
+                    None,
+                    libc::O_RDONLY as u32,
+                )
+                .await
+                .unwrap();
+            assert_eq!(n, 10);
+            assert_eq!(w.data, b"abcdefghij");
+            assert_eq!(w.events, [("inline-eagain", 10, 0), ("async", 10, 0)]);
+        });
+    }
+
+    #[test]
+    fn test_async_read_nowait_partial_fallback() {
+        let (fs, source) = prepare_async_fs();
+        let ctx = prepare_context();
+        std::fs::write(source.as_path().join("testfile"), b"abcdefghij").unwrap();
+        let name = CString::new("testfile").unwrap();
+
+        async_runtime::block_on(async {
+            let entry = fs.async_lookup(&ctx, ROOT_ID, &name).await.unwrap();
+            let (handle, _opts) = fs
+                .async_open(&ctx, entry.inode, libc::O_RDONLY as u32, 0)
+                .await
+                .unwrap();
+            let handle = handle.unwrap();
+
+            // The inline path serves the first 3 bytes and then misses: the
+            // asynchronous fallback must continue at the writer's position
+            // and at the file offset where the inline attempt stopped, not
+            // overwrite the bytes already served.
+            let mut w = PathRecorder::new(b"abcdefghij", 3);
+            let n = fs
+                .async_read(
+                    &ctx,
+                    entry.inode,
+                    handle,
+                    &mut w,
+                    10,
+                    0,
+                    None,
+                    libc::O_RDONLY as u32,
+                )
+                .await
+                .unwrap();
+            assert_eq!(n, 10);
+            assert_eq!(w.data, b"abcdefghij");
+            assert_eq!(
+                w.events,
+                [("inline", 3, 0), ("inline-eagain", 7, 3), ("async", 7, 3)]
+            );
+        });
     }
 
     #[test]
