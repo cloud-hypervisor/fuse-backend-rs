@@ -19,9 +19,9 @@ impl<'a> BytesCursor<'a> {
         BytesCursor { slice, position }
     }
 
-    // Used only by the `async-io` write path, which reads file data into the
-    // start of the reply buffer; dead code when `async-io` is disabled.
-    #[allow(dead_code)]
+    // Test-only accessor for the whole underlying slice; production code
+    // reads and writes through the cursor-aware accessors above.
+    #[cfg(test)]
     pub(crate) fn slice_mut(&mut self) -> &mut [u8] {
         self.slice
     }
