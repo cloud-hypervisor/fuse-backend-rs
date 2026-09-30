@@ -579,8 +579,12 @@ mod async_io {
         ) -> io::Result<usize> {
             self.check_available_space(count)?;
 
-            let buf =
-                unsafe { FileVolatileBuf::new_with_data(&mut self.buf.slice_mut()[..count], 0) };
+            // Continue at the writer's current position, like the synchronous
+            // write_from_at() does, so a partially written buffer can be
+            // completed asynchronously.
+            let buf = unsafe {
+                FileVolatileBuf::new_with_data(&mut self.buf.available_slice()[..count], 0)
+            };
             let (res, _) = src.async_read_at_volatile(buf, off).await;
             match res {
                 Ok(cnt) => {
@@ -1154,6 +1158,44 @@ mod tests {
             });
 
             assert_eq!(res.unwrap(), 40);
+        }
+
+        #[test]
+        fn async_write_from_at_continues_at_cursor() {
+            let file1 = TempFile::new().unwrap().into_file();
+            let fd1 = file1.as_raw_fd();
+
+            let data = vec![0xdeu8; 64];
+            let dir = TempDir::new().unwrap();
+            let path = dir.as_path().to_path_buf().join("test.txt");
+            std::fs::write(&path, &data).unwrap();
+
+            // Model the async server's READ reply shape: the writer is split
+            // into an `OutHeader` piece and a data piece, and the data piece
+            // is filled by `async_write_from_at()`.
+            let mut buf = vec![0x0u8; 48];
+            let buf = unsafe { std::mem::transmute::<&mut [u8], &'static mut [u8]>(&mut buf) };
+            let mut writer = FuseDevWriter::<()>::new(fd1, buf).unwrap();
+            let mut w2 = writer.split_at(4).expect("failed to split Writer");
+
+            let res = async_runtime::block_on(async {
+                let file = File::async_open(&path, true, false).await.unwrap();
+                // A first short read serves bytes [0..10), like an inline
+                // fast path delivering a partial chunk...
+                let n = w2.async_write_from_at(&file, 10, 0).await.unwrap();
+                assert_eq!(n, 10);
+                // ...and the follow-up call must continue at the writer's
+                // cursor, appending bytes [10..20) instead of overwriting
+                // the first ten.
+                let n = w2.async_write_from_at(&file, 10, 10).await.unwrap();
+                assert_eq!(n, 10);
+            });
+            let _ = res;
+
+            assert_eq!(w2.bytes_written(), 20);
+            // The split writer owns buf[4..], so the data landed at buf[4..24].
+            assert_eq!(&buf[4..14], &data[..10]);
+            assert_eq!(&buf[14..24], &data[10..20]);
         }
 
         #[test]
