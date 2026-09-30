@@ -28,8 +28,9 @@ fuse transport and request concurrency dominate there.
 
 `tests/scripts/bench_sync_async.sh` mounts the `fuse-backend-rs-benchmark`
 daemon once per mode — sync mode (N worker threads, one fuse channel each),
-async mode (a single `FuseDevTask` driven by the async runtime, tokio-uring
-when io_uring is available) and uring mode (the experimental
+async mode (N asynchronous workers through `AsyncFuseServing`, each with
+its own `/dev/fuse` file description and async runtime, tokio-uring when
+io_uring is available) and uring mode (the experimental
 FUSE-over-io_uring transport, requires kernel 6.14+ and is skipped
 otherwise) — and runs identical fio workloads:
 
@@ -122,10 +123,11 @@ even on bare metal, they are flagged with a looser threshold (25% versus
 ## Interpretation
 
 The async path currently delegates all operations to the synchronous
-handlers and processes requests sequentially with a single task/buffer,
-while the sync path serves requests from multiple worker threads. Expect
-the async mode to be competitive on single-stream latency but behind the
-sync mode on highly concurrent workloads; a native io_uring hot path is
+handlers and serves requests from one `FuseDevTask` per worker thread, so
+it scales with `--threads` like the sync path: at equal worker counts the
+two transports are at parity on buffered data workloads, and the async mode
+keeps scaling as workers are added. Metadata operations are dominated by
+the per-request handler cost instead. A native io_uring hot path is
 tracked as follow-up work (#188).
 
 ## Limitations
