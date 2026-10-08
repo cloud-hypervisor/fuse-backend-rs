@@ -97,11 +97,23 @@ mod fusedev_linux {
     use fuse_backend_rs::transport::BlockingFuseChannel as FlatBlockingFuseChannel;
 }
 
-/// The async serving task of the fusedev transport.
+/// The async serving surface of the fusedev transport.
 #[cfg(all(target_os = "linux", feature = "fusedev", feature = "async-io"))]
 mod fusedev_async {
-    use fuse_backend_rs::transport::fusedev::FuseDevTask;
-    use fuse_backend_rs::transport::FuseDevTask as FlatFuseDevTask;
+    use fuse_backend_rs::transport::fusedev::{AsyncFuseServing, AsyncServingConfig, FuseDevTask};
+    use fuse_backend_rs::transport::{
+        AsyncFuseServing as FlatAsyncFuseServing, AsyncServingConfig as FlatAsyncServingConfig,
+        FuseDevTask as FlatFuseDevTask,
+    };
+
+    #[test]
+    fn fusedev_async_paths_resolve() {
+        fn same_type<T>(_: T, _: T) {}
+        same_type(
+            AsyncServingConfig::default(),
+            FlatAsyncServingConfig::default(),
+        );
+    }
 }
 
 /// The FUSE-over-io_uring transport, historical `feature = "fusedev-uring"`.
