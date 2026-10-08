@@ -161,6 +161,21 @@ jobs:
             echo "GitHub-hosted runners drift over time even within one job."
         } >> "${GITHUB_STEP_SUMMARY}"
 
+        # Cross-mode comparison of the two classic transports of this
+        # very PR run: both numbers come from the current variant,
+        # measured back to back in this same job, so environment effects
+        # cancel out and no merge-base baseline is needed.
+        {
+            echo ""
+            echo "### Cross-mode comparison: sync vs async of this PR"
+            echo ""
+            echo "Positive deltas mean async outperformed sync on that workload."
+            echo ""
+        } >> "${GITHUB_STEP_SUMMARY}"
+        python3 tests/scripts/bench_compare.py compare \
+            "current-sync-${{ matrix.threads }}threads.json" \
+            "current-async-${{ matrix.threads }}threads.json" >> "${GITHUB_STEP_SUMMARY}"
+
         # Cross-mode comparison of the uring transport against the classic
         # transports of this very PR run: same job and same machine, so
         # environment effects cancel out, and no baseline is needed (the
