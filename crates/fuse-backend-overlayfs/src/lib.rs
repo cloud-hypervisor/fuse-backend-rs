@@ -922,6 +922,25 @@ fn is_multi_link_file(stat: stat64) -> bool {
     !utils::is_dir(stat) && stat.st_nlink > 1
 }
 
+// Saturating decrement of an OverlayInode's lookup count, retrying on
+// contention: an underflow would park the inode on the deleted list
+// forever. Returns the updated count; the compare-and-swap loop cannot
+// fail because the closure always yields Some, so the 0 fallback is
+// defensive only.
+//
+// The deprecated fetch_update() is kept behind this single allow: its
+// replacement try_update() only became stable in rustc 1.95, past the
+// crate's MSRV of 1.80. Migrate once the MSRV moves beyond 1.95.
+#[allow(deprecated)]
+fn dec_lookups(lookups: &AtomicU64, count: u64) -> u64 {
+    lookups
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |l| {
+            Some(l.saturating_sub(count))
+        })
+        .map(|prev| prev.saturating_sub(count))
+        .unwrap_or(0)
+}
+
 impl OverlayFs {
     pub fn new(
         upper: Option<Arc<BoxedLayer>>,
@@ -1262,13 +1281,7 @@ impl OverlayFs {
         // count of a multi-linked inode can reach zero before its last
         // link is unlinked. The compare-and-swap loop keeps the update
         // atomic with lookups and unlinks of the inode's links.
-        let lookups = v
-            .lookups
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |l| {
-                Some(l.saturating_sub(count))
-            })
-            .map(|prev| prev.saturating_sub(count))
-            .unwrap_or(0);
+        let lookups = dec_lookups(&v.lookups, count);
 
         if lookups == 0 {
             debug!("inode is forgotten: {}, name {}", inode, v.name);
@@ -1858,11 +1871,7 @@ impl OverlayFs {
                 // can't be LOOKUP-ed, so the count is always the birth
                 // reference, but an underflow would park it on the
                 // deleted list forever.
-                let _ = n
-                    .lookups
-                    .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |l| {
-                        Some(l.saturating_sub(1))
-                    });
+                dec_lookups(&n.lookups, 1);
                 self.remove_inode(n.inode, Some(n.path.clone()));
                 // The replaced whiteout was created for a name with a
                 // lower-layer entry, so a later unlink of this link has
@@ -2494,11 +2503,7 @@ impl OverlayFs {
         // park the inode on the deleted list forever. The compare-and-swap
         // loop keeps the decrement atomic with lookups, forgets and
         // unlinks of the inode's other links.
-        let _ = node
-            .lookups
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |l| {
-                Some(l.saturating_sub(1))
-            });
+        let _ = dec_lookups(&node.lookups, 1);
 
         // Detach the directory entry from the inode. If other hard links
         // remain, keep the overlay inode alive: the file is still
@@ -2650,11 +2655,7 @@ impl OverlayFs {
                 // have looked it up at all (whiteout placeholders can
                 // never be looked up), and without this the birth
                 // reference would strand the child on the deleted list.
-                let _ = child
-                    .lookups
-                    .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |l| {
-                        Some(l.saturating_sub(1))
-                    });
+                dec_lookups(&child.lookups, 1);
 
                 // Delete the child. If it still has other hard links in
                 // other directories, keep the overlay inode alive and
@@ -2681,11 +2682,7 @@ impl OverlayFs {
                 // would keep the child's inode alive after its last live
                 // link is unlinked. Release the entry's lookups
                 // reference like do_rm() does for an unlink.
-                let _ = child
-                    .lookups
-                    .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |l| {
-                        Some(l.saturating_sub(1))
-                    });
+                dec_lookups(&child.lookups, 1);
                 let link_path = format!("{}/{}", node.path, name);
                 let remaining = self
                     .inodes
