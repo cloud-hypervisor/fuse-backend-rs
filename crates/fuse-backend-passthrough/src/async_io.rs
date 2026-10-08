@@ -8,6 +8,11 @@
 //! is transferred directly between the transport buffer and the backing file
 //! through the runtime's asynchronous file interface (io_uring when
 //! available), without going through the blocking synchronous handlers.
+//! Two classes of requests are exceptions and relayed to the synchronous
+//! handlers instead: O_DIRECT requests, whose alignment constraints the
+//! transport buffer can't satisfy (the synchronous handler stages them
+//! through a page-aligned bounce buffer), and WRITE_KILL_PRIV requests,
+//! whose CAP_FSETID handling must not span an `.await` point.
 //!
 //! The remaining operations are relayed to the synchronous handlers, which
 //! execute blocking syscalls. By default they run inline in the context of
@@ -419,81 +424,100 @@ impl<S: BitmapSlice + Send + Sync + 'static> AsyncFileSystem for PassthroughFs<S
     #[allow(clippy::too_many_arguments)]
     async fn async_read(
         &self,
-        _ctx: &Context,
+        ctx: &Context,
         inode: <Self as FileSystem>::Inode,
         handle: <Self as FileSystem>::Handle,
         w: &mut (dyn AsyncZeroCopyWriter + Send),
         size: u32,
         offset: u64,
-        _lock_owner: Option<u64>,
+        lock_owner: Option<u64>,
         flags: u32,
     ) -> io::Result<usize> {
-        let data = self.get_data(handle, inode, libc::O_RDONLY)?;
-
-        // O_DIRECT requests keep the native asynchronous path: the request is
-        // served through a descriptor armed for direct IO (cf.
-        // `ensure_file_flags`), and an inline read on it would block the
-        // runtime thread on device IO, which is exactly what the asynchronous
-        // machinery exists to avoid.
-        if flags & (libc::O_DIRECT as u32) == 0 {
-            // Buffered requests first try an inline non-blocking read: the
-            // page cache serves them without a round trip through the
-            // asynchronous IO engine.
-            let (served, miss) = self.read_nowait(&data, w, size as usize, offset, flags)?;
-            if !miss {
-                return Ok(served);
-            }
-
-            // Cache miss: serve the remainder with native asynchronous IO,
-            // continuing at the writer's position and the file offset where
-            // the inline attempt stopped.
-            let file = self.async_file_from_data(&data, flags)?;
-            let n = SendZeroCopyFuture(w.async_write_from(
-                file,
-                size as usize - served,
-                offset + served as u64,
-            ))
-            .await?;
-            return Ok(served + n);
+        // O_DIRECT requests are relayed to the synchronous handler: the
+        // native asynchronous path submits IO directly into the transport
+        // buffer, whose payload offset right after the reply header doesn't
+        // satisfy the alignment constraints of direct IO (buffer address,
+        // length and file offset must all be multiples of the logical block
+        // size), so alignment-enforcing filesystems like ext4/XFS reject it
+        // with `EINVAL`. The synchronous handler stages the data through a
+        // page-aligned bounce buffer instead (`read_direct()`). The relayed
+        // handler runs inline and blocks the runtime thread on device IO for
+        // the duration of the read: the zero-copy request buffers can't be
+        // moved to a blocking pool thread, so blocking inline is the price
+        // of serving the rare direct-IO request correctly.
+        if flags & (libc::O_DIRECT as u32) != 0 {
+            return self.read(ctx, inode, handle, w, size, offset, lock_owner, flags);
         }
 
-        let file = self.async_file_from_data(&data, flags)?;
+        let data = self.get_data(handle, inode, libc::O_RDONLY)?;
 
-        // Serve the request with native asynchronous IO: the transport
-        // transfers the data directly between its buffer and the file.
-        SendZeroCopyFuture(w.async_write_from(file, size as usize, offset)).await
+        // Buffered requests first try an inline non-blocking read: the
+        // page cache serves them without a round trip through the
+        // asynchronous IO engine.
+        let (served, miss) = self.read_nowait(&data, w, size as usize, offset, flags)?;
+        if !miss {
+            return Ok(served);
+        }
+
+        // Cache miss: serve the remainder with native asynchronous IO,
+        // continuing at the writer's position and the file offset where
+        // the inline attempt stopped.
+        let file = self.async_file_from_data(&data, flags)?;
+        let n = SendZeroCopyFuture(w.async_write_from(
+            file,
+            size as usize - served,
+            offset + served as u64,
+        ))
+        .await?;
+        Ok(served + n)
     }
 
     #[allow(clippy::too_many_arguments)]
     async fn async_write(
         &self,
-        _ctx: &Context,
+        ctx: &Context,
         inode: <Self as FileSystem>::Inode,
         handle: <Self as FileSystem>::Handle,
         r: &mut (dyn AsyncZeroCopyReader + Send),
         size: u32,
         offset: u64,
-        _lock_owner: Option<u64>,
-        _delayed_write: bool,
+        lock_owner: Option<u64>,
+        delayed_write: bool,
         flags: u32,
         fuse_flags: u32,
     ) -> io::Result<usize> {
+        // O_DIRECT requests are relayed to the synchronous handler for the
+        // same alignment reason as `async_read()` above (`write_direct()`
+        // stages the payload through a page-aligned bounce buffer).
+        // WRITE_KILL_PRIV requests are relayed too: the synchronous handler
+        // drops CAP_FSETID around the underlying write and restores it right
+        // after, whereas the native path would hold the capability-dropped
+        // state across `.await` points, so a concurrent non-killpriv write
+        // issued while this future is suspended could run with the capability
+        // already dropped and lose the setgid bit it must preserve.
+        if flags & (libc::O_DIRECT as u32) != 0
+            || (self.killpriv_v2.load(Ordering::Relaxed) && fuse_flags & WRITE_KILL_PRIV != 0)
+        {
+            return self.write(
+                ctx,
+                inode,
+                handle,
+                r,
+                size,
+                offset,
+                lock_owner,
+                delayed_write,
+                flags,
+                fuse_flags,
+            );
+        }
+
         let data = self.get_data(handle, inode, libc::O_RDWR)?;
 
         if self.seal_size.load(Ordering::Relaxed) {
             let st = stat_fd(data.get_file(), None)?;
             self.seal_size_check(Opcode::Write, st.st_size as u64, offset, size as u64, 0)?;
         }
-
-        // The capability is restored when `_killpriv` is dropped. The async
-        // runtime is single-threaded, so the capability state stays
-        // consistent while the future may be suspended.
-        let _killpriv =
-            if self.killpriv_v2.load(Ordering::Relaxed) && (fuse_flags & WRITE_KILL_PRIV != 0) {
-                super::drop_cap_fsetid()?
-            } else {
-                None
-            };
 
         // Borrow the fd of the handle for the duration of the write: the
         // asynchronous file object holds a reference to the handle data,
@@ -1168,6 +1192,161 @@ mod tests {
 
         let content = std::fs::read(source.as_path().join("newfile")).unwrap();
         assert_eq!(&content, b"async data");
+    }
+
+    // O_DIRECT and WRITE_KILL_PRIV requests are relayed to the synchronous
+    // handlers (see `async_read()`/`async_write()`): the synchronous handler
+    // stages direct-IO payloads through a page-aligned bounce buffer, which
+    // the native asynchronous path can't -- its IO goes straight into the
+    // transport buffer, which alignment-enforcing filesystems reject with
+    // EINVAL. The relay must keep such requests working. O_DIRECT needs a
+    // backing filesystem that supports it; tmpfs (a common /tmp) rejects it
+    // at open() with EINVAL, so skip gracefully there rather than fail, to
+    // keep the test from being environment-dependent.
+    #[test]
+    fn test_async_direct_io_relayed() {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        const BLOCK: usize = 4096;
+        const KILLPRIV_BLOCK: usize = 512;
+
+        let dir = TempDir::new().expect("Cannot create temporary directory.");
+        let path = dir.as_path().join("async_direct_file");
+
+        // Probe: does the filesystem support O_DIRECT at all?
+        match std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .custom_flags(libc::O_DIRECT)
+            .open(&path)
+        {
+            Ok(_) => std::fs::remove_file(&path).unwrap(),
+            Err(e) if e.raw_os_error() == Some(libc::EINVAL) => {
+                eprintln!(
+                    "skipping test_async_direct_io_relayed: {:?} does not support O_DIRECT",
+                    dir.as_path()
+                );
+                return;
+            }
+            Err(e) => panic!("unexpected error opening {:?} with O_DIRECT: {}", path, e),
+        }
+
+        // `do_import: false` enables killpriv_v2 at init(), so the
+        // WRITE_KILL_PRIV leg below takes the relay too. The root inode
+        // still needs an explicit `import()`: `init()` only imports
+        // automatically when `do_import` is set. Only HANDLE_KILLPRIV_V2 is
+        // negotiated: `FsOptions::all()` would also enable the zero-message
+        // options (negotiable exactly because `do_import` is false), and
+        // ZERO_MESSAGE_OPEN makes `create()` reply without a handle.
+        let cfg = Config {
+            root_dir: dir.as_path().to_str().unwrap().to_string(),
+            do_import: false,
+            ..Default::default()
+        };
+        let fs = PassthroughFs::<()>::new(cfg).unwrap();
+        fs.import().unwrap();
+        fs.init(FsOptions::HANDLE_KILLPRIV_V2).unwrap();
+        assert!(fs.killpriv_v2.load(Ordering::Relaxed));
+
+        let ctx = prepare_context();
+        let name = CString::new("async_direct_file").unwrap();
+        let killpriv_payload: Vec<u8> = (0..KILLPRIV_BLOCK).map(|i| (i % 241) as u8).collect();
+
+        async_runtime::block_on(async {
+            let args = CreateIn {
+                flags: (libc::O_RDWR | libc::O_CREAT | libc::O_TRUNC | libc::O_DIRECT) as u32,
+                mode: 0o600,
+                umask: 0,
+                fuse_flags: 0,
+            };
+            let (entry, handle, _opts) = fs.async_create(&ctx, ROOT_ID, &name, args).await.unwrap();
+            let handle = handle.unwrap();
+
+            // A direct-IO write: relayed to `write_direct()`, which stages
+            // the payload through an aligned bounce buffer. The native path
+            // would submit IO straight into the transport buffer and fail
+            // with EINVAL on alignment-enforcing filesystems.
+            let payload: Vec<u8> = (0..BLOCK).map(|i| (i % 251) as u8).collect();
+            let mut r = MemReader(payload.clone());
+            let n = fs
+                .async_write(
+                    &ctx,
+                    entry.inode,
+                    handle,
+                    &mut r,
+                    BLOCK as u32,
+                    0,
+                    None,
+                    false,
+                    libc::O_DIRECT as u32,
+                    0,
+                )
+                .await
+                .unwrap();
+            assert_eq!(n, BLOCK);
+
+            // A direct-IO read: relayed to `read_direct()`. The double
+            // records which path served it: neither the inline hybrid nor
+            // the native asynchronous engine may run (`write_from()` and
+            // `async_write_from()` push an event), only the synchronous
+            // relay through `io::Write` may deliver data.
+            let mut w = PathRecorder::new(&[], usize::MAX);
+            let n = fs
+                .async_read(
+                    &ctx,
+                    entry.inode,
+                    handle,
+                    &mut w,
+                    BLOCK as u32,
+                    0,
+                    None,
+                    libc::O_DIRECT as u32,
+                )
+                .await
+                .unwrap();
+            assert_eq!(n, BLOCK);
+            assert_eq!(w.data, payload);
+            assert!(w.events.is_empty());
+
+            // A WRITE_KILL_PRIV write on a second, buffered file takes the
+            // relay as well, and must keep working (the capability drop is
+            // a no-op without CAP_FSETID).
+            let killpriv_name = CString::new("async_killpriv_file").unwrap();
+            let args = CreateIn {
+                flags: (libc::O_RDWR | libc::O_CREAT | libc::O_TRUNC) as u32,
+                mode: 0o600,
+                umask: 0,
+                fuse_flags: 0,
+            };
+            let (killpriv_entry, killpriv_handle, _opts) = fs
+                .async_create(&ctx, ROOT_ID, &killpriv_name, args)
+                .await
+                .unwrap();
+            let killpriv_handle = killpriv_handle.unwrap();
+
+            let mut r = MemReader(killpriv_payload.clone());
+            let n = fs
+                .async_write(
+                    &ctx,
+                    killpriv_entry.inode,
+                    killpriv_handle,
+                    &mut r,
+                    KILLPRIV_BLOCK as u32,
+                    0,
+                    None,
+                    false,
+                    libc::O_RDWR as u32,
+                    WRITE_KILL_PRIV,
+                )
+                .await
+                .unwrap();
+            assert_eq!(n, KILLPRIV_BLOCK);
+        });
+
+        let content = std::fs::read(dir.as_path().join("async_killpriv_file")).unwrap();
+        assert_eq!(content, killpriv_payload);
     }
 
     #[test]
