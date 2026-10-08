@@ -177,6 +177,15 @@ fn main() -> Result<()> {
     print!("open fuse session\n");
     let mut se = FuseSession::new(Path::new(&args.mountpoint), &args.name, "", false).unwrap();
     print!("session opened\n");
+    // Register the termination handler before mounting: a TERM arriving
+    // between the mount and the loop below must still take the graceful
+    // umount path. With the default disposition the daemon would die with
+    // the mount left behind, and the dead mount's stat() fails with
+    // ENOTCONN, so a restarted daemon rejects the mountpoint ("is not a
+    // directory") until someone unmounts it manually. Signals delivered
+    // after registration are buffered by the iterator, so none are lost
+    // while the rest of the startup completes.
+    let mut signals = Signals::new(TERM_SIGNALS).unwrap();
     se.mount().unwrap();
 
     let mut server = FuseServer {
@@ -189,7 +198,6 @@ fn main() -> Result<()> {
     });
 
     // main thread
-    let mut signals = Signals::new(TERM_SIGNALS).unwrap();
     for _sig in signals.forever() {
         break;
     }

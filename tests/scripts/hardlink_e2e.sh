@@ -26,11 +26,21 @@ if [ ! -x "$BIN" ]; then
     exit 1
 fi
 
+# Unmount a leftover mount at $T/mnt, alive or dead.  Detection scans
+# /proc/self/mountinfo instead of stat()-based tools like mountpoint -q:
+# a daemon that died without umounting leaves a dead mount whose stat()
+# fails with ENOTCONN, so mountpoint -q and [ -e ] are blind to it, and
+# the next daemon then rejects the mountpoint as "not a directory".
+unmount_leftover_mount() {
+    grep -Fqs -- " $T/mnt " /proc/self/mountinfo || return 0
+    fusermount -u "$T/mnt" 2>/dev/null \
+        || fusermount3 -u "$T/mnt" 2>/dev/null \
+        || umount "$T/mnt" 2>/dev/null
+}
+
 # A previous crashed run may have left a FUSE mount behind; unmount it
 # before removing the scratch dir, so rm does not recurse into it.
-if mountpoint -q "$T/mnt" 2>/dev/null; then
-    fusermount -u "$T/mnt"
-fi
+unmount_leftover_mount
 rm -rf "$T"
 mkdir -p "$T/lower/a" "$T/lower/b" "$T/lower/c" "$T/upper" "$T/work" "$T/mnt"
 
@@ -126,9 +136,7 @@ cleanup() {
         wait "$DPID" 2>/dev/null
         sleep 0.5
     fi
-    if mountpoint -q "$T/mnt" 2>/dev/null; then
-        fusermount -u "$T/mnt" 2>/dev/null
-    fi
+    unmount_leftover_mount
     rm -rf "$T"
 }
 trap cleanup EXIT
@@ -149,6 +157,9 @@ stop_daemon() {
     wait "$DPID" 2>/dev/null
     DPID=
     sleep 0.5
+    # A daemon that crashed mid-run leaves its mount behind (alive or
+    # dead); clear it so the next start_daemon can take the mountpoint.
+    unmount_leftover_mount
 }
 
 start_daemon
