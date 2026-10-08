@@ -22,6 +22,21 @@
 //! the runtime's blocking thread pool, so the async task can keep receiving
 //! and dispatching requests while the syscalls execute in parallel on pool
 //! threads.
+//!
+//! # Runtime requirement
+//!
+//! The native asynchronous IO path must be driven by this crate's async
+//! `Runtime` (`fuse_backend_core::async_runtime`): when io_uring is
+//! available (the default on Linux) that is a tokio-uring runtime, and its
+//! operations panic when polled outside its context. Embedding the
+//! filesystem layer on another executor (e.g. a plain tokio runtime) is
+//! not supported: the first native WRITE, or a READ on a page-cache miss,
+//! panics -- only inline-served cache hits work. Serve the filesystem with
+//! a transport that drives this crate's `Runtime` (`AsyncFuseServing`
+//! does), or select the tokio runtime with the
+//! `FUSE_BACKEND_RS_ASYNC_RUNTIME=tokio` environment variable: its
+//! `preadv`/`pwritev` submission never depends on the runtime context, at
+//! the cost of serving cache misses as blocking syscalls.
 
 use std::future::Future;
 use std::io;
