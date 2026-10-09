@@ -18,15 +18,15 @@
 //! futures and the zero-copy buffer traits keep their single-thread
 //! guarantees.
 
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Sender};
 use std::sync::Arc;
-use std::thread::{self, JoinHandle};
+use std::thread;
 
 use fuse_backend_core::api::filesystem::AsyncFileSystem;
 use fuse_backend_core::api::server::Server;
 use fuse_backend_core::async_runtime::Runtime;
 
+use crate::serving::{FuseServing, WorkerSet};
 use crate::{Error, FuseDevTask, FuseSession, Result};
 
 /// Configuration of the multi-worker asynchronous serving layer.
@@ -60,8 +60,7 @@ impl Default for AsyncServingConfig {
 /// unmounts the filesystem and joins all serving threads.
 pub struct AsyncFuseServing<F: AsyncFileSystem + Send + Sync + 'static> {
     session: FuseSession,
-    exit: Arc<AtomicBool>,
-    workers: Vec<JoinHandle<()>>,
+    workers: WorkerSet,
     _fs: std::marker::PhantomData<F>,
 }
 
@@ -99,17 +98,22 @@ impl<F: AsyncFileSystem + Send + Sync + 'static> AsyncFuseServing<F> {
             files.push(session.clone_fuse_file()?);
         }
 
-        let exit = Arc::new(AtomicBool::new(false));
+        let mut set = WorkerSet::new();
+        let exit = set.exit_flag();
+        let tracker = set.tracker();
         let (ready_tx, ready_rx) = channel::<bool>();
-        let mut handles = Vec::with_capacity(workers);
         for (id, file) in files.into_iter().enumerate() {
             let handle = thread::Builder::new()
                 .name(format!("fuse-async-{id}"))
                 .spawn({
                     let server = server.clone();
                     let exit = exit.clone();
+                    let tracker = tracker.clone();
                     let ready_tx = ready_tx.clone();
                     move || {
+                        // Report the thread exit to the serving layer's
+                        // wait().
+                        let _exited = tracker.exit_guard();
                         // Runtime and task creation may panic (io_uring
                         // ring allocation, fd setup); the guard turns that
                         // into a constructor error below.
@@ -129,9 +133,9 @@ impl<F: AsyncFileSystem + Send + Sync + 'static> AsyncFuseServing<F> {
                     }
                 });
             match handle {
-                Ok(handle) => handles.push(handle),
+                Ok(handle) => set.push(handle),
                 Err(e) => {
-                    stop_workers(&mut session, &exit, handles);
+                    set.stop(&mut session, false);
                     return Err(Error::SessionFailure(format!(
                         "async: spawn worker {id}: {e}"
                     )));
@@ -144,7 +148,7 @@ impl<F: AsyncFileSystem + Send + Sync + 'static> AsyncFuseServing<F> {
         // out on the first one that died during startup.
         for _ in 0..workers {
             if ready_rx.recv() != Ok(true) {
-                stop_workers(&mut session, &exit, handles);
+                set.stop(&mut session, false);
                 return Err(Error::SessionFailure(
                     "async: worker exited during startup".to_string(),
                 ));
@@ -153,25 +157,30 @@ impl<F: AsyncFileSystem + Send + Sync + 'static> AsyncFuseServing<F> {
 
         Ok(AsyncFuseServing {
             session,
-            exit,
-            workers: handles,
+            workers: set,
             _fs: std::marker::PhantomData,
         })
     }
 }
 
-/// Signal all workers to stop, tear the connection down and join them.
-///
-/// Pending reads on the cloned file descriptions cannot be woken with
-/// [`FuseSession::wake()`], which only reaches the epoll-based channels:
-/// tearing the connection down completes them with `ENODEV` instead, which
-/// ends `poll_handler()`. Requests already in flight are still served and
-/// replied before a worker exits.
-fn stop_workers(session: &mut FuseSession, exit: &Arc<AtomicBool>, workers: Vec<JoinHandle<()>>) {
-    exit.store(true, Ordering::Release);
-    let _ = session.umount();
-    for handle in workers {
-        let _ = handle.join();
+impl<F: AsyncFileSystem + Send + Sync + 'static> Drop for AsyncFuseServing<F> {
+    fn drop(&mut self) {
+        // Pending reads on the workers' cloned file descriptions cannot be
+        // woken with FuseSession::wake(), which only reaches epoll-based
+        // channels: tearing the connection down completes them with ENODEV
+        // instead, which ends poll_handler(). Requests already in flight
+        // are still served and replied before a worker exits.
+        self.workers.stop(&mut self.session, false);
+    }
+}
+
+impl<F: AsyncFileSystem + Send + Sync + 'static> FuseServing for AsyncFuseServing<F> {
+    fn session(&self) -> &FuseSession {
+        &self.session
+    }
+
+    fn wait(&self) {
+        self.workers.wait();
     }
 }
 
@@ -196,13 +205,6 @@ impl Drop for StartupGuard<'_> {
         if !self.reported {
             let _ = self.tx.send(false);
         }
-    }
-}
-
-impl<F: AsyncFileSystem + Send + Sync + 'static> Drop for AsyncFuseServing<F> {
-    fn drop(&mut self) {
-        let workers = std::mem::take(&mut self.workers);
-        stop_workers(&mut self.session, &self.exit, workers);
     }
 }
 
