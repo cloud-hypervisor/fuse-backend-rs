@@ -1749,6 +1749,55 @@ impl<S: BitmapSlice + Send + Sync> FileSystem for PassthroughFs<S> {
             Ok(res as u64)
         }
     }
+
+    #[cfg(target_os = "linux")]
+    #[allow(clippy::too_many_arguments)]
+    fn copy_file_range(
+        &self,
+        _ctx: &Context,
+        inode_in: Inode,
+        fh_in: Handle,
+        offset_in: u64,
+        inode_out: Inode,
+        fh_out: Handle,
+        offset_out: u64,
+        len: u64,
+        flags: u64,
+    ) -> io::Result<u32> {
+        // Keep the Arc<HandleData> in scope, otherwise the fds may get invalid.
+        let data_in = self.handle_map.get(fh_in, inode_in)?;
+        let data_out = self.handle_map.get(fh_out, inode_out)?;
+
+        // The FUSE protocol carries explicit offsets and the reply only reports
+        // the copied length, so the backing files' own positions are neither
+        // read nor advanced: no need to serialize against lseek() by taking
+        // get_file_mut().
+        let mut off_in: libc::loff_t = offset_in as libc::loff_t;
+        let mut off_out: libc::loff_t = offset_out as libc::loff_t;
+
+        // The WriteOut reply reports the copied length as a u32, so never ask
+        // for more than can be answered; the kernel re-requests the remainder.
+        let len = len.min(u32::MAX as u64) as usize;
+
+        // Safe because the only memory this modifies is the two offset locals
+        // which we own, and we check the return value.
+        let res = unsafe {
+            libc::syscall(
+                libc::SYS_copy_file_range,
+                data_in.get_file().as_raw_fd(),
+                &mut off_in as *mut libc::loff_t,
+                data_out.get_file().as_raw_fd(),
+                &mut off_out as *mut libc::loff_t,
+                len,
+                flags as libc::c_uint,
+            )
+        };
+        if res < 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(res as u32)
+        }
+    }
 }
 
 #[cfg(test)]
@@ -2120,6 +2169,227 @@ mod tests {
             std::fs::metadata(file.as_path()).unwrap().ino()
         );
         assert_eq!(std::fs::metadata(&link_path).unwrap().nlink(), 2);
+    }
+
+    // Copying between two files through copy_file_range(): a full copy with
+    // non-zero offsets on both ends, which also grows the destination, and a
+    // short copy truncated by the end of the source file.
+    //
+    // Built without inode file handles like test_link_regular(): under an
+    // unprivileged runner open_by_handle_at() would fail EPERM first and
+    // shadow the code under test.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_copy_file_range() {
+        let source = TempDir::new().expect("Cannot create temporary directory.");
+        let fs_cfg = Config {
+            root_dir: source
+                .as_path()
+                .to_str()
+                .expect("source path to string")
+                .to_string(),
+            ..Default::default()
+        };
+        let fs = PassthroughFs::<()>::new(fs_cfg).unwrap();
+        fs.import().unwrap();
+        fs.init(FsOptions::all()).unwrap();
+        let ctx = prepare_context();
+
+        // An 8KiB source file with recognizable content.
+        let content: Vec<u8> = (0..8192u32).map(|i| (i % 251) as u8).collect();
+        let src_path = source.as_path().join("copy_src.bin");
+        std::fs::write(&src_path, &content).unwrap();
+
+        let dst1_path = source.as_path().join("copy_dst1.bin");
+        std::fs::write(&dst1_path, "").unwrap();
+        let dst2_path = source.as_path().join("copy_dst2.bin");
+        std::fs::write(&dst2_path, "").unwrap();
+
+        let src_entry = fs
+            .lookup(&ctx, ROOT_ID, &CString::new("copy_src.bin").unwrap())
+            .unwrap();
+        let dst1_entry = fs
+            .lookup(&ctx, ROOT_ID, &CString::new("copy_dst1.bin").unwrap())
+            .unwrap();
+        let dst2_entry = fs
+            .lookup(&ctx, ROOT_ID, &CString::new("copy_dst2.bin").unwrap())
+            .unwrap();
+        let (src_handle, _, _) = fs
+            .open(&ctx, src_entry.inode, libc::O_RDONLY as u32, 0)
+            .unwrap();
+        let (dst1_handle, _, _) = fs
+            .open(&ctx, dst1_entry.inode, libc::O_WRONLY as u32, 0)
+            .unwrap();
+        let (dst2_handle, _, _) = fs
+            .open(&ctx, dst2_entry.inode, libc::O_WRONLY as u32, 0)
+            .unwrap();
+
+        // Full copy: 2KiB from the middle of the source into the middle of
+        // the (empty) destination, which grows to hold the data.
+        let copied = fs
+            .copy_file_range(
+                &ctx,
+                src_entry.inode,
+                src_handle.unwrap(),
+                4 * 1024,
+                dst1_entry.inode,
+                dst1_handle.unwrap(),
+                512,
+                2 * 1024,
+                0,
+            )
+            .unwrap();
+        assert_eq!(copied, 2 * 1024);
+
+        let out = std::fs::read(&dst1_path).unwrap();
+        assert_eq!(out.len(), 512 + 2 * 1024);
+        assert!(out[..512].iter().all(|&b| b == 0));
+        assert_eq!(&out[512..], &content[4 * 1024..6 * 1024]);
+
+        // Short copy: only 1KiB is left in the source past offset 7KiB, so a
+        // request for 2KiB reports a truncated result.
+        let copied = fs
+            .copy_file_range(
+                &ctx,
+                src_entry.inode,
+                src_handle.unwrap(),
+                7 * 1024,
+                dst2_entry.inode,
+                dst2_handle.unwrap(),
+                0,
+                2 * 1024,
+                0,
+            )
+            .unwrap();
+        assert_eq!(copied, 1024);
+
+        let out = std::fs::read(&dst2_path).unwrap();
+        assert_eq!(out.len(), 1024);
+        assert_eq!(&out[..], &content[7 * 1024..]);
+
+        // The source is untouched.
+        assert_eq!(std::fs::read(&src_path).unwrap(), content);
+    }
+
+    // The WriteOut reply reports the copied length as a u32, so a request
+    // longer than u32::MAX bytes must not fail: the length is capped and the
+    // copy stays bounded by what the source holds.  The kernel clamps the
+    // request the same way (min(len, UINT_MAX & PAGE_MASK)) before sending
+    // it, so this guards the trait method against direct callers.
+    //
+    // Built without inode file handles like test_link_regular(): under an
+    // unprivileged runner open_by_handle_at() would fail EPERM first and
+    // shadow the code under test.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_copy_file_range_len_capped_to_reply_size() {
+        let source = TempDir::new().expect("Cannot create temporary directory.");
+        let fs_cfg = Config {
+            root_dir: source
+                .as_path()
+                .to_str()
+                .expect("source path to string")
+                .to_string(),
+            ..Default::default()
+        };
+        let fs = PassthroughFs::<()>::new(fs_cfg).unwrap();
+        fs.import().unwrap();
+        fs.init(FsOptions::all()).unwrap();
+        let ctx = prepare_context();
+
+        let content: Vec<u8> = (0..4096u32).map(|i| (i % 251) as u8).collect();
+        std::fs::write(source.as_path().join("cap_src.bin"), &content).unwrap();
+        std::fs::write(source.as_path().join("cap_dst.bin"), "").unwrap();
+
+        let src_entry = fs
+            .lookup(&ctx, ROOT_ID, &CString::new("cap_src.bin").unwrap())
+            .unwrap();
+        let dst_entry = fs
+            .lookup(&ctx, ROOT_ID, &CString::new("cap_dst.bin").unwrap())
+            .unwrap();
+        let (src_handle, _, _) = fs
+            .open(&ctx, src_entry.inode, libc::O_RDONLY as u32, 0)
+            .unwrap();
+        let (dst_handle, _, _) = fs
+            .open(&ctx, dst_entry.inode, libc::O_WRONLY as u32, 0)
+            .unwrap();
+
+        let copied = fs
+            .copy_file_range(
+                &ctx,
+                src_entry.inode,
+                src_handle.unwrap(),
+                0,
+                dst_entry.inode,
+                dst_handle.unwrap(),
+                0,
+                u32::MAX as u64 + 1,
+                0,
+            )
+            .unwrap();
+        assert_eq!(copied, 4096);
+        assert_eq!(
+            std::fs::read(source.as_path().join("cap_dst.bin")).unwrap(),
+            content
+        );
+    }
+
+    // A handle issued for one inode must not be usable against another: the
+    // mismatched pair fails with EBADF before anything is copied.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_copy_file_range_handle_inode_mismatch() {
+        let source = TempDir::new().expect("Cannot create temporary directory.");
+        let fs_cfg = Config {
+            root_dir: source
+                .as_path()
+                .to_str()
+                .expect("source path to string")
+                .to_string(),
+            ..Default::default()
+        };
+        let fs = PassthroughFs::<()>::new(fs_cfg).unwrap();
+        fs.import().unwrap();
+        fs.init(FsOptions::all()).unwrap();
+        let ctx = prepare_context();
+
+        std::fs::write(source.as_path().join("mm_src.bin"), [1u8; 64]).unwrap();
+        std::fs::write(source.as_path().join("mm_dst.bin"), [0u8; 64]).unwrap();
+
+        let src_entry = fs
+            .lookup(&ctx, ROOT_ID, &CString::new("mm_src.bin").unwrap())
+            .unwrap();
+        let dst_entry = fs
+            .lookup(&ctx, ROOT_ID, &CString::new("mm_dst.bin").unwrap())
+            .unwrap();
+        let (src_handle, _, _) = fs
+            .open(&ctx, src_entry.inode, libc::O_RDONLY as u32, 0)
+            .unwrap();
+        let (dst_handle, _, _) = fs
+            .open(&ctx, dst_entry.inode, libc::O_WRONLY as u32, 0)
+            .unwrap();
+
+        // The source handle paired with the destination inode.
+        let err = fs
+            .copy_file_range(
+                &ctx,
+                dst_entry.inode,
+                src_handle.unwrap(),
+                0,
+                dst_entry.inode,
+                dst_handle.unwrap(),
+                0,
+                64,
+                0,
+            )
+            .unwrap_err();
+        assert_eq!(err.raw_os_error(), Some(libc::EBADF));
+
+        // Nothing was copied.
+        assert_eq!(
+            std::fs::read(source.as_path().join("mm_dst.bin")).unwrap(),
+            [0u8; 64]
+        );
     }
 
     #[test]

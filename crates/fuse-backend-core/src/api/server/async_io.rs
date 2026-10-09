@@ -201,6 +201,8 @@ impl<F: AsyncFileSystem + Sync> Server<F> {
             x if x == Opcode::Rename2 as u32 => self.rename2(ctx),
             #[cfg(target_os = "linux")]
             x if x == Opcode::Lseek as u32 => self.lseek(ctx),
+            #[cfg(target_os = "linux")]
+            x if x == Opcode::CopyFileRange as u32 => self.copy_file_range(ctx),
             #[cfg(feature = "virtiofs")]
             x if x == Opcode::SetupMapping as u32 => self.setupmapping(ctx, vu_req),
             #[cfg(feature = "virtiofs")]
