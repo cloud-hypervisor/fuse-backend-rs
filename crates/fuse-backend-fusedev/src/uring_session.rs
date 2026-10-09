@@ -23,7 +23,7 @@ use std::os::unix::io::AsRawFd;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Sender};
 use std::sync::Arc;
-use std::thread::{self, JoinHandle};
+use std::thread;
 
 use io_uring::{cqueue, opcode, squeue, types, IoUring};
 use vm_memory::ByteValued;
@@ -40,6 +40,7 @@ use fuse_backend_core::file_buf::FileVolatileSlice;
 use fuse_backend_core::file_traits::FileReadWriteVolatile;
 use vm_memory::bitmap::BitmapSlice;
 
+use crate::serving::{FuseServing, WorkerSet};
 use crate::{FuseBuf, FuseChannel, FuseDevReaderExt, FuseSession, FUSE_HEADER_SIZE};
 
 /// Size of `fuse_in_header`/`fuse_out_header` on the wire.
@@ -782,9 +783,7 @@ impl<F: FileSystem + Send + Sync + 'static> UringWorker<F> {
 /// unmounts the filesystem and joins all serving threads.
 pub struct UringFuseServing<F: FileSystem + Send + Sync + 'static> {
     session: FuseSession,
-    exit: Arc<AtomicBool>,
-    workers: Vec<JoinHandle<io::Result<()>>>,
-    fallback: Option<JoinHandle<()>>,
+    workers: WorkerSet,
     _fs: std::marker::PhantomData<F>,
 }
 
@@ -847,11 +846,11 @@ impl<F: FileSystem + Send + Sync + 'static> UringFuseServing<F> {
             .try_clone()
             .map_err(|e| SessionFailure(format!("uring: dup fuse fd: {e}")))?;
 
-        let exit = Arc::new(AtomicBool::new(false));
-        let (ready_tx, ready_rx) = channel();
-        let mut handles = Vec::with_capacity(workers);
+        // Build one worker per queue set, cloning the fuse fd up front so
+        // cloning failures are reported before any thread is spawned.
+        let mut worker_list = Vec::with_capacity(workers);
         for ids in queue_ids {
-            let worker = UringWorker {
+            worker_list.push(UringWorker {
                 fd: file
                     .try_clone()
                     .map_err(|e| SessionFailure(format!("uring: dup fuse fd: {e}")))?,
@@ -859,16 +858,34 @@ impl<F: FileSystem + Send + Sync + 'static> UringFuseServing<F> {
                 entries_per_queue: cfg.entries_per_queue,
                 payload_cap,
                 server: server.clone(),
-            };
-            let handle = thread::Builder::new()
-                .name(format!("uring-{}", handles.len()))
-                .spawn({
-                    let exit = exit.clone();
-                    let ready_tx = ready_tx.clone();
-                    move || worker.run(exit, ready_tx)
-                })
-                .map_err(|e| SessionFailure(format!("uring: spawn worker: {e}")))?;
-            handles.push(handle);
+            });
+        }
+
+        let mut set = WorkerSet::new();
+        let exit = set.exit_flag();
+        let tracker = set.tracker();
+        let (ready_tx, ready_rx) = channel();
+        for (id, worker) in worker_list.into_iter().enumerate() {
+            let handle = thread::Builder::new().name(format!("uring-{id}")).spawn({
+                let exit = exit.clone();
+                let tracker = tracker.clone();
+                let ready_tx = ready_tx.clone();
+                move || {
+                    // Report the thread exit to the serving layer's wait().
+                    let _exited = tracker.exit_guard();
+                    // Registration failures are reported through
+                    // ready_tx; the return value only carries the error
+                    // out of the thread, which nobody reads.
+                    let _ = worker.run(exit, ready_tx);
+                }
+            });
+            match handle {
+                Ok(handle) => set.push(handle),
+                Err(e) => {
+                    set.stop(&mut session, true);
+                    return Err(SessionFailure(format!("uring: spawn worker {id}: {e}")));
+                }
+            }
         }
         drop(ready_tx);
 
@@ -878,57 +895,41 @@ impl<F: FileSystem + Send + Sync + 'static> UringFuseServing<F> {
             match ready_rx.recv() {
                 Ok(Ok(())) => {}
                 Ok(Err(e)) => {
-                    // Signal workers to exit and join them before returning.
-                    exit.store(true, Ordering::Release);
-                    let _ = session.wake();
-                    let _ = session.umount();
-                    for handle in handles {
-                        let _ = handle.join();
-                    }
+                    set.stop(&mut session, true);
                     return Err(SessionFailure(format!(
                         "uring: entry registration failed: {e}"
                     )));
                 }
                 Err(_) => {
-                    // Signal workers to exit and join them before returning.
-                    exit.store(true, Ordering::Release);
-                    let _ = session.wake();
-                    let _ = session.umount();
-                    for handle in handles {
-                        let _ = handle.join();
-                    }
+                    set.stop(&mut session, true);
                     return Err(SessionFailure(
                         "uring: worker exited during registration".to_string(),
                     ));
                 }
             }
         }
-        let live = handles;
 
         let fallback = match thread::Builder::new()
             .name("uring-fallback".to_string())
             .spawn({
                 let exit = exit.clone();
-                move || Self::fallback_loop(fallback_ch, server, exit)
+                let tracker = tracker.clone();
+                move || {
+                    let _exited = tracker.exit_guard();
+                    Self::fallback_loop(fallback_ch, server, exit)
+                }
             }) {
             Ok(handle) => handle,
             Err(e) => {
-                // Signal workers to exit and join them before returning.
-                exit.store(true, Ordering::Release);
-                let _ = session.wake();
-                let _ = session.umount();
-                for handle in live {
-                    let _ = handle.join();
-                }
+                set.stop(&mut session, true);
                 return Err(SessionFailure(format!("uring: spawn fallback thread: {e}")));
             }
         };
+        set.push(fallback);
 
         Ok(UringFuseServing {
             session,
-            exit,
-            workers: live,
-            fallback: Some(fallback),
+            workers: set,
             _fs: std::marker::PhantomData,
         })
     }
@@ -964,17 +965,20 @@ impl<F: FileSystem + Send + Sync + 'static> UringFuseServing<F> {
 
 impl<F: FileSystem + Send + Sync + 'static> Drop for UringFuseServing<F> {
     fn drop(&mut self) {
-        self.exit.store(true, Ordering::Relaxed);
-        let _ = self.session.wake();
         // Tearing down the connection completes all outstanding ring entries
-        // with an error, which unblocks the worker threads.
-        let _ = self.session.umount();
-        if let Some(handle) = self.fallback.take() {
-            let _ = handle.join();
-        }
-        for handle in self.workers.drain(..) {
-            let _ = handle.join();
-        }
+        // with an error, which unblocks the worker threads; the fallback
+        // thread is woken through its epoll channel.
+        self.workers.stop(&mut self.session, true);
+    }
+}
+
+impl<F: FileSystem + Send + Sync + 'static> FuseServing for UringFuseServing<F> {
+    fn session(&self) -> &FuseSession {
+        &self.session
+    }
+
+    fn wait(&self) {
+        self.workers.wait();
     }
 }
 
