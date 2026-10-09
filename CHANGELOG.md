@@ -13,6 +13,22 @@
   between the facade and `fuse-backend-core` and carries the `arc-swap` and
   `persist` (`versionize`/`dbs-snapshot`) stack that the multiplexer needs.
 - [188](https://github.com/cloud-hypervisor/fuse-backend-rs/issues/188): docs: document the experimental status of async-io support.
+- [188](https://github.com/cloud-hypervisor/fuse-backend-rs/issues/188): Add a unified serving layer to the fusedev transport. The `FuseServing`
+  trait is implemented by `SyncFuseServing` (classic `/dev/fuse` with synchronous handlers, always
+  available), `AsyncFuseServing` (`async-io` feature) and `UringFuseServing` (`fusedev-uring`
+  feature): each takes ownership of a mounted `FuseSession`, spawns workers per its configuration
+  and turns `Drop` into teardown (stop accepting, finish in-flight requests, unmount, join the
+  workers), while `FuseServing::wait()` waits out teardown driven from outside the process.
+- [188](https://github.com/cloud-hypervisor/fuse-backend-rs/issues/188): Add `SyncFuseServing`, the serving loop every hand-rolled fusedev daemon
+  duplicated, as a library type: N epoll-based worker channels — or, with
+  `SyncServingConfig::blocking`, blocking channels cloned with `FUSE_DEV_IOC_CLONE` — each
+  dispatching requests to a `Server<F>` until the session is torn down. On macOS the session
+  exposes a single channel, so multi-worker configurations are rejected.
+- [188](https://github.com/cloud-hypervisor/fuse-backend-rs/issues/188): Add `AsyncFuseServing`/`AsyncServingConfig`, scaling the classic transport
+  out to N asynchronous workers, and `UringFuseServing`/`UringConfig` for the experimental
+  FUSE-over-io_uring transport (kernel 6.14+). Both join the `FuseServing` interface, so a daemon
+  can pick its transport at runtime behind `Box<dyn FuseServing>` and fall back to the classic
+  transport on `Error::UringNotSupported`.
 
 ### Changed
 - [254](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/254): `fuse-backend-rs` is now a thin facade re-exporting the sub-crates. Every

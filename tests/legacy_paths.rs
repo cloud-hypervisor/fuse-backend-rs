@@ -97,6 +97,41 @@ mod fusedev_linux {
     use fuse_backend_rs::transport::BlockingFuseChannel as FlatBlockingFuseChannel;
 }
 
+/// The unified serving layer of the fusedev transport: the trait and the
+/// synchronous implementation are always available with `fusedev`.
+#[cfg(feature = "fusedev")]
+mod fusedev_serving {
+    use fuse_backend_rs::transport::fusedev::{FuseServing, SyncFuseServing, SyncServingConfig};
+    use fuse_backend_rs::transport::{
+        FuseServing as FlatFuseServing, SyncFuseServing as FlatSyncFuseServing,
+        SyncServingConfig as FlatSyncServingConfig,
+    };
+
+    #[test]
+    fn fusedev_serving_paths_resolve() {
+        struct StubFs;
+        impl fuse_backend_rs::api::filesystem::FileSystem for StubFs {
+            type Inode = u64;
+            type Handle = u64;
+        }
+
+        // The configs name the same type.
+        fn same_type<T>(_: T, _: T) {}
+        same_type(
+            SyncServingConfig::default(),
+            FlatSyncServingConfig::default(),
+        );
+
+        // The serving types name the same struct and implement the trait
+        // under both import paths: if the flat and nested `FuseServing`
+        // names ever diverged into different traits, the double bound
+        // would stop compiling.
+        fn impls_both<S: FuseServing + FlatFuseServing>() {}
+        let _ = impls_both::<SyncFuseServing<StubFs>>;
+        let _ = impls_both::<FlatSyncFuseServing<StubFs>>;
+    }
+}
+
 /// The async serving surface of the fusedev transport.
 #[cfg(all(target_os = "linux", feature = "fusedev", feature = "async-io"))]
 mod fusedev_async {
