@@ -72,17 +72,42 @@ impl Drop for AlignedBuf {
     }
 }
 
+/// Replace the access-mode bits (`O_ACCMODE`) of `flags` with those of the caller's original
+/// open flags, keeping every other bit.  This is the retry flag set for opens whose writeback
+/// promotion (O_WRONLY -> O_RDWR) was rejected with EACCES: only the access mode goes back to
+/// what the caller asked for, adjustments such as clearing O_APPEND stay in effect.
+fn restore_access_mode(flags: libc::c_int, caller_flags: libc::c_int) -> libc::c_int {
+    (flags & !libc::O_ACCMODE) | (caller_flags & libc::O_ACCMODE)
+}
+
 impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
     fn open_inode(&self, inode: Inode, flags: i32) -> io::Result<File> {
         let data = self.inode_map.get(inode)?;
         if !is_safe_inode(data.mode) {
             Err(ebadf())
         } else {
-            let mut new_flags = self.get_writeback_open_flags(flags);
+            let mut new_flags = flags;
             if !self.cfg.allow_direct_io && flags & libc::O_DIRECT != 0 {
                 new_flags &= !libc::O_DIRECT;
             }
-            data.open_file(new_flags | libc::O_CLOEXEC, &self.proc_self_fd)
+            let writeback_flags = self.get_writeback_open_flags(new_flags);
+            match data.open_file(writeback_flags | libc::O_CLOEXEC, &self.proc_self_fd) {
+                // With writeback cache enabled, `get_writeback_open_flags()` promotes O_WRONLY
+                // to O_RDWR so the kernel can issue read requests on the handle.  However, a
+                // file the caller may only write (e.g. mode 0o200: the owner has no read
+                // permission) rejects the promoted flags with EACCES, failing an open that
+                // would have succeeded with the caller's own flags.  Retry with the caller's
+                // access mode: the handle is then genuinely write-only and a kernel READ on it
+                // fails with the real error instead.
+                Err(e)
+                    if e.raw_os_error() == Some(libc::EACCES)
+                        && writeback_flags & libc::O_ACCMODE != new_flags & libc::O_ACCMODE =>
+                {
+                    let fallback_flags = restore_access_mode(writeback_flags, flags);
+                    data.open_file(fallback_flags | libc::O_CLOEXEC, &self.proc_self_fd)
+                }
+                res => res,
+            }
         }
     }
 
@@ -931,7 +956,23 @@ impl<S: BitmapSlice + Send + Sync> FileSystem for PassthroughFs<S> {
             let (_uid, _gid) = set_creds(ctx.uid, ctx.gid)?;
 
             let flags = self.get_writeback_open_flags(args.flags as i32);
-            Self::create_file_excl(&dir_file, name, flags, args.mode & !(args.umask & 0o777))?
+            let mode = args.mode & !(args.umask & 0o777);
+            // Same writeback O_WRONLY -> O_RDWR promotion rationale as the fallback in
+            // `open_inode()`: a file created with a mode that denies read access to its owner
+            // cannot be opened O_RDWR, so retry the creation with the caller's access mode
+            // instead of failing the whole CREATE.  If the first attempt already created the
+            // file, the retry answers EEXIST and the existing-file path below opens it with
+            // the caller's flags.
+            match Self::create_file_excl(&dir_file, name, flags, mode) {
+                Err(e)
+                    if e.raw_os_error() == Some(libc::EACCES)
+                        && flags & libc::O_ACCMODE != args.flags as i32 & libc::O_ACCMODE =>
+                {
+                    let fallback_flags = restore_access_mode(flags, args.flags as i32);
+                    Self::create_file_excl(&dir_file, name, fallback_flags, mode)
+                }
+                other => other,
+            }?
         };
 
         let entry = self.do_lookup(parent, name)?;
@@ -1858,6 +1899,165 @@ mod tests {
         let (test_entry, handle, _, _) = fs.create(&ctx, ROOT_ID, &fname, args).unwrap();
 
         (test_entry, handle.unwrap())
+    }
+
+    /// Build an fs with the writeback cache enabled but without inode file handles, so
+    /// reopens go through `/proc/self/fd` instead of `open_by_handle_at()`.  The latter needs
+    /// CAP_DAC_READ_SEARCH, whose EPERM would shadow the permission errors under test here
+    /// (same reason as `test_link_regular()`).
+    fn prepare_fs_writeback_no_handles() -> (PassthroughFs<()>, TempDir) {
+        let source = TempDir::new().expect("Cannot create temporary directory.");
+        let fs_cfg = Config {
+            writeback: true,
+            inode_file_handles: false,
+            root_dir: source
+                .as_path()
+                .to_str()
+                .expect("source path to string")
+                .to_string(),
+            ..Default::default()
+        };
+        let fs = PassthroughFs::<()>::new(fs_cfg).unwrap();
+        fs.import().unwrap();
+        fs.init(FsOptions::all()).unwrap();
+
+        (fs, source)
+    }
+
+    #[test]
+    fn test_open_writeback_owronly_falls_back_to_caller_flags() {
+        // Regression test for the writeback O_WRONLY promotion: with writeback cache enabled
+        // `open_inode()` first reopens the backing file O_RDWR so the kernel can issue read
+        // requests on the handle, but a file the caller may only write (mode 0o200) rejects
+        // that with EACCES.  The open must fall back to the caller's O_WRONLY flags instead of
+        // failing.  Running as root bypasses the read check (CAP_DAC_OVERRIDE), so there the
+        // promoted open succeeds and the fallback never triggers.
+        let (fs, source) = prepare_fs_writeback_no_handles();
+        let ctx = prepare_context();
+        use std::os::unix::fs::PermissionsExt;
+
+        let path = source.as_path().join("write-only");
+        std::fs::write(&path, b"data").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o200)).unwrap();
+
+        let name = CString::new("write-only").unwrap();
+        let entry = fs.lookup(&ctx, ROOT_ID, &name).unwrap();
+        let (handle, ..) = fs
+            .open(&ctx, entry.inode, libc::O_WRONLY as u32, 0)
+            .unwrap();
+        let handle = handle.unwrap();
+
+        // Whichever way the backing file was opened, the handle must be writable.
+        let payload = b"more".to_vec();
+        let n = fs
+            .write(
+                &ctx,
+                entry.inode,
+                handle,
+                &mut MemReader(payload.clone()),
+                payload.len() as u32,
+                0,
+                None,
+                false,
+                0,
+                0,
+            )
+            .unwrap();
+        assert_eq!(n, payload.len());
+
+        // Relax the mode before reading the file back: the owner may only write.
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), payload);
+
+        if unsafe { libc::geteuid() } != 0 {
+            // The fallback was taken, so the handle is genuinely write-only and a read
+            // through it fails with EBADF.
+            let err = fs
+                .read(
+                    &ctx,
+                    entry.inode,
+                    handle,
+                    &mut MemWriter::new(),
+                    4,
+                    0,
+                    None,
+                    0,
+                )
+                .unwrap_err();
+            assert_eq!(err.raw_os_error(), Some(libc::EBADF));
+        }
+    }
+
+    #[test]
+    fn test_open_writeback_ordrw_keeps_failing() {
+        // The fallback only restores the caller's own access mode: an explicit O_RDWR
+        // request on a write-only file has nothing to fall back to and must keep failing
+        // with EACCES.
+        if unsafe { libc::geteuid() } == 0 {
+            // DAC checks are bypassed when running as root, so there is nothing to observe.
+            eprintln!("skipping test_open_writeback_ordrw_keeps_failing: not running as root");
+            return;
+        }
+        let (fs, source) = prepare_fs_writeback_no_handles();
+        let ctx = prepare_context();
+        use std::os::unix::fs::PermissionsExt;
+
+        let path = source.as_path().join("write-only");
+        std::fs::write(&path, b"data").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o200)).unwrap();
+
+        let name = CString::new("write-only").unwrap();
+        let entry = fs.lookup(&ctx, ROOT_ID, &name).unwrap();
+        let err = fs
+            .open(&ctx, entry.inode, libc::O_RDWR as u32, 0)
+            .unwrap_err();
+        assert_eq!(err.raw_os_error(), Some(libc::EACCES));
+    }
+
+    #[test]
+    fn test_create_writeback_owronly_falls_back_to_caller_flags() {
+        // CREATE of a file whose mode denies read access to its owner (mode 0o200 rather
+        // than 0o277 so the fixture does not depend on the kernel stripping setgid bits
+        // for unprivileged creators): the writeback O_WRONLY -> O_RDWR promotion must not
+        // turn it into a spurious EACCES.
+        let (fs, source) = prepare_fs_writeback_no_handles();
+        let ctx = prepare_context();
+        use std::os::unix::fs::PermissionsExt;
+
+        let name = CString::new("created-wo").unwrap();
+        let args = CreateIn {
+            flags: libc::O_WRONLY as u32,
+            mode: 0o200,
+            umask: 0,
+            fuse_flags: 0,
+        };
+        let (entry, handle, ..) = fs.create(&ctx, ROOT_ID, &name, args).unwrap();
+        let handle = handle.unwrap();
+
+        let path = source.as_path().join("created-wo");
+        let md = std::fs::metadata(&path).unwrap();
+        assert_eq!(md.permissions().mode() & 0o777, 0o200);
+
+        let payload = b"hello".to_vec();
+        let n = fs
+            .write(
+                &ctx,
+                entry.inode,
+                handle,
+                &mut MemReader(payload.clone()),
+                payload.len() as u32,
+                0,
+                None,
+                false,
+                0,
+                0,
+            )
+            .unwrap();
+        assert_eq!(n, payload.len());
+
+        // Relax the mode before reading the file back: the owner may only write.
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), payload);
     }
 
     /// An in-memory sink implementing `ZeroCopyWriter`, to receive the data
