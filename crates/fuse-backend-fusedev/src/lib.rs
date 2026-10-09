@@ -55,6 +55,11 @@ mod fuse_t_session;
 #[cfg(all(target_os = "macos", feature = "fuse-t"))]
 pub use fuse_t_session::*;
 
+// The unified serving layer over the session modules above; the async and
+// io_uring serving implementations live with their transports.
+mod serving;
+pub use serving::*;
+
 #[cfg(all(target_os = "linux", feature = "uring"))]
 mod uring_session;
 #[cfg(all(target_os = "linux", feature = "uring"))]
