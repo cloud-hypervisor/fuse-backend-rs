@@ -36,8 +36,8 @@ pub use self::fusedev::BlockingFuseChannel;
 pub use self::fusedev::{AsyncFuseServing, AsyncServingConfig, FuseDevTask};
 #[cfg(feature = "fusedev")]
 pub use self::fusedev::{
-    FuseBuf, FuseChannel, FuseChannelExt, FuseDevReaderExt, FuseDevWriter, FuseSession,
-    FuseSessionExt,
+    FuseBuf, FuseChannel, FuseChannelExt, FuseDevReaderExt, FuseDevWriter, FuseServing,
+    FuseSession, FuseSessionExt, SyncFuseServing, SyncServingConfig,
 };
 #[cfg(all(target_os = "linux", feature = "fusedev-uring"))]
 pub use self::fusedev::{UringConfig, UringFuseServing, UringWriter};
