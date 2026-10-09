@@ -39,9 +39,16 @@ otherwise) — and runs identical fio workloads:
 - sequential read/write with 1MB requests
 - random read/write with 4KB requests
 - metadata operations (file create/delete)
+- directory enumeration (readdir): fio has no readdir engine, so the
+  `bench_readdir.py` helper walks the mountpoint with `os.scandir()`
+  (getdents64) between the filecreate and filedelete workloads, when the
+  directory holds `NRFILES` entries, and reports entries/s as `iops` in
+  the same JSON job shape. Enumeration is one strictly sequential request
+  chain per stream (each getdents64 resumes from the cookie of the previous
+  reply), so the rate is latency-bound and does not scale with `THREADS`.
 
 ```sh
-sudo tests/scripts/bench_sync_async.sh      # needs fio + fuse mount rights
+sudo tests/scripts/bench_sync_async.sh      # needs fio + jq + python3 + fuse mount rights
 THREADS=8 RUNTIME=60 sudo -E tests/scripts/bench_sync_async.sh
 ```
 
@@ -116,8 +123,9 @@ value.
 
 Several measures keep the measurements stable: the data workloads use a
 2 second fio ramp phase to exclude cold-start effects, a `sync` flushes
-writeback between workloads, and the metadata workloads create/delete
-50000 files each so that they run long enough to measure reliably.
+writeback between workloads, the metadata workloads create/delete
+50000 files each so that they run long enough to measure reliably, and
+the readdir helper discards its own 2 second ramp phase before measuring.
 Because the metadata workloads still fluctuate more than the data ones
 even on bare metal, they are flagged with a looser threshold (25% versus
 10%).

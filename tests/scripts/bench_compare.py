@@ -21,6 +21,8 @@ The collected format is:
 where the metrics are taken from the read side of the fio job if it
 transferred data, otherwise from the write side. `runtime_ms` is only
 meaningful for the fixed-amount workloads (filecreate/filedelete).
+The readdir workload is not driven by fio but by bench_readdir.py, which
+reports entries/s as `iops` in the same JSON job shape.
 
 `compare` prints a markdown table and always exits with 0: shared CI
 runners are noisy, so the report is advisory and not a merge gate.
@@ -37,7 +39,10 @@ import sys
 # The metadata workloads fluctuate much more than the data workloads even
 # on bare metal (up to ~25% between runs of identical code), so flag them
 # with a looser threshold to keep the false-positive rate comparable.
-METADATA_WORKLOADS = ("filecreate", "filedelete")
+# readdir is a per-entry metadata operation like create/delete (and its
+# byte metrics are only approximated reply traffic), so it shares the
+# conservative class until bare-metal variance data justifies tightening.
+METADATA_WORKLOADS = ("filecreate", "filedelete", "readdir")
 METADATA_THRESHOLD = 25.0
 
 
