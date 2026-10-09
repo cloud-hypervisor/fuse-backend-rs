@@ -13,7 +13,7 @@
 # ($RESULTS_DIR/<mode>-<workload>.json) under $RESULTS_DIR for further
 # analysis, see tests/scripts/bench_compare.py.
 #
-# Requirements: Linux, fio, jq, permission to mount fuse (root or
+# Requirements: Linux, fio, jq, python3, permission to mount fuse (root or
 # fusermount). The uring mode additionally requires kernel 6.14+ with
 # FUSE-over-io_uring enabled (the fuse module parameter enable_uring,
 # which the script tries to turn on when it is writable); kernels that
@@ -55,10 +55,11 @@ SRC_DIR="${RESULTS_DIR}/source"
 MNT_DIR="${RESULTS_DIR}/mount"
 mkdir -p "${SRC_DIR}" "${MNT_DIR}"
 
-WORKLOADS="seqwrite seqread randwrite-4k randread-4k filecreate filedelete"
+WORKLOADS="seqwrite seqread randwrite-4k randread-4k filecreate readdir filedelete"
 
 command -v fio >/dev/null 2>&1 || { echo "error: fio is required" >&2; exit 1; }
 command -v jq >/dev/null 2>&1 || { echo "error: jq is required" >&2; exit 1; }
+command -v python3 >/dev/null 2>&1 || { echo "error: python3 is required" >&2; exit 1; }
 
 # kernel_at_least MAJOR MINOR: true if the running kernel is at least
 # MAJOR.MINOR. Used to gate the uring mode, which requires the kernel
@@ -187,6 +188,28 @@ run_fixed_workload() {
            end' "${RESULTS_DIR}/${mode}-${name}.json" || true
 }
 
+# run_readdir_workload <mode>
+# Directory enumeration: fio has no readdir engine, so bench_readdir.py
+# walks the mountpoint with getdents64 for ${RUNTIME} seconds and writes
+# fio-shaped JSON for bench_compare.py. Runs right after filecreate, when
+# the directory holds ${NRFILES} entries, and before filedelete removes
+# them again. One enumeration is a strictly sequential request chain (each
+# getdents64 resumes from the cookie of the previous reply), so the rate
+# is latency-bound and does not scale with ${THREADS}.
+run_readdir_workload() {
+    local mode=$1
+    local name=readdir
+    echo "--- [${mode}] ${name}: enumerating ${MNT_DIR} for ${RUNTIME}s"
+    sync
+    python3 "${SCRIPT_DIR}/bench_readdir.py" "${MNT_DIR}" "${RUNTIME}" \
+        "${RESULTS_DIR}/${mode}-${name}.json" || {
+            echo "error: readdir workload failed" >&2
+            exit 1
+        }
+    jq -r '.jobs[0] | "  read: iops=\(.read.iops | round) entries/s"' \
+        "${RESULTS_DIR}/${mode}-${name}.json" || true
+}
+
 # shellcheck disable=SC2086
 for mode in ${MODES}; do
     mode_args=""
@@ -234,11 +257,14 @@ for mode in ${MODES}; do
     run_workload "${mode}" randread-4k --rw=randread --bs=4k --size=64M \
         --numjobs="${THREADS}" --ioengine=psync --ramp_time=2
 
-    # Metadata operations: create and delete lots of small files. These run
-    # for a fixed number of files instead of ${RUNTIME} seconds, see
-    # run_fixed_workload().
+    # Metadata operations: create lots of small files, enumerate the
+    # directory they live in, then delete the files again. Create and
+    # delete run for a fixed number of files instead of ${RUNTIME} seconds,
+    # see run_fixed_workload(); the enumeration runs for ${RUNTIME} seconds,
+    # see run_readdir_workload().
     run_fixed_workload "${mode}" filecreate --ioengine=filecreate \
         --nrfiles="${NRFILES}" --numjobs=1 --filesize=4K
+    run_readdir_workload "${mode}"
     run_fixed_workload "${mode}" filedelete --ioengine=filedelete \
         --nrfiles="${NRFILES}" --numjobs=1 --filesize=4K
 
