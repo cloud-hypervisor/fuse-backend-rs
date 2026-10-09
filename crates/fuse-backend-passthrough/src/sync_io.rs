@@ -2546,3 +2546,543 @@ mod readdir_cookie_tests {
         assert_eq!(buf, corrupted);
     }
 }
+
+// End-to-end readdir/readdirplus coverage against a real backing directory:
+// enumeration semantics (batching, cookies, EOF), the readdirplus
+// attribute contract, the lookup-refcount ownership of the two handlers,
+// the partial-delivery error contract, and the cookie cache lifecycle.
+#[cfg(test)]
+mod readdir_tests {
+    use super::*;
+    use fuse_backend_core::abi::fuse_abi::ROOT_ID;
+    use vmm_sys_util::tempdir::TempDir;
+
+    /// A passthrough fs over a fresh temporary directory, without inode
+    /// file handles: the readdir paths under test are purely path-based,
+    /// and `open_by_handle_at()` would only add an unprivileged EPERM
+    /// failure mode on hosts where file handles are unavailable.
+    fn prepare_fs() -> (PassthroughFs<()>, TempDir) {
+        let source = TempDir::new().expect("Cannot create temporary directory.");
+        let fs_cfg = Config {
+            writeback: true,
+            do_import: true,
+            root_dir: source
+                .as_path()
+                .to_str()
+                .expect("source path to string")
+                .to_string(),
+            ..Default::default()
+        };
+        let fs = PassthroughFs::<()>::new(fs_cfg).unwrap();
+        // do_import: true, so init() imports the root inode; the ZERO_MESSAGE
+        // options are not negotiated because cfg.no_open/no_opendir are false,
+        // keeping persistent opendir() handles available to the tests.
+        fs.init(FsOptions::all()).unwrap();
+        (fs, source)
+    }
+
+    fn prepare_context() -> Context {
+        Context {
+            uid: unsafe { libc::getuid() },
+            gid: unsafe { libc::getgid() },
+            pid: unsafe { libc::getpid() },
+            ..Default::default()
+        }
+    }
+
+    /// Create `count` regular files named `f%03d` directly in the backing
+    /// directory, bypassing the fs interfaces: the readdir handlers must
+    /// pick them up through do_lookup() without any prior interaction, so
+    /// the tests can observe exactly the references they take themselves.
+    fn create_backing_files(source: &TempDir, count: usize) {
+        for i in 0..count {
+            std::fs::File::create(source.as_path().join(format!("f{:03}", i)))
+                .expect("create file");
+        }
+    }
+
+    /// One delivered readdir entry.
+    struct Dirent {
+        offset: u64,
+        ino: u64,
+        type_: u32,
+        name: Vec<u8>,
+    }
+
+    /// One delivered readdirplus entry: the dirent fields plus the pieces of
+    /// the lookup `Entry` that the readdirplus contract ties together.
+    struct DirentPlus {
+        dirent: Dirent,
+        inode: u64,
+        st_ino: u64,
+        st_mode: u32,
+        st_size: i64,
+    }
+
+    /// Drain a whole directory stream through `readdir`, resuming from the
+    /// cookie of the last delivered entry until EOF, exactly like the fuse
+    /// kernel client does. The batch count is bounded so that a cookie bug
+    /// fails the test instead of looping forever.
+    fn readdir_all(
+        fs: &PassthroughFs<()>,
+        ctx: &Context,
+        handle: Handle,
+        size: u32,
+    ) -> Vec<Dirent> {
+        let mut out: Vec<Dirent> = Vec::new();
+        let mut offset = 0_u64;
+        for _ in 0..1024 {
+            let mut batch = Vec::new();
+            fs.readdir(ctx, ROOT_ID, handle, size, offset, &mut |e| {
+                batch.push(Dirent {
+                    offset: e.offset,
+                    ino: e.ino,
+                    type_: e.type_,
+                    name: e.name.to_vec(),
+                });
+                Ok(1)
+            })
+            .unwrap();
+            if batch.is_empty() {
+                break;
+            }
+            offset = batch.last().unwrap().offset;
+            out.extend(batch);
+        }
+        out
+    }
+
+    /// Drain a whole directory stream through `readdirplus`, same resume
+    /// discipline as `readdir_all()`.
+    fn readdirplus_all(
+        fs: &PassthroughFs<()>,
+        ctx: &Context,
+        handle: Handle,
+        size: u32,
+    ) -> Vec<DirentPlus> {
+        let mut out: Vec<DirentPlus> = Vec::new();
+        let mut offset = 0_u64;
+        for _ in 0..1024 {
+            let mut batch = Vec::new();
+            fs.readdirplus(ctx, ROOT_ID, handle, size, offset, &mut |e, entry| {
+                batch.push(DirentPlus {
+                    dirent: Dirent {
+                        offset: e.offset,
+                        ino: e.ino,
+                        type_: e.type_,
+                        name: e.name.to_vec(),
+                    },
+                    inode: entry.inode,
+                    st_ino: entry.attr.st_ino,
+                    st_mode: entry.attr.st_mode,
+                    st_size: entry.attr.st_size,
+                });
+                Ok(1)
+            })
+            .unwrap();
+            if batch.is_empty() {
+                break;
+            }
+            offset = batch.last().unwrap().dirent.offset;
+            out.extend(batch);
+        }
+        out
+    }
+
+    /// Current refcount of `ino` in the inode map, or None when the inode is
+    /// not mapped at all.
+    fn refcount(fs: &PassthroughFs<()>, ino: Inode) -> Option<u64> {
+        fs.inode_map
+            .inodes
+            .read()
+            .unwrap()
+            .get(&ino)
+            .map(|d| d.refcount.load(std::sync::atomic::Ordering::Acquire))
+    }
+
+    fn open_root(fs: &PassthroughFs<()>, ctx: &Context) -> Handle {
+        let (handle, _) = fs
+            .opendir(ctx, ROOT_ID, libc::O_RDONLY as u32)
+            .expect("opendir");
+        handle.expect("opendir handle")
+    }
+
+    // A directory stream that does not fit into a single reply batch must
+    // be delivered completely and exactly once: every resume goes through
+    // the cached-cookie fast path of do_readdir(), so this pins both the
+    // batch splitting and the cookie bookkeeping of the persistent handle.
+    #[test]
+    fn readdir_enumerates_all_entries_in_batches() {
+        let (fs, source) = prepare_fs();
+        let ctx = prepare_context();
+        create_backing_files(&source, 64);
+
+        let handle = open_root(&fs, &ctx);
+        // A size of 128 bytes holds only a handful of dirents, forcing the
+        // stream into ~20 reply batches.
+        let entries = readdir_all(&fs, &ctx, handle, 128);
+
+        assert_eq!(entries.len(), 64);
+        let mut names: Vec<&Vec<u8>> = entries.iter().map(|e| &e.name).collect();
+        names.sort();
+        names.dedup();
+        assert_eq!(names.len(), 64, "duplicate or lost entries");
+        assert!(entries.iter().all(|e| e.offset != 0));
+        assert!(
+            entries.windows(2).all(|w| w[0].offset < w[1].offset),
+            "cookies must strictly increase across the stream"
+        );
+        assert!(entries.iter().all(|e| e.ino != 0));
+
+        // A second full enumeration of the same handle must be identical:
+        // resuming from 0 re-seeks the stream, and the entry order of a
+        // getdents64 stream is stable within one fd.
+        let again = readdir_all(&fs, &ctx, handle, 128);
+        assert_eq!(
+            entries
+                .iter()
+                .map(|e| (e.offset, e.name.clone()))
+                .collect::<Vec<_>>(),
+            again
+                .iter()
+                .map(|e| (e.offset, e.name.clone()))
+                .collect::<Vec<_>>()
+        );
+
+        fs.releasedir(&ctx, ROOT_ID, 0, handle).unwrap();
+    }
+
+    // The readdirplus contract: the dirent inode must equal the st_ino of
+    // the accompanying Entry, the Entry must describe the same file a
+    // lookup() of the name returns, and the attributes must be real
+    // (correct type and size). Delivered entries must also stay mapped
+    // until the client forgets them.
+    #[test]
+    fn readdirplus_attrs_match_lookup() {
+        let (fs, source) = prepare_fs();
+        let ctx = prepare_context();
+        let count = 32;
+        for i in 0..count {
+            let size = (i as u64) * 17;
+            std::fs::write(
+                source.as_path().join(format!("f{:03}", i)),
+                vec![0u8; size as usize],
+            )
+            .expect("write file");
+        }
+
+        let handle = open_root(&fs, &ctx);
+        let entries = readdirplus_all(&fs, &ctx, handle, 8192);
+        assert_eq!(entries.len(), count);
+
+        for e in &entries {
+            assert_eq!(e.dirent.ino, e.st_ino, "dirent ino must equal attr.st_ino");
+            assert_eq!(e.dirent.type_, libc::DT_REG as u32);
+            assert_eq!(e.st_mode & libc::S_IFMT, libc::S_IFREG);
+
+            let name = CString::new(e.dirent.name.clone()).unwrap();
+            let looked_up = fs.lookup(&ctx, ROOT_ID, &name).unwrap();
+            assert_eq!(e.inode, looked_up.inode, "entry inode must match lookup");
+            assert_eq!(e.st_ino, looked_up.attr.st_ino);
+            assert_eq!(e.st_mode, looked_up.attr.st_mode);
+            // Drop the reference the verification lookup took again, so the
+            // refcount checks below observe only the readdirplus ones.
+            fs.forget(&ctx, looked_up.inode, 1);
+
+            let idx: usize = std::str::from_utf8(&e.dirent.name)
+                .unwrap()
+                .trim_start_matches('f')
+                .parse()
+                .unwrap();
+            assert_eq!(e.st_size, (idx as i64) * 17);
+        }
+
+        // readdirplus delivers entries with the lookup reference retained
+        // (the kernel owns it until a FORGET), so every child is mapped
+        // with exactly one reference after enumeration.
+        for e in &entries {
+            assert_eq!(refcount(&fs, e.inode), Some(1));
+        }
+        // Forgetting the delivered references must drop the mappings.
+        for e in &entries {
+            fs.forget(&ctx, e.inode, 1);
+            assert_eq!(refcount(&fs, e.inode), None);
+        }
+
+        fs.releasedir(&ctx, ROOT_ID, 0, handle).unwrap();
+    }
+
+    // Plain readdir must be reference-neutral: it looks each entry up to
+    // learn its inode and immediately forgets that reference again. Files
+    // never seen before stay unmapped, and a file the caller holds a
+    // reference to keeps exactly that reference.
+    #[test]
+    fn readdir_releases_lookup_references() {
+        let (fs, source) = prepare_fs();
+        let ctx = prepare_context();
+        create_backing_files(&source, 8);
+
+        // One file with a caller-held reference: its refcount must survive
+        // any number of enumerations unchanged.
+        let held = CString::new("f003").unwrap();
+        let held_entry = fs.lookup(&ctx, ROOT_ID, &held).unwrap();
+        assert_eq!(refcount(&fs, held_entry.inode), Some(1));
+
+        let handle = open_root(&fs, &ctx);
+        for round in 0..2 {
+            let entries = readdir_all(&fs, &ctx, handle, 4096);
+            assert_eq!(entries.len(), 8, "round {}", round);
+
+            for e in &entries {
+                if e.ino == held_entry.inode {
+                    // The pre-existing reference is untouched.
+                    assert_eq!(refcount(&fs, e.ino), Some(1));
+                } else {
+                    // The reference taken by the handler was forgotten.
+                    assert_eq!(refcount(&fs, e.ino), None, "round {}", round);
+                }
+            }
+        }
+
+        fs.releasedir(&ctx, ROOT_ID, 0, handle).unwrap();
+        assert_eq!(refcount(&fs, held_entry.inode), Some(1));
+    }
+
+    // An entry that does not fit into the reply buffer (add_entry returning
+    // 0) is not delivered, so readdirplus must release its lookup reference
+    // right away instead of leaking it -- and must not report an error.
+    #[test]
+    fn readdirplus_buffer_full_forgets_undelivered() {
+        let (fs, source) = prepare_fs();
+        let ctx = prepare_context();
+        create_backing_files(&source, 4);
+
+        let handle = open_root(&fs, &ctx);
+        let mut seen = 0;
+        let mut first_ino = 0;
+        fs.readdirplus(&ctx, ROOT_ID, handle, 8192, 0, &mut |_e, entry| {
+            seen += 1;
+            first_ino = entry.inode;
+            Ok(0)
+        })
+        .unwrap();
+        assert_eq!(seen, 1);
+
+        // The undelivered entry was looked up and forgotten again.
+        assert_eq!(refcount(&fs, first_ino), None);
+        assert_ne!(first_ino, 0, "an inode must have been observed");
+
+        fs.releasedir(&ctx, ROOT_ID, 0, handle).unwrap();
+    }
+
+    // Error contract of the reply loop: an error before any entry was
+    // stored propagates to the caller; an error after at least one entry
+    // was stored returns Ok(()) with the partial delivery, because the
+    // entries already handed out cannot be taken back. A fresh stream
+    // always begins with "." and "..", which are filtered without the
+    // callback, so the propagate case is exercised on a resumed stream
+    // whose first record is a real entry.
+    #[test]
+    fn readdir_error_contract() {
+        let (fs, source) = prepare_fs();
+        let ctx = prepare_context();
+        create_backing_files(&source, 4);
+
+        let handle = open_root(&fs, &ctx);
+        let entries = readdir_all(&fs, &ctx, handle, 8192);
+        assert_eq!(entries.len(), 4);
+
+        let eio = || io::Error::from_raw_os_error(libc::EIO);
+        let err = fs
+            .readdir(&ctx, ROOT_ID, handle, 8192, entries[0].offset, &mut |_| {
+                Err(eio())
+            })
+            .unwrap_err();
+        assert_eq!(
+            err.raw_os_error(),
+            Some(libc::EIO),
+            "the callback's error must propagate on the first entry"
+        );
+
+        let mut delivered = 0;
+        fs.readdir(&ctx, ROOT_ID, handle, 8192, 0, &mut |_| {
+            delivered += 1;
+            if delivered == 1 {
+                Ok(1)
+            } else {
+                Err(eio())
+            }
+        })
+        .unwrap();
+        assert_eq!(
+            delivered, 2,
+            "callbacks: one entry delivered, then the error"
+        );
+
+        fs.releasedir(&ctx, ROOT_ID, 0, handle).unwrap();
+    }
+
+    // An empty directory enumerates to EOF immediately, and size == 0 is
+    // answered without touching the directory at all.
+    #[test]
+    fn readdir_empty_directory() {
+        let (fs, _source) = prepare_fs();
+        let ctx = prepare_context();
+
+        let handle = open_root(&fs, &ctx);
+        assert!(readdir_all(&fs, &ctx, handle, 4096).is_empty());
+        assert!(readdirplus_all(&fs, &ctx, handle, 4096).is_empty());
+
+        let mut entries = 0;
+        fs.readdir(&ctx, ROOT_ID, handle, 0, 0, &mut |_| {
+            entries += 1;
+            Ok(1)
+        })
+        .unwrap();
+        assert_eq!(entries, 0, "size == 0 must not enumerate anything");
+
+        fs.releasedir(&ctx, ROOT_ID, 0, handle).unwrap();
+    }
+
+    // Resuming from a cookie that is not the one cached for the handle (the
+    // kernel re-issuing an earlier offset) must reposition the stream via
+    // lseek and continue with the following entry: both when the cache is
+    // empty and when it holds a stale cookie that must be discarded. A
+    // cookie that lseek cannot represent (> i64::MAX, e.g. an NFSv4 cookie)
+    // takes the linear scan fallback and terminates at EOF without looping.
+    #[test]
+    fn readdir_resume_from_mid_stream_cookie() {
+        let (fs, source) = prepare_fs();
+        let ctx = prepare_context();
+        create_backing_files(&source, 16);
+
+        let handle = open_root(&fs, &ctx);
+        let entries = readdir_all(&fs, &ctx, handle, 8192);
+        assert_eq!(entries.len(), 16);
+
+        // The drain consumed the one-shot cached cookie with its final EOF
+        // probe, so the cache is empty: resuming from a mid-stream cookie is
+        // a miss against the empty cache and must go through lseek.
+        let k = 5;
+        let mut first = None;
+        fs.readdir(&ctx, ROOT_ID, handle, 8192, entries[k].offset, &mut |e| {
+            if first.is_none() {
+                first = Some(e.name.to_vec());
+            }
+            Ok(1)
+        })
+        .unwrap();
+        assert_eq!(first, Some(entries[k + 1].name.clone()));
+
+        // A partial reply leaves the cookie of its last entry cached while
+        // the stream is mid-way. Resuming from an earlier cookie mismatches
+        // that token: it must be discarded rather than trusted as the fd
+        // position, and the stream repositioned via lseek, continuing with
+        // the entry after the requested one.
+        let mut n = 0;
+        fs.readdir(&ctx, ROOT_ID, handle, 128, 0, &mut |_| {
+            n += 1;
+            Ok(1)
+        })
+        .unwrap();
+        assert!(n > 0 && n < 16, "a 128-byte reply must be a partial batch");
+        let mut mismatch_first = None;
+        fs.readdir(&ctx, ROOT_ID, handle, 8192, entries[0].offset, &mut |e| {
+            if mismatch_first.is_none() {
+                mismatch_first = Some(e.name.to_vec());
+            }
+            Ok(1)
+        })
+        .unwrap();
+        assert_eq!(mismatch_first, Some(entries[1].name.clone()));
+
+        // A cookie beyond i64::MAX cannot be seeked to; the scan fallback
+        // walks the directory without finding it and reports EOF.
+        let mut entries_after_huge = 0;
+        fs.readdir(&ctx, ROOT_ID, handle, 8192, u64::MAX - 1, &mut |_| {
+            entries_after_huge += 1;
+            Ok(1)
+        })
+        .unwrap();
+        assert_eq!(entries_after_huge, 0, "unknown huge cookie must end at EOF");
+
+        fs.releasedir(&ctx, ROOT_ID, 0, handle).unwrap();
+    }
+
+    // The d_type bits of the getdents records must reach the client
+    // unchanged for the entry kinds a directory can hold.
+    #[test]
+    fn readdir_reports_entry_types() {
+        let (fs, source) = prepare_fs();
+        let ctx = prepare_context();
+        create_backing_files(&source, 1);
+        std::fs::create_dir(source.as_path().join("subdir")).expect("create dir");
+        std::os::unix::fs::symlink("f000", source.as_path().join("link")).expect("create symlink");
+
+        let handle = open_root(&fs, &ctx);
+        let entries = readdir_all(&fs, &ctx, handle, 8192);
+
+        let by_name = |name: &str| {
+            entries
+                .iter()
+                .find(|e| e.name == name.as_bytes())
+                .unwrap_or_else(|| panic!("entry {} missing", name))
+        };
+        assert_eq!(by_name("f000").type_, libc::DT_REG as u32);
+        assert_eq!(by_name("subdir").type_, libc::DT_DIR as u32);
+        assert_eq!(by_name("link").type_, libc::DT_LNK as u32);
+
+        fs.releasedir(&ctx, ROOT_ID, 0, handle).unwrap();
+    }
+
+    // In no_readdir mode both handlers report success without enumerating
+    // anything, letting the client fall back to lookup-based iteration.
+    #[test]
+    fn readdir_disabled_returns_empty() {
+        let (fs, source) = prepare_fs();
+        let ctx = prepare_context();
+        create_backing_files(&source, 4);
+        fs.no_readdir.store(true, Ordering::Relaxed);
+
+        let handle = open_root(&fs, &ctx);
+        assert!(readdir_all(&fs, &ctx, handle, 4096).is_empty());
+        assert!(readdirplus_all(&fs, &ctx, handle, 4096).is_empty());
+
+        fs.releasedir(&ctx, ROOT_ID, 0, handle).unwrap();
+    }
+
+    // releasedir must drop the handle together with the cookie cached for
+    // its directory stream, and the released handle must stop working.
+    #[test]
+    fn releasedir_clears_the_cookie_cache() {
+        let (fs, source) = prepare_fs();
+        let ctx = prepare_context();
+        create_backing_files(&source, 4);
+
+        let handle = open_root(&fs, &ctx);
+        // One served batch leaves the cookie of its last entry in the cache.
+        // Draining the whole stream would consume the token again: the
+        // cached cookie is a one-shot fast path for the next resume, and the
+        // final EOF probe of a full enumeration matches it.
+        let mut seen = 0;
+        fs.readdir(&ctx, ROOT_ID, handle, 4096, 0, &mut |_| {
+            seen += 1;
+            Ok(1)
+        })
+        .unwrap();
+        assert!(seen > 0);
+        assert!(
+            !fs.handle_map.cookies.lock().unwrap().is_empty(),
+            "a served readdir must have cached a cookie"
+        );
+
+        fs.releasedir(&ctx, ROOT_ID, 0, handle).unwrap();
+        assert!(
+            fs.handle_map.cookies.lock().unwrap().is_empty(),
+            "releasedir must drop the cached cookie"
+        );
+        assert!(fs
+            .readdir(&ctx, ROOT_ID, handle, 4096, 0, &mut |_| Ok(1))
+            .is_err());
+    }
+}
