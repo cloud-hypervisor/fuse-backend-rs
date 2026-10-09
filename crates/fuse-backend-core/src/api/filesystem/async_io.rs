@@ -801,6 +801,29 @@ pub trait AsyncFileSystem: FileSystem {
         Err(io::Error::from_raw_os_error(libc::ENOSYS))
     }
 
+    /// Copy data from one file to another.
+    ///
+    /// The `inode_in`/`fh_in` pair identifies the source file and the `inode_out`/`fh_out` pair
+    /// the destination file. `offset_in` and `offset_out` are the starting offsets. `len` is the
+    /// maximum number of bytes to copy and the return value is the number of bytes actually
+    /// copied, which may be smaller than `len`, for example when the end of the source file is
+    /// reached. `flags` is currently unused by the kernel and must be zero.
+    #[allow(clippy::too_many_arguments)]
+    fn copy_file_range(
+        &self,
+        ctx: Context,
+        inode_in: Self::Inode,
+        fh_in: Self::Handle,
+        offset_in: u64,
+        inode_out: Self::Inode,
+        fh_out: Self::Handle,
+        offset_out: u64,
+        len: u64,
+        flags: u64,
+    ) -> io::Result<u32> {
+        Err(io::Error::from_raw_os_error(libc::ENOSYS))
+    }
+
     /// TODO: support this
     fn getlk(&self) -> io::Result<()> {
         Err(io::Error::from_raw_os_error(libc::ENOSYS))

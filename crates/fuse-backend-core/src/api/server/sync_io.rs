@@ -282,6 +282,8 @@ impl<F: FileSystem + Sync> Server<F> {
             x if x == Opcode::Rename2 as u32 => self.rename2(ctx),
             #[cfg(target_os = "linux")]
             x if x == Opcode::Lseek as u32 => self.lseek(ctx),
+            #[cfg(target_os = "linux")]
+            x if x == Opcode::CopyFileRange as u32 => self.copy_file_range(ctx),
             #[cfg(feature = "virtiofs")]
             x if x == Opcode::SetupMapping as u32 => self.setupmapping(ctx, vu_req),
             #[cfg(feature = "virtiofs")]
@@ -1452,6 +1454,44 @@ impl<F: FileSystem + Sync> Server<F> {
             Err(e) => ctx.reply_error(e),
         }
     }
+
+    #[cfg(target_os = "linux")]
+    pub(super) fn copy_file_range<S: BitmapSlice, W: Writer>(
+        &self,
+        mut ctx: SrvContext<'_, F, S, W>,
+    ) -> Result<usize> {
+        let CopyFileRangeIn {
+            fh_in,
+            offset_in,
+            nodeid_out,
+            fh_out,
+            offset_out,
+            len,
+            flags,
+        } = ctx.r.read_obj().map_err(Error::DecodeMessage)?;
+
+        match self.fs.copy_file_range(
+            ctx.context(),
+            ctx.nodeid(),
+            fh_in.into(),
+            offset_in,
+            nodeid_out.into(),
+            fh_out.into(),
+            offset_out,
+            len,
+            flags,
+        ) {
+            Ok(count) => {
+                let out = WriteOut {
+                    size: count,
+                    ..Default::default()
+                };
+
+                ctx.reply_ok(Some(out), None)
+            }
+            Err(e) => ctx.reply_error(e),
+        }
+    }
 }
 
 #[cfg(feature = "virtiofs")]
@@ -2119,5 +2159,95 @@ mod tests {
         let ctx = prepare_srvcontext(&mut read_buf, &mut write_buf);
 
         assert_eq!(server.forget(ctx).unwrap(), 0);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_server_copy_file_range() {
+        use crate::api::filesystem::Context;
+
+        // Echoes the decoded request back as the copied size, so the whole
+        // decode/call/reply wiring can be verified.
+        struct CopyFs;
+        impl FileSystem for CopyFs {
+            type Inode = u64;
+            type Handle = u64;
+
+            #[allow(clippy::too_many_arguments)]
+            fn copy_file_range(
+                &self,
+                _ctx: &Context,
+                inode_in: Self::Inode,
+                fh_in: Self::Handle,
+                offset_in: u64,
+                inode_out: Self::Inode,
+                fh_out: Self::Handle,
+                offset_out: u64,
+                len: u64,
+                flags: u64,
+            ) -> io::Result<u32> {
+                assert_eq!((inode_in, fh_in, offset_in), (10, 100, 4096));
+                assert_eq!((inode_out, fh_out, offset_out), (20, 200, 512));
+                assert_eq!((len, flags), (2048, 0));
+                Ok(1024)
+            }
+        }
+
+        let server = Server::new(CopyFs);
+
+        let mut read_buf = [0u8; size_of::<CopyFileRangeIn>()];
+        let in_arg = CopyFileRangeIn {
+            fh_in: 100,
+            offset_in: 4096,
+            nodeid_out: 20,
+            fh_out: 200,
+            offset_out: 512,
+            len: 2048,
+            flags: 0,
+        };
+        read_buf.copy_from_slice(in_arg.as_slice());
+
+        let mut write_buf = [0u8; 4096];
+        let ctx = {
+            let reader = Reader::<()>::from_slice(&mut read_buf);
+            let writer = TestWriter::new(&mut write_buf);
+            SrvContext::new(
+                InHeader {
+                    nodeid: 10,
+                    ..Default::default()
+                },
+                reader,
+                writer,
+            )
+        };
+
+        let res = server.copy_file_range(ctx).unwrap();
+        assert_eq!(res, size_of::<OutHeader>() + size_of::<WriteOut>());
+
+        let mut out = WriteOut::default();
+        out.as_mut_slice()
+            .copy_from_slice(&write_buf[size_of::<OutHeader>()..res]);
+        assert_eq!(out.size, 1024);
+        assert_eq!(out.padding, 0);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_server_copy_file_range_enosys() {
+        // The default implementation answers ENOSYS, on which the kernel
+        // falls back to its generic read/write copy loop.
+        let server = Server::new(MockFS);
+
+        let mut read_buf = [0u8; size_of::<CopyFileRangeIn>()];
+        let mut write_buf = [0u8; 4096];
+        let ctx = prepare_srvcontext(&mut read_buf, &mut write_buf);
+
+        let res = server.copy_file_range(ctx).unwrap();
+        assert_eq!(res, size_of::<OutHeader>());
+
+        let mut out = OutHeader::default();
+        out.as_mut_slice()
+            .copy_from_slice(&write_buf[..size_of::<OutHeader>()]);
+        assert_eq!(out.error, -libc::ENOSYS);
     }
 }
