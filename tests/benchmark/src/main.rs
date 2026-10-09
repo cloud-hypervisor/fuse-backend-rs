@@ -6,10 +6,12 @@
 //! A minimal fusedev passthrough daemon used to benchmark the synchronous
 //! and asynchronous IO paths with external tools such as fio.
 //!
-//! Usage: `fuse-backend-rs-benchmark <src> <mountpoint> [--async|--uring] [--threads N]`
+//! Usage: `fuse-backend-rs-benchmark <src> <mountpoint> [--async|--uring] [--threads N] [--sync-blocking]`
 //!
-//! - default (sync) mode: requests are served by `N` worker threads, each
-//!   reading from its own fuse channel (the classic multi-threaded design).
+//! - default (sync) mode: requests are served by `N` worker threads of the
+//!   `SyncFuseServing` serving layer, each reading from its own fuse channel
+//!   (the classic multi-threaded design); `--sync-blocking` selects blocking
+//!   channels cloned with `FUSE_DEV_IOC_CLONE` instead of epoll-based ones.
 //! - `--async` mode: requests are served by `N` asynchronous workers
 //!   (`AsyncFuseServing`), each running a `FuseDevTask` on its own async
 //!   runtime (tokio-uring when io_uring is available) and its own
@@ -25,9 +27,8 @@ mod daemon {
     use std::io::{Error, Result};
     use std::path::Path;
     use std::sync::Arc;
-    use std::thread;
 
-    use log::{error, info, warn, LevelFilter};
+    use log::{error, info, LevelFilter};
     use signal_hook::{consts::TERM_SIGNALS, iterator::Signals};
     use simple_logger::SimpleLogger;
 
@@ -35,8 +36,8 @@ mod daemon {
     use fuse_backend_rs::api::{Vfs, VfsOptions};
     use fuse_backend_rs::passthrough::{Config, PassthroughFs};
     use fuse_backend_rs::transport::{
-        AsyncFuseServing, AsyncServingConfig, FuseChannel, FuseSession, UringConfig,
-        UringFuseServing,
+        AsyncFuseServing, AsyncServingConfig, FuseSession, SyncFuseServing, SyncServingConfig,
+        UringConfig, UringFuseServing,
     };
 
     struct Args {
@@ -44,12 +45,13 @@ mod daemon {
         dest: String,
         as_async: bool,
         as_uring: bool,
+        sync_blocking: bool,
         thread_cnt: u32,
     }
 
     fn help() {
         println!(
-            "Usage:\n   fuse-backend-rs-benchmark <src> <mountpoint> [--async|--uring] [--threads N]\n"
+            "Usage:\n   fuse-backend-rs-benchmark <src> <mountpoint> [--async|--uring] [--threads N] [--sync-blocking]\n"
         );
     }
 
@@ -64,6 +66,7 @@ mod daemon {
             dest: args[2].clone(),
             as_async: false,
             as_uring: false,
+            sync_blocking: false,
             thread_cnt: 4,
         };
         let mut idx = 3;
@@ -71,6 +74,7 @@ mod daemon {
             match args[idx].as_str() {
                 "--async" => res.as_async = true,
                 "--uring" => res.as_uring = true,
+                "--sync-blocking" => res.sync_blocking = true,
                 "--threads" => {
                     idx += 1;
                     if idx >= args.len() {
@@ -90,6 +94,11 @@ mod daemon {
             idx += 1;
         }
         if res.src.is_empty() || res.dest.is_empty() || res.thread_cnt == 0 {
+            help();
+            return Err(Error::from_raw_os_error(libc::EINVAL));
+        }
+        // The blocking knob only configures the sync transport.
+        if res.sync_blocking && (res.as_async || res.as_uring) {
             help();
             return Err(Error::from_raw_os_error(libc::EINVAL));
         }
@@ -119,62 +128,26 @@ mod daemon {
         Arc::new(Server::new(Arc::new(vfs)))
     }
 
-    struct FuseServer {
-        server: Arc<Server<Arc<Vfs>>>,
-        ch: FuseChannel,
-    }
-
-    impl FuseServer {
-        fn svc_loop(&mut self) -> Result<()> {
-            // Given error EBADF, it means kernel has shut down this session.
-            let _ebadf = std::io::Error::from_raw_os_error(libc::EBADF);
-            loop {
-                if let Some((reader, writer)) = self
-                    .ch
-                    .get_request()
-                    .map_err(|_| std::io::Error::from_raw_os_error(libc::EINVAL))?
-                {
-                    if let Err(e) = self.server.handle_message(reader, writer, None, None) {
-                        match e {
-                            fuse_backend_rs::Error::EncodeMessage(_ebadf) => {
-                                break;
-                            }
-                            _ => {
-                                error!("Handling fuse message failed");
-                                continue;
-                            }
-                        }
-                    }
-                } else {
-                    info!("fuse server exits");
-                    break;
-                }
-            }
-            Ok(())
-        }
-    }
-
     /// Serve requests with `thread_cnt` synchronous worker threads until a
     /// termination signal is received.
-    fn run_sync(server: Arc<Server<Arc<Vfs>>>, mut se: FuseSession, thread_cnt: u32) {
-        for _ in 0..thread_cnt {
-            let mut worker = FuseServer {
-                server: server.clone(),
-                ch: se.new_channel().unwrap(),
-            };
-            thread::Builder::new()
-                .name("fuse_server".to_string())
-                .spawn(move || {
-                    let _ = worker.svc_loop();
-                    warn!("fuse service thread exits");
-                })
-                .unwrap();
-        }
+    fn run_sync(server: Arc<Server<Arc<Vfs>>>, se: FuseSession, thread_cnt: u32, blocking: bool) {
+        let cfg = SyncServingConfig {
+            workers: thread_cnt as usize,
+            blocking,
+        };
+        let serving = match SyncFuseServing::new(se, server, cfg) {
+            Ok(serving) => serving,
+            Err(e) => {
+                error!("failed to start the sync serving layer: {}", e);
+                std::process::exit(1);
+            }
+        };
 
         let mut signals = Signals::new(TERM_SIGNALS).unwrap();
         signals.forever().next();
-        se.umount().unwrap();
-        se.wake().unwrap();
+        // Dropping the serving layer unmounts the session and joins all
+        // serving threads.
+        drop(serving);
     }
 
     /// Serve requests with `thread_cnt` asynchronous workers until a
@@ -257,6 +230,8 @@ mod daemon {
                 "uring"
             } else if args.as_async {
                 "async"
+            } else if args.sync_blocking {
+                "sync-blocking"
             } else {
                 "sync"
             },
@@ -272,7 +247,7 @@ mod daemon {
         } else if args.as_async {
             run_async(server, se, args.thread_cnt);
         } else {
-            run_sync(server, se, args.thread_cnt);
+            run_sync(server, se, args.thread_cnt, args.sync_blocking);
         }
 
         Ok(())

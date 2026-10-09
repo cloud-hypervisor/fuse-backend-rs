@@ -27,8 +27,10 @@ fuse transport and request concurrency dominate there.
 ## 2. End-to-end comparison with fio
 
 `tests/scripts/bench_sync_async.sh` mounts the `fuse-backend-rs-benchmark`
-daemon once per mode — sync mode (N worker threads, one fuse channel each),
-async mode (N asynchronous workers through `AsyncFuseServing`, each with
+daemon once per mode — sync mode (N worker threads, one epoll-based
+fuse channel each; the daemon's `--sync-blocking` flag switches them to
+blocking channels cloned with `FUSE_DEV_IOC_CLONE`), async mode (N
+asynchronous workers through `AsyncFuseServing`, each with
 its own `/dev/fuse` file description and async runtime, tokio-uring when
 io_uring is available) and uring mode (the experimental
 FUSE-over-io_uring transport, requires kernel 6.14+ and is skipped
