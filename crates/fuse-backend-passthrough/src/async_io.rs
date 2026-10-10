@@ -402,17 +402,17 @@ impl<S: BitmapSlice + Send + Sync + 'static> AsyncFileSystem for PassthroughFs<S
         inode: <Self as FileSystem>::Inode,
         flags: u32,
         fuse_flags: u32,
-    ) -> io::Result<(Option<<Self as FileSystem>::Handle>, OpenOptions)> {
+    ) -> io::Result<(
+        Option<<Self as FileSystem>::Handle>,
+        OpenOptions,
+        Option<u32>,
+    )> {
         async_relay!(
             self,
             ctx,
             [],
-            self.open(ctx, inode, flags, fuse_flags)
-                .map(|(handle, opts, _)| (handle, opts)),
-            move |fs: Arc<Self>, ctx: Context| {
-                fs.open(&ctx, inode, flags, fuse_flags)
-                    .map(|(handle, opts, _)| (handle, opts))
-            }
+            self.open(ctx, inode, flags, fuse_flags),
+            move |fs: Arc<Self>, ctx: Context| fs.open(&ctx, inode, flags, fuse_flags)
         )
     }
 
@@ -422,17 +422,18 @@ impl<S: BitmapSlice + Send + Sync + 'static> AsyncFileSystem for PassthroughFs<S
         parent: <Self as FileSystem>::Inode,
         name: &CStr,
         args: CreateIn,
-    ) -> io::Result<(Entry, Option<<Self as FileSystem>::Handle>, OpenOptions)> {
+    ) -> io::Result<(
+        Entry,
+        Option<<Self as FileSystem>::Handle>,
+        OpenOptions,
+        Option<u32>,
+    )> {
         async_relay!(
             self,
             ctx,
             [let name = name.to_owned();],
-            self.create(ctx, parent, name, args)
-                .map(|(entry, handle, opts, _)| (entry, handle, opts)),
-            move |fs: Arc<Self>, ctx: Context| {
-                fs.create(&ctx, parent, &name, args)
-                    .map(|(entry, handle, opts, _)| (entry, handle, opts))
-            }
+            self.create(ctx, parent, name, args),
+            move |fs: Arc<Self>, ctx: Context| fs.create(&ctx, parent, &name, args)
         )
     }
 
@@ -951,7 +952,7 @@ mod tests {
 
         async_runtime::block_on(async {
             let entry = fs.async_lookup(&ctx, ROOT_ID, &name).await.unwrap();
-            let (handle, _opts) = fs
+            let (handle, _opts, _) = fs
                 .async_open(&ctx, entry.inode, libc::O_RDONLY as u32, 0)
                 .await
                 .unwrap();
@@ -988,7 +989,7 @@ mod tests {
 
         async_runtime::block_on(async {
             let entry = fs.async_lookup(&ctx, ROOT_ID, &name).await.unwrap();
-            let (handle, _opts) = fs
+            let (handle, _opts, _) = fs
                 .async_open(&ctx, entry.inode, libc::O_RDONLY as u32, 0)
                 .await
                 .unwrap();
@@ -1023,7 +1024,7 @@ mod tests {
 
         async_runtime::block_on(async {
             let entry = fs.async_lookup(&ctx, ROOT_ID, &name).await.unwrap();
-            let (handle, _opts) = fs
+            let (handle, _opts, _) = fs
                 .async_open(&ctx, entry.inode, libc::O_RDONLY as u32, 0)
                 .await
                 .unwrap();
@@ -1061,7 +1062,7 @@ mod tests {
 
         async_runtime::block_on(async {
             let entry = fs.async_lookup(&ctx, ROOT_ID, &name).await.unwrap();
-            let (handle, _opts) = fs
+            let (handle, _opts, _) = fs
                 .async_open(&ctx, entry.inode, libc::O_RDONLY as u32, 0)
                 .await
                 .unwrap();
@@ -1098,7 +1099,7 @@ mod tests {
 
         async_runtime::block_on(async {
             let entry = fs.async_lookup(&ctx, ROOT_ID, &name).await.unwrap();
-            let (handle, _opts) = fs
+            let (handle, _opts, _) = fs
                 .async_open(&ctx, entry.inode, libc::O_RDONLY as u32, 0)
                 .await
                 .unwrap();
@@ -1140,7 +1141,7 @@ mod tests {
 
         async_runtime::block_on(async {
             let entry = fs.async_lookup(&ctx, ROOT_ID, &name).await.unwrap();
-            let (handle, _opts) = fs
+            let (handle, _opts, _) = fs
                 .async_open(&ctx, entry.inode, libc::O_RDONLY as u32, 0)
                 .await
                 .unwrap();
@@ -1179,7 +1180,8 @@ mod tests {
                 umask: 0,
                 fuse_flags: 0,
             };
-            let (entry, handle, _opts) = fs.async_create(&ctx, ROOT_ID, &name, args).await.unwrap();
+            let (entry, handle, _opts, _) =
+                fs.async_create(&ctx, ROOT_ID, &name, args).await.unwrap();
             let handle = handle.unwrap();
 
             let mut r = MemReader(b"async data".to_vec());
@@ -1276,7 +1278,8 @@ mod tests {
                 umask: 0,
                 fuse_flags: 0,
             };
-            let (entry, handle, _opts) = fs.async_create(&ctx, ROOT_ID, &name, args).await.unwrap();
+            let (entry, handle, _opts, _) =
+                fs.async_create(&ctx, ROOT_ID, &name, args).await.unwrap();
             let handle = handle.unwrap();
 
             // A direct-IO write: relayed to `write_direct()`, which stages
@@ -1335,7 +1338,7 @@ mod tests {
                 umask: 0,
                 fuse_flags: 0,
             };
-            let (killpriv_entry, killpriv_handle, _opts) = fs
+            let (killpriv_entry, killpriv_handle, _opts, _) = fs
                 .async_create(&ctx, ROOT_ID, &killpriv_name, args)
                 .await
                 .unwrap();
@@ -1374,7 +1377,7 @@ mod tests {
 
         async_runtime::block_on(async {
             let entry = fs.async_lookup(&ctx, ROOT_ID, &name).await.unwrap();
-            let (handle, _opts) = fs
+            let (handle, _opts, _) = fs
                 .async_open(&ctx, entry.inode, libc::O_RDWR as u32, 0)
                 .await
                 .unwrap();
@@ -1423,13 +1426,14 @@ mod tests {
                 umask: 0,
                 fuse_flags: 0,
             };
-            let (entry, handle, _opts) = fs.async_create(&ctx, ROOT_ID, &name, args).await.unwrap();
+            let (entry, handle, _opts, _) =
+                fs.async_create(&ctx, ROOT_ID, &name, args).await.unwrap();
             let handle = handle.unwrap();
             fs.async_fsync(&ctx, entry.inode, true, handle)
                 .await
                 .unwrap();
 
-            let (handle, _opts) = fs
+            let (handle, _opts, _) = fs
                 .async_open(&ctx, entry.inode, libc::O_RDWR as u32, 0)
                 .await
                 .unwrap();

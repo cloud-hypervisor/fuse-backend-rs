@@ -914,8 +914,8 @@ pub mod persist {
         /// #     async fn async_lookup(&self, _ctx: &Context, _parent: Self::Inode, _name: &CStr) -> io::Result<Entry> { Err(io::Error::from_raw_os_error(libc::ENOSYS)) }
         /// #     async fn async_getattr(&self, _ctx: &Context, _inode: Self::Inode, _handle: Option<Self::Handle>) -> io::Result<(stat64, Duration)> { Err(io::Error::from_raw_os_error(libc::ENOSYS)) }
         /// #     async fn async_setattr(&self, _ctx: &Context, _inode: Self::Inode, _attr: stat64, _handle: Option<Self::Handle>, _valid: SetattrValid) -> io::Result<(stat64, Duration)> { Err(io::Error::from_raw_os_error(libc::ENOSYS)) }
-        /// #     async fn async_open(&self, _ctx: &Context, _inode: Self::Inode, _flags: u32, _fuse_flags: u32) -> io::Result<(Option<Self::Handle>, OpenOptions)> { Err(io::Error::from_raw_os_error(libc::ENOSYS)) }
-        /// #     async fn async_create(&self, _ctx: &Context, _parent: Self::Inode, _name: &CStr, _args: CreateIn) -> io::Result<(Entry, Option<Self::Handle>, OpenOptions)> { Err(io::Error::from_raw_os_error(libc::ENOSYS)) }
+        /// #     async fn async_open(&self, _ctx: &Context, _inode: Self::Inode, _flags: u32, _fuse_flags: u32) -> io::Result<(Option<Self::Handle>, OpenOptions, Option<u32>)> { Err(io::Error::from_raw_os_error(libc::ENOSYS)) }
+        /// #     async fn async_create(&self, _ctx: &Context, _parent: Self::Inode, _name: &CStr, _args: CreateIn) -> io::Result<(Entry, Option<Self::Handle>, OpenOptions, Option<u32>)> { Err(io::Error::from_raw_os_error(libc::ENOSYS)) }
         /// #     async fn async_read(&self, _ctx: &Context, _inode: Self::Inode, _handle: Self::Handle, _w: &mut (dyn AsyncZeroCopyWriter + Send), _size: u32, _offset: u64, _lock_owner: Option<u64>, _flags: u32) -> io::Result<usize> { Err(io::Error::from_raw_os_error(libc::ENOSYS)) }
         /// #     async fn async_write(&self, _ctx: &Context, _inode: Self::Inode, _handle: Self::Handle, _r: &mut (dyn AsyncZeroCopyReader + Send), _size: u32, _offset: u64, _lock_owner: Option<u64>, _delayed_write: bool, _flags: u32, _fuse_flags: u32) -> io::Result<usize> { Err(io::Error::from_raw_os_error(libc::ENOSYS)) }
         /// #     async fn async_fsync(&self, _ctx: &Context, _inode: Self::Inode, _datasync: bool, _handle: Self::Handle) -> io::Result<()> { Err(io::Error::from_raw_os_error(libc::ENOSYS)) }
@@ -1212,7 +1212,11 @@ mod tests {
                 inode: <Self as FileSystem>::Inode,
                 flags: u32,
                 fuse_flags: u32,
-            ) -> Result<(Option<<Self as FileSystem>::Handle>, OpenOptions)> {
+            ) -> Result<(
+                Option<<Self as FileSystem>::Handle>,
+                OpenOptions,
+                Option<u32>,
+            )> {
                 unimplemented!()
             }
 
@@ -1222,7 +1226,12 @@ mod tests {
                 parent: <Self as FileSystem>::Inode,
                 name: &CStr,
                 args: CreateIn,
-            ) -> Result<(Entry, Option<<Self as FileSystem>::Handle>, OpenOptions)> {
+            ) -> Result<(
+                Entry,
+                Option<<Self as FileSystem>::Handle>,
+                OpenOptions,
+                Option<u32>,
+            )> {
                 unimplemented!()
             }
 
@@ -1343,7 +1352,11 @@ mod tests {
                 inode: <Self as FileSystem>::Inode,
                 flags: u32,
                 fuse_flags: u32,
-            ) -> Result<(Option<<Self as FileSystem>::Handle>, OpenOptions)> {
+            ) -> Result<(
+                Option<<Self as FileSystem>::Handle>,
+                OpenOptions,
+                Option<u32>,
+            )> {
                 unimplemented!()
             }
 
@@ -1353,7 +1366,12 @@ mod tests {
                 parent: <Self as FileSystem>::Inode,
                 name: &CStr,
                 args: CreateIn,
-            ) -> Result<(Entry, Option<<Self as FileSystem>::Handle>, OpenOptions)> {
+            ) -> Result<(
+                Entry,
+                Option<<Self as FileSystem>::Handle>,
+                OpenOptions,
+                Option<u32>,
+            )> {
                 unimplemented!()
             }
 

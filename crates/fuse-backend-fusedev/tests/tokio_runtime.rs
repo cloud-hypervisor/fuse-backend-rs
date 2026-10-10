@@ -334,7 +334,7 @@ mod tokio_runtime {
             inode: u64,
             flags: u32,
             fuse_flags: u32,
-        ) -> io::Result<(Option<u64>, OpenOptions)> {
+        ) -> io::Result<(Option<u64>, OpenOptions, Option<u32>)> {
             enosys()
         }
 
@@ -344,7 +344,7 @@ mod tokio_runtime {
             parent: u64,
             name: &CStr,
             args: CreateIn,
-        ) -> io::Result<(Entry, Option<u64>, OpenOptions)> {
+        ) -> io::Result<(Entry, Option<u64>, OpenOptions, Option<u32>)> {
             enosys()
         }
 
