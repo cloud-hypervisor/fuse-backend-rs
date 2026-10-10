@@ -29,6 +29,9 @@
   FUSE-over-io_uring transport (kernel 6.14+). Both join the `FuseServing` interface, so a daemon
   can pick its transport at runtime behind `Box<dyn FuseServing>` and fall back to the classic
   transport on `Error::UringNotSupported`.
+- `async_runtime::set_runtime_type()` selects the asynchronous runtime type in code, because
+  setting `FUSE_BACKEND_RS_ASYNC_RUNTIME` from a running program isn't safe.
+  `async_runtime::runtime_type()` returns the type in effect, and `RuntimeType` is now public.
 
 ### Changed
 - [254](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/254): `fuse-backend-rs` is now a thin facade re-exporting the sub-crates. Every
