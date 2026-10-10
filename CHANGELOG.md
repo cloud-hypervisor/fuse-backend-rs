@@ -32,6 +32,9 @@
 - `async_runtime::set_runtime_type()` selects the asynchronous runtime type in code, because
   setting `FUSE_BACKEND_RS_ASYNC_RUNTIME` from a running program isn't safe.
   `async_runtime::runtime_type()` returns the type in effect, and `RuntimeType` is now public.
+- `Server::init_state()` and `Server::restore_init()` let a new server take over a connection
+  that another server initialized. `abi::fuse_abi::UNIQUE_RESEND` is the bit that the kernel
+  sets in requests it sends again after `notify_resend()`.
 
 ### Changed
 - With the tokio runtime, `FuseDevTask` no longer retries reads in a loop. It waits for requests
