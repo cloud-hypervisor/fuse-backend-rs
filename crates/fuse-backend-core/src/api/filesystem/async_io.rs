@@ -338,6 +338,9 @@ pub trait AsyncFileSystem: FileSystem {
     /// The returned `OpenOptions` allow the file system to change the way the opened file is
     /// handled by the kernel. See the documentation of `OpenOptions` for more information.
     ///
+    /// With `OpenOptions::PASSTHROUGH`, the returned `u32` is the id of the backing file to pass
+    /// reads, writes and mmap through to, as returned by `fuse_backing_open()`.
+    ///
     /// If the `FsOptions::ZERO_MESSAGE_OPEN` feature is enabled by both the file system
     /// implementation and the kernel, then the file system may return an error of `ENOSYS`. This
     /// will be interpreted by the kernel as success and future calls to `open` and `release` will
@@ -356,8 +359,10 @@ pub trait AsyncFileSystem: FileSystem {
     {
         let result = self
             .open(ctx, inode, flags, fuse_flags)
-            .map(|(handle, opts, _backing_id)| (handle.map(Into::<u64>::into), opts));
-        Box::pin(async move { result.map(|(handle, opts)| (handle.map(From::from), opts)) })
+            .map(|(handle, opts, backing_id)| (handle.map(Into::<u64>::into), opts, backing_id));
+        Box::pin(async move {
+            result.map(|(handle, opts, backing_id)| (handle.map(From::from), opts, backing_id))
+        })
     }
 
     /// Create and open a file.
@@ -370,10 +375,10 @@ pub trait AsyncFileSystem: FileSystem {
     /// unimplemented and all future calls to `create` will be handled by calling the `mknod` and
     /// `open` methods instead.
     ///
-    /// See the documentation for the `open` method for more information about opening the file. In
-    /// addition to the optional `Handle` and the `OpenOptions`, the file system must also return an
-    /// `Entry` for the file. This increases the lookup count for the `Inode` associated with the
-    /// file by 1.
+    /// See the documentation for the `open` method for more information about opening the file,
+    /// including the optional backing id. In addition to the optional `Handle`, the `OpenOptions`
+    /// and the optional backing id, the file system must also return an `Entry` for the file.
+    /// This increases the lookup count for the `Inode` associated with the file by 1.
     fn async_create<'a, 'b, 'c, 'async_trait>(
         &'a self,
         ctx: &'b Context,
@@ -387,11 +392,15 @@ pub trait AsyncFileSystem: FileSystem {
         'c: 'async_trait,
         Self: 'async_trait,
     {
-        let result = self
-            .create(ctx, parent, name, args)
-            .map(|(entry, handle, opts, _backing_id)| (entry, handle.map(Into::<u64>::into), opts));
+        let result =
+            self.create(ctx, parent, name, args)
+                .map(|(entry, handle, opts, backing_id)| {
+                    (entry, handle.map(Into::<u64>::into), opts, backing_id)
+                });
         Box::pin(async move {
-            result.map(|(entry, handle, opts)| (entry, handle.map(From::from), opts))
+            result.map(|(entry, handle, opts, backing_id)| {
+                (entry, handle.map(From::from), opts, backing_id)
+            })
         })
     }
 
@@ -711,7 +720,7 @@ pub trait AsyncFileSystem: FileSystem {
         ctx: &'b Context,
         inode: Self::Inode,
         flags: u32,
-    ) -> Pin<OpenFuture<'async_trait, Self::Handle>>
+    ) -> Pin<OpendirFuture<'async_trait, Self::Handle>>
     where
         'a: 'async_trait,
         'b: 'async_trait,
@@ -1008,10 +1017,16 @@ pub trait AsyncFileSystem: FileSystem {
 
 type AttrFuture<'async_trait> =
     Box<dyn Future<Output = io::Result<(stat64, Duration)>> + Send + 'async_trait>;
-type OpenFuture<'async_trait, H> =
+type OpenFuture<'async_trait, H> = Box<
+    dyn Future<Output = io::Result<(Option<H>, OpenOptions, Option<u32>)>> + Send + 'async_trait,
+>;
+type OpendirFuture<'async_trait, H> =
     Box<dyn Future<Output = io::Result<(Option<H>, OpenOptions)>> + Send + 'async_trait>;
-type CreateFuture<'async_trait, H> =
-    Box<dyn Future<Output = io::Result<(Entry, Option<H>, OpenOptions)>> + Send + 'async_trait>;
+type CreateFuture<'async_trait, H> = Box<
+    dyn Future<Output = io::Result<(Entry, Option<H>, OpenOptions, Option<u32>)>>
+        + Send
+        + 'async_trait,
+>;
 
 impl<FS: AsyncFileSystem> AsyncFileSystem for Arc<FS> {
     fn async_lookup<'a, 'b, 'c, 'async_trait>(
@@ -1182,7 +1197,7 @@ impl<FS: AsyncFileSystem> AsyncFileSystem for Arc<FS> {
         ctx: &'b Context,
         inode: Self::Inode,
         flags: u32,
-    ) -> Pin<OpenFuture<'async_trait, Self::Handle>>
+    ) -> Pin<OpendirFuture<'async_trait, Self::Handle>>
     where
         'a: 'async_trait,
         'b: 'async_trait,
@@ -1286,7 +1301,7 @@ mod tests {
             _flags: u32,
             _fuse_flags: u32,
         ) -> io::Result<(Option<u64>, OpenOptions, Option<u32>)> {
-            Ok((Some(inode * 10), OpenOptions::KEEP_CACHE, None))
+            Ok((Some(inode * 10), OpenOptions::KEEP_CACHE, Some(7)))
         }
 
         fn read(
@@ -1419,8 +1434,8 @@ mod tests {
         let entry = fs.async_lookup(&ctx, 1, name).await.unwrap();
         assert_eq!(entry.inode, 2);
 
-        let (handle, opts) = fs.async_open(&ctx, 2, 0, 0).await.unwrap();
-        assert_eq!((handle, opts), (Some(20), OpenOptions::KEEP_CACHE));
+        let opened = fs.async_open(&ctx, 2, 0, 0).await.unwrap();
+        assert_eq!(opened, (Some(20), OpenOptions::KEEP_CACHE, Some(7)));
 
         let mut w = VecWriter(Vec::new());
         let n = fs

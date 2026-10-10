@@ -298,7 +298,7 @@ mod async_io {
             inode: u64,
             flags: u32,
             fuse_flags: u32,
-        ) -> Result<(Option<u64>, OpenOptions)> {
+        ) -> Result<(Option<u64>, OpenOptions, Option<u32>)> {
             enosys()
         }
 
@@ -308,7 +308,7 @@ mod async_io {
             parent: u64,
             name: &CStr,
             args: CreateIn,
-        ) -> Result<(Entry, Option<u64>, OpenOptions)> {
+        ) -> Result<(Entry, Option<u64>, OpenOptions, Option<u32>)> {
             enosys()
         }
 

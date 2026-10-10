@@ -72,15 +72,17 @@ impl AsyncFileSystem for Vfs {
         inode: <Self as FileSystem>::Inode,
         flags: u32,
         fuse_flags: u32,
-    ) -> Result<(Option<<Self as FileSystem>::Handle>, OpenOptions)> {
+    ) -> Result<(
+        Option<<Self as FileSystem>::Handle>,
+        OpenOptions,
+        Option<u32>,
+    )> {
         #[cfg(target_os = "linux")]
         if self.opts.load().no_open {
             return Err(Error::from_raw_os_error(libc::ENOSYS));
         }
         match self.get_real_rootfs(inode)? {
-            (Left(fs), idata) => fs
-                .open(ctx, idata.ino(), flags, fuse_flags)
-                .map(|(a, b, _)| (a, b)),
+            (Left(fs), idata) => fs.open(ctx, idata.ino(), flags, fuse_flags),
             (Right(fs), idata) => fs.async_open(ctx, idata.ino(), flags, fuse_flags).await,
         }
     }
@@ -91,7 +93,12 @@ impl AsyncFileSystem for Vfs {
         parent: <Self as FileSystem>::Inode,
         name: &CStr,
         args: CreateIn,
-    ) -> Result<(Entry, Option<<Self as FileSystem>::Handle>, OpenOptions)> {
+    ) -> Result<(
+        Entry,
+        Option<<Self as FileSystem>::Handle>,
+        OpenOptions,
+        Option<u32>,
+    )> {
         validate_path_component(name)?;
 
         // The supp gid is parsed after the request-wide id remap, so
@@ -100,13 +107,13 @@ impl AsyncFileSystem for Vfs {
         self.remap_ctx_supp_gid(&mut ctx, parent.fs_idx());
 
         match self.get_real_rootfs(parent)? {
-            (Left(fs), idata) => fs
-                .create(&ctx, idata.ino(), name, args)
-                .map(|(a, b, c, _)| (a, b, c)),
+            (Left(fs), idata) => fs.create(&ctx, idata.ino(), name, args),
             (Right(fs), idata) => fs
                 .async_create(&ctx, idata.ino(), name, args)
                 .await
-                .and_then(|(a, b, c)| self.convert_backend_entry(idata, a).map(|a| (a, b, c))),
+                .and_then(|(a, b, c, d)| {
+                    self.convert_backend_entry(idata, a).map(|a| (a, b, c, d))
+                }),
         }
     }
 

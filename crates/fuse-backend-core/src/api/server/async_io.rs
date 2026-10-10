@@ -331,11 +331,11 @@ impl<F: AsyncFileSystem + Sync> Server<F> {
             .await;
 
         match result {
-            Ok((handle, opts)) => {
+            Ok((handle, opts, passthrough)) => {
                 let out = OpenOut {
                     fh: handle.map(Into::into).unwrap_or(0),
                     open_flags: opts.bits(),
-                    ..Default::default()
+                    passthrough: passthrough.unwrap_or_default(),
                 };
 
                 ctx.async_reply_ok(Some(out), None).await
@@ -612,7 +612,7 @@ impl<F: AsyncFileSystem + Sync> Server<F> {
             .await;
 
         match result {
-            Ok((entry, handle, opts)) => {
+            Ok((entry, handle, opts, passthrough)) => {
                 let entry_out = EntryOut {
                     nodeid: entry.inode,
                     generation: entry.generation,
@@ -625,7 +625,7 @@ impl<F: AsyncFileSystem + Sync> Server<F> {
                 let open_out = OpenOut {
                     fh: handle.map(Into::into).unwrap_or(0),
                     open_flags: opts.bits(),
-                    ..Default::default()
+                    passthrough: passthrough.unwrap_or_default(),
                 };
 
                 // Kind of a hack to write both structs.
@@ -768,12 +768,14 @@ impl<'a, F: AsyncFileSystem, S: BitmapSlice, W: Writer> SrvContext<'a, F, S, W> 
 
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
+    use std::ffi::CStr;
     use std::sync::atomic::AtomicUsize;
 
     use super::super::test_util::TestWriter;
     use super::*;
     use crate::abi::fuse_abi::{Dirent, InHeader};
     use crate::api::filesystem::{Context, FileSystem, OpenOptions};
+    use crate::async_runtime;
 
     const DIR_HANDLE: u64 = 7;
 
@@ -1077,5 +1079,179 @@ mod tests {
         let reply = serve(&server, opcode, 1, read_in(0, 8192)).await;
         assert_eq!(server.fs.calls(), (4, 4));
         assert_eq!(reply_error(&reply), -libc::ENOMEM);
+    }
+
+    const BACKING_ID: u32 = 7;
+
+    struct BackingFs;
+
+    impl FileSystem for BackingFs {
+        type Inode = u64;
+        type Handle = u64;
+    }
+
+    #[allow(unused_variables)]
+    #[async_trait]
+    impl AsyncFileSystem for BackingFs {
+        async fn async_lookup(&self, ctx: &Context, parent: u64, name: &CStr) -> io::Result<Entry> {
+            unimplemented!()
+        }
+
+        async fn async_getattr(
+            &self,
+            ctx: &Context,
+            inode: u64,
+            handle: Option<u64>,
+        ) -> io::Result<(stat64, Duration)> {
+            unimplemented!()
+        }
+
+        async fn async_setattr(
+            &self,
+            ctx: &Context,
+            inode: u64,
+            attr: stat64,
+            handle: Option<u64>,
+            valid: SetattrValid,
+        ) -> io::Result<(stat64, Duration)> {
+            unimplemented!()
+        }
+
+        async fn async_open(
+            &self,
+            ctx: &Context,
+            inode: u64,
+            flags: u32,
+            fuse_flags: u32,
+        ) -> io::Result<(Option<u64>, OpenOptions, Option<u32>)> {
+            Ok((Some(3), OpenOptions::PASSTHROUGH, Some(BACKING_ID)))
+        }
+
+        async fn async_create(
+            &self,
+            ctx: &Context,
+            parent: u64,
+            name: &CStr,
+            args: CreateIn,
+        ) -> io::Result<(Entry, Option<u64>, OpenOptions, Option<u32>)> {
+            let entry = Entry {
+                inode: 2,
+                generation: 0,
+                attr: unsafe { std::mem::zeroed() },
+                attr_flags: 0,
+                attr_timeout: Duration::from_secs(1),
+                entry_timeout: Duration::from_secs(1),
+            };
+            Ok((entry, Some(4), OpenOptions::PASSTHROUGH, Some(BACKING_ID)))
+        }
+
+        async fn async_read(
+            &self,
+            ctx: &Context,
+            inode: u64,
+            handle: u64,
+            w: &mut (dyn AsyncZeroCopyWriter + Send),
+            size: u32,
+            offset: u64,
+            lock_owner: Option<u64>,
+            flags: u32,
+        ) -> io::Result<usize> {
+            unimplemented!()
+        }
+
+        async fn async_write(
+            &self,
+            ctx: &Context,
+            inode: u64,
+            handle: u64,
+            r: &mut (dyn AsyncZeroCopyReader + Send),
+            size: u32,
+            offset: u64,
+            lock_owner: Option<u64>,
+            delayed_write: bool,
+            flags: u32,
+            fuse_flags: u32,
+        ) -> io::Result<usize> {
+            unimplemented!()
+        }
+
+        async fn async_fsync(
+            &self,
+            ctx: &Context,
+            inode: u64,
+            datasync: bool,
+            handle: u64,
+        ) -> io::Result<()> {
+            unimplemented!()
+        }
+
+        async fn async_fallocate(
+            &self,
+            ctx: &Context,
+            inode: u64,
+            handle: u64,
+            mode: u32,
+            offset: u64,
+            length: u64,
+        ) -> io::Result<()> {
+            unimplemented!()
+        }
+
+        async fn async_fsyncdir(
+            &self,
+            ctx: &Context,
+            inode: u64,
+            datasync: bool,
+            handle: u64,
+        ) -> io::Result<()> {
+            unimplemented!()
+        }
+    }
+
+    /// Serves one request for inode 1 with the async server alone, and returns the reply.
+    fn serve_backing(opcode: Opcode, body: &[u8]) -> Vec<u8> {
+        let header = InHeader {
+            len: (size_of::<InHeader>() + body.len()) as u32,
+            opcode: opcode as u32,
+            unique: 1,
+            nodeid: 1,
+            ..Default::default()
+        };
+        let mut read_buf = [header.as_slice(), body].concat();
+        let mut write_buf = vec![0u8; 4096];
+        let server = Server::new(BackingFs);
+        let len = async_runtime::block_on(async {
+            let reader = Reader::<()>::from_slice(&mut read_buf);
+            let writer = TestWriter::new(&mut write_buf);
+            unsafe { server.async_handle_message(reader, writer, None, None) }
+                .await
+                .unwrap()
+        });
+        write_buf.truncate(len);
+        write_buf
+    }
+
+    #[test]
+    fn test_async_open_backing_id() {
+        let open_in = OpenIn::default();
+        let reply = serve_backing(Opcode::Open, open_in.as_slice());
+        assert_eq!(reply.len(), size_of::<OutHeader>() + size_of::<OpenOut>());
+        let out = OpenOut::from_slice(&reply[size_of::<OutHeader>()..]).unwrap();
+        assert_eq!(out.fh, 3);
+        assert_eq!(out.open_flags, OpenOptions::PASSTHROUGH.bits());
+        assert_eq!(out.passthrough, BACKING_ID);
+    }
+
+    #[test]
+    fn test_async_create_backing_id() {
+        let create_in = CreateIn::default();
+        let body = [create_in.as_slice(), b"file\0"].concat();
+        let reply = serve_backing(Opcode::Create, &body);
+        let offset = size_of::<OutHeader>() + size_of::<EntryOut>();
+        assert_eq!(reply.len(), offset + size_of::<OpenOut>());
+        let out = OpenOut::from_slice(&reply[offset..]).unwrap();
+        assert_eq!(out.fh, 4);
+        assert_eq!(out.open_flags, OpenOptions::PASSTHROUGH.bits());
+        assert_eq!(out.passthrough, BACKING_ID);
     }
 }
