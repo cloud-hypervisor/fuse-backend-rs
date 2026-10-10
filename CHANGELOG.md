@@ -34,6 +34,10 @@
   `async_runtime::runtime_type()` returns the type in effect, and `RuntimeType` is now public.
 
 ### Changed
+- With the tokio runtime, `FuseDevTask` no longer retries reads in a loop. It waits for requests
+  through the IO driver of the tokio runtime that polls it, and checks its state flag every 100ms
+  while idle. Polling it on a tokio runtime without IO enabled panics. `fuse-backend-fusedev`
+  needs tokio 1.53.3.
 - [254](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/254): `fuse-backend-rs` is now a thin facade re-exporting the sub-crates. Every
   historical `fuse_backend_rs::{abi, api, buffer, common, transport, passthrough,
   overlayfs}` import path and cargo feature name (`fusedev`, `virtiofs`,
