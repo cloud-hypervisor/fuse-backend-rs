@@ -599,6 +599,20 @@ impl Vfs {
         if let Some((internal_id, external_id, range)) = mapping {
             ctx.uid = remap_id(ctx.uid, external_id, internal_id, range);
             ctx.gid = remap_id(ctx.gid, external_id, internal_id, range);
+            // Translate the supplementary group list with the same security
+            // policy as remap_ctx_supp_gid(): groups outside the mapped range
+            // have no host counterpart and are dropped rather than adopted
+            // untranslated.
+            if let Some(groups) = ctx.supplementary_groups.as_mut() {
+                groups.retain_mut(|gid| {
+                    if *gid >= external_id && *gid - external_id < range {
+                        *gid = *gid - external_id + internal_id;
+                        true
+                    } else {
+                        false
+                    }
+                });
+            }
         }
         Ok(())
     }
