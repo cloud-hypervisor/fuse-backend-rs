@@ -982,6 +982,10 @@ impl<F: FileSystem + Sync> Server<F> {
                     out.max_pages = MAX_REQ_PAGES;
                     out.max_write = MAX_REQ_PAGES as u32 * pagesize() as u32; // 1MB
                 }
+                #[cfg(target_os = "linux")]
+                if enabled.contains(FsOptions::PASSTHROUGH) {
+                    out.max_stack_depth = self.max_stack_depth.load(Ordering::Relaxed);
+                }
                 self.vers.store(
                     encode_version(version.major, version.minor),
                     Ordering::Release,
@@ -2069,6 +2073,50 @@ mod tests {
         server.handle_message(reader, writer, None, None).unwrap();
         let out = OutHeader::from_slice(&write_buf[..size_of::<OutHeader>()]).unwrap();
         assert_eq!(out.unique, unique);
+    }
+
+    #[test]
+    fn test_server_init_passthrough() {
+        struct PassthroughFs;
+        impl FileSystem for PassthroughFs {
+            type Inode = u64;
+            type Handle = u64;
+
+            fn init(&self, _capable: FsOptions) -> io::Result<FsOptions> {
+                Ok(FsOptions::PASSTHROUGH)
+            }
+        }
+
+        let server = Server::new(PassthroughFs);
+        // The kernel turns passthrough off for depths other than 1 and 2.
+        assert!(server.set_max_stack_depth(0).is_err());
+        assert!(server.set_max_stack_depth(3).is_err());
+        server.set_max_stack_depth(2).unwrap();
+
+        let init_in = InitIn {
+            major: KERNEL_VERSION,
+            minor: 40,
+            max_readahead: 0,
+            flags: FsOptions::INIT_EXT.bits() as u32,
+        };
+        let init_in2 = InitIn2 {
+            flags2: (FsOptions::PASSTHROUGH.bits() >> 32) as u32,
+            unused: [0; 11],
+        };
+        let mut read_buf = [init_in.as_slice(), init_in2.as_slice()].concat();
+        let mut write_buf = [0u8; 4096];
+        let ctx = {
+            let reader = Reader::<()>::from_slice(&mut read_buf);
+            let writer = TestWriter::new(&mut write_buf);
+            SrvContext::new(InHeader::default(), reader, writer)
+        };
+        let res = server.init(ctx, |_| {}).unwrap();
+        assert_eq!(res, size_of::<OutHeader>() + size_of::<InitOut>());
+
+        let out = InitOut::from_slice(&write_buf[size_of::<OutHeader>()..res]).unwrap();
+        assert_ne!(out.flags as u64 & FsOptions::INIT_EXT.bits(), 0);
+        assert_eq!((out.flags2 as u64) << 32, FsOptions::PASSTHROUGH.bits());
+        assert_eq!(out.max_stack_depth, 2);
     }
 
     #[cfg(feature = "fusedev-uring")]

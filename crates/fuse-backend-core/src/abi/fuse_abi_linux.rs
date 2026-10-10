@@ -84,6 +84,9 @@ const FOPEN_CACHE_DIR: u32 = 8;
 /// the file is stream-like (no file position at all)
 const FOPEN_STREAM: u32 = 16;
 
+/// Pass reads, writes and mmap through to the backing file.
+const FOPEN_PASSTHROUGH: u32 = 1 << 7;
+
 bitflags! {
     /// Options controlling the behavior of files opened by the server in response
     /// to an open or create request.
@@ -98,6 +101,9 @@ bitflags! {
         const CACHE_DIR = FOPEN_CACHE_DIR;
         /// the file is stream-like (no file position at all)
         const STREAM = FOPEN_STREAM;
+        /// Pass reads, writes and mmap through to the backing file whose id is returned along
+        /// with this flag. Requires `FsOptions::PASSTHROUGH`.
+        const PASSTHROUGH = FOPEN_PASSTHROUGH;
     }
 }
 
@@ -196,6 +202,9 @@ const INIT_EXT: u64 = 0x4000_0000;
 
 // This flag indicates whether the guest kernel enable per-file dax
 const PERFILE_DAX: u64 = 0x2_0000_0000;
+
+// Passthrough of reads, writes and mmap to backing files
+const PASSTHROUGH: u64 = 1_u64 << 37;
 
 // this flag indicates whether the guest kernel enable resend
 const HAS_RESEND: u64 = 1_u64 << 39;
@@ -473,6 +482,15 @@ bitflags! {
 
         /// indicates whether the kernel support resend inflight request
         const HAS_RESEND = HAS_RESEND;
+
+        /// Indicates support for passthrough of reads, writes and mmap to backing files, as
+        /// added in Linux 6.9 (not the Anolis `FD_PASSTHROUGH`).
+        ///
+        /// The kernel enables it only if the reply doesn't also set `WRITEBACK_CACHE` and the
+        /// max stack depth from `Server::set_max_stack_depth()` is 1 or 2. Register a backing
+        /// file with `fuse_backing_open()` and return its id from `open` along with
+        /// `OpenOptions::PASSTHROUGH`.
+        const PASSTHROUGH = PASSTHROUGH;
 
         /// Daemon supports serving FUSE requests over io_uring (experimental).
         #[cfg(feature = "fusedev-uring")]
@@ -1155,7 +1173,8 @@ pub struct InitOut {
     pub max_pages: u16,
     pub map_alignment: u16,
     pub flags2: u32,
-    pub unused: [u32; 7],
+    pub max_stack_depth: u32,
+    pub unused: [u32; 6],
 }
 unsafe impl ByteValued for InitOut {}
 
@@ -1421,6 +1440,16 @@ pub struct CopyFileRangeIn {
 }
 unsafe impl ByteValued for CopyFileRangeIn {}
 
+/// Argument of the FUSE_DEV_IOC_BACKING_OPEN ioctl.
+#[repr(C)]
+#[derive(Debug, Default, Copy, Clone)]
+pub struct BackingMap {
+    pub fd: i32,
+    pub flags: u32,
+    pub padding: u64,
+}
+unsafe impl ByteValued for BackingMap {}
+
 #[cfg(test)]
 mod tests {
 
@@ -1441,6 +1470,20 @@ mod tests {
         assert_eq!(std::mem::size_of::<MkdirIn>(), 8);
         assert_eq!(std::mem::size_of::<InHeader>(), 40);
         assert_eq!(std::mem::size_of::<OutHeader>(), 16);
+        assert_eq!(std::mem::size_of::<OpenOut>(), 16);
+        assert_eq!(std::mem::size_of::<InitOut>(), 64);
+        assert_eq!(std::mem::size_of::<BackingMap>(), 16);
+    }
+
+    #[test]
+    fn test_passthrough_abi() {
+        assert_eq!(std::mem::offset_of!(OpenOut, passthrough), 12);
+        assert_eq!(std::mem::offset_of!(InitOut, flags2), 32);
+        assert_eq!(std::mem::offset_of!(InitOut, max_stack_depth), 36);
+        assert_eq!(std::mem::offset_of!(BackingMap, flags), 4);
+        assert_eq!(std::mem::offset_of!(BackingMap, padding), 8);
+        assert_eq!(FsOptions::PASSTHROUGH.bits(), 1 << 37);
+        assert_eq!(OpenOptions::PASSTHROUGH.bits(), 1 << 7);
     }
 
     #[test]
