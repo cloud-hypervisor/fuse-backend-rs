@@ -30,7 +30,7 @@ libc = "0.2.68"
 log = "0.4.6"
 mio = { version = "0.8", features = ["os-poll", "os-ext"] }
 nix = "0.24"
-tokio = { version = "1", optional = true }
+tokio = { version = "1.53.3", optional = true }
 vm-memory = { workspace = true }
 vmm-sys-util = { workspace = true }
 
@@ -49,6 +49,7 @@ async-io = [
     "futures-util",
     "tokio/rt",
     "tokio/macros",
+    "tokio/net",
     "fuse-backend-core/async-io",
     # The session tests mount a real `PassthroughFs`, and core's
     # `BackendFileSystem` requires `AsyncFileSystem` once core's `async-io`

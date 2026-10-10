@@ -52,6 +52,10 @@
 - The FUSE-over-io_uring transport answers opcodes it doesn't know with ENOSYS instead of EIO.
   Kernels that send `FUSE_STATX` only fall back to `FUSE_GETATTR` after ENOSYS, so `statx()`
   calls that ask for more than the basic fields, like the birth time `stat(1)` shows, failed.
+- With the tokio runtime, `FuseDevTask` no longer retries reads in a loop. It waits for requests
+  through the IO driver of the tokio runtime that polls it, and checks its state flag every 100ms
+  while idle. Polling it on a tokio runtime without IO enabled panics. `fuse-backend-fusedev`
+  needs tokio 1.53.3.
 - [254](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/254): `fuse-backend-rs` is now a thin facade re-exporting the sub-crates. Every
   historical `fuse_backend_rs::{abi, api, buffer, common, transport, passthrough,
   overlayfs}` import path and cargo feature name (`fusedev`, `virtiofs`,
