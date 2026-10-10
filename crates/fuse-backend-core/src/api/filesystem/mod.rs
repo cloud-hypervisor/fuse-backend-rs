@@ -559,7 +559,7 @@ impl ZeroCopyWriter for File {
 }
 
 /// Additional context associated with requests.
-#[derive(Default, Clone, Copy, Debug)]
+#[derive(Default, Clone, Debug)]
 pub struct Context {
     /// The user ID of the calling process.
     pub uid: libc::uid_t,
@@ -579,6 +579,17 @@ pub struct Context {
     /// this group in their supplementary group list so that objects created
     /// in setgid directories get the correct group ownership.
     pub supp_gid: Option<libc::gid_t>,
+
+    /// Supplementary groups of the calling process.
+    ///
+    /// When set, these groups are used directly instead of reading from
+    /// /proc/<pid>/status.  This is essential for remote filesystems where
+    /// the PID doesn't exist on the server.  The ordinary request path
+    /// leaves it `None`: the FUSE device only reports uid, primary gid and
+    /// -- for create-family requests -- `supp_gid` above.  A VFS with an id
+    /// mapping translates the list to internal (host) ids together with
+    /// uid/gid, dropping groups outside the mapped range.
+    pub supplementary_groups: Option<Vec<libc::gid_t>>,
 }
 
 impl Context {
@@ -595,6 +606,7 @@ impl From<&fuse::InHeader> for Context {
             gid: source.gid,
             pid: source.pid as i32,
             supp_gid: None,
+            supplementary_groups: None,
         }
     }
 }

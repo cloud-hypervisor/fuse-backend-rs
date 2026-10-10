@@ -327,7 +327,7 @@ macro_rules! async_relay {
     ($self:expr, $ctx:expr, [$($capture:tt)*], $inline_call:expr, $pool_fn:expr) => {
         match $self.shared_ref.upgrade() {
             Some(fs) if $self.async_thread_pool_enabled.load(Ordering::Relaxed) => {
-                let ctx = *$ctx;
+                let ctx = $ctx.clone();
                 $($capture)*
                 join_blocking(Runtime::spawn_blocking(move || ($pool_fn)(fs, ctx))).await
             }

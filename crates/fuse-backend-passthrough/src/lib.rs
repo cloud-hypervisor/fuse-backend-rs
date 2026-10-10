@@ -1786,6 +1786,7 @@ mod tests {
             gid: uid,
             pid: 1,
             supp_gid: Some(100000 + gid),
+            ..Default::default()
         };
         let parent = vfs
             .lookup(
@@ -1800,7 +1801,7 @@ mod tests {
         // switches to the caller's credentials, which lack `gid`.
         let ctx_no_group = Context {
             supp_gid: None,
-            ..ctx
+            ..ctx.clone()
         };
         let err = vfs
             .mkdir(

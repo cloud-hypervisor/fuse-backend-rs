@@ -160,7 +160,7 @@ impl FileSystem for Vfs {
 
         // The supp gid is parsed after the request-wide id remap, so
         // translate it here, where the target mount is known.
-        let mut ctx = *ctx;
+        let mut ctx = ctx.clone();
         self.remap_ctx_supp_gid(&mut ctx, parent.fs_idx());
 
         match self.get_real_rootfs(parent)? {
@@ -184,7 +184,7 @@ impl FileSystem for Vfs {
 
         // The supp gid is parsed after the request-wide id remap, so
         // translate it here, where the target mount is known.
-        let mut ctx = *ctx;
+        let mut ctx = ctx.clone();
         self.remap_ctx_supp_gid(&mut ctx, inode.fs_idx());
 
         match self.get_real_rootfs(inode)? {
@@ -207,7 +207,7 @@ impl FileSystem for Vfs {
 
         // The supp gid is parsed after the request-wide id remap, so
         // translate it here, where the target mount is known.
-        let mut ctx = *ctx;
+        let mut ctx = ctx.clone();
         self.remap_ctx_supp_gid(&mut ctx, parent.fs_idx());
 
         match self.get_real_rootfs(parent)? {
@@ -327,7 +327,7 @@ impl FileSystem for Vfs {
 
         // The supp gid is parsed after the request-wide id remap, so
         // translate it here, where the target mount is known.
-        let mut ctx = *ctx;
+        let mut ctx = ctx.clone();
         self.remap_ctx_supp_gid(&mut ctx, parent.fs_idx());
 
         match self.get_real_rootfs(parent)? {
@@ -721,6 +721,7 @@ mod tests {
             gid: 100123,
             pid: 1,
             supp_gid: None,
+            ..Default::default()
         };
 
         vfs.id_remap(&mut ctx).unwrap();
@@ -741,6 +742,7 @@ mod tests {
             gid: 100123,
             pid: 1,
             supp_gid: None,
+            ..Default::default()
         };
 
         // fs_idx == 0 (pseudo fs) falls back to global mapping
@@ -766,6 +768,7 @@ mod tests {
             gid: 100123,
             pid: 1,
             supp_gid: Some(100123),
+            ..Default::default()
         };
         vfs.remap_ctx_supp_gid(&mut ctx, 0);
         assert_eq!(ctx.supp_gid, Some(123));
@@ -777,6 +780,7 @@ mod tests {
             gid: 100123,
             pid: 1,
             supp_gid: Some(5),
+            ..Default::default()
         };
         vfs.remap_ctx_supp_gid(&mut ctx, 0);
         assert_eq!(ctx.supp_gid, None);
@@ -788,8 +792,70 @@ mod tests {
             gid: 0,
             pid: 1,
             supp_gid: Some(123),
+            ..Default::default()
         };
         vfs.remap_ctx_supp_gid(&mut ctx, 0);
         assert_eq!(ctx.supp_gid, Some(123));
+    }
+
+    #[test]
+    fn test_remap_ctx_supplementary_groups() {
+        let vfs = Vfs::new(VfsOptions {
+            id_mapping: (0, 100000, 65536),
+            ..Default::default()
+        });
+
+        // Groups inside the mapped range are translated to internal (host)
+        // ids in order; groups outside the range have no host counterpart
+        // and are dropped instead of being adopted untranslated.
+        let mut ctx = Context {
+            uid: 100000,
+            gid: 100123,
+            pid: 1,
+            supplementary_groups: Some(vec![100123, 5, 165535, 100124]),
+            ..Default::default()
+        };
+        vfs.id_remap(&mut ctx).unwrap();
+        assert_eq!(ctx.supplementary_groups, Some(vec![123, 65535, 124]),);
+        assert_eq!(ctx.uid, 0);
+        assert_eq!(ctx.gid, 123);
+
+        // An empty list stays empty, and a reversed mapping direction
+        // (internal base above the external base) translates without
+        // underflow.
+        let vfs = Vfs::new(VfsOptions {
+            id_mapping: (200000, 100000, 65536),
+            ..Default::default()
+        });
+        let mut ctx = Context {
+            uid: 100000,
+            gid: 100500,
+            pid: 1,
+            supplementary_groups: Some(Vec::new()),
+            ..Default::default()
+        };
+        vfs.id_remap(&mut ctx).unwrap();
+        assert_eq!(ctx.supplementary_groups, Some(Vec::new()));
+
+        ctx.supplementary_groups = Some(vec![100500, 99999]);
+        vfs.id_remap(&mut ctx).unwrap();
+        assert_eq!(ctx.supplementary_groups, Some(vec![200500]));
+
+        // Without an id mapping the groups pass through unchanged, and
+        // `None` never allocates a list.
+        let vfs = Vfs::new(VfsOptions::default());
+        let mut ctx = Context {
+            uid: 0,
+            gid: 0,
+            pid: 1,
+            supplementary_groups: Some(vec![123]),
+            ..Default::default()
+        };
+        vfs.id_remap(&mut ctx).unwrap();
+        assert_eq!(ctx.supplementary_groups, Some(vec![123]));
+
+        ctx.supplementary_groups = None;
+        vfs.id_remap(&mut ctx).unwrap();
+        assert_eq!(ctx.supplementary_groups, None);
     }
 }

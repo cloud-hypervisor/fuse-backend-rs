@@ -96,7 +96,7 @@ impl AsyncFileSystem for Vfs {
 
         // The supp gid is parsed after the request-wide id remap, so
         // translate it here, where the target mount is known.
-        let mut ctx = *ctx;
+        let mut ctx = ctx.clone();
         self.remap_ctx_supp_gid(&mut ctx, parent.fs_idx());
 
         match self.get_real_rootfs(parent)? {
@@ -232,6 +232,7 @@ mod tests {
             gid: 0,
             pid: 0,
             supp_gid: None,
+            ..Default::default()
         };
 
         assert!(vfs.mount(Box::new(fs), "/x/y").is_ok());
