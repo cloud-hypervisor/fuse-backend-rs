@@ -303,6 +303,9 @@ pub trait FileSystem {
     /// The returned `OpenOptions` allow the file system to change the way the opened file is
     /// handled by the kernel. See the documentation of `OpenOptions` for more information.
     ///
+    /// With `OpenOptions::PASSTHROUGH`, the returned `u32` is the id of the backing file to pass
+    /// reads, writes and mmap through to, as returned by `fuse_backing_open()`.
+    ///
     /// If the `FsOptions::ZERO_MESSAGE_OPEN` feature is enabled by both the file system
     /// implementation and the kernel, then the file system may return an error of `ENOSYS`. This
     /// will be interpreted by the kernel as success and future calls to `open` and `release` will
