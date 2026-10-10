@@ -20,6 +20,8 @@ use std::ffi::CStr;
 use std::io::{self, Read};
 use std::marker::PhantomData;
 use std::mem::size_of;
+#[cfg(target_os = "linux")]
+use std::sync::atomic::AtomicU32;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::abi::fuse_abi::*;
@@ -63,6 +65,9 @@ pub struct Server<F: FileSystem + Sync> {
     /// Capability flags actually enabled by the INIT exchange.
     #[cfg(all(target_os = "linux", feature = "fusedev-uring"))]
     negotiated_init_flags: AtomicU64,
+    /// Max stack depth sent in the INIT reply with `FsOptions::PASSTHROUGH`.
+    #[cfg(target_os = "linux")]
+    max_stack_depth: AtomicU32,
 }
 
 impl<F: FileSystem + Sync> Server<F> {
@@ -76,7 +81,26 @@ impl<F: FileSystem + Sync> Server<F> {
             extra_init_flags: AtomicU64::new(0),
             #[cfg(all(target_os = "linux", feature = "fusedev-uring"))]
             negotiated_init_flags: AtomicU64::new(0),
+            #[cfg(target_os = "linux")]
+            max_stack_depth: AtomicU32::new(1),
         }
+    }
+
+    /// Set the max stack depth of the filesystem sent in the INIT reply when
+    /// `FsOptions::PASSTHROUGH` is enabled. The default of 1 allows backing files on a
+    /// filesystem that isn't stacked, and 2 allows them on a stacked one such as overlayfs.
+    /// Call it before the server handles the INIT request.
+    ///
+    /// Fails with `EINVAL` for other depths. The kernel turns passthrough off for them, and
+    /// every `fuse_backing_open()` would then fail.
+    #[cfg(target_os = "linux")]
+    pub fn set_max_stack_depth(&self, depth: u32) -> io::Result<()> {
+        // FILESYSTEM_MAX_STACK_DEPTH in the kernel is 2.
+        if !(1..=2).contains(&depth) {
+            return Err(io::Error::from_raw_os_error(libc::EINVAL));
+        }
+        self.max_stack_depth.store(depth, Ordering::Relaxed);
+        Ok(())
     }
 
     /// Get the protocol version and the options enabled at INIT, for `restore_init()`. Before
