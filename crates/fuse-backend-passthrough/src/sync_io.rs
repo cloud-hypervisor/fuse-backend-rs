@@ -2885,6 +2885,61 @@ mod tests {
             }
         }
     }
+
+    #[test]
+    fn test_lseek() {
+        // The kernel sends raw uapi SEEK_* values in LseekIn.whence, which
+        // the implementation forwards to lseek(2) unchanged.  Assert only
+        // positions and errors that hold on every filesystem.
+        let (fs, source) = prepare_fs_writeback_no_handles();
+        let ctx = prepare_context();
+
+        let payload = b"0123456789";
+        let path = source.as_path().join("seekfile");
+        std::fs::write(&path, payload).unwrap();
+
+        let name = CString::new("seekfile").unwrap();
+        let entry = fs.lookup(&ctx, ROOT_ID, &name).unwrap();
+        let (handle, ..) = fs.open(&ctx, entry.inode, libc::O_RDWR as u32, 0).unwrap();
+        let handle = handle.unwrap();
+
+        // Raw whence values must position the file like lseek(2) does.
+        assert_eq!(
+            fs.lseek(&ctx, entry.inode, handle, 4, libc::SEEK_SET as u32)
+                .unwrap(),
+            4
+        );
+        assert_eq!(
+            fs.lseek(&ctx, entry.inode, handle, 2, libc::SEEK_END as u32)
+                .unwrap(),
+            payload.len() as u64 + 2
+        );
+
+        // SEEK_DATA lands on the written prefix ...
+        assert_eq!(
+            fs.lseek(&ctx, entry.inode, handle, 0, libc::SEEK_DATA as u32)
+                .unwrap(),
+            0
+        );
+        // ... and reports ENXIO at EOF.
+        let err = fs
+            .lseek(
+                &ctx,
+                entry.inode,
+                handle,
+                payload.len() as u64,
+                libc::SEEK_DATA as u32,
+            )
+            .unwrap_err();
+        assert_eq!(err.raw_os_error(), Some(libc::ENXIO));
+
+        // A handle issued for another inode is rejected with EBADF before
+        // lseek(2) is reached.
+        let err = fs
+            .lseek(&ctx, ROOT_ID, handle, 0, libc::SEEK_SET as u32)
+            .unwrap_err();
+        assert_eq!(err.raw_os_error(), Some(libc::EBADF));
+    }
 }
 
 #[cfg(test)]
