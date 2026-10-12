@@ -2250,4 +2250,88 @@ mod tests {
             .copy_from_slice(&write_buf[..size_of::<OutHeader>()]);
         assert_eq!(out.error, -libc::ENOSYS);
     }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_server_lseek() {
+        use crate::api::filesystem::Context;
+
+        // Echoes the decoded request back as the resulting offset, so the
+        // whole decode/call/reply wiring can be verified.
+        struct LseekFs;
+        impl FileSystem for LseekFs {
+            type Inode = u64;
+            type Handle = u64;
+
+            fn lseek(
+                &self,
+                _ctx: &Context,
+                inode: Self::Inode,
+                handle: Self::Handle,
+                offset: u64,
+                whence: u32,
+            ) -> io::Result<u64> {
+                assert_eq!(
+                    (inode, handle, offset, whence),
+                    (10, 100, 4096, libc::SEEK_DATA as u32)
+                );
+                Ok(8192)
+            }
+        }
+
+        let server = Server::new(LseekFs);
+
+        // The kernel sends the raw uapi SEEK_* value in LseekIn.whence, which
+        // the server must pass to the file system unchanged.
+        let mut read_buf = [0u8; size_of::<LseekIn>()];
+        let in_arg = LseekIn {
+            fh: 100,
+            offset: 4096,
+            whence: libc::SEEK_DATA as u32,
+            padding: 0,
+        };
+        read_buf.copy_from_slice(in_arg.as_slice());
+
+        let mut write_buf = [0u8; 4096];
+        let ctx = {
+            let reader = Reader::<()>::from_slice(&mut read_buf);
+            let writer = TestWriter::new(&mut write_buf);
+            SrvContext::new(
+                InHeader {
+                    nodeid: 10,
+                    ..Default::default()
+                },
+                reader,
+                writer,
+            )
+        };
+
+        let res = server.lseek(ctx).unwrap();
+        assert_eq!(res, size_of::<OutHeader>() + size_of::<LseekOut>());
+
+        let mut out = LseekOut::default();
+        out.as_mut_slice()
+            .copy_from_slice(&write_buf[size_of::<OutHeader>()..res]);
+        assert_eq!(out.offset, 8192);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_server_lseek_enosys() {
+        // The default implementation answers ENOSYS, on which the kernel
+        // sets fc->no_lseek and falls back to generic_file_llseek().
+        let server = Server::new(MockFS);
+
+        let mut read_buf = [0u8; size_of::<LseekIn>()];
+        let mut write_buf = [0u8; 4096];
+        let ctx = prepare_srvcontext(&mut read_buf, &mut write_buf);
+
+        let res = server.lseek(ctx).unwrap();
+        assert_eq!(res, size_of::<OutHeader>());
+
+        let mut out = OutHeader::default();
+        out.as_mut_slice()
+            .copy_from_slice(&write_buf[..size_of::<OutHeader>()]);
+        assert_eq!(out.error, -libc::ENOSYS);
+    }
 }
