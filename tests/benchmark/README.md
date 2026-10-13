@@ -87,6 +87,15 @@ python3 tests/scripts/bench_compare.py compare sync.json uring.json
 Both transports run on the same machine back-to-back, so environment
 effects mostly cancel out; for confidence run once per `BENCH_MODES` order.
 
+`BENCH_DAEMON_ARGS` passes extra arguments to the daemon in every mode. With
+`BENCH_DAEMON_ARGS=--kernel-passthrough` the kernel passes reads, writes and mmap
+of open files through to the source files (Linux 6.9+ with
+`CONFIG_FUSE_PASSTHROUGH`), so the data workloads measure the backing
+filesystem rather than the daemon. The kernel doesn't allow passthrough with
+the writeback cache, so the flag turns the cache off too.
+`BENCH_DAEMON_ARGS=--no-writeback` turns the cache off without passthrough, to
+tell the two effects apart.
+
 ## 3. Continuous benchmarking in CI
 
 The `Benchmark` workflow (`.github/workflows/benchmark.yml`) runs the fio
