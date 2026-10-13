@@ -27,7 +27,7 @@ use fuse_backend_rs::api::filesystem::{
     ZeroCopyReader, ZeroCopyWriter,
 };
 use fuse_backend_rs::async_runtime::Runtime;
-use fuse_backend_rs::file_buf::FileVolatileSlice;
+use fuse_backend_rs::file_buf::{FileVolatileBuf, FileVolatileSlice};
 use fuse_backend_rs::file_traits::{AsyncFileReadWriteVolatile, FileReadWriteVolatile};
 use fuse_backend_rs::passthrough::{Config, PassthroughFs};
 
@@ -126,11 +126,21 @@ impl ZeroCopyReader for MemReader {
 impl AsyncZeroCopyReader for MemReader {
     async fn async_read_to(
         &mut self,
-        _f: Arc<dyn AsyncFileReadWriteVolatile>,
-        _count: usize,
-        _off: u64,
+        f: Arc<dyn AsyncFileReadWriteVolatile>,
+        count: usize,
+        off: u64,
     ) -> io::Result<usize> {
-        unreachable!("the synchronous delegation never uses the async zero-copy path")
+        let start = off as usize;
+        if start >= self.0.len() {
+            return Ok(0);
+        }
+        let n = std::cmp::min(count, self.0.len() - start);
+        // Safe because the buffer is only read from and doesn't out-live
+        // `self.0`.
+        let buf =
+            unsafe { FileVolatileBuf::from_raw_ptr(self.0.as_ptr().add(start) as *mut u8, n, n) };
+        let (res, _) = f.async_write_at_volatile(buf, off).await;
+        res
     }
 }
 
