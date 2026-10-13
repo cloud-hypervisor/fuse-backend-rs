@@ -155,7 +155,7 @@ def main():
         type=float,
         default=10.0,
         help="flag regressions of the data workloads beyond this percent; "
-        "the metadata workloads use at least %.0f%% (default: %%(default)s)"
+        "the metadata workloads use at least %.0f%%%% (default: %%(default)s)"
         % METADATA_THRESHOLD,
     )
 
