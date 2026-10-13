@@ -573,6 +573,15 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
         drop(killpriv);
 
         let data = HandleData::new(inode, file, flags);
+        // Only regular files pass through, `opendir` also gets here.
+        #[cfg(target_os = "linux")]
+        let backing_id = if flags & (libc::O_DIRECTORY as u32) == 0 {
+            self.acquire_backing_id(inode, &data.file)?
+        } else {
+            None
+        };
+        #[cfg(not(target_os = "linux"))]
+        let backing_id = None;
         let handle = self.next_handle.fetch_add(1, Ordering::Relaxed);
         self.handle_map.insert(handle, data);
 
@@ -609,8 +618,12 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
             }
             _ => {}
         };
+        #[cfg(target_os = "linux")]
+        if backing_id.is_some() {
+            opts = passthrough_open_options(opts);
+        }
 
-        Ok((Some(handle), opts, None))
+        Ok((Some(handle), opts, backing_id))
     }
 
     fn do_getattr(
@@ -684,6 +697,14 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
     }
 }
 
+/// Add `PASSTHROUGH` to the options of an open with a backing id. The kernel fails such an open
+/// with any other flag than `DIRECT_IO`, `PARALLEL_DIRECT_WRITES` and `NOFLUSH`, and the backing
+/// file has its own page cache, so drop `KEEP_CACHE`.
+#[cfg(target_os = "linux")]
+fn passthrough_open_options(opts: OpenOptions) -> OpenOptions {
+    (opts - OpenOptions::KEEP_CACHE) | OpenOptions::PASSTHROUGH
+}
+
 impl<S: BitmapSlice + Send + Sync> FileSystem for PassthroughFs<S> {
     type Inode = Inode;
     type Handle = Handle;
@@ -735,12 +756,47 @@ impl<S: BitmapSlice + Send + Sync> FileSystem for PassthroughFs<S> {
             self.perfile_dax.store(true, Ordering::Relaxed);
         }
 
+        #[cfg(target_os = "linux")]
+        if self.kernel_passthrough.is_some() && capable.contains(FsOptions::PASSTHROUGH) {
+            // The kernel ignores FUSE_PASSTHROUGH along with FUSE_WRITEBACK_CACHE, and needs open
+            // requests to get the backing ids. Passthrough writes skip the seal_size check. The
+            // Never and Metadata cache policies open files with FOPEN_DIRECT_IO, which overrides
+            // passthrough for reads and writes. The kernel opens the backing file with the
+            // client's O_DIRECT, which allow_direct_io = false would filter out.
+            if self.writeback.load(Ordering::Relaxed)
+                || self.no_open.load(Ordering::Relaxed)
+                || self.seal_size.load(Ordering::Relaxed)
+                || !self.cfg.allow_direct_io
+                || matches!(
+                    self.cfg.cache_policy,
+                    CachePolicy::Never | CachePolicy::Metadata
+                )
+            {
+                warn!(
+                    "fuse: kernel passthrough conflicts with writeback, no_open, seal_size, \
+                     allow_direct_io = false or cache policy {:?}, disabled",
+                    self.cfg.cache_policy
+                );
+            } else {
+                info!("fuse: kernel passthrough enabled");
+                opts |= FsOptions::PASSTHROUGH;
+                self.passthrough.store(true, Ordering::Relaxed);
+            }
+        }
+
         Ok(opts)
     }
 
     fn destroy(&self) {
         self.handle_map.clear();
         self.inode_map.clear();
+        // `Vfs::umount()` destroys a file system while the connection goes on, so release the
+        // backing ids.
+        #[cfg(target_os = "linux")]
+        if let Some(kp) = &self.kernel_passthrough {
+            kp.close_all();
+            self.passthrough.store(false, Ordering::Relaxed);
+        }
 
         if let Err(e) = self.import() {
             error!("fuse: failed to destroy instance, {:?}", e);
@@ -1002,10 +1058,23 @@ impl<S: BitmapSlice + Send + Sync> FileSystem for PassthroughFs<S> {
             }
         };
 
+        #[allow(unused_mut)]
+        let mut backing_id = None;
         let ret_handle = if !self.no_open.load(Ordering::Relaxed) {
-            let handle = self.next_handle.fetch_add(1, Ordering::Relaxed);
             let data = HandleData::new(entry.inode, file, args.flags);
-
+            #[cfg(target_os = "linux")]
+            {
+                backing_id = match self.acquire_backing_id(entry.inode, &data.file) {
+                    Ok(id) => id,
+                    Err(e) => {
+                        // Drop the lookup count of the entry that the kernel won't get.
+                        let mut inodes = self.inode_map.get_map_mut();
+                        self.forget_one(&mut inodes, entry.inode, 1);
+                        return Err(e);
+                    }
+                };
+            }
+            let handle = self.next_handle.fetch_add(1, Ordering::Relaxed);
             self.handle_map.insert(handle, data);
             Some(handle)
         } else {
@@ -1019,8 +1088,12 @@ impl<S: BitmapSlice + Send + Sync> FileSystem for PassthroughFs<S> {
             CachePolicy::Always => opts |= OpenOptions::KEEP_CACHE,
             _ => {}
         };
+        #[cfg(target_os = "linux")]
+        if backing_id.is_some() {
+            opts = passthrough_open_options(opts);
+        }
 
-        Ok((entry, ret_handle, opts, None))
+        Ok((entry, ret_handle, opts, backing_id))
     }
 
     fn unlink(&self, _ctx: &Context, parent: Inode, name: &CStr) -> io::Result<()> {
