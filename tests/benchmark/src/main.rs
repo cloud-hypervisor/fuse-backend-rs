@@ -6,7 +6,8 @@
 //! A minimal fusedev passthrough daemon used to benchmark the synchronous
 //! and asynchronous IO paths with external tools such as fio.
 //!
-//! Usage: `fuse-backend-rs-benchmark <src> <mountpoint> [--async|--uring] [--threads N] [--sync-blocking]`
+//! Usage: `fuse-backend-rs-benchmark <src> <mountpoint> [--async|--uring] [--threads N] [--sync-blocking]
+//! [--kernel-passthrough] [--no-writeback]`
 //!
 //! - default (sync) mode: requests are served by `N` worker threads of the
 //!   `SyncFuseServing` serving layer, each reading from its own fuse channel
@@ -19,25 +20,35 @@
 //! - `--uring` mode: requests are served through the FUSE-over-io_uring
 //!   transport (`UringFuseServing`, experimental, requires kernel 6.14+);
 //!   `N` limits the number of io_uring worker threads.
+//!
+//! `--kernel-passthrough` makes the kernel pass reads, writes and mmap of open
+//! files through to the source files (Linux 6.9+, needs `CAP_SYS_ADMIN`), so
+//! that they never reach the daemon. The kernel doesn't allow it with the
+//! writeback cache, so it also turns the writeback cache off.
+//!
+//! `--no-writeback` turns the writeback cache off without enabling kernel
+//! passthrough, to tell the effects of the two apart.
 
 #[cfg(target_os = "linux")]
 mod daemon {
     use std::env;
     use std::fs;
     use std::io::{Error, Result};
+    use std::os::fd::{AsRawFd, BorrowedFd};
     use std::path::Path;
-    use std::sync::Arc;
+    use std::sync::{Arc, OnceLock};
 
     use log::{error, info, LevelFilter};
     use signal_hook::{consts::TERM_SIGNALS, iterator::Signals};
     use simple_logger::SimpleLogger;
 
+    use fuse_backend_rs::abi::fuse_abi::FsOptions;
     use fuse_backend_rs::api::server::Server;
     use fuse_backend_rs::api::{Vfs, VfsOptions};
-    use fuse_backend_rs::passthrough::{Config, PassthroughFs};
+    use fuse_backend_rs::passthrough::{BackingFiles, Config, PassthroughFs};
     use fuse_backend_rs::transport::{
-        AsyncFuseServing, AsyncServingConfig, FuseSession, SyncFuseServing, SyncServingConfig,
-        UringConfig, UringFuseServing,
+        fuse_backing_close, fuse_backing_open, AsyncFuseServing, AsyncServingConfig, FuseSession,
+        SyncFuseServing, SyncServingConfig, UringConfig, UringFuseServing,
     };
 
     struct Args {
@@ -46,12 +57,31 @@ mod daemon {
         as_async: bool,
         as_uring: bool,
         sync_blocking: bool,
+        kernel_passthrough: bool,
+        no_writeback: bool,
         thread_cnt: u32,
+    }
+
+    /// Registers backing files on the FUSE device of the session, which is
+    /// only known once it is mounted.
+    #[derive(Default)]
+    struct FuseBackingFiles {
+        fuse_file: OnceLock<fs::File>,
+    }
+
+    impl BackingFiles for FuseBackingFiles {
+        fn open(&self, fd: BorrowedFd<'_>) -> Result<u32> {
+            fuse_backing_open(self.fuse_file.get().unwrap(), fd.as_raw_fd())
+        }
+
+        fn close(&self, backing_id: u32) -> Result<()> {
+            fuse_backing_close(self.fuse_file.get().unwrap(), backing_id)
+        }
     }
 
     fn help() {
         println!(
-            "Usage:\n   fuse-backend-rs-benchmark <src> <mountpoint> [--async|--uring] [--threads N] [--sync-blocking]\n"
+            "Usage:\n   fuse-backend-rs-benchmark <src> <mountpoint> [--async|--uring] [--threads N] [--sync-blocking] [--kernel-passthrough] [--no-writeback]\n"
         );
     }
 
@@ -67,6 +97,8 @@ mod daemon {
             as_async: false,
             as_uring: false,
             sync_blocking: false,
+            kernel_passthrough: false,
+            no_writeback: false,
             thread_cnt: 4,
         };
         let mut idx = 3;
@@ -75,6 +107,8 @@ mod daemon {
                 "--async" => res.as_async = true,
                 "--uring" => res.as_uring = true,
                 "--sync-blocking" => res.sync_blocking = true,
+                "--kernel-passthrough" => res.kernel_passthrough = true,
+                "--no-writeback" => res.no_writeback = true,
                 "--threads" => {
                     idx += 1;
                     if idx >= args.len() {
@@ -109,23 +143,42 @@ mod daemon {
         Ok(res)
     }
 
-    fn create_server(src: &str) -> Arc<Server<Arc<Vfs>>> {
-        let vfs = Vfs::new(VfsOptions {
+    fn create_server(
+        src: &str,
+        backing_files: Option<Arc<FuseBackingFiles>>,
+        no_writeback: bool,
+    ) -> Arc<Server<Arc<Vfs>>> {
+        let mut opts = VfsOptions {
             no_open: false,
             no_opendir: false,
+            // The kernel ignores FUSE_PASSTHROUGH along with the writeback cache.
+            no_writeback: no_writeback || backing_files.is_some(),
             ..Default::default()
-        });
+        };
+        if backing_files.is_some() {
+            opts.out_opts |= FsOptions::PASSTHROUGH;
+        }
+        let vfs = Vfs::new(opts);
 
         let cfg = Config {
             root_dir: src.to_string(),
             do_import: false,
             ..Default::default()
         };
-        let fs = PassthroughFs::<()>::new(cfg).unwrap();
+        let mut fs = PassthroughFs::<()>::new(cfg).unwrap();
         fs.import().unwrap();
+        let passthrough = backing_files.is_some();
+        if let Some(files) = backing_files {
+            fs.set_backing_files(files);
+        }
 
         vfs.mount(Box::new(fs), "/").unwrap();
-        Arc::new(Server::new(Arc::new(vfs)))
+        let server = Arc::new(Server::new(Arc::new(vfs)));
+        if passthrough {
+            // Allow a source directory on a stacked file system such as overlayfs.
+            server.set_max_stack_depth(2).unwrap();
+        }
+        server
     }
 
     /// Serve requests with `thread_cnt` synchronous worker threads until a
@@ -223,7 +276,7 @@ mod daemon {
             }
         }
         info!(
-            "passthrough src {} mountpoint {} mode {} threads {}",
+            "passthrough src {} mountpoint {} mode {} threads {} kernel passthrough {} writeback {}",
             args.src,
             args.dest,
             if args.as_uring {
@@ -236,11 +289,20 @@ mod daemon {
                 "sync"
             },
             args.thread_cnt,
+            args.kernel_passthrough,
+            !(args.no_writeback || args.kernel_passthrough),
         );
 
-        let server = create_server(&args.src);
+        let backing_files = args
+            .kernel_passthrough
+            .then(|| Arc::new(FuseBackingFiles::default()));
+        let server = create_server(&args.src, backing_files.clone(), args.no_writeback);
         let mut se = FuseSession::new(Path::new(&args.dest), "bench_passthru", "", false).unwrap();
         se.mount().unwrap();
+        if let Some(files) = backing_files {
+            let fuse_file = se.get_fuse_file().unwrap().try_clone()?;
+            files.fuse_file.set(fuse_file).unwrap();
+        }
 
         if args.as_uring {
             run_uring(server, se, args.thread_cnt);
