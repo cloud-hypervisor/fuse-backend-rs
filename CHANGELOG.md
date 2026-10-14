@@ -31,6 +31,8 @@
   transport on `Error::UringNotSupported`.
 - `AsyncFileSystem` methods default to calling their `FileSystem` counterparts, so a
   file system only implements the handlers it serves asynchronously.
+- `FuseSession::detach()` lazily unmounts a Linux session through `&self`, so the owner of a
+  serving layer can start the teardown while another thread waits in `FuseServing::wait()`.
 
 ### Changed
 - [254](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/254): `fuse-backend-rs` is now a thin facade re-exporting the sub-crates. Every

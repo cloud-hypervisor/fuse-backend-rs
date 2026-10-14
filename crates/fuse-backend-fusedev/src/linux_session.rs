@@ -14,7 +14,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::os::unix::io::AsRawFd;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, PoisonError};
 
 use crate::{FuseChannelExt, FuseDevReaderExt, FuseSessionExt};
 use mio::{Events, Poll, Token, Waker};
@@ -64,6 +64,10 @@ pub struct FuseSession {
     // fusermount binary, default to fusermount3
     fusermount: String,
     mount_flags: Option<MsFlags>,
+    // Set once detach() has unmounted the file system. A detached mount that is still in use
+    // keeps the connection up, so umount() and later detach() calls check this flag to avoid
+    // unmounting the mountpoint again. Another mount may be there by then.
+    detached: Mutex<bool>,
 }
 
 impl FuseSession {
@@ -106,6 +110,7 @@ impl FuseSession {
             fusermount: FUSERMOUNT_BIN.to_string(),
             allow_other: true,
             mount_flags: None,
+            detached: Mutex::new(false),
         })
     }
 
@@ -229,19 +234,58 @@ impl FuseSession {
             .map_err(|e| SessionFailure(format!("set fd nonblocking: {e}")))?;
         self.file = Some(file);
         self.keep_alive = socket;
+        *self
+            .detached
+            .get_mut()
+            .unwrap_or_else(PoisonError::into_inner) = false;
 
         Ok(())
     }
 
     /// Destroy a fuse session.
     pub fn umount(&mut self) -> Result<()> {
+        let detached = std::mem::take(
+            self.detached
+                .get_mut()
+                .unwrap_or_else(PoisonError::into_inner),
+        );
         // If we have a keep_alive socket, just drop it,
         // and let fusermount do the unmount.
         if let (None, Some(file)) = (self.keep_alive.take(), self.file.take()) {
+            if detached {
+                // detach() already unmounted it, so just close the fd.
+                return Ok(());
+            }
             fuse_kern_umount(&self.mountpoint, file, &self.fusermount, self.target_mntns)
         } else {
             Ok(())
         }
+    }
+
+    /// Lazily unmount the file system, like `umount -l`.
+    ///
+    /// Unlike [`FuseSession::umount()`], this takes `&self` and keeps the fuse fd open, so it
+    /// works through [`FuseServing::session()`](crate::FuseServing::session) while another thread
+    /// blocks in [`FuseServing::wait()`](crate::FuseServing::wait). Once nothing in the mount is
+    /// in use, the kernel tears the connection down and the workers stop.
+    ///
+    /// It unmounts at most once, and a later `umount()` doesn't unmount again. So neither of them
+    /// unmounts another file system mounted at the mountpoint after the detach. With
+    /// `auto_unmount`, fusermount still unmounts the mountpoint once `umount()` closes the session.
+    /// Like `umount()`, it does nothing once the connection is torn down. That includes a
+    /// connection aborted through `/sys/fs/fuse/connections` whose mount is still in place.
+    pub fn detach(&self) -> Result<()> {
+        let Some(file) = &self.file else {
+            return Ok(());
+        };
+        // Hold the lock across the unmount, so concurrent calls unmount only once.
+        let mut detached = self.detached.lock().unwrap_or_else(PoisonError::into_inner);
+        if *detached || is_torn_down(file) {
+            return Ok(());
+        }
+        fuse_lazy_umount(&self.mountpoint, &self.fusermount, self.target_mntns)?;
+        *detached = true;
+        Ok(())
     }
 
     /// Create a new fuse message channel.
