@@ -545,26 +545,7 @@ impl FileSystem for Vfs {
     ) -> Result<()> {
         match self.get_real_rootfs(inode)? {
             (Left(fs), idata) => {
-                fs.readdir(
-                    ctx,
-                    idata.ino(),
-                    handle,
-                    size,
-                    offset,
-                    &mut |mut dir_entry| {
-                        match self.mountpoints.load().get(&dir_entry.ino) {
-                            // cross mountpoint, return mount root entry
-                            Some(mnt) => {
-                                dir_entry.ino = self.convert_inode(mnt.fs_idx, mnt.ino)?;
-                            }
-                            None => {
-                                dir_entry.ino =
-                                    self.convert_inode(idata.fs_idx(), dir_entry.ino)?;
-                            }
-                        }
-                        add_entry(dir_entry)
-                    },
-                )
+                self.readdir_pseudo(fs, idata, ctx, handle, size, offset, add_entry)
             }
 
             (Right(fs), idata) => fs.readdir(
@@ -592,28 +573,9 @@ impl FileSystem for Vfs {
         add_entry: &mut dyn FnMut(DirEntry, Entry) -> Result<usize>,
     ) -> Result<()> {
         match self.get_real_rootfs(inode)? {
-            (Left(fs), idata) => fs.readdirplus(
-                ctx,
-                idata.ino(),
-                handle,
-                size,
-                offset,
-                &mut |mut dir_entry, mut entry| {
-                    match self.mountpoints.load().get(&dir_entry.ino) {
-                        Some(mnt) => {
-                            // cross mountpoint, return mount root entry
-                            dir_entry.ino = self.convert_inode(mnt.fs_idx, mnt.ino)?;
-                            entry = mnt.root_entry;
-                        }
-                        None => {
-                            dir_entry.ino = self.convert_inode(idata.fs_idx(), dir_entry.ino)?;
-                            entry.inode = dir_entry.ino;
-                        }
-                    }
-                    entry.attr.st_ino = entry.inode;
-                    add_entry(dir_entry, entry)
-                },
-            ),
+            (Left(fs), idata) => {
+                self.readdirplus_pseudo(fs, idata, ctx, handle, size, offset, add_entry)
+            }
 
             (Right(fs), idata) => fs.readdirplus(
                 ctx,
@@ -621,11 +583,9 @@ impl FileSystem for Vfs {
                 handle,
                 size,
                 offset,
-                &mut |mut dir_entry, mut entry| {
-                    dir_entry.ino = self.convert_inode(idata.fs_idx(), entry.inode)?;
-                    entry.inode = dir_entry.ino;
-                    entry.attr.st_ino = entry.inode;
-                    self.remap_attr_id(idata.fs_idx(), true, &mut entry.attr);
+                &mut |mut dir_entry, entry| {
+                    let entry = self.convert_backend_entry(idata, entry)?;
+                    dir_entry.ino = entry.inode;
                     add_entry(dir_entry, entry)
                 },
             ),
