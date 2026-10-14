@@ -210,6 +210,16 @@ impl File {
         }
     }
 
+    /// Whether IO on this file goes through io_uring rather than blocking syscalls.
+    pub(crate) fn uses_io_uring(&self) -> bool {
+        match self {
+            File::Tokio(_) => false,
+            #[cfg(target_os = "linux")]
+            File::Uring(_) => true,
+            File::Borrowed { .. } => !RUNTIME_TYPE.file_io_blocks(),
+        }
+    }
+
     /// Get metadata about the file.
     pub fn metadata(&self) -> std::io::Result<std::fs::Metadata> {
         // Safe because we have manually forget() the `file` object below.
@@ -295,8 +305,54 @@ impl<T> Drop for ForgetOnDrop<T> {
     }
 }
 
+/// The most buffers one `preadv()` or `pwritev()` call accepts.
+#[cfg(target_os = "linux")]
+const IOV_MAX: usize = libc::UIO_MAXIOV as usize;
+/// The most buffers one `preadv()` or `pwritev()` call accepts.
+#[cfg(target_os = "macos")]
+const IOV_MAX: usize = libc::IOV_MAX as usize;
+
+/// Transfer `chunks` in order with one call of `io` each, and return the total count. Each
+/// chunk comes with its full length, and `io` gets the file offset of the chunk. It stops after
+/// a short transfer. Like a single call, it returns the count transferred so far if a later call
+/// fails.
+fn transfer_chunks<C>(
+    chunks: impl Iterator<Item = (C, usize)>,
+    offset: u64,
+    mut io: impl FnMut(C, u64) -> std::io::Result<usize>,
+) -> std::io::Result<usize> {
+    let mut count = 0;
+    for (chunk, len) in chunks {
+        match io(chunk, offset + count as u64) {
+            Ok(n) => {
+                count += n;
+                if n < len {
+                    break;
+                }
+            }
+            Err(_) if count > 0 => break,
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(count)
+}
+
 /// A simple wrapper over posix `preadv` to deal with `FileVolatileBuf`.
+///
+/// It fills the buffers in order and sets their sizes. With more than `IOV_MAX` buffers, it
+/// calls `preadv` once per `IOV_MAX` buffers, and stops after a short read. Like a single call,
+/// it returns the count read so far if a later call fails.
 pub fn preadv(fd: RawFd, bufs: &mut [FileVolatileBuf], offset: u64) -> std::io::Result<usize> {
+    let chunks = bufs.chunks_mut(IOV_MAX).map(|chunk| {
+        let space = chunk.iter().map(|b| b.cap() - b.len()).sum();
+        (chunk, space)
+    });
+    transfer_chunks(chunks, offset, |chunk, offset| {
+        preadv_once(fd, chunk, offset)
+    })
+}
+
+fn preadv_once(fd: RawFd, bufs: &mut [FileVolatileBuf], offset: u64) -> std::io::Result<usize> {
     let iov: Vec<IoSliceMut> = bufs.iter().map(|v| v.io_slice_mut()).collect();
 
     loop {
@@ -333,7 +389,20 @@ pub fn preadv(fd: RawFd, bufs: &mut [FileVolatileBuf], offset: u64) -> std::io::
 }
 
 /// A simple wrapper over posix `pwritev` to deal with `FileVolatileBuf`.
+///
+/// It writes the data of the buffers in order. With more than `IOV_MAX` buffers, it calls
+/// `pwritev` once per `IOV_MAX` buffers, and stops after a short write. Like a single call,
+/// it returns the count written so far if a later call fails.
 pub fn pwritev(fd: RawFd, bufs: &[FileVolatileBuf], offset: u64) -> std::io::Result<usize> {
+    let chunks = bufs
+        .chunks(IOV_MAX)
+        .map(|chunk| (chunk, chunk.iter().map(|b| b.len()).sum()));
+    transfer_chunks(chunks, offset, |chunk, offset| {
+        pwritev_once(fd, chunk, offset)
+    })
+}
+
+fn pwritev_once(fd: RawFd, bufs: &[FileVolatileBuf], offset: u64) -> std::io::Result<usize> {
     let iov: Vec<IoSlice> = bufs.iter().map(|v| v.io_slice()).collect();
 
     loop {

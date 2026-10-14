@@ -523,6 +523,13 @@ mod async_io {
             mut bufs: Vec<FileVolatileBuf>,
             mut offset: u64,
         ) -> (Result<usize>, Vec<FileVolatileBuf>) {
+            // Without io_uring, every read is a blocking syscall, so splitting the buffers
+            // over several reads only adds syscalls. Read them all with one preadv().
+            if !self.uses_io_uring() {
+                return self.async_readv_at(bufs, offset).await;
+            }
+
+            // With io_uring, submit up to four reads at once.
             if bufs.is_empty() {
                 return (Ok(0), bufs);
             } else if bufs.len() == 1 {
@@ -681,6 +688,13 @@ mod async_io {
             mut bufs: Vec<FileVolatileBuf>,
             mut offset: u64,
         ) -> (Result<usize>, Vec<FileVolatileBuf>) {
+            // Without io_uring, every write is a blocking syscall, so splitting the buffers
+            // over several writes only adds syscalls. Write them all with one pwritev().
+            if !self.uses_io_uring() {
+                return self.async_writev_at(bufs, offset).await;
+            }
+
+            // With io_uring, submit up to four writes at once.
             if bufs.is_empty() {
                 return (Ok(0), bufs);
             } else if bufs.len() == 1 {
@@ -873,6 +887,97 @@ mod async_io {
         use super::*;
         use crate::async_runtime::block_on;
         use crate::file_buf::FileVolatileSlice;
+        use std::os::unix::io::AsRawFd;
+
+        /// Buffers over consecutive pieces of `mem` with the given sizes. They hold data to
+        /// write if `full`, and are empty to read into otherwise.
+        fn split_bufs(mem: &mut [u8], sizes: &[usize], full: bool) -> Vec<FileVolatileBuf> {
+            assert_eq!(sizes.iter().sum::<usize>(), mem.len());
+            let mut pos = 0;
+            sizes
+                .iter()
+                .map(|&size| {
+                    let len = if full { size } else { 0 };
+                    // Safe because the buffers don't outlive `mem`.
+                    let buf = unsafe {
+                        FileVolatileBuf::from_raw_ptr(mem[pos..].as_mut_ptr(), len, size)
+                    };
+                    pos += size;
+                    buf
+                })
+                .collect()
+        }
+
+        /// Write `data` at `offset` from buffers of `write_sizes` bytes, which must be the
+        /// end of the file, then read it back into buffers of `read_sizes` bytes, which reach
+        /// past the end of the file.
+        async fn check_vectored_io(
+            file: &File,
+            data: &[u8],
+            offset: u64,
+            write_sizes: &[usize],
+            read_sizes: &[usize],
+        ) {
+            let mut src = data.to_vec();
+            let bufs = split_bufs(&mut src, write_sizes, true);
+            let (res, bufs) = file.async_write_vectored_at_volatile(bufs, offset).await;
+            assert_eq!(res.unwrap(), data.len());
+            assert_eq!(bufs.len(), write_sizes.len());
+
+            let mut dst = vec![0u8; read_sizes.iter().sum()];
+            assert!(dst.len() > data.len());
+            let bufs = split_bufs(&mut dst, read_sizes, false);
+            let (res, bufs) = file.async_read_vectored_at_volatile(bufs, offset).await;
+            assert_eq!(res.unwrap(), data.len());
+            // The buffers fill in order, up to the end of the file.
+            let mut left = data.len();
+            for (buf, &size) in bufs.iter().zip(read_sizes) {
+                let n = std::cmp::min(left, size);
+                assert_eq!(buf.len(), n);
+                left -= n;
+            }
+            assert_eq!(&dst[..data.len()], data);
+        }
+
+        /// Vectored IO moves the right data through many buffers. The runtime's own file uses
+        /// io_uring when the runtime does, a borrowed descriptor follows the runtime, and a tokio
+        /// file always makes blocking syscalls.
+        #[test]
+        fn async_vectored_io_data() {
+            let dir = tempfile::tempdir().unwrap();
+            let open = |name: &str| {
+                std::fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .create(true)
+                    .truncate(true)
+                    .open(dir.path().join(name))
+                    .unwrap()
+            };
+
+            let data: Vec<u8> = (0..20000u32).map(|i| (i % 251) as u8).collect();
+            // The read buffers end where no write buffer ends.
+            let write_sizes = [1, 4096, 3, 100, 4096, 7, 2000, 9697];
+            let read_sizes = [13, 4096, 1, 500, 8192, 7000, 4096];
+            // More buffers than one preadv() or pwritev() call takes.
+            let many: Vec<u8> = (0..4500u32).map(|i| (i % 241) as u8).collect();
+            let many_write_sizes = vec![3; 1500];
+            let many_read_sizes = vec![4; 1200];
+
+            let owner = open("borrowed");
+            block_on(async {
+                let files = [
+                    File::from_std_file(open("runtime")),
+                    File::borrow_fd(owner.as_raw_fd(), Arc::new(())),
+                    File::Tokio(tokio::fs::File::from_std(open("tokio"))),
+                ];
+                for file in files.iter() {
+                    check_vectored_io(file, &data, 5, &write_sizes, &read_sizes).await;
+                    check_vectored_io(file, &many, 30000, &many_write_sizes, &many_read_sizes)
+                        .await;
+                }
+            });
+        }
 
         #[test]
         fn io_uring_async_read_at_volatile() {
