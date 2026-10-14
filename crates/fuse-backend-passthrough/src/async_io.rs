@@ -59,6 +59,7 @@ use fuse_backend_core::api::filesystem::{
 };
 use fuse_backend_core::async_file::File as AsyncFile;
 use fuse_backend_core::async_runtime::{self, Runtime};
+use fuse_backend_core::buffer::pagesize;
 use fuse_backend_core::file_buf::FileVolatileSlice;
 use fuse_backend_core::file_traits::{AsyncFileReadWriteVolatile, FileReadWriteVolatile};
 
@@ -271,17 +272,17 @@ impl<S: BitmapSlice + Send + Sync + 'static> PassthroughFs<S> {
             ));
         }
         let buf = Self::run_on_pool(fs, ctx, move |fs, _ctx| {
-            let mut buf = OwnedWriter::new(size as usize)?;
-            fs.do_read(&data, &mut buf, size, offset, flags)?;
-            Ok(buf.data)
+            let mut buf = PoolBuf::new(size as usize)?;
+            fs.do_read(&data, &mut buf, size, offset, flags, true)?;
+            Ok(buf)
         })
         .await?;
-        w.write_all(&buf)?;
-        Ok(buf.len())
+        w.write_all(buf.data())?;
+        Ok(buf.len)
     }
 
-    /// Copy the payload of a WRITE out of `r`, and serve the WRITE with the
-    /// synchronous handler on the blocking thread pool.
+    /// Copy the payload of a WRITE out of `r`, and serve the WRITE with
+    /// `do_write()` on the blocking thread pool.
     ///
     /// The copy runs on the runtime thread before the pool task starts, so
     /// the pool thread never accesses the transport buffer behind `r`, which
@@ -297,26 +298,14 @@ impl<S: BitmapSlice + Send + Sync + 'static> PassthroughFs<S> {
         r: &mut (dyn AsyncZeroCopyReader + Send),
         size: u32,
         offset: u64,
-        lock_owner: Option<u64>,
-        delayed_write: bool,
         flags: u32,
         fuse_flags: u32,
     ) -> io::Result<usize> {
-        let mut data = Vec::with_capacity(size as usize);
-        r.read_to(&mut PayloadSink(&mut data), size as usize, 0)?;
-        Self::run_on_pool(fs, ctx, move |fs, ctx| {
-            fs.write(
-                &ctx,
-                inode,
-                handle,
-                &mut OwnedReader { data, pos: 0 },
-                size,
-                offset,
-                lock_owner,
-                delayed_write,
-                flags,
-                fuse_flags,
-            )
+        let mut buf = PoolBuf::new(size as usize)?;
+        r.read_to(&mut PayloadSink(&mut buf), size as usize, 0)?;
+        Self::run_on_pool(fs, ctx, move |fs, _ctx| {
+            let data = fs.get_data(handle, inode, libc::O_RDWR)?;
+            fs.do_write(&data, &mut buf, size, offset, flags, fuse_flags, true)
         })
         .await
     }
@@ -462,29 +451,81 @@ impl FileReadWriteVolatile for NowaitFile<'_> {
     }
 }
 
-/// A reply buffer of at most `limit` bytes that a pool thread owns, in
-/// place of the transport's writer, see `PassthroughFs::read_on_pool()`.
-struct OwnedWriter {
-    data: Vec<u8>,
-    limit: usize,
+/// A page-aligned buffer that a pool thread owns in place of a transport
+/// buffer, see `PassthroughFs::read_on_pool()` and `write_on_pool()`. The
+/// alignment lets an O_DIRECT request do its IO on it directly, without the
+/// bounce buffer of `read_direct()` and `write_direct()`. A READ fills the
+/// buffer up to its capacity. A WRITE copies its payload in and then reads
+/// it out from `pos`.
+struct PoolBuf {
+    /// Holds the data from the first page boundary in its spare capacity.
+    mem: Vec<u8>,
+    /// Offset of the first page boundary in `mem`.
+    start: usize,
+    /// Size of the buffer that the caller asked for.
+    capacity: usize,
+    len: usize,
+    pos: usize,
 }
 
-impl OwnedWriter {
-    /// Fails with ENOMEM if it can't allocate `limit` bytes, where
-    /// `Vec::with_capacity()` would abort the process.
-    fn new(limit: usize) -> io::Result<Self> {
-        let mut data = Vec::new();
-        data.try_reserve_exact(limit)
-            .map_err(|_| io::Error::from_raw_os_error(libc::ENOMEM))?;
-        Ok(OwnedWriter { data, limit })
+impl PoolBuf {
+    /// Fails with ENOMEM if it can't allocate `capacity` bytes, where
+    /// `Vec::with_capacity()` would abort the process. It allocates a page
+    /// more than `capacity`, so the buffer can start at a page boundary.
+    fn new(capacity: usize) -> io::Result<Self> {
+        let enomem = || io::Error::from_raw_os_error(libc::ENOMEM);
+        let page = pagesize();
+        let mut mem = Vec::new();
+        mem.try_reserve_exact(capacity.checked_add(page).ok_or_else(enomem)?)
+            .map_err(|_| enomem())?;
+        let addr = mem.as_ptr() as usize;
+        let start = addr.next_multiple_of(page) - addr;
+        Ok(PoolBuf {
+            mem,
+            start,
+            capacity,
+            len: 0,
+            pos: 0,
+        })
+    }
+
+    fn data(&self) -> &[u8] {
+        // SAFETY: `start + len` is within the vector's capacity, and the
+        // first `len` bytes from `start` are initialized.
+        unsafe { std::slice::from_raw_parts(self.mem.as_ptr().add(self.start), self.len) }
+    }
+
+    /// The page-aligned start of the buffer.
+    fn as_mut_ptr(&mut self) -> *mut u8 {
+        // SAFETY: `start` is less than a page, and the vector has a page more
+        // capacity than the buffer.
+        unsafe { self.mem.as_mut_ptr().add(self.start) }
+    }
+
+    fn spare_len(&self) -> usize {
+        self.capacity - self.len
+    }
+
+    /// Append up to `len` bytes from `src`, as many as fit, and return the
+    /// count.
+    ///
+    /// # Safety
+    ///
+    /// `src` must be valid for reads of `len` bytes, and must not point into
+    /// this buffer.
+    unsafe fn append(&mut self, src: *const u8, len: usize) -> usize {
+        let n = std::cmp::min(len, self.spare_len());
+        std::ptr::copy_nonoverlapping(src, self.as_mut_ptr().add(self.len), n);
+        self.len += n;
+        n
     }
 }
 
-impl io::Write for OwnedWriter {
+impl io::Write for PoolBuf {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        let n = std::cmp::min(buf.len(), self.limit - self.data.len());
-        self.data.extend_from_slice(&buf[..n]);
-        Ok(n)
+        // SAFETY: `buf` is valid for reads and doesn't point into `self`,
+        // which is borrowed mutably.
+        Ok(unsafe { self.append(buf.as_ptr(), buf.len()) })
     }
 
     fn flush(&mut self) -> io::Result<()> {
@@ -492,21 +533,19 @@ impl io::Write for OwnedWriter {
     }
 }
 
-impl ZeroCopyWriter for OwnedWriter {
+impl ZeroCopyWriter for PoolBuf {
     fn write_from(
         &mut self,
         f: &mut dyn FileReadWriteVolatile,
         count: usize,
         off: u64,
     ) -> io::Result<usize> {
-        let start = self.data.len();
-        let count = std::cmp::min(count, self.limit - start);
-        // `new()` reserved `limit` bytes, so the spare capacity holds `count`.
-        let spare = &mut self.data.spare_capacity_mut()[..count];
-        // SAFETY: the slice covers `spare`, which stays valid during the read.
-        // The read only writes to it, so its bytes don't need to be
-        // initialized.
-        let slice = unsafe { FileVolatileSlice::from_raw_ptr(spare.as_mut_ptr().cast(), count) };
+        let count = std::cmp::min(count, self.spare_len());
+        // SAFETY: the slice covers spare capacity of the buffer, which stays
+        // valid during the read. The read only writes to it, so its bytes
+        // don't need to be initialized.
+        let slice =
+            unsafe { FileVolatileSlice::from_raw_ptr(self.as_mut_ptr().add(self.len), count) };
         // Retry a read that a signal interrupted, as the native path does.
         let n = loop {
             match f.read_at_volatile(slice, off) {
@@ -514,49 +553,42 @@ impl ZeroCopyWriter for OwnedWriter {
                 res => break res?,
             }
         };
-        // SAFETY: the read initialized the first `n` bytes of `spare`. This
-        // runs only in `PassthroughFs::read()`, where `f` is a `std::fs::File`
+        // The read initialized the first `n` bytes of the slice. This runs
+        // only in `PassthroughFs::do_read()`, where `f` is a `std::fs::File`
         // that reads with `pread()`, which returns the count it wrote.
-        unsafe { self.data.set_len(start + std::cmp::min(n, count)) };
+        self.len += std::cmp::min(n, count);
         Ok(n)
     }
 
     fn available_bytes(&self) -> usize {
-        self.limit - self.data.len()
+        self.spare_len()
     }
 }
 
-/// The payload of a WRITE that a pool thread owns, in place of the
-/// transport's reader, see `PassthroughFs::write_on_pool()`.
-struct OwnedReader {
-    data: Vec<u8>,
-    pos: usize,
-}
-
-impl io::Read for OwnedReader {
+impl io::Read for PoolBuf {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        let n = std::cmp::min(buf.len(), self.data.len() - self.pos);
-        buf[..n].copy_from_slice(&self.data[self.pos..self.pos + n]);
+        let n = std::cmp::min(buf.len(), self.len - self.pos);
+        buf[..n].copy_from_slice(&self.data()[self.pos..self.pos + n]);
         self.pos += n;
         Ok(n)
     }
 }
 
-impl ZeroCopyReader for OwnedReader {
+impl ZeroCopyReader for PoolBuf {
     fn read_to(
         &mut self,
         f: &mut dyn FileReadWriteVolatile,
         count: usize,
         off: u64,
     ) -> io::Result<usize> {
-        let count = std::cmp::min(count, self.data.len() - self.pos);
+        let count = std::cmp::min(count, self.len - self.pos);
         if count == 0 {
             return Ok(0);
         }
-        // Safe because the slice points into `self.data`, which outlives it,
-        // and a write only reads from it.
+        // SAFETY: the slice covers initialized bytes of the buffer, which
+        // stays valid during the write, and a write only reads from it.
         let slice =
-            unsafe { FileVolatileSlice::from_raw_ptr(self.data[self.pos..].as_mut_ptr(), count) };
+            unsafe { FileVolatileSlice::from_raw_ptr(self.as_mut_ptr().add(self.pos), count) };
         // Retry a write that a signal interrupted, as the native path does.
         let n = loop {
             match f.write_at_volatile(slice, off) {
@@ -569,29 +601,20 @@ impl ZeroCopyReader for OwnedReader {
     }
 }
 
-/// A file that appends the data written to it to a vector, so that
+/// A file that appends the data written to it to a `PoolBuf`, so that
 /// `PassthroughFs::write_on_pool()` copies the payload of a WRITE out of the
-/// request with one call. It copies into the spare capacity, which the
-/// vector doesn't have to zero first, and takes no more than that. It
+/// request with one call. It takes no more than the buffer's capacity, and
 /// ignores the file offsets.
-struct PayloadSink<'a>(&'a mut Vec<u8>);
+struct PayloadSink<'a>(&'a mut PoolBuf);
 
 impl PayloadSink<'_> {
     fn append(&mut self, bufs: &[FileVolatileSlice]) -> usize {
         let mut count = 0;
         for buf in bufs {
-            let len = self.0.len();
-            let spare = self.0.spare_capacity_mut();
-            let n = std::cmp::min(buf.len(), spare.len());
             // SAFETY: whoever created `buf` guarantees that it's valid for
-            // reads of `buf.len()` bytes, and `spare` is valid for writes of
-            // `spare.len()` bytes. They don't overlap, because `spare` belongs
-            // to the vector, which `self` borrows mutably. The copy
-            // initializes the first `n` bytes of `spare`.
-            unsafe {
-                std::ptr::copy_nonoverlapping(buf.as_ptr(), spare.as_mut_ptr().cast(), n);
-                self.0.set_len(len + n);
-            }
+            // reads of `buf.len()` bytes. It doesn't point into the pool
+            // buffer, which `self` borrows mutably.
+            let n = unsafe { self.0.append(buf.as_ptr(), buf.len()) };
             count += n;
             if n < buf.len() {
                 break;
@@ -768,13 +791,14 @@ impl<S: BitmapSlice + Send + Sync + 'static> AsyncFileSystem for PassthroughFs<S
         // ext4 and XFS reject it with `EINVAL`. `do_read()` stages the data
         // through a page-aligned bounce buffer instead (`read_direct()`), and
         // blocks the thread it runs on for the duration of the read.
-        // With the thread pool enabled, that's a pool thread, see
+        // With the thread pool enabled, that's a pool thread, which reads
+        // into its page-aligned buffer without a bounce buffer, see
         // `read_on_pool()`, and otherwise the runtime thread.
         let data = self.get_data(handle, inode, libc::O_RDONLY)?;
         if flags & (libc::O_DIRECT as u32) != 0 {
             return match self.pool_fs() {
                 Some(fs) => Self::read_on_pool(fs, ctx, data, w, size, offset, flags).await,
-                None => self.do_read(&data, w, size, offset, flags),
+                None => self.do_read(&data, w, size, offset, flags, false),
             };
         }
 
@@ -842,25 +866,16 @@ impl<S: BitmapSlice + Send + Sync + 'static> AsyncFileSystem for PassthroughFs<S
         // issued while this future is suspended could run with the capability
         // already dropped and lose the setgid bit it must preserve.
         // With the thread pool enabled, a pool thread serves these relayed
-        // requests, and on the tokio runtime every WRITE, see
-        // `write_on_pool()`. The synchronous handler drops and restores
-        // CAP_FSETID on the pool thread, with no `.await` in between.
+        // requests, and on the tokio runtime every WRITE, with `do_write()`
+        // from its page-aligned buffer, which needs no bounce buffer, see
+        // `write_on_pool()`. `do_write()` drops and restores CAP_FSETID on
+        // the pool thread, with no `.await` in between.
         let relay = flags & (libc::O_DIRECT as u32) != 0
             || (self.killpriv_v2.load(Ordering::Relaxed) && fuse_flags & WRITE_KILL_PRIV != 0);
         if relay || async_runtime::runtime_type().file_io_blocks() {
             if let Some(fs) = self.pool_fs() {
                 return Self::write_on_pool(
-                    fs,
-                    ctx,
-                    inode,
-                    handle,
-                    r,
-                    size,
-                    offset,
-                    lock_owner,
-                    delayed_write,
-                    flags,
-                    fuse_flags,
+                    fs, ctx, inode, handle, r, size, offset, flags, fuse_flags,
                 )
                 .await;
             }
@@ -1566,6 +1581,36 @@ mod tests {
         assert_eq!(&content, b"async data");
     }
 
+    /// Whether the file system of `dir` supports O_DIRECT. Prints why `test`
+    /// skips if it doesn't.
+    fn supports_direct_io(dir: &TempDir, test: &str) -> bool {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        let path = dir.as_path().join("direct_io_probe");
+        match std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .custom_flags(libc::O_DIRECT)
+            .open(&path)
+        {
+            Ok(_) => {
+                std::fs::remove_file(&path).unwrap();
+                true
+            }
+            Err(e) if e.raw_os_error() == Some(libc::EINVAL) => {
+                eprintln!(
+                    "skipping {}: {:?} does not support O_DIRECT",
+                    test,
+                    dir.as_path()
+                );
+                false
+            }
+            Err(e) => panic!("unexpected error opening {:?} with O_DIRECT: {}", path, e),
+        }
+    }
+
     // O_DIRECT and WRITE_KILL_PRIV requests are relayed to the synchronous
     // handlers (see `async_read()`/`async_write()`): the synchronous handler
     // stages direct-IO payloads through a page-aligned bounce buffer, which
@@ -1577,32 +1622,12 @@ mod tests {
     // keep the test from being environment-dependent.
     #[test]
     fn test_async_direct_io_relayed() {
-        use std::os::unix::fs::OpenOptionsExt;
-
         const BLOCK: usize = 4096;
         const KILLPRIV_BLOCK: usize = 512;
 
         let dir = TempDir::new().expect("Cannot create temporary directory.");
-        let path = dir.as_path().join("async_direct_file");
-
-        // Probe: does the filesystem support O_DIRECT at all?
-        match std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .custom_flags(libc::O_DIRECT)
-            .open(&path)
-        {
-            Ok(_) => std::fs::remove_file(&path).unwrap(),
-            Err(e) if e.raw_os_error() == Some(libc::EINVAL) => {
-                eprintln!(
-                    "skipping test_async_direct_io_relayed: {:?} does not support O_DIRECT",
-                    dir.as_path()
-                );
-                return;
-            }
-            Err(e) => panic!("unexpected error opening {:?} with O_DIRECT: {}", path, e),
+        if !supports_direct_io(&dir, "test_async_direct_io_relayed") {
+            return;
         }
 
         // `do_import: false` enables killpriv_v2 at init(), so the
@@ -1719,6 +1744,85 @@ mod tests {
 
         let content = std::fs::read(dir.as_path().join("async_killpriv_file")).unwrap();
         assert_eq!(content, killpriv_payload);
+    }
+
+    // With the thread pool, O_DIRECT requests do their IO on the pool's
+    // page-aligned buffer, without a bounce buffer. An unaligned buffer would
+    // fail with EINVAL.
+    // The O_DIRECT tests skip on file systems without direct IO, so check
+    // the alignment that they rely on here.
+    #[test]
+    fn test_pool_buf_page_aligned() {
+        for size in [0, 1, 4096, 1 << 20] {
+            let mut buf = PoolBuf::new(size).unwrap();
+            assert_eq!(buf.as_mut_ptr() as usize % pagesize(), 0);
+            assert_eq!(buf.available_bytes(), size);
+        }
+        assert!(PoolBuf::new(usize::MAX).is_err());
+    }
+
+    #[test]
+    fn test_async_pool_direct_io() {
+        const BLOCK: usize = 4096;
+
+        let (fs, dir) = prepare_async_fs_shared(true);
+        if !supports_direct_io(&dir, "test_async_pool_direct_io") {
+            return;
+        }
+        let ctx = prepare_context();
+        let name = CString::new("direct_file").unwrap();
+        let flags = libc::O_DIRECT as u32;
+        let payload: Vec<u8> = (0..2 * BLOCK).map(|i| (i % 251) as u8).collect();
+
+        async_runtime::block_on(async {
+            let args = CreateIn {
+                flags: (libc::O_RDWR | libc::O_CREAT | libc::O_DIRECT) as u32,
+                mode: 0o600,
+                umask: 0,
+                fuse_flags: 0,
+            };
+            let (entry, handle, _opts) = fs.async_create(&ctx, ROOT_ID, &name, args).await.unwrap();
+            let handle = handle.unwrap();
+
+            for (i, block) in payload.chunks(BLOCK).enumerate() {
+                let mut r = MemReader(block.to_vec());
+                let off = (i * BLOCK) as u64;
+                let n = fs
+                    .async_write(
+                        &ctx,
+                        entry.inode,
+                        handle,
+                        &mut r,
+                        BLOCK as u32,
+                        off,
+                        None,
+                        false,
+                        flags,
+                        0,
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(n, BLOCK);
+            }
+
+            let mut w = PathRecorder::new(&[], usize::MAX);
+            let n = fs
+                .async_read(
+                    &ctx,
+                    entry.inode,
+                    handle,
+                    &mut w,
+                    2 * BLOCK as u32,
+                    0,
+                    None,
+                    flags,
+                )
+                .await
+                .unwrap();
+            assert_eq!(n, 2 * BLOCK);
+            assert_eq!(w.data, payload);
+            assert!(w.events.is_empty());
+        });
     }
 
     #[test]
