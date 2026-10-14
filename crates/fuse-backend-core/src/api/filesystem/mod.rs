@@ -506,11 +506,11 @@ pub trait ZeroCopyWriter: io::Write {
     ///
     /// A transport that can send scattered memory may keep `buf` until the
     /// reply is sent and send it in place, without copying it into the reply
-    /// buffer. The default copies it with `write_all()`. With the writer the
-    /// server passes to `read()`, either all of `buf` is added or, on error,
-    /// none of it. Calls can be mixed with `write()`, and the reply keeps
-    /// their order. Each call boxes one buffer, so hand over whole chunks, not
-    /// small pieces.
+    /// buffer, as `FuseDevWriter` does. The default copies it with
+    /// `write_all()`. With the writer the server passes to `read()`, either
+    /// all of `buf` is added or, on error, none of it. Calls can be mixed with
+    /// `write()`, and the reply keeps their order. Each call boxes one buffer,
+    /// so hand over whole chunks, not small pieces.
     fn write_owned(&mut self, buf: ReplyBuf) -> io::Result<()> {
         self.write_all((*buf).as_ref())
     }

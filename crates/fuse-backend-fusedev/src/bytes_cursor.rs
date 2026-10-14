@@ -9,14 +9,21 @@ use crate::Error;
 #[derive(Debug, Default)]
 pub(crate) struct BytesCursor<'a> {
     slice: &'a mut [u8],
-    /// position <= slice.len()
+    /// position + reserved <= slice.len()
     position: usize,
+    /// Capacity taken by data sent from elsewhere, such as owned reply
+    /// buffers, that the slice doesn't hold.
+    reserved: usize,
 }
 
 impl<'a> BytesCursor<'a> {
     pub(crate) fn new(slice: &'a mut [u8], position: usize) -> Self {
         assert!(position <= slice.len());
-        BytesCursor { slice, position }
+        BytesCursor {
+            slice,
+            position,
+            reserved: 0,
+        }
     }
 
     // Test-only accessor for the whole underlying slice; production code
@@ -31,7 +38,7 @@ impl<'a> BytesCursor<'a> {
     }
 
     pub(crate) fn available_bytes(&self) -> usize {
-        self.slice.len() - self.position
+        self.slice.len() - self.position - self.reserved
     }
 
     pub(crate) fn check_available_space(&self, sz: usize) -> io::Result<()> {
@@ -49,6 +56,17 @@ impl<'a> BytesCursor<'a> {
         }
     }
 
+    /// Take `count` bytes of capacity without writing them to the slice.
+    pub(crate) fn reserve(&mut self, count: usize) -> io::Result<()> {
+        self.check_available_space(count)?;
+        self.reserved += count;
+        Ok(())
+    }
+
+    pub(crate) fn reserved(&self) -> usize {
+        self.reserved
+    }
+
     pub(crate) fn available_slice(&mut self) -> &mut [u8] {
         &mut self.slice[self.position..]
     }
@@ -63,6 +81,7 @@ impl<'a> BytesCursor<'a> {
     }
 
     pub(crate) fn split_at(&mut self, offset: usize) -> Result<BytesCursor<'a>, Error> {
+        debug_assert_eq!(self.reserved, 0, "split after reserve()");
         if self.slice.len() < offset {
             return Err(Error::SplitOutOfBounds(offset));
         }

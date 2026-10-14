@@ -30,7 +30,7 @@ use fuse_backend_core::file_traits::FileReadWriteVolatile;
 // Re-export the transport-neutral buffer types so the session backends below
 // can keep using `super::{Error::IoError, ...}` style imports, and so users
 // of this crate get the buffer surface it builds on from one place.
-pub use fuse_backend_core::buffer::{pagesize, Error, Reader, Result, Writer};
+pub use fuse_backend_core::buffer::{pagesize, Error, Reader, ReplyBuf, Result, Writer};
 
 mod bytes_cursor;
 use crate::bytes_cursor::BytesCursor;
@@ -70,6 +70,26 @@ pub use uring_session::*;
 pub const FUSE_KERN_BUF_PAGES: usize = 256;
 /// Maximum size of FUSE message header, 4K.
 pub const FUSE_HEADER_SIZE: usize = 0x1000;
+
+/// `FuseDevWriter` copies owned reply buffers shorter than this into its own
+/// buffer, because a memcpy of a few KiB costs less than an extra iovec.
+const OWNED_COPY_THRESHOLD: usize = 4096;
+
+/// The most owned buffers a writer keeps before it copies the rest. Each one
+/// adds at most two iovecs, so a reply made of a header writer and a data
+/// writer stays under the 1024 iovecs that `writev()` accepts.
+const MAX_OWNED_BUFS: usize = 255;
+
+/// Buffers handed over with `write_owned()`, each with the number of bytes in
+/// the writer's own buffer that were written before it.
+#[derive(Default)]
+struct OwnedBufs(Vec<(usize, ReplyBuf)>);
+
+impl std::fmt::Debug for OwnedBufs {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("OwnedBufs").field(&self.0.len()).finish()
+    }
+}
 
 /// A buffer reference wrapper for fuse requests.
 #[derive(Debug)]
@@ -138,6 +158,7 @@ pub struct FuseDevWriter<'a, S: BitmapSlice = ()> {
     fd: RawFd,
     buffered: bool,
     buf: BytesCursor<'a>,
+    owned: OwnedBufs,
     bitmapslice: S,
     phantom: PhantomData<&'a mut [S]>,
 }
@@ -150,6 +171,7 @@ impl<'a, S: BitmapSlice + Default> FuseDevWriter<'a, S> {
             fd,
             buffered: false,
             buf,
+            owned: OwnedBufs::default(),
             bitmapslice: S::default(),
             phantom: PhantomData,
         })
@@ -161,8 +183,12 @@ impl<'a, S: BitmapSlice> FuseDevWriter<'a, S> {
     ///
     /// After the split, `self` will be able to write up to `offset` bytes while the returned
     /// `Writer` can write up to `available_bytes() - offset` bytes.  Returns an error if
-    /// `offset > self.available_bytes()`.
+    /// `offset > self.available_bytes()`, or if `self` already holds buffers from
+    /// `write_owned()`.
     pub fn split_at(&mut self, offset: usize) -> Result<FuseDevWriter<'a, S>> {
+        if !self.owned.0.is_empty() {
+            return Err(Error::InvalidParameter);
+        }
         let buf2 = self.buf.split_at(offset)?;
 
         self.buffered = true;
@@ -171,6 +197,7 @@ impl<'a, S: BitmapSlice> FuseDevWriter<'a, S> {
             fd: self.fd,
             buffered: true,
             buf: buf2,
+            owned: OwnedBufs::default(),
             bitmapslice: self.bitmapslice.clone(),
             phantom: PhantomData,
         })
@@ -180,6 +207,10 @@ impl<'a, S: BitmapSlice> FuseDevWriter<'a, S> {
     pub fn commit(&mut self, other: Option<&FuseDevWriter<'a, S>>) -> io::Result<usize> {
         if !self.buffered {
             return Ok(0);
+        }
+
+        if let Some(res) = self.commit_owned(other) {
+            return res;
         }
 
         let o = other.map(|w| w.buf.written()).unwrap_or(&[]);
@@ -196,14 +227,67 @@ impl<'a, S: BitmapSlice> FuseDevWriter<'a, S> {
         res.map_err(|e| io::Error::from_raw_os_error(e as i32))
     }
 
-    /// Return number of bytes already written to the internal buffer.
+    /// Return number of bytes already written, including the buffers from
+    /// `write_owned()`.
     pub fn bytes_written(&self) -> usize {
-        self.buf.position()
+        self.buf.position() + self.buf.reserved()
     }
 
     /// Return number of bytes available for writing.
     pub fn available_bytes(&self) -> usize {
         self.buf.available_bytes()
+    }
+
+    /// Append a buffer owned by the file system to the reply.
+    ///
+    /// A split writer keeps `buf` and sends it in place with `writev()` on
+    /// commit. It copies a buffer shorter than `OWNED_COPY_THRESHOLD`, and
+    /// every buffer past the first `MAX_OWNED_BUFS`, into its own buffer. An
+    /// unsplit writer writes `buf` to the device right away.
+    pub fn write_owned(&mut self, buf: ReplyBuf) -> io::Result<()> {
+        let len = (*buf).as_ref().len();
+        if !self.buffered || len < OWNED_COPY_THRESHOLD || self.owned.0.len() >= MAX_OWNED_BUFS {
+            return self.write_all((*buf).as_ref());
+        }
+        self.buf.reserve(len)?;
+        self.owned.0.push((self.buf.position(), buf));
+        Ok(())
+    }
+
+    /// Send the reply with `writev()` if `self` or `other` holds buffers from
+    /// `write_owned()`. Return `None` otherwise, so that a plain reply skips
+    /// building the iovec list.
+    fn commit_owned(&self, other: Option<&FuseDevWriter<'a, S>>) -> Option<io::Result<usize>> {
+        let count = self.owned.0.len() + other.map_or(0, |o| o.owned.0.len());
+        if count == 0 {
+            return None;
+        }
+        let mut iov = Vec::with_capacity(2 * count + 2);
+        self.push_iovecs(&mut iov);
+        if let Some(o) = other {
+            o.push_iovecs(&mut iov);
+        }
+        Some(writev(self.fd, &iov).map_err(|e| {
+            error! {"fail to write to fuse device fd {}: {}", self.fd, e};
+            io::Error::from_raw_os_error(e as i32)
+        }))
+    }
+
+    /// Append what was written to `self` to `iov`, with each owned buffer
+    /// between the inline bytes written before and after it.
+    fn push_iovecs<'b>(&'b self, iov: &mut Vec<IoSlice<'b>>) {
+        let inline = self.buf.written();
+        let mut start = 0;
+        for (pos, buf) in &self.owned.0 {
+            if *pos > start {
+                iov.push(IoSlice::new(&inline[start..*pos]));
+                start = *pos;
+            }
+            iov.push(IoSlice::new((**buf).as_ref()));
+        }
+        if inline.len() > start {
+            iov.push(IoSlice::new(&inline[start..]));
+        }
     }
 
     /// Write an object to the writer.
@@ -375,6 +459,10 @@ impl<'a, S: BitmapSlice> Writer for FuseDevWriter<'a, S> {
 
     fn commit(&mut self, other: Option<&Self>) -> io::Result<usize> {
         FuseDevWriter::commit(self, other)
+    }
+
+    fn write_owned(&mut self, buf: ReplyBuf) -> io::Result<()> {
+        FuseDevWriter::write_owned(self, buf)
     }
 
     #[cfg(feature = "async-io")]
@@ -624,6 +712,10 @@ mod async_io {
                 // In non-buffered mode, all data has been written to the fuse device
                 // synchronously by the write methods, so there's nothing to commit.
                 return Ok(0);
+            }
+
+            if let Some(res) = self.commit_owned(other) {
+                return res;
             }
 
             let o = other.map(|w| w.buf.written()).unwrap_or(&[]);
@@ -1075,6 +1167,86 @@ mod tests {
         assert_eq!(writer.bytes_written(), 40);
     }
 
+    fn read_back(file: &mut std::fs::File) -> Vec<u8> {
+        let mut out = Vec::new();
+        file.seek(SeekFrom::Start(0)).unwrap();
+        file.read_to_end(&mut out).unwrap();
+        out
+    }
+
+    #[test]
+    fn write_owned_keeps_order() {
+        let mut file = TempFile::new().unwrap().into_file();
+        let mut buf = vec![0x0u8; 0x10000];
+        let mut header = FuseDevWriter::<()>::new(file.as_raw_fd(), &mut buf).unwrap();
+        let mut data = header.split_at(16).unwrap();
+        let cap = data.available_bytes();
+
+        let big1 = vec![1u8; OWNED_COPY_THRESHOLD];
+        let big2 = vec![2u8; OWNED_COPY_THRESHOLD * 2];
+        data.write_all(b"ab").unwrap();
+        data.write_owned(Box::new(big1.clone())).unwrap();
+        data.write_owned(Box::new(big2.clone())).unwrap();
+        // The writer copies this one, because it's under the threshold.
+        data.write_owned(Box::new(b"xyz".to_vec())).unwrap();
+        data.write_owned(Box::new(big1.clone())).unwrap();
+        data.write_all(b"c").unwrap();
+        assert_eq!(data.owned.0.len(), 3);
+
+        let written = 2 + big1.len() * 2 + big2.len() + 3 + 1;
+        assert_eq!(data.bytes_written(), written);
+        assert_eq!(data.available_bytes(), cap - written);
+        // A buffer that doesn't fit leaves the writer unchanged.
+        data.write_owned(Box::new(vec![0u8; cap - written + 1]))
+            .unwrap_err();
+        assert_eq!(data.bytes_written(), written);
+
+        header.write_all(&[0xffu8; 16]).unwrap();
+        assert_eq!(header.commit(Some(&data)).unwrap(), 16 + written);
+
+        let mut expected = vec![0xffu8; 16];
+        expected.extend_from_slice(b"ab");
+        expected.extend_from_slice(&big1);
+        expected.extend_from_slice(&big2);
+        expected.extend_from_slice(b"xyz");
+        expected.extend_from_slice(&big1);
+        expected.extend_from_slice(b"c");
+        assert_eq!(read_back(&mut file), expected);
+    }
+
+    #[test]
+    fn write_owned_copies_past_the_cap() {
+        let mut file = TempFile::new().unwrap().into_file();
+        let count = MAX_OWNED_BUFS + 3;
+        let mut buf = vec![0x0u8; 16 + count * OWNED_COPY_THRESHOLD];
+        let mut header = FuseDevWriter::<()>::new(file.as_raw_fd(), &mut buf).unwrap();
+        let mut data = header.split_at(16).unwrap();
+
+        let mut expected = vec![0u8; 16];
+        for i in 0..count {
+            let chunk = vec![i as u8; OWNED_COPY_THRESHOLD];
+            expected.extend_from_slice(&chunk);
+            data.write_owned(Box::new(chunk)).unwrap();
+        }
+        assert_eq!(data.owned.0.len(), MAX_OWNED_BUFS);
+        assert_eq!(data.available_bytes(), 0);
+
+        header.write_all(&[0u8; 16]).unwrap();
+        assert_eq!(header.commit(Some(&data)).unwrap(), expected.len());
+        assert_eq!(read_back(&mut file), expected);
+    }
+
+    #[test]
+    fn write_owned_blocks_split() {
+        let file = TempFile::new().unwrap().into_file();
+        let mut buf = vec![0x0u8; 0x4000];
+        let mut header = FuseDevWriter::<()>::new(file.as_raw_fd(), &mut buf).unwrap();
+        let mut data = header.split_at(16).unwrap();
+        data.write_owned(Box::new(vec![0u8; OWNED_COPY_THRESHOLD]))
+            .unwrap();
+        data.split_at(0).unwrap_err();
+    }
+
     #[cfg(feature = "async-io")]
     mod async_io {
         use vmm_sys_util::tempdir::TempDir;
@@ -1168,6 +1340,26 @@ mod tests {
             });
 
             assert_eq!(res.unwrap(), 40);
+        }
+
+        #[test]
+        fn async_commit_sends_owned_buffers() {
+            let mut file = TempFile::new().unwrap().into_file();
+            let mut buf = vec![0x0u8; 0x4000];
+            let mut header = FuseDevWriter::<()>::new(file.as_raw_fd(), &mut buf).unwrap();
+            let mut data = header.split_at(16).unwrap();
+
+            let chunk = vec![7u8; OWNED_COPY_THRESHOLD];
+            data.write_all(b"ab").unwrap();
+            data.write_owned(Box::new(chunk.clone())).unwrap();
+            header.write_all(&[0xffu8; 16]).unwrap();
+            let n = async_runtime::block_on(header.async_commit(Some(&data))).unwrap();
+
+            let mut expected = vec![0xffu8; 16];
+            expected.extend_from_slice(b"ab");
+            expected.extend_from_slice(&chunk);
+            assert_eq!(n, expected.len());
+            assert_eq!(read_back(&mut file), expected);
         }
 
         #[test]

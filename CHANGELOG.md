@@ -33,6 +33,9 @@
   with buffers it already owns, such as cached `bytes::Bytes` chunks. They take a `ReplyBuf`,
   which is a `Box<dyn AsRef<[u8]> + Send + Sync>`. The default copies the buffer, so
   existing transports and writers keep working.
+- `FuseDevWriter` sends buffers of 4 KiB and more from `write_owned()` with `writev()`, without
+  copying them into the reply buffer. It copies smaller buffers, and a writer copies every
+  buffer past its first 255.
 
 ### Changed
 - [254](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/254): `fuse-backend-rs` is now a thin facade re-exporting the sub-crates. Every
