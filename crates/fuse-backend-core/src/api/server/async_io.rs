@@ -25,7 +25,7 @@ use crate::api::server::{
     decode_version, InitParams, MetricsHook, Server, ServerUtil, SrvContext, BUFFER_HEADER_SIZE,
     MAX_BUFFER_SIZE,
 };
-use crate::buffer::{Reader, Writer};
+use crate::buffer::{Reader, ReplyBuf, Writer};
 use crate::file_traits::{AsyncFileReadWriteVolatile, FileReadWriteVolatile};
 use crate::{bytes_to_cstr, encode_io_error_kind, BitmapSlice, Error, Result};
 
@@ -96,6 +96,10 @@ impl<W: Writer> ZeroCopyWriter for AsyncZcWriter<W> {
 
     fn available_bytes(&self) -> usize {
         self.0.available_bytes()
+    }
+
+    fn write_owned(&mut self, buf: ReplyBuf) -> io::Result<()> {
+        self.0.write_owned(buf)
     }
 }
 

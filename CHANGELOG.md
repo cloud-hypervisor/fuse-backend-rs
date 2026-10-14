@@ -29,6 +29,10 @@
   FUSE-over-io_uring transport (kernel 6.14+). Both join the `FuseServing` interface, so a daemon
   can pick its transport at runtime behind `Box<dyn FuseServing>` and fall back to the classic
   transport on `Error::UringNotSupported`.
+- `ZeroCopyWriter::write_owned()` and `Writer::write_owned()` let a file system answer READ
+  with buffers it already owns, such as cached `bytes::Bytes` chunks. They take a `ReplyBuf`,
+  which is a `Box<dyn AsRef<[u8]> + Send + Sync>`. The default copies the buffer, so
+  existing transports and writers keep working.
 
 ### Changed
 - [254](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/254): `fuse-backend-rs` is now a thin facade re-exporting the sub-crates. Every

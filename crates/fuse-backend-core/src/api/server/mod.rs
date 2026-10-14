@@ -24,7 +24,7 @@ use std::sync::atomic::AtomicU64;
 
 use crate::abi::fuse_abi::*;
 use crate::api::filesystem::{Context, FileSystem, ZeroCopyReader, ZeroCopyWriter};
-use crate::buffer::{Reader, Writer};
+use crate::buffer::{Reader, ReplyBuf, Writer};
 use crate::file_traits::FileReadWriteVolatile;
 use crate::{bytes_to_cstr, BitmapSlice, Error, Result};
 #[cfg(all(target_os = "linux", feature = "fusedev-uring"))]
@@ -170,6 +170,10 @@ impl<W: Writer> ZeroCopyWriter for ZcWriter<W> {
 
     fn available_bytes(&self) -> usize {
         self.0.available_bytes()
+    }
+
+    fn write_owned(&mut self, buf: ReplyBuf) -> io::Result<()> {
+        self.0.write_owned(buf)
     }
 }
 

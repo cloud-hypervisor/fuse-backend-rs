@@ -558,6 +558,15 @@ impl<S: BitmapSlice> io::Read for Reader<'_, S> {
     }
 }
 
+/// A buffer that a file system owns and hands to the transport as part of a
+/// reply.
+///
+/// A transport that can send scattered memory, for example with `writev()`,
+/// may keep it alive until the reply is sent and send it without copying it
+/// into the reply buffer first. The others copy it. `bytes::Bytes`,
+/// `Vec<u8>`, `Arc<[u8]>` and memory map guards all qualify.
+pub type ReplyBuf = Box<dyn AsRef<[u8]> + Send + Sync>;
+
 /// Trait for sending FUSE reply messages back to the client, implemented by
 /// each transport's concrete writer type.
 ///
@@ -596,6 +605,16 @@ pub trait Writer: io::Write + Sized {
     /// Write an object to the reply buffer.
     fn write_obj<T: ByteValued>(&mut self, val: T) -> io::Result<()> {
         self.write_all(val.as_slice())
+    }
+
+    /// Append a buffer owned by the file system to the reply, the transport
+    /// side of [`ZeroCopyWriter::write_owned()`](crate::api::filesystem::ZeroCopyWriter::write_owned).
+    ///
+    /// A transport that can send `buf` in place overrides this. The default
+    /// copies it with `write_all()`, which is all or nothing because `write()`
+    /// rejects data that doesn't fit before copying any of it.
+    fn write_owned(&mut self, buf: ReplyBuf) -> io::Result<()> {
+        self.write_all((*buf).as_ref())
     }
 
     /// Write data from a buffer into this writer in asynchronous mode.

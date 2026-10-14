@@ -2102,6 +2102,53 @@ mod tests {
     }
 
     #[test]
+    fn test_server_read_owned_buffers() {
+        use crate::api::filesystem::{Context, ZeroCopyWriter};
+
+        // Mixes copied and owned data, then offers a buffer that doesn't fit.
+        struct OwnedFs;
+        impl FileSystem for OwnedFs {
+            type Inode = u64;
+            type Handle = u64;
+
+            fn read(
+                &self,
+                _ctx: &Context,
+                _inode: Self::Inode,
+                _handle: Self::Handle,
+                w: &mut dyn ZeroCopyWriter,
+                _size: u32,
+                _offset: u64,
+                _lock_owner: Option<u64>,
+                _flags: u32,
+            ) -> io::Result<usize> {
+                w.write_all(b"ab")?;
+                w.write_owned(Box::new(b"cd".to_vec()))?;
+                w.write_all(b"e")?;
+                w.write_owned(Box::new(std::sync::Arc::<[u8]>::from(&b"fg"[..])))?;
+                // The writer rejects a buffer that doesn't fit and adds none of it.
+                let avail = w.available_bytes();
+                assert!(w.write_owned(Box::new(vec![0u8; avail + 1])).is_err());
+                assert_eq!(w.available_bytes(), avail);
+                Ok(7)
+            }
+        }
+
+        let server = Server::new(OwnedFs);
+        let mut read_buf = [0u8; size_of::<ReadIn>()];
+        let mut write_buf = [0u8; 64];
+        let ctx = {
+            let reader = Reader::<()>::from_slice(&mut read_buf);
+            let writer = TestWriter::new(&mut write_buf);
+            SrvContext::new(InHeader::default(), reader, writer)
+        };
+
+        let res = server.read(ctx).unwrap();
+        assert_eq!(res, size_of::<OutHeader>() + 7);
+        assert_eq!(&write_buf[size_of::<OutHeader>()..res], b"abcdefg");
+    }
+
+    #[test]
     fn test_server_readdir() {
         let server = Server::new(MockFS);
 
