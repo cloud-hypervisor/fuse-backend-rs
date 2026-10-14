@@ -211,8 +211,8 @@ mod overlayfs_paths {
     }
 }
 
-/// The async IO surface, historical `feature = "async-io"` (Linux-only).
-#[cfg(all(target_os = "linux", feature = "async-io"))]
+/// The async IO surface, historical `feature = "async-io"`.
+#[cfg(feature = "async-io")]
 mod async_paths {
     use fuse_backend_rs::api::filesystem::{
         AsyncFileSystem, AsyncZeroCopyReader, AsyncZeroCopyWriter,
