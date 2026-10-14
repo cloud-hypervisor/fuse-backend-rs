@@ -35,6 +35,8 @@
 - `Server::init_state()` and `Server::restore_init()` let a new server take over a connection
   that another server initialized. `abi::fuse_abi::UNIQUE_RESEND` is the bit that the kernel
   sets in requests it sends again after `notify_resend()`.
+- `RuntimeType::file_io_blocks()` tells whether async file IO on a runtime type blocks the
+  calling thread, as it does on tokio.
 
 ### Changed
 - With the tokio runtime, `FuseDevTask` no longer retries reads in a loop. It waits for requests
@@ -45,6 +47,10 @@
   `io-uring` only on Linux, like `tokio-uring`.
 - If io-uring isn't available, `set_runtime_type(RuntimeType::Uring)` returns the probe's
   error, and the fallback warning includes it.
+- On the tokio runtime, the vectored reads and writes of `async_file::File` make one
+  `preadv()`/`pwritev()` call for all buffers instead of one call per buffer.
+  `async_file::preadv()` and `pwritev()` accept more than 1024 buffers and make one call per
+  1024.
 - The umbrella crate's `async-io` no longer turns on the `fusedev` and `virtiofs`
   transports. Code that uses the items they gate, such as `abi::virtio_fs`, has
   to enable them. A crate that depends on a transport crate directly must enable

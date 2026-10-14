@@ -83,6 +83,12 @@ pub fn runtime_type() -> RuntimeType {
 }
 
 impl RuntimeType {
+    /// Whether async file IO on this runtime type blocks the calling thread. It does on tokio,
+    /// which makes plain syscalls, and doesn't on io-uring.
+    pub fn file_io_blocks(self) -> bool {
+        matches!(self, RuntimeType::Tokio)
+    }
+
     fn new() -> Self {
         let requested = REQUESTED_RUNTIME_TYPE
             .get()
