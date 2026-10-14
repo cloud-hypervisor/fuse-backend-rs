@@ -668,7 +668,9 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
         }
     }
 
-    /// Serve a READ on the handle data that `get_data()` returned.
+    /// Serve a READ on the handle data that `get_data()` returned. `aligned`
+    /// says that `w` writes to page-aligned memory, so an O_DIRECT read can
+    /// go there without a bounce buffer.
     pub(super) fn do_read(
         &self,
         data: &Arc<HandleData>,
@@ -676,6 +678,7 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
         size: u32,
         offset: u64,
         flags: u32,
+        aligned: bool,
     ) -> io::Result<usize> {
         let fd = data.borrow_fd();
 
@@ -689,12 +692,80 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
 
         // The backing file was opened with O_DIRECT (see `open_inode()`), whose
         // alignment constraints the transport buffers don't satisfy, so stage
-        // the data through an aligned bounce buffer.
+        // the data through an aligned bounce buffer. An aligned `w` takes the
+        // data directly, and reads until EOF like `read_direct()`.
         if self.cfg.allow_direct_io && flags & (libc::O_DIRECT as u32) != 0 {
-            return self.read_direct(&f, w, size as usize, offset);
+            if !aligned {
+                return self.read_direct(&f, w, size as usize, offset);
+            }
+            let mut read = 0;
+            while read < size as usize {
+                match w.write_from(&mut *f, size as usize - read, offset + read as u64)? {
+                    0 => break,
+                    n => read += n,
+                }
+            }
+            return Ok(read);
         }
 
         w.write_from(&mut *f, size as usize, offset)
+    }
+
+    /// Serve a WRITE on the handle data that `get_data()` returned. `aligned`
+    /// says that `r` reads from page-aligned memory, so an O_DIRECT write can
+    /// go from there without a bounce buffer.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn do_write(
+        &self,
+        data: &Arc<HandleData>,
+        r: &mut dyn ZeroCopyReader,
+        size: u32,
+        offset: u64,
+        flags: u32,
+        fuse_flags: u32,
+        aligned: bool,
+    ) -> io::Result<usize> {
+        let fd = data.borrow_fd();
+
+        // Hold the guard over the whole IO operation, so that no other request
+        // can change the O_DIRECT flag of the fd while we are using it.
+        let _flags_guard = self.ensure_file_flags(data, &fd, flags)?;
+        if self.seal_size.load(Ordering::Relaxed) {
+            let st = stat_fd(&fd, None)?;
+            self.seal_size_check(Opcode::Write, st.st_size as u64, offset, size as u64, 0)?;
+        }
+
+        // Cap restored when _killpriv is dropped
+        let _killpriv =
+            if self.killpriv_v2.load(Ordering::Relaxed) && (fuse_flags & WRITE_KILL_PRIV != 0) {
+                self::drop_cap_fsetid()?
+            } else {
+                None
+            };
+
+        // Manually implement File::try_clone() by borrowing fd of data.file instead of dup().
+        // It's safe because `data` outlives this function, so data.file won't be closed.
+        let mut f = unsafe { ManuallyDrop::new(File::from_raw_fd(fd.as_raw_fd())) };
+
+        // The backing file was opened with O_DIRECT (see `open_inode()`), whose
+        // alignment constraints the transport buffers don't satisfy, so stage
+        // the payload through an aligned bounce buffer. An aligned `r` gives
+        // the payload directly, and writes all of it like `write_direct()`.
+        if self.cfg.allow_direct_io && flags & (libc::O_DIRECT as u32) != 0 {
+            if !aligned {
+                return self.write_direct(&f, r, size as usize, offset);
+            }
+            let mut written = 0;
+            while written < size as usize {
+                match r.read_to(&mut *f, size as usize - written, offset + written as u64)? {
+                    0 => break,
+                    n => written += n,
+                }
+            }
+            return Ok(written);
+        }
+
+        r.read_to(&mut *f, size as usize, offset)
     }
 
     pub(super) fn get_data(
@@ -1107,7 +1178,7 @@ impl<S: BitmapSlice + Send + Sync> FileSystem for PassthroughFs<S> {
         flags: u32,
     ) -> io::Result<usize> {
         let data = self.get_data(handle, inode, libc::O_RDONLY)?;
-        self.do_read(&data, w, size, offset, flags)
+        self.do_read(&data, w, size, offset, flags, false)
     }
 
     fn write(
@@ -1124,37 +1195,7 @@ impl<S: BitmapSlice + Send + Sync> FileSystem for PassthroughFs<S> {
         fuse_flags: u32,
     ) -> io::Result<usize> {
         let data = self.get_data(handle, inode, libc::O_RDWR)?;
-        let fd = data.borrow_fd();
-
-        // Hold the guard over the whole IO operation, so that no other request
-        // can change the O_DIRECT flag of the fd while we are using it.
-        let _flags_guard = self.ensure_file_flags(&data, &fd, flags)?;
-        if self.seal_size.load(Ordering::Relaxed) {
-            let st = stat_fd(&fd, None)?;
-            self.seal_size_check(Opcode::Write, st.st_size as u64, offset, size as u64, 0)?;
-        }
-
-        // Cap restored when _killpriv is dropped
-        let _killpriv =
-            if self.killpriv_v2.load(Ordering::Relaxed) && (fuse_flags & WRITE_KILL_PRIV != 0) {
-                self::drop_cap_fsetid()?
-            } else {
-                None
-            };
-
-        // Manually implement File::try_clone() by borrowing fd of data.file instead of dup().
-        // It's safe because the `data` variable's lifetime spans the whole function,
-        // so data.file won't be closed.
-        let mut f = unsafe { ManuallyDrop::new(File::from_raw_fd(fd.as_raw_fd())) };
-
-        // The backing file was opened with O_DIRECT (see `open_inode()`), whose
-        // alignment constraints the transport buffers don't satisfy, so stage
-        // the payload through an aligned bounce buffer.
-        if self.cfg.allow_direct_io && flags & (libc::O_DIRECT as u32) != 0 {
-            return self.write_direct(&f, r, size as usize, offset);
-        }
-
-        r.read_to(&mut *f, size as usize, offset)
+        self.do_write(&data, r, size, offset, flags, fuse_flags, false)
     }
 
     fn getattr(
