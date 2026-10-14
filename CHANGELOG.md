@@ -35,11 +35,27 @@
 - `Server::init_state()` and `Server::restore_init()` let a new server take over a connection
   that another server initialized. `abi::fuse_abi::UNIQUE_RESEND` is the bit that the kernel
   sets in requests it sends again after `notify_resend()`.
+- Linux kernel FUSE passthrough, from Linux 6.9 on. `FsOptions::PASSTHROUGH` and
+  `OpenOptions::PASSTHROUGH` enable it, and the fusedev transport's `fuse_backing_open()` and
+  `fuse_backing_close()` register and release backing files. `Server::set_max_stack_depth()` sets
+  the depth sent in the INIT reply, which a backing file on overlayfs needs. In the ABI,
+  `BackingMap` is the argument of the backing ioctl.
+- `PassthroughFs::set_backing_files()` and the `BackingFiles` trait make `PassthroughFs` use
+  kernel passthrough. `init` leaves it off when the kernel doesn't offer it. It also stays off
+  with the writeback cache, `no_open`, `seal_size`, `allow_direct_io = false`, and the `Never`
+  and `Metadata` cache policies. With the `async-io` feature, `PassthroughFs::into_shared()` shares a file system
+  created with `new()`, so the blocking thread pool can use passthrough too.
 
 ### Changed
 - The FUSE-over-io_uring transport answers opcodes it doesn't know with ENOSYS instead of EIO.
   Kernels that send `FUSE_STATX` only fall back to `FUSE_GETATTR` after ENOSYS, so `statx()`
   calls that ask for more than the basic fields, like the birth time `stat(1)` shows, failed.
+- `AsyncFileSystem::async_open()` and `AsyncFileSystem::async_create()` return the backing id of
+  kernel passthrough as the last element of their tuple, like `FileSystem::open()` and
+  `FileSystem::create()`. Implementations of the trait need to add it, and `None` keeps the old
+  behavior.
+- `InitOut` has a `max_stack_depth` field, which takes one of its `unused` words, so `unused` is
+  now `[u32; 6]`.
 - With the tokio runtime, `FuseDevTask` no longer retries reads in a loop. It waits for requests
   through the IO driver of the tokio runtime that polls it, and checks its state flag every 100ms
   while idle. Polling it on a tokio runtime without IO enabled panics. `fuse-backend-fusedev`
