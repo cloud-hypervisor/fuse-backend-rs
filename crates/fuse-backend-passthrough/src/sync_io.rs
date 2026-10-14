@@ -85,6 +85,15 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
     /// it passes through.
     #[cfg_attr(not(target_os = "linux"), allow(unused_variables))]
     fn file_open_options(&self, flags: u32, backing_id: Option<u32>) -> OpenOptions {
+        // The kernel fails a passthrough open with `KEEP_CACHE`, and the backing file has its
+        // own page cache anyway. `DIRECT_IO` would send reads and writes through the daemon. The
+        // kernel opens the backing file with the client's open flags, so an O_DIRECT open still
+        // does direct IO on the host. Changing O_DIRECT later with fcntl() only reaches the
+        // backing file for async IO, which carries the flag per call.
+        #[cfg(target_os = "linux")]
+        if backing_id.is_some() {
+            return OpenOptions::PASSTHROUGH;
+        }
         let mut opts = OpenOptions::empty();
         // If the client requested O_DIRECT and we honor it, the host file has O_DIRECT too, so
         // the kernel must route IO on this handle through the direct IO path. Serving an
@@ -98,13 +107,6 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
             CachePolicy::Always => opts |= OpenOptions::KEEP_CACHE,
             _ => {}
         };
-        // The kernel fails an open with a backing id and any other flag than `DIRECT_IO`,
-        // `PARALLEL_DIRECT_WRITES` and `NOFLUSH`, and the backing file has its own page cache, so
-        // drop `KEEP_CACHE`. `DIRECT_IO` takes precedence over passthrough for reads and writes.
-        #[cfg(target_os = "linux")]
-        if backing_id.is_some() {
-            opts = (opts - OpenOptions::KEEP_CACHE) | OpenOptions::PASSTHROUGH;
-        }
         opts
     }
 
@@ -752,9 +754,9 @@ impl<S: BitmapSlice + Send + Sync> FileSystem for PassthroughFs<S> {
         if self.kernel_passthrough.is_some() && capable.contains(FsOptions::PASSTHROUGH) {
             // The kernel ignores FUSE_PASSTHROUGH along with FUSE_WRITEBACK_CACHE, and needs open
             // requests to get the backing ids. Passthrough writes skip the seal_size check. The
-            // Never and Metadata cache policies open files with FOPEN_DIRECT_IO, which overrides
-            // passthrough for reads and writes. The kernel opens the backing file with the
-            // client's O_DIRECT, which allow_direct_io = false would filter out.
+            // Never and Metadata cache policies want FOPEN_DIRECT_IO, which passthrough opens drop.
+            // The kernel opens the backing file with the client's O_DIRECT, which
+            // allow_direct_io = false would filter out.
             if self.writeback.load(Ordering::Relaxed)
                 || self.no_open.load(Ordering::Relaxed)
                 || self.seal_size.load(Ordering::Relaxed)
