@@ -42,14 +42,14 @@ otherwise) — and runs identical fio workloads:
 - directory enumeration (readdir): fio has no readdir engine, so the
   `bench_readdir.py` helper walks the mountpoint with `os.scandir()`
   (getdents64) between the filecreate and filedelete workloads, when the
-  directory holds `NRFILES` entries, and reports entries/s as `iops` in
+  directory holds `BENCH_NRFILES` entries, and reports entries/s as `iops` in
   the same JSON job shape. Enumeration is one strictly sequential request
   chain per stream (each getdents64 resumes from the cookie of the previous
-  reply), so the rate is latency-bound and does not scale with `THREADS`.
+  reply), so the rate is latency-bound and does not scale with `BENCH_THREADS`.
 
 ```sh
 sudo tests/scripts/bench_sync_async.sh      # needs fio + jq + python3 + fuse mount rights
-THREADS=8 RUNTIME=60 sudo -E tests/scripts/bench_sync_async.sh
+BENCH_THREADS=8 BENCH_RUNTIME=60 sudo -E tests/scripts/bench_sync_async.sh
 ```
 
 The script builds the daemon in release mode; when invoking it with `sudo`,
@@ -61,8 +61,8 @@ The fio results are written in JSON format to a temporary results directory
 (printed at the start, `<dir>/<mode>-<workload>.json`), and a side-by-side
 summary is printed at the end. The default execution order is sync then
 async; the second mode benefits from a warmer page cache, so cross-check
-with `MODES="async sync"`. The uring mode is included with
-`MODES="sync async uring"`.
+with `BENCH_MODES="async sync"`. The uring mode is included with
+`BENCH_MODES="sync async uring"`.
 
 To quantify the difference between the transports, collect each mode's
 results and compare the collected files — `bench_compare.py` is
@@ -70,7 +70,7 @@ mode-agnostic, so any two collected files can be diffed (positive deltas
 mean the second file outperformed the first):
 
 ```sh
-MODES="sync async uring" sudo -E tests/scripts/bench_sync_async.sh
+BENCH_MODES="sync async uring" sudo -E tests/scripts/bench_sync_async.sh
 python3 tests/scripts/bench_compare.py collect <results-dir> sync  sync.json
 python3 tests/scripts/bench_compare.py collect <results-dir> uring uring.json
 # uring vs sync: positive deltas mean uring won that workload
@@ -78,7 +78,7 @@ python3 tests/scripts/bench_compare.py compare sync.json uring.json
 ```
 
 Both transports run on the same machine back-to-back, so environment
-effects mostly cancel out; for confidence run once per `MODES` order.
+effects mostly cancel out; for confidence run once per `BENCH_MODES` order.
 
 ## 3. Continuous benchmarking in CI
 
