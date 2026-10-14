@@ -29,6 +29,8 @@
   FUSE-over-io_uring transport (kernel 6.14+). Both join the `FuseServing` interface, so a daemon
   can pick its transport at runtime behind `Box<dyn FuseServing>` and fall back to the classic
   transport on `Error::UringNotSupported`.
+- `AsyncFileSystem` methods default to calling their `FileSystem` counterparts, so a
+  file system only implements the handlers it serves asynchronously.
 
 ### Changed
 - The FUSE-over-io_uring transport answers opcodes it doesn't know with ENOSYS instead of EIO.

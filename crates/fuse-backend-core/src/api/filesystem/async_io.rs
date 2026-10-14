@@ -66,6 +66,17 @@ pub trait AsyncZeroCopyWriter: ZeroCopyWriter {
 }
 
 /// The main trait that connects a file system with a transport with asynchronous IO.
+///
+/// Each method defaults to calling its [`FileSystem`] counterpart, which blocks the thread
+/// serving the request until the handler returns. Override the methods that wait on IO, so the
+/// thread can serve other requests in the meantime.
+///
+/// A default method calls the sync handler as soon as it is called, not when its future is
+/// polled, so the handler runs even if the caller drops the future without polling it. The
+/// handler runs on an async runtime thread, inside the runtime's context. Blocking on a tokio
+/// runtime there, for example with `Handle::block_on()`, panics. The `async_open()` and
+/// `async_create()` defaults drop the passthrough id that `open()` and `create()` return,
+/// because the asynchronous replies have no field for it.
 #[allow(unused_variables)]
 #[async_trait]
 pub trait AsyncFileSystem: FileSystem {
@@ -73,12 +84,20 @@ pub trait AsyncFileSystem: FileSystem {
     ///
     /// If this call is successful then the lookup count of the `Inode` associated with the returned
     /// `Entry` must be increased by 1.
-    async fn async_lookup(
-        &self,
-        ctx: &Context,
+    fn async_lookup<'a, 'b, 'c, 'async_trait>(
+        &'a self,
+        ctx: &'b Context,
         parent: Self::Inode,
-        name: &CStr,
-    ) -> io::Result<Entry>;
+        name: &'c CStr,
+    ) -> Pin<Box<dyn Future<Output = io::Result<Entry>> + Send + 'async_trait>>
+    where
+        'a: 'async_trait,
+        'b: 'async_trait,
+        'c: 'async_trait,
+        Self: 'async_trait,
+    {
+        Box::pin(std::future::ready(self.lookup(ctx, parent, name)))
+    }
 
     /*
     /// Forget about an inode.
@@ -109,12 +128,19 @@ pub trait AsyncFileSystem: FileSystem {
     /// The returned `Duration` indicates how long the returned attributes should be considered
     /// valid by the client. If the attributes are only changed via the FUSE kernel module (i.e.,
     /// the kernel module has exclusive access), then this should be a very large value.
-    async fn async_getattr(
-        &self,
-        ctx: &Context,
+    fn async_getattr<'a, 'b, 'async_trait>(
+        &'a self,
+        ctx: &'b Context,
         inode: Self::Inode,
         handle: Option<Self::Handle>,
-    ) -> io::Result<(stat64, Duration)>;
+    ) -> Pin<AttrFuture<'async_trait>>
+    where
+        'a: 'async_trait,
+        'b: 'async_trait,
+        Self: 'async_trait,
+    {
+        Box::pin(std::future::ready(self.getattr(ctx, inode, handle)))
+    }
 
     /// Set attributes for a file / directory.
     ///
@@ -133,14 +159,23 @@ pub trait AsyncFileSystem: FileSystem {
     /// considered valid by the client. If the attributes are only changed via the FUSE kernel
     /// module (i.e., the kernel module has exclusive access), then this should be a very large
     /// value.
-    async fn async_setattr(
-        &self,
-        ctx: &Context,
+    fn async_setattr<'a, 'b, 'async_trait>(
+        &'a self,
+        ctx: &'b Context,
         inode: Self::Inode,
         attr: stat64,
         handle: Option<Self::Handle>,
         valid: SetattrValid,
-    ) -> io::Result<(stat64, Duration)>;
+    ) -> Pin<AttrFuture<'async_trait>>
+    where
+        'a: 'async_trait,
+        'b: 'async_trait,
+        Self: 'async_trait,
+    {
+        Box::pin(std::future::ready(
+            self.setattr(ctx, inode, attr, handle, valid),
+        ))
+    }
 
     /*
         /// Read a symbolic link.
@@ -307,13 +342,23 @@ pub trait AsyncFileSystem: FileSystem {
     /// implementation and the kernel, then the file system may return an error of `ENOSYS`. This
     /// will be interpreted by the kernel as success and future calls to `open` and `release` will
     /// be handled by the kernel without being passed on to the file system.
-    async fn async_open(
-        &self,
-        ctx: &Context,
+    fn async_open<'a, 'b, 'async_trait>(
+        &'a self,
+        ctx: &'b Context,
         inode: Self::Inode,
         flags: u32,
         fuse_flags: u32,
-    ) -> io::Result<(Option<Self::Handle>, OpenOptions)>;
+    ) -> Pin<OpenFuture<'async_trait, Self::Handle>>
+    where
+        'a: 'async_trait,
+        'b: 'async_trait,
+        Self: 'async_trait,
+    {
+        let result = self
+            .open(ctx, inode, flags, fuse_flags)
+            .map(|(handle, opts, _backing_id)| (handle.map(Into::<u64>::into), opts));
+        Box::pin(async move { result.map(|(handle, opts)| (handle.map(From::from), opts)) })
+    }
 
     /// Create and open a file.
     ///
@@ -329,13 +374,26 @@ pub trait AsyncFileSystem: FileSystem {
     /// addition to the optional `Handle` and the `OpenOptions`, the file system must also return an
     /// `Entry` for the file. This increases the lookup count for the `Inode` associated with the
     /// file by 1.
-    async fn async_create(
-        &self,
-        ctx: &Context,
+    fn async_create<'a, 'b, 'c, 'async_trait>(
+        &'a self,
+        ctx: &'b Context,
         parent: Self::Inode,
-        name: &CStr,
+        name: &'c CStr,
         args: CreateIn,
-    ) -> io::Result<(Entry, Option<Self::Handle>, OpenOptions)>;
+    ) -> Pin<CreateFuture<'async_trait, Self::Handle>>
+    where
+        'a: 'async_trait,
+        'b: 'async_trait,
+        'c: 'async_trait,
+        Self: 'async_trait,
+    {
+        let result = self
+            .create(ctx, parent, name, args)
+            .map(|(entry, handle, opts, _backing_id)| (entry, handle.map(Into::<u64>::into), opts));
+        Box::pin(async move {
+            result.map(|(entry, handle, opts)| (entry, handle.map(From::from), opts))
+        })
+    }
 
     /// Read data from a file.
     ///
@@ -353,17 +411,27 @@ pub trait AsyncFileSystem: FileSystem {
     /// (`libc::O_DIRECT`), in which case the kernel will forward the return code from this method
     /// to the userspace application that made the system call.
     #[allow(clippy::too_many_arguments)]
-    async fn async_read(
-        &self,
-        ctx: &Context,
+    fn async_read<'a, 'b, 'c, 'async_trait>(
+        &'a self,
+        ctx: &'b Context,
         inode: Self::Inode,
         handle: Self::Handle,
-        w: &mut (dyn AsyncZeroCopyWriter + Send),
+        w: &'c mut (dyn AsyncZeroCopyWriter + Send),
         size: u32,
         offset: u64,
         lock_owner: Option<u64>,
         flags: u32,
-    ) -> io::Result<usize>;
+    ) -> Pin<Box<dyn Future<Output = io::Result<usize>> + Send + 'async_trait>>
+    where
+        'a: 'async_trait,
+        'b: 'async_trait,
+        'c: 'async_trait,
+        Self: 'async_trait,
+    {
+        Box::pin(std::future::ready(
+            self.read(ctx, inode, handle, w, size, offset, lock_owner, flags),
+        ))
+    }
 
     /// Write data to a file.
     ///
@@ -385,19 +453,38 @@ pub trait AsyncFileSystem: FileSystem {
     /// option (`libc::O_DIRECT`), in which case the kernel will forward the return code from this
     /// method to the userspace application that made the system call.
     #[allow(clippy::too_many_arguments)]
-    async fn async_write(
-        &self,
-        ctx: &Context,
+    fn async_write<'a, 'b, 'c, 'async_trait>(
+        &'a self,
+        ctx: &'b Context,
         inode: Self::Inode,
         handle: Self::Handle,
-        r: &mut (dyn AsyncZeroCopyReader + Send),
+        r: &'c mut (dyn AsyncZeroCopyReader + Send),
         size: u32,
         offset: u64,
         lock_owner: Option<u64>,
         delayed_write: bool,
         flags: u32,
         fuse_flags: u32,
-    ) -> io::Result<usize>;
+    ) -> Pin<Box<dyn Future<Output = io::Result<usize>> + Send + 'async_trait>>
+    where
+        'a: 'async_trait,
+        'b: 'async_trait,
+        'c: 'async_trait,
+        Self: 'async_trait,
+    {
+        Box::pin(std::future::ready(self.write(
+            ctx,
+            inode,
+            handle,
+            r,
+            size,
+            offset,
+            lock_owner,
+            delayed_write,
+            flags,
+            fuse_flags,
+        )))
+    }
 
     /*
         /// Flush the contents of a file.
@@ -446,13 +533,20 @@ pub trait AsyncFileSystem: FileSystem {
     /// If this method returns an `ENOSYS` error then the kernel will treat it as success and all
     /// subsequent calls to `fsync` will be handled by the kernel without being forwarded to the
     /// file system.
-    async fn async_fsync(
-        &self,
-        ctx: &Context,
+    fn async_fsync<'a, 'b, 'async_trait>(
+        &'a self,
+        ctx: &'b Context,
         inode: Self::Inode,
         datasync: bool,
         handle: Self::Handle,
-    ) -> io::Result<()>;
+    ) -> Pin<Box<dyn Future<Output = io::Result<()>> + Send + 'async_trait>>
+    where
+        'a: 'async_trait,
+        'b: 'async_trait,
+        Self: 'async_trait,
+    {
+        Box::pin(std::future::ready(self.fsync(ctx, inode, datasync, handle)))
+    }
 
     /// Allocate requested space for file data.
     ///
@@ -467,15 +561,24 @@ pub trait AsyncFileSystem: FileSystem {
     /// If this method returns an `ENOSYS` error then the kernel will treat that as a permanent
     /// failure: all future calls to `fallocate` will fail with `EOPNOTSUPP` without being forwarded
     /// to the file system.
-    async fn async_fallocate(
-        &self,
-        ctx: &Context,
+    fn async_fallocate<'a, 'b, 'async_trait>(
+        &'a self,
+        ctx: &'b Context,
         inode: Self::Inode,
         handle: Self::Handle,
         mode: u32,
         offset: u64,
         length: u64,
-    ) -> io::Result<()>;
+    ) -> Pin<Box<dyn Future<Output = io::Result<()>> + Send + 'async_trait>>
+    where
+        'a: 'async_trait,
+        'b: 'async_trait,
+        Self: 'async_trait,
+    {
+        Box::pin(std::future::ready(
+            self.fallocate(ctx, inode, handle, mode, offset, length),
+        ))
+    }
 
     /*
         /// Release an open file.
@@ -705,13 +808,22 @@ pub trait AsyncFileSystem: FileSystem {
     /// If this method returns an `ENOSYS` error then the kernel will treat it as success and all
     /// subsequent calls to `fsyncdir` will be handled by the kernel without being forwarded to the
     /// file system.
-    async fn async_fsyncdir(
-        &self,
-        ctx: &Context,
+    fn async_fsyncdir<'a, 'b, 'async_trait>(
+        &'a self,
+        ctx: &'b Context,
         inode: Self::Inode,
         datasync: bool,
         handle: Self::Handle,
-    ) -> io::Result<()>;
+    ) -> Pin<Box<dyn Future<Output = io::Result<()>> + Send + 'async_trait>>
+    where
+        'a: 'async_trait,
+        'b: 'async_trait,
+        Self: 'async_trait,
+    {
+        Box::pin(std::future::ready(
+            self.fsyncdir(ctx, inode, datasync, handle),
+        ))
+    }
 
     /*
     /// Release an open directory.
@@ -1045,5 +1157,115 @@ impl<FS: AsyncFileSystem> AsyncFileSystem for Arc<FS> {
         Self: 'async_trait,
     {
         self.deref().async_fsyncdir(ctx, inode, datasync, handle)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::file_traits::FileReadWriteVolatile;
+
+    /// Implements only the sync handlers.
+    struct SyncFs;
+
+    impl FileSystem for SyncFs {
+        type Inode = u64;
+        type Handle = u64;
+
+        fn lookup(&self, _ctx: &Context, parent: u64, _name: &CStr) -> io::Result<Entry> {
+            Ok(Entry {
+                inode: parent + 1,
+                ..Default::default()
+            })
+        }
+
+        fn open(
+            &self,
+            _ctx: &Context,
+            inode: u64,
+            _flags: u32,
+            _fuse_flags: u32,
+        ) -> io::Result<(Option<u64>, OpenOptions, Option<u32>)> {
+            Ok((Some(inode * 10), OpenOptions::KEEP_CACHE, None))
+        }
+
+        fn read(
+            &self,
+            _ctx: &Context,
+            _inode: u64,
+            _handle: u64,
+            w: &mut dyn ZeroCopyWriter,
+            size: u32,
+            _offset: u64,
+            _lock_owner: Option<u64>,
+            _flags: u32,
+        ) -> io::Result<usize> {
+            w.write(&b"served by read()"[..size as usize])
+        }
+    }
+
+    impl AsyncFileSystem for SyncFs {}
+
+    struct VecWriter(Vec<u8>);
+
+    impl io::Write for VecWriter {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.0.write(buf)
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl ZeroCopyWriter for VecWriter {
+        fn write_from(
+            &mut self,
+            _f: &mut dyn FileReadWriteVolatile,
+            _count: usize,
+            _off: u64,
+        ) -> io::Result<usize> {
+            Err(io::Error::from_raw_os_error(libc::ENOSYS))
+        }
+
+        fn available_bytes(&self) -> usize {
+            usize::MAX
+        }
+    }
+
+    #[async_trait(?Send)]
+    impl AsyncZeroCopyWriter for VecWriter {
+        async fn async_write_from(
+            &mut self,
+            _f: Arc<dyn AsyncFileReadWriteVolatile>,
+            _count: usize,
+            _off: u64,
+        ) -> io::Result<usize> {
+            Err(io::Error::from_raw_os_error(libc::ENOSYS))
+        }
+    }
+
+    #[tokio::test]
+    async fn test_defaults_call_sync_handlers() {
+        let fs = SyncFs;
+        let ctx = Context::default();
+
+        let name = CStr::from_bytes_with_nul(b"file\0").unwrap();
+        let entry = fs.async_lookup(&ctx, 1, name).await.unwrap();
+        assert_eq!(entry.inode, 2);
+
+        let (handle, opts) = fs.async_open(&ctx, 2, 0, 0).await.unwrap();
+        assert_eq!((handle, opts), (Some(20), OpenOptions::KEEP_CACHE));
+
+        let mut w = VecWriter(Vec::new());
+        let n = fs
+            .async_read(&ctx, 2, 20, &mut w, 9, 0, None, 0)
+            .await
+            .unwrap();
+        assert_eq!(&w.0[..n], b"served by");
+
+        // Without a sync handler, the default still returns ENOSYS.
+        let err = fs.async_getattr(&ctx, 2, None).await.unwrap_err();
+        assert_eq!(err.raw_os_error(), Some(libc::ENOSYS));
     }
 }
