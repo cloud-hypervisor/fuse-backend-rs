@@ -10,11 +10,12 @@ mod tokio_runtime {
     use std::ffi::CStr;
     use std::fs::File;
     use std::io;
+    use std::os::unix::fs::MetadataExt;
     use std::os::unix::io::AsRawFd;
     use std::path::Path;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-    use std::sync::mpsc::channel;
-    use std::sync::Arc;
+    use std::sync::mpsc::{channel, Receiver};
+    use std::sync::{Arc, Condvar, Mutex};
     use std::thread;
     use std::time::Duration;
 
@@ -22,11 +23,13 @@ mod tokio_runtime {
     use fuse_backend_core::abi::fuse_abi::{stat64, CreateIn, FsOptions, OpenOptions, ROOT_ID};
     use fuse_backend_core::api::filesystem::{
         AsyncFileSystem, AsyncZeroCopyReader, AsyncZeroCopyWriter, Context, Entry, FileSystem,
-        SetattrValid,
+        SetattrValid, ZeroCopyWriter,
     };
     use fuse_backend_core::api::server::Server;
     use fuse_backend_core::async_runtime::{self, RuntimeType};
-    use fuse_backend_fusedev::{FuseDevTask, FuseDevWriter, FuseSession};
+    use fuse_backend_fusedev::{
+        FuseDevTask, FuseDevWriter, FuseSession, SyncFuseServing, SyncServingConfig,
+    };
     use fuse_backend_passthrough::{Config, PassthroughFs};
     use tokio::sync::{oneshot, Semaphore};
     use vmm_sys_util::tempdir::TempDir;
@@ -95,15 +98,10 @@ mod tokio_runtime {
             let mut task = FuseDevTask::new(buf_size, file, server, state);
             block_on_without_tokio(task.poll_handler());
         });
-        let (tx, rx) = channel();
         let path = mnt.as_path().join("hello");
-        let reader = thread::spawn(move || {
-            let _ = tx.send(std::fs::read(path));
-        });
-        let read = rx.recv_timeout(Duration::from_secs(5));
+        let read = in_thread(move || std::fs::read(path)).recv_timeout(Duration::from_secs(5));
         se.umount().unwrap();
         let served = handle.join();
-        reader.join().unwrap();
         assert!(
             served.is_ok(),
             "poll_handler() panicked without a tokio runtime"
@@ -218,12 +216,11 @@ mod tokio_runtime {
         }
     }
 
-    /// Stat `path` in a thread of its own and send the inode number.
-    fn stat_in_thread(path: std::path::PathBuf) -> std::sync::mpsc::Receiver<u64> {
+    /// Run `f` in a thread of its own and send its result.
+    fn in_thread<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> Receiver<T> {
         let (tx, rx) = channel();
         thread::spawn(move || {
-            use std::os::unix::fs::MetadataExt;
-            let _ = tx.send(std::fs::metadata(path).unwrap().ino());
+            let _ = tx.send(f());
         });
         rx
     }
@@ -407,10 +404,10 @@ mod tokio_runtime {
 
     /// Serve `file` with `server` on a tokio runtime of its own until the task returns or `stop`
     /// completes. Stopping drops the requests in flight.
-    fn serve(
+    fn serve<F: AsyncFileSystem + Send + Sync + 'static>(
         file: File,
         buf_size: usize,
-        server: Arc<Server<Arc<TestFs>>>,
+        server: Arc<Server<F>>,
         stop: oneshot::Receiver<()>,
     ) -> thread::JoinHandle<()> {
         thread::spawn(move || {
@@ -451,11 +448,11 @@ mod tokio_runtime {
             stop,
         );
 
-        let slow = stat_in_thread(mnt.as_path().join("slow"));
+        let path = mnt.as_path().join("slow");
+        let slow = in_thread(move || std::fs::metadata(path).unwrap().ino());
         thread::sleep(Duration::from_millis(100));
 
         // A lookup waiting in the file system doesn't hold up the others.
-        use std::os::unix::fs::MetadataExt;
         let fast = std::fs::metadata(mnt.as_path().join("fast")).unwrap();
         assert_eq!(fast.ino(), FAST);
         assert!(slow.try_recv().is_err());
@@ -511,7 +508,8 @@ mod tokio_runtime {
             old_handle.join().unwrap();
             return;
         }
-        let slow = stat_in_thread(mnt.as_path().join("slow"));
+        let path = mnt.as_path().join("slow");
+        let slow = in_thread(move || std::fs::metadata(path).unwrap().ino());
         thread::sleep(Duration::from_millis(100));
         stop_tx.send(()).unwrap();
         old_handle.join().unwrap();
@@ -531,6 +529,282 @@ mod tokio_runtime {
         assert_eq!(slow.recv_timeout(Duration::from_secs(5)).unwrap(), SLOW);
 
         se.umount().unwrap();
+        new_handle.join().unwrap();
+    }
+
+    /// Size of the files of `SlowFs`.
+    const SLOW_FS_FILE_SIZE: usize = 64 << 10;
+
+    /// The content of the files of `SlowFs`.
+    fn slow_fs_data() -> Vec<u8> {
+        (0..SLOW_FS_FILE_SIZE).map(|i| (i % 251) as u8).collect()
+    }
+
+    /// A root directory with the files `fast` and `slow`, which `SyncFuseServing` serves. Reading
+    /// `slow` waits until the gate opens. The files are direct IO, so every read reaches the file
+    /// system.
+    #[derive(Default)]
+    struct SlowFs {
+        gate: Mutex<bool>,
+        opened: Condvar,
+        slow_reads: AtomicUsize,
+        has_resend: AtomicBool,
+    }
+
+    impl SlowFs {
+        fn open_gate(&self) {
+            *self.gate.lock().unwrap() = true;
+            self.opened.notify_all();
+        }
+
+        /// Wait until `n` reads of `slow` have started.
+        fn wait_for_slow_reads(&self, n: usize) {
+            for _ in 0..500 {
+                if self.slow_reads.load(Ordering::Acquire) >= n {
+                    return;
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
+            panic!("the file system got no read of slow");
+        }
+
+        fn stat(inode: u64) -> stat64 {
+            let mut st = stat(inode);
+            if inode != ROOT_ID {
+                st.st_size = SLOW_FS_FILE_SIZE as i64;
+            }
+            st
+        }
+    }
+
+    #[allow(unused_variables)]
+    impl FileSystem for SlowFs {
+        type Inode = u64;
+        type Handle = u64;
+
+        fn init(&self, capable: FsOptions) -> io::Result<FsOptions> {
+            self.has_resend
+                .store(capable.contains(FsOptions::HAS_RESEND), Ordering::Relaxed);
+            Ok(FsOptions::empty())
+        }
+
+        fn lookup(&self, ctx: &Context, parent: u64, name: &CStr) -> io::Result<Entry> {
+            let inode = match name.to_bytes() {
+                b"fast" => FAST,
+                b"slow" => SLOW,
+                _ => return Err(io::Error::from_raw_os_error(libc::ENOENT)),
+            };
+            Ok(Entry {
+                attr: Self::stat(inode),
+                ..entry(inode)
+            })
+        }
+
+        fn forget(&self, ctx: &Context, inode: u64, count: u64) {}
+
+        fn getattr(
+            &self,
+            ctx: &Context,
+            inode: u64,
+            handle: Option<u64>,
+        ) -> io::Result<(stat64, Duration)> {
+            Ok((Self::stat(inode), Duration::from_secs(60)))
+        }
+
+        fn open(
+            &self,
+            ctx: &Context,
+            inode: u64,
+            flags: u32,
+            fuse_flags: u32,
+        ) -> io::Result<(Option<u64>, OpenOptions, Option<u32>)> {
+            Ok((Some(inode), OpenOptions::DIRECT_IO, None))
+        }
+
+        fn read(
+            &self,
+            ctx: &Context,
+            inode: u64,
+            handle: u64,
+            w: &mut dyn ZeroCopyWriter,
+            size: u32,
+            offset: u64,
+            lock_owner: Option<u64>,
+            flags: u32,
+        ) -> io::Result<usize> {
+            if inode == SLOW {
+                self.slow_reads.fetch_add(1, Ordering::AcqRel);
+                let mut open = self.gate.lock().unwrap();
+                while !*open {
+                    open = self.opened.wait(open).unwrap();
+                }
+            }
+            let data = slow_fs_data();
+            let start = std::cmp::min(offset as usize, data.len());
+            let end = std::cmp::min(start + size as usize, data.len());
+            w.write_all(&data[start..end])?;
+            Ok(end - start)
+        }
+
+        fn release(
+            &self,
+            ctx: &Context,
+            inode: u64,
+            flags: u32,
+            handle: u64,
+            flush: bool,
+            flock_release: bool,
+            lock_owner: Option<u64>,
+        ) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// A mounted `SlowFs`, and an unserved mount for a `PassthroughFs` of it. Dropping it opens
+    /// the gate first, so a failing test doesn't leave reads waiting. Then the fields drop in
+    /// order, so the upper mount, and the files that `fs` holds open in the lower mount, go away
+    /// before the lower mount.
+    struct SlowFsStack {
+        upper_se: FuseSession,
+        fs: Arc<PassthroughFs<()>>,
+        _lower: SyncFuseServing<Arc<SlowFs>>,
+        slow_fs: Arc<SlowFs>,
+    }
+
+    impl Drop for SlowFsStack {
+        fn drop(&mut self) {
+            self.slow_fs.open_gate();
+        }
+    }
+
+    /// Mount a `SlowFs` at `lower`, served by threads of its own, and create a `PassthroughFs`
+    /// of it with the blocking thread pool enabled, for a mount at `upper`.
+    fn mount_passthrough_of_slow_fs(lower: &Path, upper: &Path) -> Option<SlowFsStack> {
+        let slow_fs = Arc::new(SlowFs::default());
+        let lower_se = mount(lower)?;
+        let serving = SyncFuseServing::new(
+            lower_se,
+            Arc::new(Server::new(slow_fs.clone())),
+            SyncServingConfig {
+                workers: 4,
+                blocking: false,
+            },
+        )
+        .unwrap();
+        let fs = PassthroughFs::<()>::new_shared(Config {
+            root_dir: lower.to_string_lossy().to_string(),
+            do_import: false,
+            ..Default::default()
+        })
+        .unwrap();
+        fs.import().unwrap();
+        fs.enable_async_thread_pool(true);
+        let upper_se = mount(upper)?;
+        Some(SlowFsStack {
+            upper_se,
+            fs,
+            _lower: serving,
+            slow_fs,
+        })
+    }
+
+    /// With the thread pool, a READ that waits for the backing file doesn't hold up the other
+    /// requests on the current-thread runtime.
+    #[test]
+    fn test_passthrough_pool_serves_while_read_waits() {
+        async_runtime::set_runtime_type(RuntimeType::Tokio).unwrap();
+
+        let lower = TempDir::new().unwrap();
+        let upper = TempDir::new().unwrap();
+        let Some(mut stack) = mount_passthrough_of_slow_fs(lower.as_path(), upper.as_path()) else {
+            return;
+        };
+        let (_stop_tx, stop) = oneshot::channel();
+        let handle = serve(
+            stack.upper_se.clone_fuse_file().unwrap(),
+            stack.upper_se.bufsize(),
+            Arc::new(Server::new(stack.fs.clone())),
+            stop,
+        );
+
+        let path = upper.as_path().join("slow");
+        let slow = in_thread(move || std::fs::read(path));
+        stack.slow_fs.wait_for_slow_reads(1);
+        // Without the pool, the runtime thread waits for the gate, which opens 2s from now.
+        let backstop = stack.slow_fs.clone();
+        thread::spawn(move || {
+            thread::sleep(Duration::from_secs(2));
+            backstop.open_gate();
+        });
+        let start = std::time::Instant::now();
+        let fast = std::fs::read(upper.as_path().join("fast")).unwrap();
+        let elapsed = start.elapsed();
+        eprintln!("reading fast while slow waits took {:?}", elapsed);
+        assert_eq!(fast, slow_fs_data());
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "reading fast took {:?}",
+            elapsed
+        );
+        assert!(slow.try_recv().is_err());
+
+        stack.slow_fs.open_gate();
+        let slow = slow.recv_timeout(Duration::from_secs(5)).unwrap().unwrap();
+        assert_eq!(slow, slow_fs_data());
+
+        stack.upper_se.umount().unwrap();
+        handle.join().unwrap();
+    }
+
+    /// A server that stops with a READ waiting on a pool thread frees the request's buffer while
+    /// the pool thread still reads. The pool thread reads into a buffer of its own, and a new
+    /// server answers the READ that the kernel sends again.
+    #[test]
+    fn test_passthrough_pool_read_survives_takeover() {
+        async_runtime::set_runtime_type(RuntimeType::Tokio).unwrap();
+
+        let lower = TempDir::new().unwrap();
+        let upper = TempDir::new().unwrap();
+        let Some(mut stack) = mount_passthrough_of_slow_fs(lower.as_path(), upper.as_path()) else {
+            return;
+        };
+        // `import()` stat'ed the root of the lower mount, which waited for its INIT.
+        if !stack.slow_fs.has_resend.load(Ordering::Relaxed) {
+            eprintln!("kernel without FUSE_NOTIFY_RESEND, skipping");
+            return;
+        }
+        let buf_size = stack.upper_se.bufsize();
+        // The kernel ends the requests read from a file description when it is closed, so the
+        // test keeps the one the old server reads from, as a takeover passes it to the new one.
+        let file = stack.upper_se.clone_fuse_file().unwrap();
+        let old = Arc::new(Server::new(stack.fs.clone()));
+        let (stop_tx, stop) = oneshot::channel();
+        let old_handle = serve(file.try_clone().unwrap(), buf_size, old.clone(), stop);
+
+        let path = upper.as_path().join("slow");
+        let slow = in_thread(move || std::fs::read(path));
+        stack.slow_fs.wait_for_slow_reads(1);
+        // Dropping poll_handler() frees the request buffers. The runtime then waits for its pool
+        // threads when it shuts down, so the old serving thread ends only after the gate opens.
+        stop_tx.send(()).unwrap();
+        thread::sleep(Duration::from_millis(100));
+
+        let new = Arc::new(Server::new(stack.fs.clone()));
+        let (version, options) = old.init_state();
+        new.restore_init(version, options);
+        let mut buf = vec![0u8; 0x1000];
+        let writer = FuseDevWriter::<()>::new(file.as_raw_fd(), &mut buf).unwrap();
+        new.notify_resend(writer).unwrap();
+        let (_stop_tx, stop) = oneshot::channel();
+        let new_handle = serve(file.try_clone().unwrap(), buf_size, new, stop);
+        stack.slow_fs.wait_for_slow_reads(2);
+
+        stack.slow_fs.open_gate();
+        let slow = slow.recv_timeout(Duration::from_secs(5)).unwrap().unwrap();
+        assert_eq!(slow, slow_fs_data());
+        old_handle.join().unwrap();
+
+        stack.upper_se.umount().unwrap();
         new_handle.join().unwrap();
     }
 }

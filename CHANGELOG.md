@@ -51,6 +51,12 @@
   `preadv()`/`pwritev()` call for all buffers instead of one call per buffer.
   `async_file::preadv()` and `pwritev()` accept more than 1024 buffers and make one call per
   1024.
+- `PassthroughFs::enable_async_thread_pool(true)` also moves READ and WRITE
+  requests that would block the runtime thread to the blocking thread pool.
+  These are the O_DIRECT and WRITE_KILL_PRIV requests, and on the tokio
+  runtime also READ cache misses and every WRITE. On a file system without
+  `RWF_NOWAIT`, such as tmpfs, overlayfs or FUSE, every READ counts as a cache
+  miss. Each of these requests costs one more copy and a thread handoff.
 - The umbrella crate's `async-io` no longer turns on the `fusedev` and `virtiofs`
   transports. Code that uses the items they gate, such as `abi::virtio_fs`, has
   to enable them. A crate that depends on a transport crate directly must enable
