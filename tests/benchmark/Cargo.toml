@@ -19,8 +19,13 @@ signal-hook = ">=0.3.10"
 [dev-dependencies]
 async-trait = "0.1.42"
 criterion = "0.5"
+vm-memory = { workspace = true }
 vmm-sys-util = "0.15.0"
 
 [[bench]]
 name = "sync_vs_async_microbench"
+harness = false
+
+[[bench]]
+name = "reply_buffers_microbench"
 harness = false

@@ -16,13 +16,28 @@ Covered operations: `lookup`, `getattr`, `open+read(4KB)+release`,
 
 ```sh
 cd tests/benchmark
-cargo bench
+cargo bench --bench sync_vs_async_microbench
 ```
 
 Note that the async numbers include the runtime dispatch cost
 (`Runtime::block_on()` per operation). These numbers quantify the overhead
 of delegation itself; they do not predict end-to-end throughput, because the
 fuse transport and request concurrency dominate there.
+
+`benches/reply_buffers_microbench.rs` runs READ requests through
+`Server::handle_message()` and a `FuseDevWriter` for a file system that
+serves chunked data from memory. It compares copying the chunks into the
+reply with handing them over with `write_owned()`. The `hot` cases serve the
+same data on every READ, and the `cold` cases walk a 256 MiB pool that doesn't
+fit in the CPU caches. The reply goes to a file in `/dev/shm`, so it needs
+Linux.
+
+```sh
+cd tests/benchmark
+cargo bench --bench reply_buffers_microbench
+```
+
+A plain `cargo bench` runs every micro-benchmark.
 
 ## 2. End-to-end comparison with fio
 
