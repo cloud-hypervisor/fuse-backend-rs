@@ -40,7 +40,8 @@
 - `AsyncFileSystem` has `async_opendir()`, `async_readdir()`, `async_readdirplus()` and
   `async_releasedir()`, which default to the sync handlers. The async server serves OPENDIR,
   READDIR, READDIRPLUS and RELEASEDIR with them, so a file system that implements them can
-  list a directory without blocking the worker.
+  list a directory without blocking the worker. `Vfs` passes them on to the mounted file
+  systems.
 
 ### Changed
 - Bump the declared minimum supported Rust version (MSRV) from 1.80 to 1.86.

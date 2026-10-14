@@ -196,6 +196,84 @@ impl AsyncFileSystem for Vfs {
         }
     }
 
+    async fn async_opendir(
+        &self,
+        ctx: &Context,
+        inode: <Self as FileSystem>::Inode,
+        flags: u32,
+    ) -> Result<(Option<<Self as FileSystem>::Handle>, OpenOptions)> {
+        #[cfg(target_os = "linux")]
+        if self.opts.load().no_opendir {
+            return Err(Error::from_raw_os_error(libc::ENOSYS));
+        }
+        match self.get_real_rootfs(inode)? {
+            (Left(fs), idata) => fs.opendir(ctx, idata.ino(), flags),
+            (Right(fs), idata) => fs.async_opendir(ctx, idata.ino(), flags).await,
+        }
+    }
+
+    async fn async_readdir(
+        &self,
+        ctx: &Context,
+        inode: <Self as FileSystem>::Inode,
+        handle: <Self as FileSystem>::Handle,
+        size: u32,
+        offset: u64,
+        add_entry: &mut (dyn FnMut(DirEntry) -> Result<usize> + Send),
+    ) -> Result<()> {
+        match self.get_real_rootfs(inode)? {
+            // The pseudo fs answers right away.
+            (Left(fs), idata) => {
+                self.readdir_pseudo(fs, idata, ctx, handle, size, offset, add_entry)
+            }
+            (Right(fs), idata) => {
+                fs.async_readdir(
+                    ctx,
+                    idata.ino(),
+                    handle,
+                    size,
+                    offset,
+                    &mut |mut dir_entry| {
+                        dir_entry.ino = self.convert_inode(idata.fs_idx(), dir_entry.ino)?;
+                        add_entry(dir_entry)
+                    },
+                )
+                .await
+            }
+        }
+    }
+
+    async fn async_readdirplus(
+        &self,
+        ctx: &Context,
+        inode: <Self as FileSystem>::Inode,
+        handle: <Self as FileSystem>::Handle,
+        size: u32,
+        offset: u64,
+        add_entry: &mut (dyn FnMut(DirEntry, Entry) -> Result<usize> + Send),
+    ) -> Result<()> {
+        match self.get_real_rootfs(inode)? {
+            (Left(fs), idata) => {
+                self.readdirplus_pseudo(fs, idata, ctx, handle, size, offset, add_entry)
+            }
+            (Right(fs), idata) => {
+                fs.async_readdirplus(
+                    ctx,
+                    idata.ino(),
+                    handle,
+                    size,
+                    offset,
+                    &mut |mut dir_entry, entry| {
+                        let entry = self.convert_backend_entry(idata, entry)?;
+                        dir_entry.ino = entry.inode;
+                        add_entry(dir_entry, entry)
+                    },
+                )
+                .await
+            }
+        }
+    }
+
     async fn async_fsyncdir(
         &self,
         ctx: &Context,
@@ -206,6 +284,19 @@ impl AsyncFileSystem for Vfs {
         match self.get_real_rootfs(inode)? {
             (Left(fs), idata) => fs.fsyncdir(ctx, idata.ino(), datasync, handle),
             (Right(fs), idata) => fs.async_fsyncdir(ctx, idata.ino(), datasync, handle).await,
+        }
+    }
+
+    async fn async_releasedir(
+        &self,
+        ctx: &Context,
+        inode: <Self as FileSystem>::Inode,
+        flags: u32,
+        handle: <Self as FileSystem>::Handle,
+    ) -> Result<()> {
+        match self.get_real_rootfs(inode)? {
+            (Left(fs), idata) => fs.releasedir(ctx, idata.ino(), flags, handle),
+            (Right(fs), idata) => fs.async_releasedir(ctx, idata.ino(), flags, handle).await,
         }
     }
 }
@@ -221,6 +312,7 @@ mod tests {
     use super::*;
     use crate::Vfs;
 
+    use std::any::Any;
     use std::ffi::CString;
 
     #[tokio::test]
@@ -267,6 +359,214 @@ mod tests {
             assert_eq!(entry3.inode, 0);
         });
         handle.await.unwrap();
+    }
+
+    const DIR_HANDLE: u64 = 7;
+
+    fn check_dir_handle(handle: u64) -> Result<()> {
+        if handle == DIR_HANDLE {
+            Ok(())
+        } else {
+            Err(io::Error::from_raw_os_error(libc::EBADF))
+        }
+    }
+
+    /// A backend whose root directory, inode 1, holds a file with inode 5. Only the async
+    /// handlers serve the directory, after they yield to the runtime once.
+    struct AsyncDirFs;
+
+    impl FileSystem for AsyncDirFs {
+        type Inode = u64;
+        type Handle = u64;
+    }
+
+    #[async_trait]
+    impl AsyncFileSystem for AsyncDirFs {
+        async fn async_opendir(
+            &self,
+            _ctx: &Context,
+            _inode: u64,
+            _flags: u32,
+        ) -> Result<(Option<u64>, OpenOptions)> {
+            tokio::task::yield_now().await;
+            Ok((Some(DIR_HANDLE), OpenOptions::empty()))
+        }
+
+        async fn async_readdir(
+            &self,
+            _ctx: &Context,
+            _inode: u64,
+            handle: u64,
+            _size: u32,
+            offset: u64,
+            add_entry: &mut (dyn FnMut(DirEntry) -> Result<usize> + Send),
+        ) -> Result<()> {
+            tokio::task::yield_now().await;
+            check_dir_handle(handle)?;
+            if offset == 0 {
+                add_entry(DirEntry {
+                    ino: 5,
+                    offset: 1,
+                    type_: libc::DT_REG as u32,
+                    name: b"file",
+                })?;
+            }
+            Ok(())
+        }
+
+        async fn async_readdirplus(
+            &self,
+            ctx: &Context,
+            inode: u64,
+            handle: u64,
+            size: u32,
+            offset: u64,
+            add_entry: &mut (dyn FnMut(DirEntry, Entry) -> Result<usize> + Send),
+        ) -> Result<()> {
+            self.async_readdir(ctx, inode, handle, size, offset, &mut |dir_entry| {
+                let mut entry = Entry {
+                    inode: dir_entry.ino,
+                    ..Default::default()
+                };
+                entry.attr.st_ino = dir_entry.ino;
+                add_entry(dir_entry, entry)
+            })
+            .await
+        }
+
+        async fn async_releasedir(
+            &self,
+            _ctx: &Context,
+            _inode: u64,
+            _flags: u32,
+            handle: u64,
+        ) -> Result<()> {
+            tokio::task::yield_now().await;
+            check_dir_handle(handle)
+        }
+    }
+
+    impl BackendFileSystem for AsyncDirFs {
+        fn mount(&self) -> Result<(Entry, u64)> {
+            Ok((
+                Entry {
+                    inode: 1,
+                    ..Default::default()
+                },
+                0,
+            ))
+        }
+
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+    }
+
+    /// The VFS inode of the root of the first mount.
+    const MOUNT_ROOT: u64 = 0x100_0000_0000_0001;
+
+    /// Lists the directory `inode` with READDIR, as the name and inode of each entry. It uses
+    /// the handle that `AsyncDirFs` opens, which the pseudo fs ignores.
+    async fn list(vfs: &Vfs, inode: u64) -> Vec<(Vec<u8>, u64)> {
+        let mut names = Vec::new();
+        vfs.async_readdir(
+            &Context::default(),
+            inode.into(),
+            DIR_HANDLE,
+            4096,
+            0,
+            &mut |dir_entry| {
+                names.push((dir_entry.name.to_vec(), dir_entry.ino));
+                Ok(1)
+            },
+        )
+        .await
+        .unwrap();
+        names
+    }
+
+    /// Like `list()` with READDIRPLUS, as the inode of each entry, the inode and `st_ino` of
+    /// its `Entry`, and its owner.
+    async fn list_plus(vfs: &Vfs, inode: u64) -> Vec<(u64, u64, u64, u32)> {
+        let mut inodes = Vec::new();
+        vfs.async_readdirplus(
+            &Context::default(),
+            inode.into(),
+            DIR_HANDLE,
+            4096,
+            0,
+            &mut |dir_entry, entry| {
+                let attr = entry.attr;
+                inodes.push((dir_entry.ino, entry.inode, attr.st_ino, attr.st_uid));
+                Ok(1)
+            },
+        )
+        .await
+        .unwrap();
+        inodes
+    }
+
+    #[tokio::test]
+    async fn test_vfs_async_readdir_pseudo() {
+        let vfs = Vfs::new(VfsOptions::default());
+        vfs.mount(Box::new(FakeFileSystemOne {}), "/x/y").unwrap();
+
+        // Spawning checks that the futures, which hold add_entry, are Send.
+        let handle = tokio::spawn(async move {
+            assert_eq!(list(&vfs, ROOT_ID).await, [(b"x".to_vec(), 2)]);
+            // The mountpoint y lists as the root of the mounted file system.
+            assert_eq!(list(&vfs, 2).await, [(b"y".to_vec(), MOUNT_ROOT)]);
+            let root = MOUNT_ROOT;
+            assert_eq!(list_plus(&vfs, 2).await, [(root, root, root, 0)]);
+        });
+        handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_vfs_async_readdir_backend() {
+        let vfs = Vfs::new(VfsOptions::default());
+        // Map the backend's uid 0 to 1000.
+        vfs.mount_with_id_mapping(Box::new(AsyncDirFs), "/x", Some((0, 1000, 1)))
+            .unwrap();
+        let ctx = Context::default();
+        let file = 0x100_0000_0000_0005;
+
+        let handle = tokio::spawn(async move {
+            assert_eq!(list(&vfs, MOUNT_ROOT).await, [(b"file".to_vec(), file)]);
+            assert_eq!(
+                list_plus(&vfs, MOUNT_ROOT).await,
+                [(file, file, file, 1000)]
+            );
+            vfs.async_releasedir(&ctx, MOUNT_ROOT.into(), 0, DIR_HANDLE)
+                .await
+                .unwrap();
+        });
+        handle.await.unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn test_vfs_async_opendir() {
+        let ctx = Context::default();
+
+        // By default Vfs answers OPENDIR with ENOSYS, so the kernel stops sending it.
+        let vfs = Vfs::new(VfsOptions::default());
+        vfs.mount(Box::new(AsyncDirFs), "/x").unwrap();
+        let err = vfs
+            .async_opendir(&ctx, MOUNT_ROOT.into(), 0)
+            .await
+            .unwrap_err();
+        assert_eq!(err.raw_os_error(), Some(libc::ENOSYS));
+
+        let vfs = Vfs::new(VfsOptions {
+            no_opendir: false,
+            ..Default::default()
+        });
+        vfs.mount(Box::new(AsyncDirFs), "/x").unwrap();
+        let (handle, _) = vfs.async_opendir(&ctx, ROOT_ID.into(), 0).await.unwrap();
+        assert_eq!(handle, None);
+        let (handle, _) = vfs.async_opendir(&ctx, MOUNT_ROOT.into(), 0).await.unwrap();
+        assert_eq!(handle, Some(DIR_HANDLE));
     }
 
     // Note: the passthrough integration test driving async requests through
