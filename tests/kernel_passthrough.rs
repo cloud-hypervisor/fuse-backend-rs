@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Mounts a filesystem with one file whose reads are passed through to a backing file, served
-//! by the sync server and, with `async-io`, by `FuseDevTask`. Needs root and a kernel with
-//! CONFIG_FUSE_PASSTHROUGH, and is skipped without them.
+//! by the sync server and, with `async-io`, by `FuseDevTask`. Needs root in the initial user
+//! namespace and a kernel with CONFIG_FUSE_PASSTHROUGH, and is skipped without them.
 
 #[cfg(all(feature = "fusedev", target_os = "linux"))]
 mod fusedev_tests {
@@ -130,7 +130,13 @@ mod fusedev_tests {
     fn check(result: Option<io::Result<Vec<u8>>>) {
         match result {
             // The default `read` returns ENOSYS, so the data can only come from the backing file.
-            Some(data) => assert_eq!(data.unwrap(), b"passed through"),
+            Some(Ok(data)) => assert_eq!(data, b"passed through"),
+            // Registering a backing file needs CAP_SYS_ADMIN in the initial user namespace, which
+            // root in another one, such as from `unshare -r`, doesn't have.
+            Some(Err(e)) if e.raw_os_error() == Some(libc::EPERM) => {
+                eprintln!("no CAP_SYS_ADMIN in the initial user namespace, skipping")
+            }
+            Some(Err(e)) => panic!("failed to read the file: {}", e),
             None => eprintln!("kernel without FUSE passthrough, skipping"),
         }
     }
