@@ -69,17 +69,18 @@ default = ["fusedev"]
 # its own. The `dep:` prefix keeps the dependency crate names themselves out of
 # the public feature list.
 #
-# Forwarding `async-io` to the sub-crates with the `pkg/feature` syntax also
-# activates those optional dependencies, so an async-io-only build compiles
-# the sub-crates even when no transport feature is selected. The umbrella's
-# own re-exports stay gated on the transport features below, so its public
-# surface is unchanged; resolver-level weak dependencies would avoid the
-# extra compilation but require `resolver = "2"`.
+# The weak `pkg?/feature` syntax passes `async-io` only to the transports that
+# a transport feature enables. This keeps the Linux-only virtiofs transport out
+# of macOS builds. A crate that depends on a transport directly must enable the
+# transport's `async-io` itself, or the transport's writers fail asynchronous
+# replies with EINVAL. The drivers always get `async-io`, because core's
+# `async-io` makes `BackendFileSystem` require `AsyncFileSystem`. They are
+# Linux-only dependencies, so macOS builds don't see them.
 async-io = [
     "fuse-backend-core/async-io",
     "fuse-backend-vfs/async-io",
-    "fuse-backend-fusedev/async-io",
-    "fuse-backend-virtiofs/async-io",
+    "fuse-backend-fusedev?/async-io",
+    "fuse-backend-virtiofs?/async-io",
     "fuse-backend-passthrough/async-io",
     "fuse-backend-overlayfs/async-io",
 ]
