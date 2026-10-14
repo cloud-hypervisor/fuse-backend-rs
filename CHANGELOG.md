@@ -36,7 +36,8 @@
 - `AsyncFileSystem` has `async_opendir()`, `async_readdir()`, `async_readdirplus()` and
   `async_releasedir()`, which default to the sync handlers. The async server serves OPENDIR,
   READDIR, READDIRPLUS and RELEASEDIR with them, so a file system that implements them can
-  list a directory without blocking the worker.
+  list a directory without blocking the worker. `Vfs` passes them on to the mounted file
+  systems.
 
 ### Changed
 - The FUSE-over-io_uring transport answers opcodes it doesn't know with ENOSYS instead of EIO.
