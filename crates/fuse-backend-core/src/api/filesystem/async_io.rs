@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 
-use super::{Context, Entry, FileSystem, ZeroCopyReader, ZeroCopyWriter};
+use super::{Context, DirEntry, Entry, FileSystem, ZeroCopyReader, ZeroCopyWriter};
 use crate::abi::fuse_abi::{stat64, CreateIn, OpenOptions, SetattrValid};
 use crate::file_traits::AsyncFileReadWriteVolatile;
 
@@ -688,112 +688,138 @@ pub trait AsyncFileSystem: FileSystem {
         fn removexattr(&self, ctx: Context, inode: Self::Inode, name: &CStr) -> io::Result<()> {
             Err(io::Error::from_raw_os_error(libc::ENOSYS))
         }
-
-        /// Open a directory for reading.
-        ///
-        /// The file system may choose to return a `Handle` to refer to the newly opened directory. The
-        /// kernel will then use this `Handle` for all operations on the content of the directory
-        /// (`readdir`, `readdirplus`, `fsyncdir`, `releasedir`). If the file system does not return a
-        /// `Handle` then the kernel will use the `Inode` for the directory to operate on its contents.
-        /// In this case the file system may wish to enable the `FsOptions::ZERO_MESSAGE_OPENDIR`
-        /// feature if it is supported by the kernel (see below).
-        ///
-        /// The returned `OpenOptions` allow the file system to change the way the opened directory is
-        /// handled by the kernel. See the documentation of `OpenOptions` for more information.
-        ///
-        /// If the `FsOptions::ZERO_MESSAGE_OPENDIR` feature is enabled by both the file system
-        /// implementation and the kernel, then the file system may return an error of `ENOSYS`. This
-        /// will be interpreted by the kernel as success and future calls to `opendir` and `releasedir`
-        /// will be handled by the kernel without being passed on to the file system.
-        fn opendir(
-            &self,
-            ctx: Context,
-            inode: Self::Inode,
-            flags: u32,
-        ) -> io::Result<(Option<Self::Handle>, OpenOptions)> {
-            // Matches the behavior of libfuse.
-            Ok((None, OpenOptions::empty()))
-        }
-
-        /// Read a directory.
-        ///
-        /// `handle` is the `Handle` returned by the file system from the `opendir` method, if any. If
-        /// the file system did not return a `Handle` from `opendir` then the contents of `handle` are
-        /// undefined.
-        ///
-        /// `size` indicates the maximum number of bytes that should be returned by this method,
-        /// but can be ignored in practice. Instead, entries are returned by calling the
-        /// `add_entry` function until it returns zero (indicating that the buffer is full).
-        ///
-        /// If `offset` is non-zero then it corresponds to one of the `offset` values from a `DirEntry`
-        /// that was previously returned by a call to `readdir` for the same handle. In this case the
-        /// file system should skip over the entries before the position defined by the `offset` value.
-        /// If entries were added or removed while the `Handle` is open then the file system may still
-        /// include removed entries or skip newly created entries. However, adding or removing entries
-        /// should never cause the file system to skip over unrelated entries or include an entry more
-        /// than once. This means that `offset` cannot be a simple index and must include sufficient
-        /// information to uniquely determine the next entry in the list even when the set of entries is
-        /// being changed.
-        ///
-        /// The file system may return entries for the current directory (".") and parent directory
-        /// ("..") but is not required to do so. If the file system does not return these entries, then
-        /// they are implicitly added by the kernel.
-        ///
-        /// The lookup count for `Inode`s associated with the returned directory entries is **NOT**
-        /// affected by this method.
-        ///
-        // TODO(chirantan): Change method signature to return `Iterator<DirEntry>` rather than using an
-        // `FnMut` for adding entries.
-        fn readdir(
-            &self,
-            ctx: Context,
-            inode: Self::Inode,
-            handle: Self::Handle,
-            size: u32,
-            offset: u64,
-            add_entry: &mut dyn FnMut(DirEntry) -> io::Result<usize>,
-        ) -> io::Result<()> {
-            Err(io::Error::from_raw_os_error(libc::ENOSYS))
-        }
-
-        /// Read a directory with entry attributes.
-        ///
-        /// Like `readdir` but also includes the attributes for each directory entry.
-        ///
-        /// `handle` is the `Handle` returned by the file system from the `opendir` method, if any. If
-        /// the file system did not return a `Handle` from `opendir` then the contents of `handle` are
-        /// undefined.
-        ///
-        /// `size` indicates the maximum number of bytes that should be returned by this method,
-        /// but can be ignored in practice. Instead, entries are returned by calling the
-        /// `add_entry` function until it returns zero (indicating that the buffer is full).
-        ///
-        /// Unlike `readdir`, the lookup count for `Inode`s associated with the returned directory
-        /// entries **IS** affected by this method (since it returns an `Entry` for each `DirEntry`).
-        /// The count for each `Inode` should be increased by 1.
-        ///
-        /// File systems that implement this method should enable the `FsOptions::DO_READDIRPLUS`
-        /// feature when supported by the kernel. The kernel will not call this method unless that
-        /// feature is enabled.
-        ///
-        /// Additionally, file systems that implement both `readdir` and `readdirplus` should enable the
-        /// `FsOptions::READDIRPLUS_AUTO` feature to allow the kernel to issue both `readdir` and
-        /// `readdirplus` requests, depending on how much information is expected to be required.
-        ///
-        /// TODO(chirantan): Change method signature to return `Iterator<(DirEntry, Entry)>` rather than
-        /// using an `FnMut` for adding entries.
-        fn readdirplus(
-            &self,
-            ctx: Context,
-            inode: Self::Inode,
-            handle: Self::Handle,
-            size: u32,
-            offset: u64,
-            add_entry: &mut dyn FnMut(DirEntry, Entry) -> io::Result<usize>,
-        ) -> io::Result<()> {
-            Err(io::Error::from_raw_os_error(libc::ENOSYS))
-        }
     */
+
+    /// Open a directory for reading.
+    ///
+    /// The file system may choose to return a `Handle` to refer to the newly opened directory. The
+    /// kernel will then use this `Handle` for all operations on the content of the directory
+    /// (`readdir`, `readdirplus`, `fsyncdir`, `releasedir`). If the file system does not return a
+    /// `Handle` then the kernel will use the `Inode` for the directory to operate on its contents.
+    /// In this case the file system may wish to enable the `FsOptions::ZERO_MESSAGE_OPENDIR`
+    /// feature if it is supported by the kernel (see below).
+    ///
+    /// The returned `OpenOptions` allow the file system to change the way the opened directory is
+    /// handled by the kernel. See the documentation of `OpenOptions` for more information.
+    ///
+    /// If the `FsOptions::ZERO_MESSAGE_OPENDIR` feature is enabled by both the file system
+    /// implementation and the kernel, then the file system may return an error of `ENOSYS`. This
+    /// will be interpreted by the kernel as success and future calls to `opendir` and `releasedir`
+    /// will be handled by the kernel without being passed on to the file system.
+    fn async_opendir<'a, 'b, 'async_trait>(
+        &'a self,
+        ctx: &'b Context,
+        inode: Self::Inode,
+        flags: u32,
+    ) -> Pin<OpenFuture<'async_trait, Self::Handle>>
+    where
+        'a: 'async_trait,
+        'b: 'async_trait,
+        Self: 'async_trait,
+    {
+        let result = self
+            .opendir(ctx, inode, flags)
+            .map(|(handle, opts)| (handle.map(Into::<u64>::into), opts));
+        Box::pin(async move { result.map(|(handle, opts)| (handle.map(From::from), opts)) })
+    }
+
+    /// Read a directory.
+    ///
+    /// `handle` is the `Handle` returned by the file system from the `opendir` method, if any. If
+    /// the file system did not return a `Handle` from `opendir` then the contents of `handle` are
+    /// undefined.
+    ///
+    /// `size` indicates the maximum number of bytes that should be returned by this method,
+    /// but can be ignored in practice. Instead, entries are returned by calling the
+    /// `add_entry` function until it returns zero (indicating that the buffer is full).
+    ///
+    /// `add_entry` copies the entry into the reply buffer and returns right away, so the returned
+    /// future may call it between `.await` points. It is `Send`, so a future that holds it stays
+    /// `Send`. The server sends the reply once the future completes. If the future fails, the
+    /// reply carries only the error and none of the entries added before.
+    ///
+    /// If `offset` is non-zero then it corresponds to one of the `offset` values from a `DirEntry`
+    /// that was previously returned by a call to `readdir` for the same handle. In this case the
+    /// file system should skip over the entries before the position defined by the `offset` value.
+    /// If entries were added or removed while the `Handle` is open then the file system may still
+    /// include removed entries or skip newly created entries. However, adding or removing entries
+    /// should never cause the file system to skip over unrelated entries or include an entry more
+    /// than once. This means that `offset` cannot be a simple index and must include sufficient
+    /// information to uniquely determine the next entry in the list even when the set of entries is
+    /// being changed.
+    ///
+    /// The file system may return entries for the current directory (".") and parent directory
+    /// ("..") but is not required to do so. The Linux kernel doesn't add them, so a listing shows
+    /// them only if the file system returns them.
+    ///
+    /// The lookup count for `Inode`s associated with the returned directory entries is **NOT**
+    /// affected by this method.
+    fn async_readdir<'a, 'b, 'c, 'async_trait>(
+        &'a self,
+        ctx: &'b Context,
+        inode: Self::Inode,
+        handle: Self::Handle,
+        size: u32,
+        offset: u64,
+        add_entry: &'c mut (dyn FnMut(DirEntry) -> io::Result<usize> + Send),
+    ) -> Pin<Box<dyn Future<Output = io::Result<()>> + Send + 'async_trait>>
+    where
+        'a: 'async_trait,
+        'b: 'async_trait,
+        'c: 'async_trait,
+        Self: 'async_trait,
+    {
+        Box::pin(std::future::ready(
+            self.readdir(ctx, inode, handle, size, offset, add_entry),
+        ))
+    }
+
+    /// Read a directory with entry attributes.
+    ///
+    /// Like `async_readdir` but also includes the attributes for each directory entry.
+    ///
+    /// `handle` is the `Handle` returned by the file system from the `opendir` method, if any. If
+    /// the file system did not return a `Handle` from `opendir` then the contents of `handle` are
+    /// undefined.
+    ///
+    /// `size` indicates the maximum number of bytes that should be returned by this method,
+    /// but can be ignored in practice. Instead, entries are returned by calling the
+    /// `add_entry` function until it returns zero (indicating that the buffer is full).
+    /// `add_entry` works as it does for `async_readdir`.
+    ///
+    /// Unlike `async_readdir`, the lookup count for `Inode`s associated with the returned
+    /// directory entries **IS** affected by this method (since it returns an `Entry` for each
+    /// `DirEntry`). The count for each `Inode` should be increased by 1. If the future fails after
+    /// `add_entry` accepted entries, the kernel never sees them and sends no FORGET for them. So
+    /// drop the lookup counts taken for them before failing, or succeed with the entries added so
+    /// far and report the error on the next call.
+    ///
+    /// File systems that implement this method should enable the `FsOptions::DO_READDIRPLUS`
+    /// feature when supported by the kernel. The kernel will not call this method unless that
+    /// feature is enabled.
+    ///
+    /// Additionally, file systems that implement both `readdir` and `readdirplus` should enable the
+    /// `FsOptions::READDIRPLUS_AUTO` feature to allow the kernel to issue both `readdir` and
+    /// `readdirplus` requests, depending on how much information is expected to be required.
+    fn async_readdirplus<'a, 'b, 'c, 'async_trait>(
+        &'a self,
+        ctx: &'b Context,
+        inode: Self::Inode,
+        handle: Self::Handle,
+        size: u32,
+        offset: u64,
+        add_entry: &'c mut (dyn FnMut(DirEntry, Entry) -> io::Result<usize> + Send),
+    ) -> Pin<Box<dyn Future<Output = io::Result<()>> + Send + 'async_trait>>
+    where
+        'a: 'async_trait,
+        'b: 'async_trait,
+        'c: 'async_trait,
+        Self: 'async_trait,
+    {
+        Box::pin(std::future::ready(
+            self.readdirplus(ctx, inode, handle, size, offset, add_entry),
+        ))
+    }
 
     /// Synchronize the contents of a directory.
     ///
@@ -825,7 +851,6 @@ pub trait AsyncFileSystem: FileSystem {
         ))
     }
 
-    /*
     /// Release an open directory.
     ///
     /// For every `opendir` call there will be exactly one `releasedir` call (unless the file system
@@ -836,16 +861,24 @@ pub trait AsyncFileSystem: FileSystem {
     /// undefined.
     ///
     /// `flags` contains used the flags used to open the directory in `opendir`.
-    fn releasedir(
-        &self,
-        ctx: Context,
+    fn async_releasedir<'a, 'b, 'async_trait>(
+        &'a self,
+        ctx: &'b Context,
         inode: Self::Inode,
         flags: u32,
         handle: Self::Handle,
-    ) -> io::Result<()> {
-        Err(io::Error::from_raw_os_error(libc::ENOSYS))
+    ) -> Pin<Box<dyn Future<Output = io::Result<()>> + Send + 'async_trait>>
+    where
+        'a: 'async_trait,
+        'b: 'async_trait,
+        Self: 'async_trait,
+    {
+        Box::pin(std::future::ready(
+            self.releasedir(ctx, inode, flags, handle),
+        ))
     }
 
+    /*
     #[cfg(feature = "virtiofs")]
     /// Setup a mapping so that guest can access files in DAX style.
     ///
@@ -1144,6 +1177,58 @@ impl<FS: AsyncFileSystem> AsyncFileSystem for Arc<FS> {
             .async_fallocate(ctx, inode, handle, mode, offset, length)
     }
 
+    fn async_opendir<'a, 'b, 'async_trait>(
+        &'a self,
+        ctx: &'b Context,
+        inode: Self::Inode,
+        flags: u32,
+    ) -> Pin<OpenFuture<'async_trait, Self::Handle>>
+    where
+        'a: 'async_trait,
+        'b: 'async_trait,
+        Self: 'async_trait,
+    {
+        self.deref().async_opendir(ctx, inode, flags)
+    }
+
+    fn async_readdir<'a, 'b, 'c, 'async_trait>(
+        &'a self,
+        ctx: &'b Context,
+        inode: Self::Inode,
+        handle: Self::Handle,
+        size: u32,
+        offset: u64,
+        add_entry: &'c mut (dyn FnMut(DirEntry) -> io::Result<usize> + Send),
+    ) -> Pin<Box<dyn Future<Output = io::Result<()>> + Send + 'async_trait>>
+    where
+        'a: 'async_trait,
+        'b: 'async_trait,
+        'c: 'async_trait,
+        Self: 'async_trait,
+    {
+        self.deref()
+            .async_readdir(ctx, inode, handle, size, offset, add_entry)
+    }
+
+    fn async_readdirplus<'a, 'b, 'c, 'async_trait>(
+        &'a self,
+        ctx: &'b Context,
+        inode: Self::Inode,
+        handle: Self::Handle,
+        size: u32,
+        offset: u64,
+        add_entry: &'c mut (dyn FnMut(DirEntry, Entry) -> io::Result<usize> + Send),
+    ) -> Pin<Box<dyn Future<Output = io::Result<()>> + Send + 'async_trait>>
+    where
+        'a: 'async_trait,
+        'b: 'async_trait,
+        'c: 'async_trait,
+        Self: 'async_trait,
+    {
+        self.deref()
+            .async_readdirplus(ctx, inode, handle, size, offset, add_entry)
+    }
+
     fn async_fsyncdir<'a, 'b, 'async_trait>(
         &'a self,
         ctx: &'b Context,
@@ -1157,6 +1242,21 @@ impl<FS: AsyncFileSystem> AsyncFileSystem for Arc<FS> {
         Self: 'async_trait,
     {
         self.deref().async_fsyncdir(ctx, inode, datasync, handle)
+    }
+
+    fn async_releasedir<'a, 'b, 'async_trait>(
+        &'a self,
+        ctx: &'b Context,
+        inode: Self::Inode,
+        flags: u32,
+        handle: Self::Handle,
+    ) -> Pin<Box<dyn Future<Output = io::Result<()>> + Send + 'async_trait>>
+    where
+        'a: 'async_trait,
+        'b: 'async_trait,
+        Self: 'async_trait,
+    {
+        self.deref().async_releasedir(ctx, inode, flags, handle)
     }
 }
 
@@ -1201,6 +1301,71 @@ mod tests {
             _flags: u32,
         ) -> io::Result<usize> {
             w.write(&b"served by read()"[..size as usize])
+        }
+
+        fn opendir(
+            &self,
+            _ctx: &Context,
+            inode: u64,
+            _flags: u32,
+        ) -> io::Result<(Option<u64>, OpenOptions)> {
+            Ok((Some(inode * 10), OpenOptions::DIRECT_IO))
+        }
+
+        fn readdir(
+            &self,
+            _ctx: &Context,
+            _inode: u64,
+            _handle: u64,
+            _size: u32,
+            offset: u64,
+            add_entry: &mut dyn FnMut(DirEntry) -> io::Result<usize>,
+        ) -> io::Result<()> {
+            let names: [&[u8]; 2] = [b"a", b"b"];
+            for (i, name) in names.iter().enumerate().skip(offset as usize) {
+                let entry = DirEntry {
+                    ino: i as u64 + 2,
+                    offset: i as u64 + 1,
+                    type_: libc::DT_REG as u32,
+                    name,
+                };
+                if add_entry(entry)? == 0 {
+                    break;
+                }
+            }
+            Ok(())
+        }
+
+        fn readdirplus(
+            &self,
+            ctx: &Context,
+            inode: u64,
+            handle: u64,
+            size: u32,
+            offset: u64,
+            add_entry: &mut dyn FnMut(DirEntry, Entry) -> io::Result<usize>,
+        ) -> io::Result<()> {
+            self.readdir(ctx, inode, handle, size, offset, &mut |dir_entry| {
+                let entry = Entry {
+                    inode: dir_entry.ino,
+                    ..Default::default()
+                };
+                add_entry(dir_entry, entry)
+            })
+        }
+
+        fn releasedir(
+            &self,
+            _ctx: &Context,
+            inode: u64,
+            _flags: u32,
+            handle: u64,
+        ) -> io::Result<()> {
+            if handle == inode * 10 {
+                Ok(())
+            } else {
+                Err(io::Error::from_raw_os_error(libc::EBADF))
+            }
         }
     }
 
@@ -1267,5 +1432,38 @@ mod tests {
         // Without a sync handler, the default still returns ENOSYS.
         let err = fs.async_getattr(&ctx, 2, None).await.unwrap_err();
         assert_eq!(err.raw_os_error(), Some(libc::ENOSYS));
+    }
+
+    #[tokio::test]
+    async fn test_dir_defaults_call_sync_handlers() {
+        let fs = SyncFs;
+        let ctx = Context::default();
+
+        let (handle, opts) = fs.async_opendir(&ctx, 1, 0).await.unwrap();
+        assert_eq!((handle, opts), (Some(10), OpenOptions::DIRECT_IO));
+
+        // The entries come from readdir(), which starts at the offset and
+        // stops once add_entry() returns 0.
+        let mut names = Vec::new();
+        fs.async_readdir(&ctx, 1, 10, 4096, 0, &mut |dir_entry| {
+            names.push(dir_entry.name.to_vec());
+            Ok(0)
+        })
+        .await
+        .unwrap();
+        assert_eq!(names, [b"a"]);
+
+        let mut inodes = Vec::new();
+        fs.async_readdirplus(&ctx, 1, 10, 4096, 1, &mut |dir_entry, entry| {
+            inodes.push((dir_entry.ino, entry.inode));
+            Ok(1)
+        })
+        .await
+        .unwrap();
+        assert_eq!(inodes, [(3, 3)]);
+
+        fs.async_releasedir(&ctx, 1, 0, 10).await.unwrap();
+        let err = fs.async_releasedir(&ctx, 1, 0, 11).await.unwrap_err();
+        assert_eq!(err.raw_os_error(), Some(libc::EBADF));
     }
 }
