@@ -285,14 +285,38 @@ impl KernelPassthrough {
     /// Get the backing id of `inode` for a new handle, registering `file` if the inode has none.
     fn acquire(&self, inode: Inode, file: &File) -> io::Result<u32> {
         // Do not expect poisoned lock here, so safe to unwrap().
-        let mut ids = self.ids.lock().unwrap();
-        if let Some((id, handles)) = ids.get_mut(&inode) {
+        if let Some((id, handles)) = self.ids.lock().unwrap().get_mut(&inode) {
             *handles += 1;
             return Ok(*id);
         }
-        let id = self.files.open(file.as_fd())?;
-        ids.insert(inode, (id, 1));
-        Ok(id)
+        // Register the file without the lock, so that a slow ioctl doesn't hold up the opens and
+        // releases of other inodes.
+        let new_id = self.files.open(file.as_fd());
+        let mut ids = self.ids.lock().unwrap();
+        if let Some((id, handles)) = ids.get_mut(&inode) {
+            // Another open of the inode registered it meanwhile, and the kernel needs all the
+            // opens of an inode to use the same id. Use that id, even if registering this file
+            // failed.
+            *handles += 1;
+            let id = *id;
+            drop(ids);
+            if let Ok(new_id) = new_id {
+                self.close(inode, new_id);
+            }
+            return Ok(id);
+        }
+        let new_id = new_id?;
+        ids.insert(inode, (new_id, 1));
+        Ok(new_id)
+    }
+
+    fn close(&self, inode: Inode, id: u32) {
+        if let Err(e) = self.files.close(id) {
+            warn!(
+                "fuse: failed to close backing id {} of inode {}: {}",
+                id, inode, e
+            );
+        }
     }
 
     /// Drop the reference of a released handle, and close the backing id of `inode` with the last
@@ -305,12 +329,7 @@ impl KernelPassthrough {
                 let (id, _) = e.remove();
                 // Nothing needs the map during the ioctl.
                 drop(ids);
-                if let Err(e) = self.files.close(id) {
-                    warn!(
-                        "fuse: failed to close backing id {} of inode {}: {}",
-                        id, inode, e
-                    );
-                }
+                self.close(inode, id);
             }
         }
     }
@@ -1916,6 +1935,59 @@ mod tests {
         // Destroying the file system, as `Vfs::umount()` does, closes the ids still open.
         fs.destroy();
         assert_eq!(*files.closed.lock().unwrap(), vec![1, 2]);
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn test_kernel_passthrough_racing_opens() {
+        use std::sync::atomic::AtomicU32;
+        use std::sync::Barrier;
+
+        // `open()` waits until both acquires are in it, and then hands out the ids 1 and 2. This
+        // deadlocks if `acquire()` holds the lock across `open()`.
+        struct Files {
+            barrier: Barrier,
+            next: AtomicU32,
+            closed: Mutex<Vec<u32>>,
+        }
+        impl BackingFiles for Files {
+            fn open(&self, _fd: BorrowedFd<'_>) -> io::Result<u32> {
+                self.barrier.wait();
+                Ok(self.next.fetch_add(1, Ordering::Relaxed) + 1)
+            }
+            fn close(&self, backing_id: u32) -> io::Result<()> {
+                self.closed.lock().unwrap().push(backing_id);
+                Ok(())
+            }
+        }
+
+        let files = Arc::new(Files {
+            barrier: Barrier::new(2),
+            next: AtomicU32::new(0),
+            closed: Mutex::new(Vec::new()),
+        });
+        let kp = KernelPassthrough {
+            files: files.clone(),
+            ids: Mutex::new(HashMap::new()),
+        };
+        let file = TempFile::new().unwrap().into_file();
+        let (a, b) = std::thread::scope(|s| {
+            let a = s.spawn(|| kp.acquire(1, &file).unwrap());
+            let b = s.spawn(|| kp.acquire(1, &file).unwrap());
+            (a.join().unwrap(), b.join().unwrap())
+        });
+
+        // Both opens share the id that was registered first, and the other one is closed.
+        assert_eq!(a, b);
+        let closed = files.closed.lock().unwrap().clone();
+        assert_eq!(closed.len(), 1);
+        assert_ne!(closed[0], a);
+        assert_eq!(kp.ids.lock().unwrap().get(&1), Some(&(a, 2)));
+
+        kp.release(1);
+        kp.release(1);
+        assert_eq!(files.closed.lock().unwrap().len(), 2);
+        assert!(kp.ids.lock().unwrap().is_empty());
     }
 
     #[test]
