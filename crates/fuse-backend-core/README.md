@@ -16,7 +16,7 @@ without any transport or driver.
 
 | Feature | Effect |
 | --- | --- |
-| `async-io` | Experimental asynchronous IO path (tokio-uring / io_uring; Linux-only). |
+| `async-io` | Experimental asynchronous IO path. It runs on tokio-uring on Linux when io_uring is available, and on tokio otherwise. |
 | `fusedev`, `virtiofs`, `fusedev-uring`, `fuse-t` | Dependency-free cfg flags forwarded from the umbrella and transport crates so code historically gated on those names keeps compiling. Enable them through the transport crates, not directly. |
 
 ## Usage

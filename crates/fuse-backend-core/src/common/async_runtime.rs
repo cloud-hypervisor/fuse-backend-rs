@@ -5,12 +5,12 @@
 //! `Runtime` to wrap over tokio current-thread `Runtime` and tokio-uring `Runtime`.
 //!
 //! By default the runtime type is auto-detected: `tokio-uring` is used if io-uring is
-//! available, otherwise the tokio current-thread runtime is used. The detection result
-//! may be overridden with the `FUSE_BACKEND_RS_ASYNC_RUNTIME` environment variable,
-//! which accepts `tokio` or `uring`, or by calling [`set_runtime_type()`] before any
-//! other function of this module or `async_file`. This is useful when the application's
-//! own tokio runtime drives futures from this crate, such as `FuseDevTask::poll_handler()`,
-//! because a plain tokio runtime can't poll `tokio-uring` objects.
+//! available, otherwise the tokio current-thread runtime is used. Other platforms always use
+//! tokio. The `FUSE_BACKEND_RS_ASYNC_RUNTIME` environment variable overrides the
+//! detection. It accepts `tokio`, and on Linux also `uring`. Calling [`set_runtime_type()`]
+//! before any other function of this module or `async_file` overrides both. This is useful when
+//! the application's own tokio runtime drives futures from this crate, such as
+//! `FuseDevTask::poll_handler()`, because a plain tokio runtime can't poll `tokio-uring` objects.
 //!
 //! Note: creating io-uring rings locks kernel memory accounted against `RLIMIT_MEMLOCK`
 //! (see `account_memlock()` in the kernel). If the limit is too low (e.g. the default
@@ -22,7 +22,7 @@ use std::future::Future;
 use std::io;
 use std::sync::{LazyLock, OnceLock};
 
-/// Environment variable to select the asynchronous runtime type, `tokio` or `uring`.
+/// Environment variable that selects the runtime type, `tokio` or, on Linux, `uring`.
 pub const RUNTIME_TYPE_ENV: &str = "FUSE_BACKEND_RS_ASYNC_RUNTIME";
 
 /// Number of submission queue entries of the io-uring rings created by this crate.

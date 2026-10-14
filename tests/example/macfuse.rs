@@ -250,6 +250,134 @@ impl BackendFileSystem for HelloFileSystem {
     }
 }
 
+// With `async-io`, `BackendFileSystem` requires the asynchronous interface too.
+// The example serves requests synchronously, so nothing calls these handlers.
+#[cfg(feature = "async-io")]
+mod async_io {
+    use super::*;
+    use async_trait::async_trait;
+    use fuse_backend_rs::abi::fuse_abi::{stat64, CreateIn, OpenOptions, SetattrValid};
+    use fuse_backend_rs::api::filesystem::{
+        AsyncFileSystem, AsyncZeroCopyReader, AsyncZeroCopyWriter,
+    };
+
+    fn enosys<T>() -> Result<T> {
+        Err(std::io::Error::from_raw_os_error(libc::ENOSYS))
+    }
+
+    #[allow(unused_variables)]
+    #[async_trait]
+    impl AsyncFileSystem for HelloFileSystem {
+        async fn async_lookup(&self, ctx: &Context, parent: u64, name: &CStr) -> Result<Entry> {
+            enosys()
+        }
+
+        async fn async_getattr(
+            &self,
+            ctx: &Context,
+            inode: u64,
+            handle: Option<u64>,
+        ) -> Result<(stat64, Duration)> {
+            enosys()
+        }
+
+        async fn async_setattr(
+            &self,
+            ctx: &Context,
+            inode: u64,
+            attr: stat64,
+            handle: Option<u64>,
+            valid: SetattrValid,
+        ) -> Result<(stat64, Duration)> {
+            enosys()
+        }
+
+        async fn async_open(
+            &self,
+            ctx: &Context,
+            inode: u64,
+            flags: u32,
+            fuse_flags: u32,
+        ) -> Result<(Option<u64>, OpenOptions)> {
+            enosys()
+        }
+
+        async fn async_create(
+            &self,
+            ctx: &Context,
+            parent: u64,
+            name: &CStr,
+            args: CreateIn,
+        ) -> Result<(Entry, Option<u64>, OpenOptions)> {
+            enosys()
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        async fn async_read(
+            &self,
+            ctx: &Context,
+            inode: u64,
+            handle: u64,
+            w: &mut (dyn AsyncZeroCopyWriter + Send),
+            size: u32,
+            offset: u64,
+            lock_owner: Option<u64>,
+            flags: u32,
+        ) -> Result<usize> {
+            enosys()
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        async fn async_write(
+            &self,
+            ctx: &Context,
+            inode: u64,
+            handle: u64,
+            r: &mut (dyn AsyncZeroCopyReader + Send),
+            size: u32,
+            offset: u64,
+            lock_owner: Option<u64>,
+            delayed_write: bool,
+            flags: u32,
+            fuse_flags: u32,
+        ) -> Result<usize> {
+            enosys()
+        }
+
+        async fn async_fsync(
+            &self,
+            ctx: &Context,
+            inode: u64,
+            datasync: bool,
+            handle: u64,
+        ) -> Result<()> {
+            enosys()
+        }
+
+        async fn async_fallocate(
+            &self,
+            ctx: &Context,
+            inode: u64,
+            handle: u64,
+            mode: u32,
+            offset: u64,
+            length: u64,
+        ) -> Result<()> {
+            enosys()
+        }
+
+        async fn async_fsyncdir(
+            &self,
+            ctx: &Context,
+            inode: u64,
+            datasync: bool,
+            handle: u64,
+        ) -> Result<()> {
+            enosys()
+        }
+    }
+}
+
 /// A fusedev daemon example
 #[allow(dead_code)]
 pub struct Daemon {
