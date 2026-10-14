@@ -37,7 +37,7 @@ impl FileSystem for MockFS {
 /// It mirrors the semantics of the virtio-fs writer: writes go straight into
 /// the buffer, `commit()` is a no-op returning zero, and `bytes_written()`
 /// counts the bytes actually copied, which is what the server reports as the
-/// reply size.
+/// reply size. The async methods do the same and never wait.
 pub(crate) struct TestWriter<'a> {
     buffers: IoBuffers<'a, ()>,
 }
@@ -134,5 +134,33 @@ impl Writer for TestWriter<'_> {
     fn commit(&mut self, _other: Option<&Self>) -> io::Result<usize> {
         // Writes go straight into the buffer, so there's nothing to commit.
         Ok(0)
+    }
+
+    #[cfg(feature = "async-io")]
+    async fn async_write(&mut self, data: &[u8]) -> io::Result<usize> {
+        io::Write::write(self, data)
+    }
+
+    #[cfg(feature = "async-io")]
+    async fn async_write2(&mut self, data: &[u8], data2: &[u8]) -> io::Result<usize> {
+        io::Write::write_vectored(self, &[IoSlice::new(data), IoSlice::new(data2)])
+    }
+
+    #[cfg(feature = "async-io")]
+    async fn async_write3(&mut self, data: &[u8], data2: &[u8], data3: &[u8]) -> io::Result<usize> {
+        io::Write::write_vectored(
+            self,
+            &[IoSlice::new(data), IoSlice::new(data2), IoSlice::new(data3)],
+        )
+    }
+
+    #[cfg(feature = "async-io")]
+    async fn async_write_all(&mut self, buf: &[u8]) -> io::Result<()> {
+        io::Write::write_all(self, buf)
+    }
+
+    #[cfg(feature = "async-io")]
+    async fn async_commit(&mut self, other: Option<&Self>) -> io::Result<usize> {
+        self.commit(other)
     }
 }

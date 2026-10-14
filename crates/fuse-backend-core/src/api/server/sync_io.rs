@@ -1009,7 +1009,7 @@ impl<F: FileSystem + Sync> Server<F> {
         }
     }
 
-    pub(super) fn opendir<S: BitmapSlice, W: Writer>(
+    fn opendir<S: BitmapSlice, W: Writer>(
         &self,
         mut ctx: SrvContext<'_, F, S, W>,
     ) -> Result<usize> {
@@ -1038,15 +1038,9 @@ impl<F: FileSystem + Sync> Server<F> {
             fh, offset, size, ..
         } = ctx.r.read_obj().map_err(Error::DecodeMessage)?;
 
-        let available_bytes = ctx.w.available_bytes();
-        if available_bytes < size as usize {
-            return ctx.reply_error(io::Error::from_raw_os_error(libc::ENOMEM));
-        }
-
-        // Skip over enough bytes for the header.
-        let mut cursor = match ctx.w.split_at(size_of::<OutHeader>()) {
-            Ok(v) => v,
-            Err(_e) => return Err(Error::InvalidHeaderLength),
+        let mut cursor = match ctx.dirent_cursor(size)? {
+            Some(cursor) => cursor,
+            None => return ctx.reply_error(io::Error::from_raw_os_error(libc::ENOMEM)),
         };
 
         let res = if plus {
@@ -1088,22 +1082,19 @@ impl<F: FileSystem + Sync> Server<F> {
         }
     }
 
-    pub(super) fn readdir<S: BitmapSlice, W: Writer>(
-        &self,
-        ctx: SrvContext<'_, F, S, W>,
-    ) -> Result<usize> {
+    fn readdir<S: BitmapSlice, W: Writer>(&self, ctx: SrvContext<'_, F, S, W>) -> Result<usize> {
         self.do_readdir(ctx, false)
     }
 
     #[cfg(target_os = "linux")]
-    pub(super) fn readdirplus<S: BitmapSlice, W: Writer>(
+    fn readdirplus<S: BitmapSlice, W: Writer>(
         &self,
         ctx: SrvContext<'_, F, S, W>,
     ) -> Result<usize> {
         self.do_readdir(ctx, true)
     }
 
-    pub(super) fn releasedir<S: BitmapSlice, W: Writer>(
+    fn releasedir<S: BitmapSlice, W: Writer>(
         &self,
         mut ctx: SrvContext<'_, F, S, W>,
     ) -> Result<usize> {
@@ -1643,6 +1634,20 @@ impl<F: FileSystem, S: BitmapSlice, W: Writer> SrvContext<'_, F, S, W> {
         self.do_reply_error(err, true)
     }
 
+    /// Splits the reply buffer of a READDIR or READDIRPLUS request after the `OutHeader`, and
+    /// returns the part that `add_dirent()` writes the entries to. Returns `None` if the buffer
+    /// can't hold the `size` bytes of entries that the request asks for.
+    pub(super) fn dirent_cursor(&mut self, size: u32) -> Result<Option<W>> {
+        if self.w.available_bytes() < size as usize {
+            return Ok(None);
+        }
+
+        self.w
+            .split_at(size_of::<OutHeader>())
+            .map(Some)
+            .map_err(|_| Error::InvalidHeaderLength)
+    }
+
     fn handle_attr_result(&mut self, result: io::Result<(stat64, Duration)>) -> Result<usize> {
         match result {
             Ok((st, timeout)) => {
@@ -1659,7 +1664,9 @@ impl<F: FileSystem, S: BitmapSlice, W: Writer> SrvContext<'_, F, S, W> {
     }
 }
 
-fn add_dirent<W: Writer>(
+/// Adds a directory entry, and `entry` for READDIRPLUS, to the reply in `cursor`. Returns the
+/// number of bytes added, or 0 if the entry doesn't fit in `max` bytes.
+pub(super) fn add_dirent<W: Writer>(
     cursor: &mut W,
     max: u32,
     d: DirEntry,

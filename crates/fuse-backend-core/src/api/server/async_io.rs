@@ -10,16 +10,17 @@ use std::time::Duration;
 use async_trait::async_trait;
 use vm_memory::ByteValued;
 
-use super::sync_io::parse_create_extensions;
+use super::sync_io::{add_dirent, parse_create_extensions};
 use crate::abi::fuse_abi::{
     stat64, AttrOut, CreateIn, EntryOut, FallocateIn, FsOptions, FsyncIn, GetattrIn, Opcode,
-    OpenIn, OpenOut, OutHeader, ReadIn, SetattrIn, SetattrValid, WriteIn, WriteOut, FATTR_FH,
-    GETATTR_FH, KERNEL_MINOR_VERSION_LOOKUP_NEGATIVE_ENTRY_ZERO, READ_LOCKOWNER, WRITE_CACHE,
-    WRITE_LOCKOWNER,
+    OpenIn, OpenOut, OutHeader, ReadIn, ReleaseIn, SetattrIn, SetattrValid, WriteIn, WriteOut,
+    FATTR_FH, GETATTR_FH, KERNEL_MINOR_VERSION_LOOKUP_NEGATIVE_ENTRY_ZERO, READ_LOCKOWNER,
+    WRITE_CACHE, WRITE_LOCKOWNER,
 };
 use crate::api::filesystem::FsCacheReqHandler;
 use crate::api::filesystem::{
-    AsyncFileSystem, AsyncZeroCopyReader, AsyncZeroCopyWriter, ZeroCopyReader, ZeroCopyWriter,
+    AsyncFileSystem, AsyncZeroCopyReader, AsyncZeroCopyWriter, DirEntry, Entry, ZeroCopyReader,
+    ZeroCopyWriter,
 };
 use crate::api::server::{
     decode_version, InitParams, MetricsHook, Server, ServerUtil, SrvContext, BUFFER_HEADER_SIZE,
@@ -109,6 +110,14 @@ impl<W: Writer> io::Write for AsyncZcWriter<W> {
     }
 }
 
+impl<W: Writer> AsyncZcWriter<W> {
+    /// Adds a directory entry to a READDIR or READDIRPLUS reply. A closure that calls this
+    /// captures the whole writer, so it is `Send` like the writer.
+    fn add_dirent(&mut self, max: u32, d: DirEntry, entry: Option<Entry>) -> io::Result<usize> {
+        add_dirent(&mut self.0, max, d, entry)
+    }
+}
+
 impl<F: AsyncFileSystem + Sync> Server<F> {
     /// Main entrance to handle requests from the transport layer.
     ///
@@ -180,9 +189,9 @@ impl<F: AsyncFileSystem + Sync> Server<F> {
                     h.on_init_params(init_params);
                 }
             }),
-            x if x == Opcode::Opendir as u32 => self.opendir(ctx),
-            x if x == Opcode::Readdir as u32 => self.readdir(ctx),
-            x if x == Opcode::Releasedir as u32 => self.releasedir(ctx),
+            x if x == Opcode::Opendir as u32 => self.async_opendir(ctx).await,
+            x if x == Opcode::Readdir as u32 => self.async_do_readdir(ctx, false).await,
+            x if x == Opcode::Releasedir as u32 => self.async_releasedir(ctx).await,
             x if x == Opcode::Fsyncdir as u32 => self.async_fsyncdir(ctx).await,
             x if x == Opcode::Getlk as u32 => self.getlk(ctx),
             x if x == Opcode::Setlk as u32 => self.setlk(ctx),
@@ -196,7 +205,7 @@ impl<F: AsyncFileSystem + Sync> Server<F> {
             x if x == Opcode::BatchForget as u32 => self.batch_forget(ctx),
             x if x == Opcode::Fallocate as u32 => self.async_fallocate(ctx).await,
             #[cfg(target_os = "linux")]
-            x if x == Opcode::Readdirplus as u32 => self.readdirplus(ctx),
+            x if x == Opcode::Readdirplus as u32 => self.async_do_readdir(ctx, true).await,
             #[cfg(target_os = "linux")]
             x if x == Opcode::Rename2 as u32 => self.rename2(ctx),
             #[cfg(target_os = "linux")]
@@ -376,25 +385,7 @@ impl<F: AsyncFileSystem + Sync> Server<F> {
             .await;
 
         match result {
-            Ok(count) => {
-                // Don't use `reply_ok` because we need to set a custom size length for the
-                // header.
-                let out = OutHeader {
-                    len: (size_of::<OutHeader>() + count) as u32,
-                    error: 0,
-                    unique: ctx.unique(),
-                };
-
-                ctx.w
-                    .async_write_all(out.as_slice())
-                    .await
-                    .map_err(Error::EncodeMessage)?;
-                ctx.w
-                    .async_commit(Some(&data_writer.0))
-                    .await
-                    .map_err(Error::EncodeMessage)?;
-                Ok(out.len as usize)
-            }
+            Ok(count) => ctx.async_reply_with_data(&data_writer.0, count).await,
             Err(e) => ctx.async_reply_error_explicit(e).await,
         }
     }
@@ -473,6 +464,82 @@ impl<F: AsyncFileSystem + Sync> Server<F> {
         }
     }
 
+    async fn async_opendir<S: BitmapSlice, W: Writer>(
+        &self,
+        mut ctx: SrvContext<'_, F, S, W>,
+    ) -> Result<usize> {
+        let OpenIn { flags, .. } = ctx.r.read_obj().map_err(Error::DecodeMessage)?;
+        let result = self
+            .fs
+            .async_opendir(ctx.context(), ctx.nodeid(), flags)
+            .await;
+
+        match result {
+            Ok((handle, opts)) => {
+                let out = OpenOut {
+                    fh: handle.map(Into::into).unwrap_or(0),
+                    open_flags: opts.bits(),
+                    ..Default::default()
+                };
+
+                ctx.async_reply_ok(Some(out), None).await
+            }
+            Err(e) => ctx.async_reply_error(e).await,
+        }
+    }
+
+    async fn async_do_readdir<S: BitmapSlice, W: Writer>(
+        &self,
+        mut ctx: SrvContext<'_, F, S, W>,
+        plus: bool,
+    ) -> Result<usize> {
+        let ReadIn {
+            fh, offset, size, ..
+        } = ctx.r.read_obj().map_err(Error::DecodeMessage)?;
+
+        // The file system's future holds `add_entry`, so the closure has to be `Send`. Wrap
+        // the cursor in `AsyncZcWriter`, which is `Send`, as READ does with its data writer.
+        let mut cursor = match ctx.dirent_cursor(size)? {
+            Some(cursor) => AsyncZcWriter(cursor),
+            None => {
+                return ctx
+                    .async_reply_error(io::Error::from_raw_os_error(libc::ENOMEM))
+                    .await
+            }
+        };
+        let result = if plus {
+            self.fs
+                .async_readdirplus(
+                    ctx.context(),
+                    ctx.nodeid(),
+                    fh.into(),
+                    size,
+                    offset,
+                    &mut |d, e| cursor.add_dirent(size, d, Some(e)),
+                )
+                .await
+        } else {
+            self.fs
+                .async_readdir(
+                    ctx.context(),
+                    ctx.nodeid(),
+                    fh.into(),
+                    size,
+                    offset,
+                    &mut |d| cursor.add_dirent(size, d, None),
+                )
+                .await
+        };
+
+        match result {
+            Ok(()) => {
+                ctx.async_reply_with_data(&cursor.0, cursor.0.bytes_written())
+                    .await
+            }
+            Err(e) => ctx.async_reply_error_explicit(e).await,
+        }
+    }
+
     async fn async_fsyncdir<S: BitmapSlice, W: Writer>(
         &self,
         mut ctx: SrvContext<'_, F, S, W>,
@@ -484,6 +551,22 @@ impl<F: AsyncFileSystem + Sync> Server<F> {
         let result = self
             .fs
             .async_fsyncdir(ctx.context(), ctx.nodeid(), datasync, fh.into())
+            .await;
+
+        match result {
+            Ok(()) => ctx.async_reply_ok(None::<u8>, None).await,
+            Err(e) => ctx.async_reply_error(e).await,
+        }
+    }
+
+    async fn async_releasedir<S: BitmapSlice, W: Writer>(
+        &self,
+        mut ctx: SrvContext<'_, F, S, W>,
+    ) -> Result<usize> {
+        let ReleaseIn { fh, flags, .. } = ctx.r.read_obj().map_err(Error::DecodeMessage)?;
+        let result = self
+            .fs
+            .async_releasedir(ctx.context(), ctx.nodeid(), flags, fh.into())
             .await;
 
         match result {
@@ -604,6 +687,27 @@ impl<'a, F: AsyncFileSystem, S: BitmapSlice, W: Writer> SrvContext<'a, F, S, W> 
         Ok(self.w.bytes_written())
     }
 
+    /// Replies with the `data_len` bytes that a READ or READDIR handler wrote to `data_writer`,
+    /// the part of the reply buffer after the `OutHeader`. Writes the header and commits it
+    /// together with the data.
+    async fn async_reply_with_data(&mut self, data_writer: &W, data_len: usize) -> Result<usize> {
+        let header = OutHeader {
+            len: (size_of::<OutHeader>() + data_len) as u32,
+            error: 0,
+            unique: self.in_header.unique,
+        };
+
+        self.w
+            .async_write_all(header.as_slice())
+            .await
+            .map_err(Error::EncodeMessage)?;
+        self.w
+            .async_commit(Some(data_writer))
+            .await
+            .map_err(Error::EncodeMessage)?;
+        Ok(header.len as usize)
+    }
+
     async fn async_do_reply_error(&mut self, err: io::Error, internal_err: bool) -> Result<usize> {
         let header = OutHeader {
             len: size_of::<OutHeader>() as u32,
@@ -659,5 +763,319 @@ impl<'a, F: AsyncFileSystem, S: BitmapSlice, W: Writer> SrvContext<'a, F, S, W> 
             }
             Err(e) => self.async_reply_error(e).await,
         }
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use std::sync::atomic::AtomicUsize;
+
+    use super::super::test_util::TestWriter;
+    use super::*;
+    use crate::abi::fuse_abi::{Dirent, InHeader};
+    use crate::api::filesystem::{Context, FileSystem, OpenOptions};
+
+    const DIR_HANDLE: u64 = 7;
+
+    /// Lists inode 1, the only directory, from `offset` until `add_entry()` returns 0.
+    fn list(
+        inode: u64,
+        offset: u64,
+        mut add_entry: impl FnMut(DirEntry, Entry) -> io::Result<usize>,
+    ) -> io::Result<()> {
+        if inode != 1 {
+            return Err(io::Error::from_raw_os_error(libc::ENOTDIR));
+        }
+        let names: [&[u8]; 3] = [b"a", b"bb", b"ccc"];
+        for (i, name) in names.iter().enumerate().skip(offset as usize) {
+            let ino = i as u64 + 2;
+            let mut entry = Entry {
+                inode: ino,
+                generation: 1,
+                ..Default::default()
+            };
+            entry.attr.st_ino = ino;
+            entry.attr.st_mode = libc::S_IFREG | 0o644;
+            let dir_entry = DirEntry {
+                ino,
+                offset: i as u64 + 1,
+                type_: libc::DT_REG as u32,
+                name,
+            };
+            if add_entry(dir_entry, entry)? == 0 {
+                break;
+            }
+        }
+        Ok(())
+    }
+
+    fn release(handle: u64) -> io::Result<()> {
+        if handle == DIR_HANDLE {
+            Ok(())
+        } else {
+            Err(io::Error::from_raw_os_error(libc::EBADF))
+        }
+    }
+
+    /// Serves the same directory with the sync and the async handlers, and counts the calls
+    /// of each.
+    #[derive(Default)]
+    struct DirFs {
+        sync_calls: AtomicUsize,
+        async_calls: AtomicUsize,
+    }
+
+    impl DirFs {
+        fn calls(&self) -> (usize, usize) {
+            (
+                self.sync_calls.load(Ordering::Relaxed),
+                self.async_calls.load(Ordering::Relaxed),
+            )
+        }
+    }
+
+    impl FileSystem for DirFs {
+        type Inode = u64;
+        type Handle = u64;
+
+        fn opendir(
+            &self,
+            _ctx: &Context,
+            _inode: u64,
+            _flags: u32,
+        ) -> io::Result<(Option<u64>, OpenOptions)> {
+            self.sync_calls.fetch_add(1, Ordering::Relaxed);
+            Ok((Some(DIR_HANDLE), OpenOptions::CACHE_DIR))
+        }
+
+        fn readdir(
+            &self,
+            _ctx: &Context,
+            inode: u64,
+            _handle: u64,
+            _size: u32,
+            offset: u64,
+            add_entry: &mut dyn FnMut(DirEntry) -> io::Result<usize>,
+        ) -> io::Result<()> {
+            self.sync_calls.fetch_add(1, Ordering::Relaxed);
+            list(inode, offset, |dir_entry, _| add_entry(dir_entry))
+        }
+
+        fn readdirplus(
+            &self,
+            _ctx: &Context,
+            inode: u64,
+            _handle: u64,
+            _size: u32,
+            offset: u64,
+            add_entry: &mut dyn FnMut(DirEntry, Entry) -> io::Result<usize>,
+        ) -> io::Result<()> {
+            self.sync_calls.fetch_add(1, Ordering::Relaxed);
+            list(inode, offset, add_entry)
+        }
+
+        fn releasedir(
+            &self,
+            _ctx: &Context,
+            _inode: u64,
+            _flags: u32,
+            handle: u64,
+        ) -> io::Result<()> {
+            self.sync_calls.fetch_add(1, Ordering::Relaxed);
+            release(handle)
+        }
+    }
+
+    // Each handler yields to the runtime before it answers, so the server has to wait for
+    // the future.
+    #[async_trait]
+    impl AsyncFileSystem for DirFs {
+        async fn async_opendir(
+            &self,
+            _ctx: &Context,
+            _inode: u64,
+            _flags: u32,
+        ) -> io::Result<(Option<u64>, OpenOptions)> {
+            self.async_calls.fetch_add(1, Ordering::Relaxed);
+            tokio::task::yield_now().await;
+            Ok((Some(DIR_HANDLE), OpenOptions::CACHE_DIR))
+        }
+
+        async fn async_readdir(
+            &self,
+            _ctx: &Context,
+            inode: u64,
+            _handle: u64,
+            _size: u32,
+            offset: u64,
+            add_entry: &mut (dyn FnMut(DirEntry) -> io::Result<usize> + Send),
+        ) -> io::Result<()> {
+            self.async_calls.fetch_add(1, Ordering::Relaxed);
+            tokio::task::yield_now().await;
+            list(inode, offset, |dir_entry, _| add_entry(dir_entry))
+        }
+
+        async fn async_readdirplus(
+            &self,
+            _ctx: &Context,
+            inode: u64,
+            _handle: u64,
+            _size: u32,
+            offset: u64,
+            add_entry: &mut (dyn FnMut(DirEntry, Entry) -> io::Result<usize> + Send),
+        ) -> io::Result<()> {
+            self.async_calls.fetch_add(1, Ordering::Relaxed);
+            tokio::task::yield_now().await;
+            list(inode, offset, add_entry)
+        }
+
+        async fn async_releasedir(
+            &self,
+            _ctx: &Context,
+            _inode: u64,
+            _flags: u32,
+            handle: u64,
+        ) -> io::Result<()> {
+            self.async_calls.fetch_add(1, Ordering::Relaxed);
+            tokio::task::yield_now().await;
+            release(handle)
+        }
+    }
+
+    /// Serves a request for `nodeid` with the sync and with the async server, checks that both
+    /// send the same reply, and returns it.
+    async fn serve<T: ByteValued>(
+        server: &Server<DirFs>,
+        opcode: Opcode,
+        nodeid: u64,
+        body: T,
+    ) -> Vec<u8> {
+        let in_header = InHeader {
+            len: (size_of::<InHeader>() + size_of::<T>()) as u32,
+            opcode: opcode as u32,
+            unique: 1,
+            nodeid,
+            ..Default::default()
+        };
+        let mut req = in_header.as_slice().to_vec();
+        req.extend_from_slice(body.as_slice());
+
+        let mut sync_req = req.clone();
+        let mut sync_reply = vec![0u8; 4096];
+        let len = server
+            .handle_message(
+                Reader::<()>::from_slice(&mut sync_req),
+                TestWriter::new(&mut sync_reply),
+                None,
+                None,
+            )
+            .unwrap();
+        sync_reply.truncate(len);
+
+        let mut async_req = req;
+        let mut async_reply = vec![0u8; 4096];
+        let len = unsafe {
+            server
+                .async_handle_message(
+                    Reader::<()>::from_slice(&mut async_req),
+                    TestWriter::new(&mut async_reply),
+                    None,
+                    None,
+                )
+                .await
+        }
+        .unwrap();
+        async_reply.truncate(len);
+
+        assert_eq!(sync_reply, async_reply);
+        async_reply
+    }
+
+    fn reply_error(reply: &[u8]) -> i32 {
+        let mut header = OutHeader::default();
+        header
+            .as_mut_slice()
+            .copy_from_slice(&reply[..size_of::<OutHeader>()]);
+        header.error
+    }
+
+    #[tokio::test]
+    async fn test_async_opendir_releasedir() {
+        let server = Server::new(DirFs::default());
+
+        let reply = serve(&server, Opcode::Opendir, 1, OpenIn::default()).await;
+        assert_eq!(server.fs.calls(), (1, 1));
+        let mut out = OpenOut::default();
+        out.as_mut_slice()
+            .copy_from_slice(&reply[size_of::<OutHeader>()..]);
+        assert_eq!(out.fh, DIR_HANDLE);
+        assert_eq!(out.open_flags, OpenOptions::CACHE_DIR.bits());
+
+        let release_in = ReleaseIn {
+            fh: DIR_HANDLE,
+            ..Default::default()
+        };
+        let reply = serve(&server, Opcode::Releasedir, 1, release_in).await;
+        assert_eq!(server.fs.calls(), (2, 2));
+        assert_eq!(reply.len(), size_of::<OutHeader>());
+        assert_eq!(reply_error(&reply), 0);
+
+        let release_in = ReleaseIn {
+            fh: DIR_HANDLE + 1,
+            ..Default::default()
+        };
+        let reply = serve(&server, Opcode::Releasedir, 1, release_in).await;
+        assert_eq!(server.fs.calls(), (3, 3));
+        assert_eq!(reply_error(&reply), -libc::EBADF);
+    }
+
+    #[tokio::test]
+    async fn test_async_readdir() {
+        test_async_readdir_replies(Opcode::Readdir, 0).await;
+    }
+
+    #[tokio::test]
+    async fn test_async_readdirplus() {
+        test_async_readdir_replies(Opcode::Readdirplus, size_of::<EntryOut>()).await;
+    }
+
+    /// Lists the directory in a few ways, where each entry takes `entry_len` bytes besides its
+    /// dirent. Each name is short enough for the dirent to take 32 bytes.
+    async fn test_async_readdir_replies(opcode: Opcode, entry_len: usize) {
+        let server = Server::new(DirFs::default());
+        let header_len = size_of::<OutHeader>();
+        let entry_len = entry_len + size_of::<Dirent>() + 8;
+        let read_in = |offset, size| ReadIn {
+            fh: DIR_HANDLE,
+            offset,
+            size,
+            ..Default::default()
+        };
+
+        // The whole directory.
+        let reply = serve(&server, opcode, 1, read_in(0, 1024)).await;
+        assert_eq!(server.fs.calls(), (1, 1));
+        assert_eq!(reply.len(), header_len + 3 * entry_len);
+
+        // The entries after the first one.
+        let reply = serve(&server, opcode, 1, read_in(1, 1024)).await;
+        assert_eq!(server.fs.calls(), (2, 2));
+        assert_eq!(reply.len(), header_len + 2 * entry_len);
+
+        // As many entries as fit in the requested size.
+        let size = 2 * entry_len as u32 + 1;
+        let reply = serve(&server, opcode, 1, read_in(0, size)).await;
+        assert_eq!(server.fs.calls(), (3, 3));
+        assert_eq!(reply.len(), header_len + 2 * entry_len);
+
+        // An error from the file system.
+        let reply = serve(&server, opcode, 2, read_in(0, 1024)).await;
+        assert_eq!(server.fs.calls(), (4, 4));
+        assert_eq!(reply_error(&reply), -libc::ENOTDIR);
+
+        // A size that doesn't fit in the reply buffer doesn't reach the file system.
+        let reply = serve(&server, opcode, 1, read_in(0, 8192)).await;
+        assert_eq!(server.fs.calls(), (4, 4));
+        assert_eq!(reply_error(&reply), -libc::ENOMEM);
     }
 }

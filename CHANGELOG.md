@@ -34,7 +34,9 @@
 - `FuseSession::detach()` lazily unmounts a Linux session through `&self`, so the owner of a
   serving layer can start the teardown while another thread waits in `FuseServing::wait()`.
 - `AsyncFileSystem` has `async_opendir()`, `async_readdir()`, `async_readdirplus()` and
-  `async_releasedir()`, which default to the sync handlers.
+  `async_releasedir()`, which default to the sync handlers. The async server serves OPENDIR,
+  READDIR, READDIRPLUS and RELEASEDIR with them, so a file system that implements them can
+  list a directory without blocking the worker.
 
 ### Changed
 - [254](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/254): `fuse-backend-rs` is now a thin facade re-exporting the sub-crates. Every
