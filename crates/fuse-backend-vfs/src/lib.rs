@@ -724,6 +724,76 @@ impl Vfs {
             None => self.convert_entry(idata.fs_idx(), entry.inode, &mut entry),
         }
     }
+
+    /// Lists the pseudo fs directory `idata`. A mountpoint lists as the root of the file system
+    /// mounted on it.
+    #[allow(clippy::too_many_arguments)]
+    fn readdir_pseudo(
+        &self,
+        fs: &PseudoFs,
+        idata: VfsInode,
+        ctx: &Context,
+        handle: u64,
+        size: u32,
+        offset: u64,
+        add_entry: &mut dyn FnMut(DirEntry) -> Result<usize>,
+    ) -> Result<()> {
+        fs.readdir(
+            ctx,
+            idata.ino(),
+            handle,
+            size,
+            offset,
+            &mut |mut dir_entry| {
+                match self.mountpoints.load().get(&dir_entry.ino) {
+                    // cross mountpoint, return mount root entry
+                    Some(mnt) => {
+                        dir_entry.ino = self.convert_inode(mnt.fs_idx, mnt.ino)?;
+                    }
+                    None => {
+                        dir_entry.ino = self.convert_inode(idata.fs_idx(), dir_entry.ino)?;
+                    }
+                }
+                add_entry(dir_entry)
+            },
+        )
+    }
+
+    /// Like `readdir_pseudo()`, and also passes the `Entry` of each directory entry.
+    #[allow(clippy::too_many_arguments)]
+    fn readdirplus_pseudo(
+        &self,
+        fs: &PseudoFs,
+        idata: VfsInode,
+        ctx: &Context,
+        handle: u64,
+        size: u32,
+        offset: u64,
+        add_entry: &mut dyn FnMut(DirEntry, Entry) -> Result<usize>,
+    ) -> Result<()> {
+        fs.readdirplus(
+            ctx,
+            idata.ino(),
+            handle,
+            size,
+            offset,
+            &mut |mut dir_entry, mut entry| {
+                match self.mountpoints.load().get(&dir_entry.ino) {
+                    Some(mnt) => {
+                        // cross mountpoint, return mount root entry
+                        dir_entry.ino = self.convert_inode(mnt.fs_idx, mnt.ino)?;
+                        entry = mnt.root_entry;
+                    }
+                    None => {
+                        dir_entry.ino = self.convert_inode(idata.fs_idx(), dir_entry.ino)?;
+                        entry.inode = dir_entry.ino;
+                    }
+                }
+                entry.attr.st_ino = entry.inode;
+                add_entry(dir_entry, entry)
+            },
+        )
+    }
 }
 
 /// Sava and restore Vfs state.
