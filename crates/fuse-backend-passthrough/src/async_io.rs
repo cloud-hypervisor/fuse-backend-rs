@@ -23,20 +23,24 @@
 //! and dispatching requests while the syscalls execute in parallel on pool
 //! threads.
 //!
+//! The thread pool also serves READ and WRITE when their IO would block the
+//! runtime thread. These are the relayed READ and WRITE requests, and on the
+//! tokio runtime also READ cache misses and every WRITE. A pool thread runs
+//! the synchronous handler on its own copy of the data, see `read_on_pool()`
+//! and `write_on_pool()`.
+//!
 //! # Runtime requirement
 //!
 //! The native asynchronous IO path must be driven by this crate's async
-//! `Runtime` (`fuse_backend_core::async_runtime`): when io_uring is
-//! available (the default on Linux) that is a tokio-uring runtime, and its
-//! operations panic when polled outside its context. Embedding the
-//! filesystem layer on another executor (e.g. a plain tokio runtime) is
-//! not supported: the first native WRITE, or a READ on a page-cache miss,
-//! panics -- only inline-served cache hits work. Serve the filesystem with
-//! a transport that drives this crate's `Runtime` (`AsyncFuseServing`
-//! does), or select the tokio runtime with the
-//! `FUSE_BACKEND_RS_ASYNC_RUNTIME=tokio` environment variable: its
-//! `preadv`/`pwritev` submission never depends on the runtime context, at
-//! the cost of serving cache misses as blocking syscalls.
+//! `Runtime` (`fuse_backend_core::async_runtime`). On Linux with io_uring,
+//! the default, that is a tokio-uring runtime, whose operations panic when
+//! polled outside its context. So on another executor, such as a plain tokio
+//! runtime, the first native WRITE or READ cache miss panics. Serve the
+//! filesystem with a transport that drives this crate's `Runtime`, as
+//! `AsyncFuseServing` does, or choose the tokio runtime with
+//! `async_runtime::set_runtime_type()` or `FUSE_BACKEND_RS_ASYNC_RUNTIME=tokio`.
+//! Its `preadv`/`pwritev` calls work in any runtime context, but block the
+//! runtime thread on cache misses unless the thread pool is enabled.
 
 use std::future::Future;
 use std::io;
@@ -50,10 +54,11 @@ use fuse_backend_core::abi::fuse_abi::{
     CreateIn, Opcode, OpenOptions, SetattrValid, WRITE_KILL_PRIV,
 };
 use fuse_backend_core::api::filesystem::{
-    AsyncFileSystem, AsyncZeroCopyReader, AsyncZeroCopyWriter, Context, FileSystem,
+    AsyncFileSystem, AsyncZeroCopyReader, AsyncZeroCopyWriter, Context, FileSystem, ZeroCopyReader,
+    ZeroCopyWriter,
 };
 use fuse_backend_core::async_file::File as AsyncFile;
-use fuse_backend_core::async_runtime::Runtime;
+use fuse_backend_core::async_runtime::{self, Runtime};
 use fuse_backend_core::file_buf::FileVolatileSlice;
 use fuse_backend_core::file_traits::{AsyncFileReadWriteVolatile, FileReadWriteVolatile};
 
@@ -89,9 +94,22 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
     /// runtime is created, this method only selects between the two modes
     /// of operation.
     ///
-    /// `async_read()` and `async_write()` are served with native
-    /// asynchronous IO instead of relaying to the synchronous handlers,
-    /// so they are never offloaded to the blocking thread pool.
+    /// When enabled, `async_read()` and `async_write()` also use the pool for
+    /// requests that would otherwise block the runtime thread. These are the
+    /// O_DIRECT and WRITE_KILL_PRIV requests, which they relay to the
+    /// synchronous handlers, and on the tokio runtime also READ cache misses
+    /// and every WRITE. On a file system without `RWF_NOWAIT`, such as tmpfs,
+    /// overlayfs or FUSE, every READ counts as a cache miss. Pool threads
+    /// can't access the transport buffers, so the data takes one more copy.
+    /// With io_uring, cache misses and WRITE requests stay on native
+    /// asynchronous IO.
+    ///
+    /// If a request future is dropped, for example for a takeover, a request
+    /// that no pool thread has started yet doesn't run. One that already runs
+    /// completes, and the kernel may send it again after the takeover. So a
+    /// WRITE to a file opened with `O_APPEND` can land twice. To avoid that,
+    /// stop the serving task through its state flag, which answers the
+    /// requests in flight before it returns.
     pub fn enable_async_thread_pool(&self, enable: bool) {
         self.async_thread_pool_enabled
             .store(enable, Ordering::Relaxed);
@@ -124,6 +142,16 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
         drop(self.ensure_file_flags(data, &data.borrow_fd(), flags)?);
 
         Ok(Arc::new(AsyncFile::borrow_fd(fd, data.clone())))
+    }
+
+    /// The shared file system to offload blocking handlers to, if the thread
+    /// pool is enabled and the file system was created with `new_shared()`.
+    fn pool_fs(&self) -> Option<Arc<Self>> {
+        if self.async_thread_pool_enabled.load(Ordering::Relaxed) {
+            self.shared_ref.upgrade()
+        } else {
+            None
+        }
     }
 
     /// Try to serve a buffered READ request inline with `preadv2(RWF_NOWAIT)`,
@@ -186,6 +214,120 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
     }
 }
 
+// The pool closures own `Arc<Self>`, which needs `S: 'static`.
+impl<S: BitmapSlice + Send + Sync + 'static> PassthroughFs<S> {
+    /// Run `f` with `fs` and a copy of `ctx` on the blocking thread pool, and
+    /// wait for its result.
+    ///
+    /// If this future is dropped before a pool thread starts `f`, for example
+    /// when `FuseDevTask::poll_handler()` is dropped for a takeover, `f`
+    /// doesn't run. The kernel sends the request again after a takeover, and
+    /// a late run of the old copy could undo newer requests, such as a WRITE
+    /// to the same range. If a pool thread already runs `f`, it finishes,
+    /// like an io_uring operation that the kernel has already started.
+    async fn run_on_pool<T, F>(fs: Arc<Self>, ctx: &Context, f: F) -> io::Result<T>
+    where
+        T: Send + 'static,
+        F: FnOnce(Arc<Self>, Context) -> io::Result<T> + Send + 'static,
+    {
+        let ctx = ctx.clone();
+        let mut task = AbortOnDrop(Runtime::spawn_blocking(move || f(fs, ctx)));
+        join_blocking(&mut task.0).await
+    }
+
+    /// Serve a READ with the synchronous handler on the blocking thread
+    /// pool, and copy the data into `w`.
+    ///
+    /// `w` writes into a transport buffer that the request owns, and nothing
+    /// keeps that buffer alive after the request future is dropped, for
+    /// example for a takeover. So the pool thread never sees `w`. It reads
+    /// into a buffer that the closure owns and returns it through the
+    /// `JoinHandle`. The runtime thread then copies it into `w`, while this
+    /// future, and so `w`, is still alive. If the future is dropped first, a
+    /// pool task that already runs reads into its own buffer and frees it,
+    /// see `run_on_pool()`. The closure's `Arc` of the file system keeps the
+    /// handle map alive, and the handler's handle data keeps the file
+    /// descriptor open until the read returns.
+    ///
+    /// The server doesn't bound the size of a READ, so a READ larger than the
+    /// room in `w` fails before the pool task allocates for it, as the
+    /// transports' writers would fail it.
+    #[allow(clippy::too_many_arguments)]
+    async fn read_on_pool(
+        fs: Arc<Self>,
+        ctx: &Context,
+        inode: Inode,
+        handle: Handle,
+        w: &mut (dyn AsyncZeroCopyWriter + Send),
+        size: u32,
+        offset: u64,
+        lock_owner: Option<u64>,
+        flags: u32,
+    ) -> io::Result<usize> {
+        if size as usize > w.available_bytes() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "data out of range, available {} requested {}",
+                    w.available_bytes(),
+                    size
+                ),
+            ));
+        }
+        let data = Self::run_on_pool(fs, ctx, move |fs, ctx| {
+            let mut buf = OwnedWriter::new(size as usize)?;
+            fs.read(
+                &ctx, inode, handle, &mut buf, size, offset, lock_owner, flags,
+            )?;
+            Ok(buf.data)
+        })
+        .await?;
+        w.write_all(&data)?;
+        Ok(data.len())
+    }
+
+    /// Copy the payload of a WRITE out of `r`, and serve the WRITE with the
+    /// synchronous handler on the blocking thread pool.
+    ///
+    /// The copy runs on the runtime thread before the pool task starts, so
+    /// the pool thread never accesses the transport buffer behind `r`, which
+    /// the request owns, see `read_on_pool()`. If this future is dropped
+    /// before a pool thread starts the WRITE, it doesn't run, and one that
+    /// already runs finishes, see `run_on_pool()`.
+    #[allow(clippy::too_many_arguments)]
+    async fn write_on_pool(
+        fs: Arc<Self>,
+        ctx: &Context,
+        inode: Inode,
+        handle: Handle,
+        r: &mut (dyn AsyncZeroCopyReader + Send),
+        size: u32,
+        offset: u64,
+        lock_owner: Option<u64>,
+        delayed_write: bool,
+        flags: u32,
+        fuse_flags: u32,
+    ) -> io::Result<usize> {
+        let mut data = Vec::with_capacity(size as usize);
+        r.read_to(&mut PayloadSink(&mut data), size as usize, 0)?;
+        Self::run_on_pool(fs, ctx, move |fs, ctx| {
+            fs.write(
+                &ctx,
+                inode,
+                handle,
+                &mut OwnedReader { data, pos: 0 },
+                size,
+                offset,
+                lock_owner,
+                delayed_write,
+                flags,
+                fuse_flags,
+            )
+        })
+        .await
+    }
+}
+
 // `BackendFileSystem` is implemented for `Arc<FS>` by a blanket impl in
 // `fuse-backend_core::api::filesystem`, so a shared instance created with
 // `new_shared()` can be mounted to a `Vfs` directly; `as_any()` exposes the
@@ -195,11 +337,22 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
 ///
 /// Panics of the blocking task are propagated, a cancelled task is reported
 /// as an `Other` io error.
-async fn join_blocking<T>(handle: tokio::task::JoinHandle<io::Result<T>>) -> io::Result<T> {
+async fn join_blocking<T>(handle: &mut tokio::task::JoinHandle<io::Result<T>>) -> io::Result<T> {
     match handle.await {
         Ok(res) => res,
         Err(e) if e.is_panic() => std::panic::resume_unwind(e.into_panic()),
         Err(e) => Err(io::Error::other(e)),
+    }
+}
+
+/// A task on the blocking thread pool that is aborted when this is dropped.
+/// Aborting stops a task that no pool thread has started yet, and does
+/// nothing to one that runs or has finished.
+struct AbortOnDrop<T>(tokio::task::JoinHandle<T>);
+
+impl<T> Drop for AbortOnDrop<T> {
+    fn drop(&mut self) {
+        self.0.abort();
     }
 }
 
@@ -315,23 +468,188 @@ impl FileReadWriteVolatile for NowaitFile<'_> {
     }
 }
 
-/// Relay a synchronous handler according to the `async_thread_pool_enabled`
-/// setting: offload it to the runtime's blocking thread pool if the setting
-/// is enabled and the file system was created with `PassthroughFs::new_shared()`
-/// (so the handler can hold a reference to it across threads), otherwise
-/// execute it inline. `$capture` rebinds the borrowed request arguments to
-/// owned copies which can be moved into the pool closure, and `$pool_fn`
-/// is a `move` closure taking the file system and the request context by
-/// value.
+/// A reply buffer of at most `limit` bytes that a pool thread owns, in
+/// place of the transport's writer, see `PassthroughFs::read_on_pool()`.
+struct OwnedWriter {
+    data: Vec<u8>,
+    limit: usize,
+}
+
+impl OwnedWriter {
+    /// Fails with ENOMEM if it can't allocate `limit` bytes, where
+    /// `Vec::with_capacity()` would abort the process.
+    fn new(limit: usize) -> io::Result<Self> {
+        let mut data = Vec::new();
+        data.try_reserve_exact(limit)
+            .map_err(|_| io::Error::from_raw_os_error(libc::ENOMEM))?;
+        Ok(OwnedWriter { data, limit })
+    }
+}
+
+impl io::Write for OwnedWriter {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let n = std::cmp::min(buf.len(), self.limit - self.data.len());
+        self.data.extend_from_slice(&buf[..n]);
+        Ok(n)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+impl ZeroCopyWriter for OwnedWriter {
+    fn write_from(
+        &mut self,
+        f: &mut dyn FileReadWriteVolatile,
+        count: usize,
+        off: u64,
+    ) -> io::Result<usize> {
+        let start = self.data.len();
+        let count = std::cmp::min(count, self.limit - start);
+        // `new()` reserved `limit` bytes, so the spare capacity holds `count`.
+        let spare = &mut self.data.spare_capacity_mut()[..count];
+        // SAFETY: the slice covers `spare`, which stays valid during the read.
+        // The read only writes to it, so its bytes don't need to be
+        // initialized.
+        let slice = unsafe { FileVolatileSlice::from_raw_ptr(spare.as_mut_ptr().cast(), count) };
+        // Retry a read that a signal interrupted, as the native path does.
+        let n = loop {
+            match f.read_at_volatile(slice, off) {
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                res => break res?,
+            }
+        };
+        // SAFETY: the read initialized the first `n` bytes of `spare`. This
+        // runs only in `PassthroughFs::read()`, where `f` is a `std::fs::File`
+        // that reads with `pread()`, which returns the count it wrote.
+        unsafe { self.data.set_len(start + std::cmp::min(n, count)) };
+        Ok(n)
+    }
+
+    fn available_bytes(&self) -> usize {
+        self.limit - self.data.len()
+    }
+}
+
+/// The payload of a WRITE that a pool thread owns, in place of the
+/// transport's reader, see `PassthroughFs::write_on_pool()`.
+struct OwnedReader {
+    data: Vec<u8>,
+    pos: usize,
+}
+
+impl io::Read for OwnedReader {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let n = std::cmp::min(buf.len(), self.data.len() - self.pos);
+        buf[..n].copy_from_slice(&self.data[self.pos..self.pos + n]);
+        self.pos += n;
+        Ok(n)
+    }
+}
+
+impl ZeroCopyReader for OwnedReader {
+    fn read_to(
+        &mut self,
+        f: &mut dyn FileReadWriteVolatile,
+        count: usize,
+        off: u64,
+    ) -> io::Result<usize> {
+        let count = std::cmp::min(count, self.data.len() - self.pos);
+        if count == 0 {
+            return Ok(0);
+        }
+        // Safe because the slice points into `self.data`, which outlives it,
+        // and a write only reads from it.
+        let slice =
+            unsafe { FileVolatileSlice::from_raw_ptr(self.data[self.pos..].as_mut_ptr(), count) };
+        // Retry a write that a signal interrupted, as the native path does.
+        let n = loop {
+            match f.write_at_volatile(slice, off) {
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                res => break res?,
+            }
+        };
+        self.pos += std::cmp::min(n, count);
+        Ok(n)
+    }
+}
+
+/// A file that appends the data written to it to a vector, so that
+/// `PassthroughFs::write_on_pool()` copies the payload of a WRITE out of the
+/// request with one call. It copies into the spare capacity, which the
+/// vector doesn't have to zero first, and takes no more than that. It
+/// ignores the file offsets.
+struct PayloadSink<'a>(&'a mut Vec<u8>);
+
+impl PayloadSink<'_> {
+    fn append(&mut self, bufs: &[FileVolatileSlice]) -> usize {
+        let mut count = 0;
+        for buf in bufs {
+            let len = self.0.len();
+            let spare = self.0.spare_capacity_mut();
+            let n = std::cmp::min(buf.len(), spare.len());
+            // SAFETY: whoever created `buf` guarantees that it's valid for
+            // reads of `buf.len()` bytes, and `spare` is valid for writes of
+            // `spare.len()` bytes. They don't overlap, because `spare` belongs
+            // to the vector, which `self` borrows mutably. The copy
+            // initializes the first `n` bytes of `spare`.
+            unsafe {
+                std::ptr::copy_nonoverlapping(buf.as_ptr(), spare.as_mut_ptr().cast(), n);
+                self.0.set_len(len + n);
+            }
+            count += n;
+            if n < buf.len() {
+                break;
+            }
+        }
+        count
+    }
+}
+
+impl FileReadWriteVolatile for PayloadSink<'_> {
+    fn read_volatile(&mut self, _slice: FileVolatileSlice) -> io::Result<usize> {
+        Err(io::Error::from_raw_os_error(libc::EINVAL))
+    }
+
+    fn write_volatile(&mut self, slice: FileVolatileSlice) -> io::Result<usize> {
+        Ok(self.append(&[slice]))
+    }
+
+    fn write_vectored_volatile(&mut self, bufs: &[FileVolatileSlice]) -> io::Result<usize> {
+        Ok(self.append(bufs))
+    }
+
+    fn read_at_volatile(&mut self, _slice: FileVolatileSlice, _offset: u64) -> io::Result<usize> {
+        Err(io::Error::from_raw_os_error(libc::EINVAL))
+    }
+
+    fn write_at_volatile(&mut self, slice: FileVolatileSlice, _offset: u64) -> io::Result<usize> {
+        Ok(self.append(&[slice]))
+    }
+
+    fn write_vectored_at_volatile(
+        &mut self,
+        bufs: &[FileVolatileSlice],
+        _offset: u64,
+    ) -> io::Result<usize> {
+        Ok(self.append(bufs))
+    }
+}
+
+/// Relay a synchronous handler to the runtime's blocking thread pool if
+/// `pool_fs()` returns a file system to offload it to, and run it inline
+/// otherwise. `$capture` rebinds the borrowed request arguments to owned
+/// copies which can be moved into the pool closure, and `$pool_fn` is a
+/// `move` closure taking the file system and the request context by value.
 macro_rules! async_relay {
     ($self:expr, $ctx:expr, [$($capture:tt)*], $inline_call:expr, $pool_fn:expr) => {
-        match $self.shared_ref.upgrade() {
-            Some(fs) if $self.async_thread_pool_enabled.load(Ordering::Relaxed) => {
-                let ctx = $ctx.clone();
+        match $self.pool_fs() {
+            Some(fs) => {
                 $($capture)*
-                join_blocking(Runtime::spawn_blocking(move || ($pool_fn)(fs, ctx))).await
+                Self::run_on_pool(fs, $ctx, $pool_fn).await
             }
-            _ => $inline_call,
+            None => $inline_call,
         }
     };
 }
@@ -456,12 +774,17 @@ impl<S: BitmapSlice + Send + Sync + 'static> AsyncFileSystem for PassthroughFs<S
         // size), so alignment-enforcing filesystems like ext4/XFS reject it
         // with `EINVAL`. The synchronous handler stages the data through a
         // page-aligned bounce buffer instead (`read_direct()`). The relayed
-        // handler runs inline and blocks the runtime thread on device IO for
-        // the duration of the read: the zero-copy request buffers can't be
-        // moved to a blocking pool thread, so blocking inline is the price
-        // of serving the rare direct-IO request correctly.
+        // handler blocks the thread it runs on for the duration of the read.
+        // With the thread pool enabled, that's a pool thread, see
+        // `read_on_pool()`, and otherwise the runtime thread.
         if flags & (libc::O_DIRECT as u32) != 0 {
-            return self.read(ctx, inode, handle, w, size, offset, lock_owner, flags);
+            return match self.pool_fs() {
+                Some(fs) => {
+                    Self::read_on_pool(fs, ctx, inode, handle, w, size, offset, lock_owner, flags)
+                        .await
+                }
+                None => self.read(ctx, inode, handle, w, size, offset, lock_owner, flags),
+            };
         }
 
         let data = self.get_data(handle, inode, libc::O_RDONLY)?;
@@ -472,6 +795,27 @@ impl<S: BitmapSlice + Send + Sync + 'static> AsyncFileSystem for PassthroughFs<S
         let (served, miss) = self.read_nowait(&data, w, size as usize, offset, flags)?;
         if !miss {
             return Ok(served);
+        }
+
+        // On a cache miss on the tokio runtime, whose file IO would block the
+        // runtime thread, serve the remainder on the thread pool if it's
+        // enabled. It continues where the inline attempt stopped.
+        if async_runtime::runtime_type().file_io_blocks() {
+            if let Some(fs) = self.pool_fs() {
+                let n = Self::read_on_pool(
+                    fs,
+                    ctx,
+                    inode,
+                    handle,
+                    w,
+                    size - served as u32,
+                    offset + served as u64,
+                    lock_owner,
+                    flags,
+                )
+                .await?;
+                return Ok(served + n);
+            }
         }
 
         // Cache miss: serve the remainder with native asynchronous IO,
@@ -510,9 +854,31 @@ impl<S: BitmapSlice + Send + Sync + 'static> AsyncFileSystem for PassthroughFs<S
         // state across `.await` points, so a concurrent non-killpriv write
         // issued while this future is suspended could run with the capability
         // already dropped and lose the setgid bit it must preserve.
-        if flags & (libc::O_DIRECT as u32) != 0
-            || (self.killpriv_v2.load(Ordering::Relaxed) && fuse_flags & WRITE_KILL_PRIV != 0)
-        {
+        // With the thread pool enabled, a pool thread serves these relayed
+        // requests, and on the tokio runtime every WRITE, see
+        // `write_on_pool()`. The synchronous handler drops and restores
+        // CAP_FSETID on the pool thread, with no `.await` in between.
+        let relay = flags & (libc::O_DIRECT as u32) != 0
+            || (self.killpriv_v2.load(Ordering::Relaxed) && fuse_flags & WRITE_KILL_PRIV != 0);
+        if relay || async_runtime::runtime_type().file_io_blocks() {
+            if let Some(fs) = self.pool_fs() {
+                return Self::write_on_pool(
+                    fs,
+                    ctx,
+                    inode,
+                    handle,
+                    r,
+                    size,
+                    offset,
+                    lock_owner,
+                    delayed_write,
+                    flags,
+                    fuse_flags,
+                )
+                .await;
+            }
+        }
+        if relay {
             return self.write(
                 ctx,
                 inode,
@@ -898,14 +1264,18 @@ mod tests {
     impl AsyncZeroCopyWriter for PathRecorder {
         async fn async_write_from(
             &mut self,
-            _f: Arc<dyn AsyncFileReadWriteVolatile>,
+            f: Arc<dyn AsyncFileReadWriteVolatile>,
             count: usize,
             off: u64,
         ) -> io::Result<usize> {
-            let start = off as usize;
-            let n = std::cmp::min(count, self.source.len() - start);
+            // Read the file, so the tests see the data the native path reads.
+            let mut buf = vec![0u8; count];
+            // Safe because `vbuf` doesn't outlive `buf`.
+            let vbuf = unsafe { FileVolatileBuf::from_raw_ptr(buf.as_mut_ptr(), 0, count) };
+            let (res, _) = f.async_read_at_volatile(vbuf, off).await;
+            let n = res?;
             self.events.push(("async", n, off));
-            self.data.extend_from_slice(&self.source[start..start + n]);
+            self.data.extend_from_slice(&buf[..n]);
             Ok(n)
         }
     }
@@ -1444,6 +1814,88 @@ mod tests {
                 .unwrap()
                 .len(),
             4096
+        );
+    }
+
+    // With the thread pool enabled, READ and WRITE work on either runtime.
+    // On tokio the pool serves the cache miss and the WRITE, which
+    // tests/thread_pool.rs checks. With io_uring the native path serves them.
+    // The pool serves the WRITE_KILL_PRIV write on both.
+    #[test]
+    fn test_async_pool_read_write() {
+        let source = TempDir::new().expect("Cannot create temporary directory.");
+        // Negotiating HANDLE_KILLPRIV_V2 needs `do_import: false`.
+        let cfg = Config {
+            root_dir: source.as_path().to_str().unwrap().to_string(),
+            do_import: false,
+            ..Default::default()
+        };
+        let fs = PassthroughFs::<()>::new_shared(cfg).unwrap();
+        fs.import().unwrap();
+        fs.init(FsOptions::HANDLE_KILLPRIV_V2).unwrap();
+        fs.enable_async_thread_pool(true);
+        let ctx = prepare_context();
+        let payload: Vec<u8> = (0..20000u32).map(|i| (i % 251) as u8).collect();
+        // The WRITE_KILL_PRIV write replaces what the first write stored.
+        let first: Vec<u8> = payload.iter().rev().copied().collect();
+        let flags = libc::O_RDWR as u32;
+
+        async_runtime::block_on(async {
+            let name = CString::new("newfile").unwrap();
+            let args = CreateIn {
+                flags: (libc::O_RDWR | libc::O_CREAT | libc::O_TRUNC) as u32,
+                mode: 0o644,
+                umask: 0,
+                fuse_flags: 0,
+            };
+            let (entry, handle, _opts) = fs.async_create(&ctx, ROOT_ID, &name, args).await.unwrap();
+            let handle = handle.unwrap();
+
+            for (fuse_flags, data) in [(0, &first), (WRITE_KILL_PRIV, &payload)] {
+                let mut r = MemReader(data.clone());
+                let n = fs
+                    .async_write(
+                        &ctx,
+                        entry.inode,
+                        handle,
+                        &mut r,
+                        payload.len() as u32,
+                        0,
+                        None,
+                        false,
+                        flags,
+                        fuse_flags,
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(n, payload.len());
+            }
+
+            // The inline attempt misses right away.
+            let mut w = PathRecorder::new(&payload, 0);
+            let n = fs
+                .async_read(
+                    &ctx,
+                    entry.inode,
+                    handle,
+                    &mut w,
+                    payload.len() as u32,
+                    0,
+                    None,
+                    flags,
+                )
+                .await
+                .unwrap();
+            assert_eq!(n, payload.len());
+            assert_eq!(w.data, payload);
+            // With io_uring the native path serves the miss, and on tokio the pool does.
+            let native = !async_runtime::runtime_type().file_io_blocks();
+            assert_eq!(w.events.iter().any(|e| e.0 == "async"), native);
+        });
+
+        assert_eq!(
+            std::fs::read(source.as_path().join("newfile")).unwrap(),
+            payload
         );
     }
 
