@@ -41,6 +41,11 @@
   through the IO driver of the tokio runtime that polls it, and checks its state flag every 100ms
   while idle. Polling it on a tokio runtime without IO enabled panics. `fuse-backend-fusedev`
   needs tokio 1.53.3.
+- The umbrella crate's `async-io` no longer turns on the `fusedev` and `virtiofs`
+  transports. Code that uses the items they gate, such as `abi::virtio_fs`, has
+  to enable them. A crate that depends on a transport crate directly must enable
+  that crate's `async-io` too, or its writers fail asynchronous replies with
+  `EINVAL`.
 - [254](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/254): `fuse-backend-rs` is now a thin facade re-exporting the sub-crates. Every
   historical `fuse_backend_rs::{abi, api, buffer, common, transport, passthrough,
   overlayfs}` import path and cargo feature name (`fusedev`, `virtiofs`,

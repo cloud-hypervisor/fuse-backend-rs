@@ -1191,7 +1191,7 @@ mod tests {
                 ctx: &Context,
                 inode: <Self as FileSystem>::Inode,
                 handle: Option<<Self as FileSystem>::Handle>,
-            ) -> Result<(libc::stat64, Duration)> {
+            ) -> Result<(stat64, Duration)> {
                 unimplemented!()
             }
 
@@ -1199,10 +1199,10 @@ mod tests {
                 &self,
                 ctx: &Context,
                 inode: <Self as FileSystem>::Inode,
-                attr: libc::stat64,
+                attr: stat64,
                 handle: Option<<Self as FileSystem>::Handle>,
                 valid: SetattrValid,
-            ) -> Result<(libc::stat64, Duration)> {
+            ) -> Result<(stat64, Duration)> {
                 unimplemented!()
             }
 
@@ -1322,7 +1322,7 @@ mod tests {
                 ctx: &Context,
                 inode: <Self as FileSystem>::Inode,
                 handle: Option<<Self as FileSystem>::Handle>,
-            ) -> Result<(libc::stat64, Duration)> {
+            ) -> Result<(stat64, Duration)> {
                 unimplemented!()
             }
 
@@ -1330,10 +1330,10 @@ mod tests {
                 &self,
                 ctx: &Context,
                 inode: <Self as FileSystem>::Inode,
-                attr: libc::stat64,
+                attr: stat64,
                 handle: Option<<Self as FileSystem>::Handle>,
                 valid: SetattrValid,
-            ) -> Result<(libc::stat64, Duration)> {
+            ) -> Result<(stat64, Duration)> {
                 unimplemented!()
             }
 
