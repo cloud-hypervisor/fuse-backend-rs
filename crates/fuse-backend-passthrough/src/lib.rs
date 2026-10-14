@@ -645,7 +645,7 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
     /// It takes effect when INIT enables `FsOptions::PASSTHROUGH`. The kernel only allows that
     /// without `FsOptions::WRITEBACK_CACHE`, and the backing ids come from open requests, so it
     /// doesn't work with `no_open`. Under a `Vfs`, add `FsOptions::PASSTHROUGH` to its `out_opts`,
-    /// set `no_writeback`, and set `no_open` to false, which `VfsOptions` enables by default.
+    /// set `no_writeback`, and set `no_open` to false, because `VfsOptions` enables it by default.
     ///
     /// It stays off with `Config::seal_size`, because passthrough writes don't reach the size
     /// check, and with `CachePolicy::Never` and `CachePolicy::Metadata`. Those open files with
@@ -657,9 +657,12 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
     /// such as overlayfs needs `Server::set_max_stack_depth(2)`. Otherwise the kernel rejects the
     /// registration, and the open fails.
     ///
-    /// Passthrough doesn't survive a takeover with `Server::restore_init()`. The new instance
-    /// registers new backing files, and while files that the old one opened in passthrough mode
-    /// stay open, the kernel fails other opens of them with `EBUSY`.
+    /// After a takeover with `Server::restore_init()`, passthrough keeps working if the new server
+    /// serves the same instance, which keeps its handles and backing ids. That fails if something
+    /// destroys the instance in between, as `Vfs::umount()` does. A new instance doesn't know the
+    /// old backing ids, which stay registered until the connection ends. While files that the old
+    /// instance opened in passthrough mode stay open, the kernel fails other opens of them with
+    /// `EIO`, with or without a new backing file.
     ///
     /// To use it with the blocking thread pool of the `async-io` feature, create the file system
     /// with `new()`, call this, and then share it with `into_shared()`.
