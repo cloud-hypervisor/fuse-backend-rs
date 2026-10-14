@@ -238,11 +238,7 @@ impl FuseSession {
         // If we have a keep_alive socket, just drop it,
         // and let fusermount do the unmount.
         if let (None, Some(file)) = (self.keep_alive.take(), self.file.take()) {
-            if let Some(mountpoint) = self.mountpoint.to_str() {
-                fuse_kern_umount(mountpoint, file, self.fusermount.as_str())
-            } else {
-                Err(SessionFailure("invalid mountpoint".to_string()))
-            }
+            fuse_kern_umount(&self.mountpoint, file, &self.fusermount, self.target_mntns)
         } else {
             Ok(())
         }
@@ -710,19 +706,8 @@ fn fuse_fusermount_mount(
     fcntl(send.as_raw_fd(), FcntlArg::F_SETFD(FdFlag::empty()))
         .map_err(|e| SessionFailure(format!("Failed to remove close-on-exec flag: {e}")))?;
 
-    let mut cmd = match target_mntns {
-        Some(pid) => {
-            let mut c = std::process::Command::new("nsenter");
-            c.arg("-t")
-                .arg(format!("{}", pid))
-                .arg("-m")
-                .arg(fusermount);
-            c
-        }
-        None => std::process::Command::new(fusermount),
-    };
     // Old version of fusermount doesn't support long --options, yet.
-    let mut proc = cmd
+    let mut proc = fusermount_command(fusermount, target_mntns)
         .env("_FUSE_COMMFD", format!("{}", send.as_raw_fd()))
         .arg("-o")
         .arg(opts)
@@ -762,35 +747,83 @@ fn fuse_fusermount_mount(
     }
 }
 
-/// Umount a fuse file system
-fn fuse_kern_umount(mountpoint: &str, file: File, fusermount: &str) -> Result<()> {
+/// Whether the file system is unmounted already, or its connection was aborted through
+/// /sys/fs/fuse/connections/NNN/abort. In both cases the fuse fd reports only POLLERR.
+fn is_torn_down(file: &File) -> bool {
     let mut fds = [PollFd::new(file.as_raw_fd(), PollFlags::empty())];
+    poll(&mut fds, 0).is_ok() && fds[0].revents() == Some(PollFlags::POLLERR)
+}
 
-    if poll(&mut fds, 0).is_ok() {
-        // POLLERR means the file system is already umounted,
-        // or the connection has been aborted via /sys/fs/fuse/connections/NNN/abort
-        if let Some(event) = fds[0].revents() {
-            if event == PollFlags::POLLERR {
-                return Ok(());
-            }
-        }
+/// Umount a fuse file system
+fn fuse_kern_umount(
+    mountpoint: &Path,
+    file: File,
+    fusermount: &str,
+    target_mntns: Option<libc::pid_t>,
+) -> Result<()> {
+    if is_torn_down(&file) {
+        return Ok(());
     }
 
     // Drop to close fuse session fd, otherwise synchronous umount can recurse into filesystem and
     // cause deadlock.
     drop(file);
-    match umount2(mountpoint, MntFlags::MNT_DETACH) {
-        Ok(()) => Ok(()),
-        Err(Errno::EPERM) => fuse_fusermount_umount(mountpoint, fusermount),
-        Err(e) => Err(SessionFailure(format!(
-            "failed to umount {mountpoint}: {e}"
-        ))),
+    fuse_lazy_umount(mountpoint, fusermount, target_mntns)
+}
+
+/// Detach a fuse file system from the mount tree. Fall back to fusermount if umount2() fails
+/// with EPERM.
+///
+/// umount2() acts in the caller's mount namespace. For a file system mounted in the namespace
+/// of `target_mntns`, nsenter and fusermount unmount it there, the way they mounted it.
+fn fuse_lazy_umount(
+    mountpoint: &Path,
+    fusermount: &str,
+    target_mntns: Option<libc::pid_t>,
+) -> Result<()> {
+    if target_mntns.is_none() {
+        // Like fusermount, don't follow a symlink that replaced the mountpoint.
+        match umount2(mountpoint, MntFlags::MNT_DETACH | MntFlags::UMOUNT_NOFOLLOW) {
+            Ok(()) => return Ok(()),
+            Err(Errno::EPERM) => {}
+            Err(e) => {
+                return Err(SessionFailure(format!(
+                    "failed to umount {}: {e}",
+                    mountpoint.display()
+                )))
+            }
+        }
+    }
+    fuse_fusermount_umount(mountpoint, fusermount, target_mntns)
+}
+
+/// Build a fusermount command. With `target_mntns` set, it runs through nsenter in the mount
+/// namespace of that process.
+fn fusermount_command(
+    fusermount: &str,
+    target_mntns: Option<libc::pid_t>,
+) -> std::process::Command {
+    match target_mntns {
+        Some(pid) => {
+            let mut c = std::process::Command::new("nsenter");
+            c.arg("-t")
+                .arg(format!("{}", pid))
+                .arg("-m")
+                .arg(fusermount);
+            c
+        }
+        None => std::process::Command::new(fusermount),
     }
 }
 
-/// Umount a fuse file system by fusermount helper
-fn fuse_fusermount_umount(mountpoint: &str, fusermount: &str) -> Result<()> {
-    match std::process::Command::new(fusermount)
+/// Umount a fuse file system with the fusermount helper, in the mount namespace of
+/// `target_mntns`.
+fn fuse_fusermount_umount(
+    mountpoint: &Path,
+    fusermount: &str,
+    target_mntns: Option<libc::pid_t>,
+) -> Result<()> {
+    match fusermount_command(fusermount, target_mntns)
         .arg("--unmount")
         .arg("--quiet")
         .arg("--lazy")
