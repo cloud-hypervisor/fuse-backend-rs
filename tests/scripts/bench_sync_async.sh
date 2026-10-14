@@ -10,7 +10,7 @@
 # async runtime, uring: the experimental FUSE-over-io_uring transport),
 # the script mounts the benchmark daemon and runs the same fio workloads
 # against the mountpoint. The fio results are stored in JSON format
-# ($RESULTS_DIR/<mode>-<workload>.json) under $RESULTS_DIR for further
+# (<mode>-<workload>.json) under $BENCH_RESULTS_DIR for further
 # analysis, see tests/scripts/bench_compare.py.
 #
 # Requirements: Linux, fio, jq, python3, permission to mount fuse (root or
@@ -21,36 +21,55 @@
 # skipped with a warning.
 #
 # Tunables (environment variables):
-#   THREADS  number of sync worker threads / fio jobs (default 4)
-#   SIZE     file size for the sequential workloads (default 256M)
-#   RUNTIME  seconds per time-based workload (default 30)
-#   NRFILES  number of files for the metadata workloads (default 50000);
-#            large enough that each metadata workload runs for several
-#            seconds, since sub-second measurements are noise dominated
-#   MODES    execution order of the modes (default "sync async"); the
-#            second mode benefits from a warmer page cache, so run both
-#            orders to cross-check the results
-#   DAEMON   path of a prebuilt benchmark daemon (default: build the
-#            daemon of this repository in release mode); used by the CI
-#            pipeline to benchmark different code variants with an
-#            identical workload definition
-#   RESULTS_DIR where to store results (default a fresh mktemp directory)
+#   BENCH_THREADS  number of sync worker threads / fio jobs (default 4)
+#   BENCH_SIZE     file size for the sequential workloads (default 256M)
+#   BENCH_RUNTIME  seconds per time-based workload (default 30)
+#   BENCH_NRFILES  number of files for the metadata workloads (default
+#                  50000); large enough that each metadata workload runs
+#                  for several seconds, since sub-second measurements are
+#                  noise dominated
+#   BENCH_MODES    execution order of the modes (default "sync async"); the
+#                  second mode benefits from a warmer page cache, so run
+#                  both orders to cross-check the results
+#   BENCH_DAEMON   path of a prebuilt benchmark daemon (default: build the
+#                  daemon of this repository in release mode); used by the
+#                  CI pipeline to benchmark different code variants with an
+#                  identical workload definition
+#   BENCH_RESULTS_DIR where to store results (default a fresh mktemp
+#                  directory)
+# The names without the BENCH_ prefix still work when the prefixed one isn't
+# set. The script warns about each one it uses, because other tools can
+# leave a generic name such as SIZE in the environment.
 
 set -euo pipefail
 
+# tunable NAME DEFAULT: set $NAME to $BENCH_NAME, or else keep the deprecated
+# $NAME, or else set it to DEFAULT. Empty values count as unset.
+tunable() {
+    local new="BENCH_$1"
+    if [ -n "${!new:-}" ]; then
+        printf -v "$1" '%s' "${!new}"
+    elif [ -n "${!1:-}" ]; then
+        echo "warning: $1 is deprecated, set ${new} instead" >&2
+    else
+        printf -v "$1" '%s' "$2"
+    fi
+}
+
 SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
 REPO_DIR=$(cd "${SCRIPT_DIR}/../.." && pwd)
-BENCH_DIR="${REPO_DIR}/tests/benchmark"
+DAEMON_CRATE_DIR="${REPO_DIR}/tests/benchmark"
 # tests/benchmark is a member of the root workspace, so build artifacts
 # land in the workspace target directory, not under tests/benchmark.
-DAEMON=${DAEMON:-"${REPO_DIR}/target/release/fuse-backend-rs-benchmark"}
+tunable DAEMON "${REPO_DIR}/target/release/fuse-backend-rs-benchmark"
 
-THREADS=${THREADS:-4}
-SIZE=${SIZE:-256M}
-RUNTIME=${RUNTIME:-30}
-NRFILES=${NRFILES:-50000}
-MODES=${MODES:-"sync async"}
-RESULTS_DIR=${RESULTS_DIR:-$(mktemp -d /tmp/fuse-bench-results.XXXXXX)}
+tunable THREADS 4
+tunable SIZE 256M
+tunable RUNTIME 30
+tunable NRFILES 50000
+tunable MODES "sync async"
+tunable RESULTS_DIR ""
+[ -n "${RESULTS_DIR}" ] || RESULTS_DIR=$(mktemp -d /tmp/fuse-bench-results.XXXXXX)
 SRC_DIR="${RESULTS_DIR}/source"
 MNT_DIR="${RESULTS_DIR}/mount"
 mkdir -p "${SRC_DIR}" "${MNT_DIR}"
@@ -90,10 +109,10 @@ fi
 echo "results directory: ${RESULTS_DIR}"
 
 # Build the benchmark daemon in release mode, unless the caller provided
-# a prebuilt one via $DAEMON (e.g. the CI pipeline benchmarking several
+# a prebuilt one via $BENCH_DAEMON (e.g. the CI pipeline benchmarking several
 # code variants with this very script).
 if [ ! -x "${DAEMON}" ]; then
-    (cd "${BENCH_DIR}" && cargo build --release)
+    (cd "${DAEMON_CRATE_DIR}" && cargo build --release)
 fi
 
 DAEMON_PID=
