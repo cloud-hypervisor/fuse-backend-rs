@@ -505,10 +505,10 @@ pub struct PassthroughFs<S: BitmapSlice + Send + Sync = ()> {
     // PassthroughFs::enable_async_thread_pool().
     #[cfg(feature = "async-io")]
     async_thread_pool_enabled: AtomicBool,
-    // Weak reference to the `Arc` created by `new_shared()`, used by the
+    // Weak reference to the `Arc` created by `into_shared()`, used by the
     // async handlers to offload the synchronous handlers to the blocking
-    // thread pool. It is dangling for instances created with `new()`, so
-    // `upgrade()` always fails for those.
+    // thread pool. Only `into_shared()` sets it, so `upgrade()` fails for
+    // any other instance, even one wrapped in a plain `Arc::new()`.
     #[cfg(feature = "async-io")]
     shared_ref: std::sync::Weak<PassthroughFs<S>>,
 
@@ -641,6 +641,9 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
     /// Passthrough doesn't survive a takeover with `Server::restore_init()`. The new instance
     /// registers new backing files, and while files that the old one opened in passthrough mode
     /// stay open, the kernel fails other opens of them with `EBUSY`.
+    ///
+    /// To use it with the blocking thread pool of the `async-io` feature, create the file system
+    /// with `new()`, call this, and then share it with `into_shared()`.
     #[cfg(target_os = "linux")]
     pub fn set_backing_files(&mut self, files: Arc<dyn BackingFiles>) {
         self.kernel_passthrough = Some(KernelPassthrough {
