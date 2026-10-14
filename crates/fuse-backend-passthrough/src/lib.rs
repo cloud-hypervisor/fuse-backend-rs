@@ -653,10 +653,11 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
     /// set `no_writeback`, and set `no_open` to false, because `VfsOptions` enables it by default.
     ///
     /// It stays off with `Config::seal_size`, because passthrough writes don't reach the size
-    /// check, and with `CachePolicy::Never` and `CachePolicy::Metadata`. Those open files with
-    /// `OpenOptions::DIRECT_IO`, which takes precedence over passthrough for reads and writes.
-    /// It also stays off when `Config::allow_direct_io` is false, because the kernel opens the
-    /// backing file with the client's `O_DIRECT`.
+    /// check, and with `CachePolicy::Never` and `CachePolicy::Metadata`, which open files with
+    /// `OpenOptions::DIRECT_IO` to keep file data out of the page cache. Passthrough opens drop
+    /// `DIRECT_IO`, so the host page cache would serve their reads and writes. It also stays off
+    /// when `Config::allow_direct_io` is false, because the kernel opens the backing file with the
+    /// client's `O_DIRECT`.
     ///
     /// Registering a backing file needs `CAP_SYS_ADMIN`, and a host file on a stacked file system
     /// such as overlayfs needs `Server::set_max_stack_depth(2)`. Otherwise the kernel rejects the
@@ -2001,16 +2002,6 @@ mod tests {
     #[test]
     #[cfg(target_os = "linux")]
     fn test_kernel_passthrough_cache_always() {
-        struct Files;
-        impl BackingFiles for Files {
-            fn open(&self, _fd: BorrowedFd<'_>) -> io::Result<u32> {
-                Ok(1)
-            }
-            fn close(&self, _backing_id: u32) -> io::Result<()> {
-                Ok(())
-            }
-        }
-
         let tmpdir = TempDir::new().expect("Cannot create temporary directory.");
         let fs_cfg = Config {
             do_import: false,
@@ -2019,7 +2010,7 @@ mod tests {
             ..Default::default()
         };
         let mut fs = PassthroughFs::<()>::new(fs_cfg).unwrap();
-        fs.set_backing_files(Arc::new(Files));
+        fs.set_backing_files(Arc::new(OneIdFiles));
         fs.import().unwrap();
         fs.init(FsOptions::PASSTHROUGH).unwrap();
 
@@ -2046,6 +2037,71 @@ mod tests {
         assert_eq!(opts, OpenOptions::KEEP_CACHE | OpenOptions::CACHE_DIR);
     }
 
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn test_kernel_passthrough_o_direct() {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        let tmpdir = TempDir::new().expect("Cannot create temporary directory.");
+        let probe = tmpdir.as_path().join("probe");
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .custom_flags(libc::O_DIRECT)
+            .open(&probe)
+        {
+            Ok(_) => std::fs::remove_file(&probe).unwrap(),
+            Err(e) if e.raw_os_error() == Some(libc::EINVAL) => {
+                eprintln!(
+                    "skipping test_kernel_passthrough_o_direct: no O_DIRECT in {:?}",
+                    tmpdir.as_path()
+                );
+                return;
+            }
+            Err(e) => panic!("unexpected error opening {:?} with O_DIRECT: {}", probe, e),
+        }
+        let fs_cfg = Config {
+            do_import: false,
+            allow_direct_io: true,
+            root_dir: tmpdir.as_path().to_string_lossy().to_string(),
+            ..Default::default()
+        };
+        let mut fs = PassthroughFs::<()>::new(fs_cfg).unwrap();
+        fs.set_backing_files(Arc::new(OneIdFiles));
+        fs.import().unwrap();
+        fs.init(FsOptions::PASSTHROUGH).unwrap();
+
+        // O_DIRECT creates and opens pass through without DIRECT_IO, which would send their IO
+        // through the daemon. The backing file gets the client's O_DIRECT instead.
+        let ctx = Context::default();
+        let flags = libc::O_RDWR as u32 | libc::O_DIRECT as u32;
+        let createin = CreateIn {
+            flags: flags | libc::O_CREAT as u32,
+            mode: 0o644,
+            umask: 0,
+            fuse_flags: 0,
+        };
+        let name = CString::new("file").unwrap();
+        let (entry, _, opts, id) = fs.create(&ctx, ROOT_ID, &name, createin).unwrap();
+        assert_eq!(id, Some(1));
+        assert_eq!(opts, OpenOptions::PASSTHROUGH);
+        let (_, opts, id) = fs.open(&ctx, entry.inode, flags, 0).unwrap();
+        assert_eq!(id, Some(1));
+        assert_eq!(opts, OpenOptions::PASSTHROUGH);
+
+        // Without passthrough, an O_DIRECT open gets DIRECT_IO.
+        let fs = PassthroughFs::<()>::new(fs.cfg.clone()).unwrap();
+        fs.import().unwrap();
+        fs.init(FsOptions::empty()).unwrap();
+        let name = CString::new("other").unwrap();
+        let (entry, _, _, id) = fs.create(&ctx, ROOT_ID, &name, createin).unwrap();
+        assert_eq!(id, None);
+        let (_, opts, id) = fs.open(&ctx, entry.inode, flags, 0).unwrap();
+        assert_eq!(id, None);
+        assert_eq!(opts, OpenOptions::DIRECT_IO);
+    }
+
     /// Backing files for tests in which passthrough stays off.
     #[cfg(target_os = "linux")]
     struct UnusedFiles;
@@ -2057,6 +2113,20 @@ mod tests {
         }
         fn close(&self, _backing_id: u32) -> io::Result<()> {
             unreachable!()
+        }
+    }
+
+    /// Backing files that hand out the id 1 for every file.
+    #[cfg(target_os = "linux")]
+    struct OneIdFiles;
+
+    #[cfg(target_os = "linux")]
+    impl BackingFiles for OneIdFiles {
+        fn open(&self, _fd: BorrowedFd<'_>) -> io::Result<u32> {
+            Ok(1)
+        }
+        fn close(&self, _backing_id: u32) -> io::Result<()> {
+            Ok(())
         }
     }
 
