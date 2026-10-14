@@ -104,8 +104,11 @@ pub trait FuseServing: Send {
     ///
     /// This serves teardown driven from outside the process — e.g. an
     /// admin `umount(8)` of the mountpoint — which ends every worker's
-    /// reception with `ENODEV`. Dropping the serving layer instead
-    /// performs the teardown itself and joins the workers.
+    /// reception with `ENODEV`. On Linux, another thread can start that
+    /// teardown with `FuseSession::detach()` on [`FuseServing::session()`].
+    /// The Linux serving layers are `Sync`, so share one as
+    /// `dyn FuseServing + Sync` for this. Dropping the serving layer
+    /// instead performs the teardown itself and joins the workers.
     fn wait(&self);
 }
 
@@ -533,6 +536,55 @@ mod tests {
                     blocking: false,
                 },
             );
+        }
+
+        /// A detached mount that is still in use keeps its connection up.
+        /// Neither a second detach() nor dropping the serving layer may
+        /// unmount the mountpoint again, because another mount may be
+        /// there by then. In this test, that is the tmpfs the file system
+        /// was mounted over.
+        #[test]
+        fn test_sync_serving_detach_busy() {
+            use nix::mount::{mount, umount2, MntFlags, MsFlags};
+
+            let mnt = TempDir::new().unwrap();
+            if let Err(e) = mount(
+                Some("tmpfs"),
+                mnt.as_path(),
+                Some("tmpfs"),
+                MsFlags::empty(),
+                None::<&str>,
+            ) {
+                eprintln!("can't mount a tmpfs ({e}), skipping");
+                return;
+            }
+            let below = mnt.as_path().join("below");
+            std::fs::write(&below, b"tmpfs").unwrap();
+
+            let src = TempDir::new().unwrap();
+            std::fs::write(src.as_path().join("hello"), b"busy").unwrap();
+            let fs = PassthroughFs::<()>::new(Config {
+                root_dir: src.as_path().to_string_lossy().to_string(),
+                do_import: false,
+                ..Default::default()
+            })
+            .unwrap();
+            fs.import().unwrap();
+            let mut se = FuseSession::new(mnt.as_path(), "sync_serving_test", "", false).unwrap();
+            se.mount().unwrap();
+            let server = Arc::new(Server::new(fs));
+            let serving = SyncFuseServing::new(se, server, SyncServingConfig::default()).unwrap();
+
+            let busy = std::fs::File::open(mnt.as_path().join("hello")).unwrap();
+            serving.session().detach().unwrap();
+            assert_eq!(std::fs::read(&below).unwrap(), b"tmpfs");
+            serving.session().detach().unwrap();
+            assert_eq!(std::fs::read(&below).unwrap(), b"tmpfs");
+            drop(serving);
+            assert_eq!(std::fs::read(&below).unwrap(), b"tmpfs");
+
+            drop(busy);
+            umount2(mnt.as_path(), MntFlags::MNT_DETACH).unwrap();
         }
 
         #[test]
