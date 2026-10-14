@@ -14,25 +14,26 @@
 //!
 //! Run with: `cargo bench` from this directory (Linux only).
 
+mod common;
+
 use std::ffi::CString;
 use std::io;
 use std::sync::Arc;
 
 use criterion::{criterion_group, criterion_main, BatchSize, Criterion};
-use vmm_sys_util::tempdir::TempDir;
 
 use fuse_backend_rs::abi::fuse_abi::{CreateIn, ROOT_ID};
 use fuse_backend_rs::api::filesystem::{
-    AsyncFileSystem, AsyncZeroCopyReader, AsyncZeroCopyWriter, Context, FileSystem, FsOptions,
-    ZeroCopyReader, ZeroCopyWriter,
+    AsyncFileSystem, AsyncZeroCopyReader, AsyncZeroCopyWriter, FileSystem, ZeroCopyReader,
+    ZeroCopyWriter,
 };
 use fuse_backend_rs::async_runtime::Runtime;
 use fuse_backend_rs::file_buf::FileVolatileSlice;
 use fuse_backend_rs::file_traits::{AsyncFileReadWriteVolatile, FileReadWriteVolatile};
-use fuse_backend_rs::passthrough::{Config, PassthroughFs};
+
+use common::{prepare_context, prepare_fs, TEST_FILE};
 
 const DATA_SIZE: u32 = 4096;
-const TEST_FILE: &str = "benchfile";
 
 /// An in-memory sink implementing `ZeroCopyWriter`/`AsyncZeroCopyWriter`,
 /// to receive data from `read()`/`async_read()`.
@@ -134,38 +135,8 @@ impl AsyncZeroCopyReader for MemReader {
     }
 }
 
-/// Create a `PassthroughFs` backed by a fresh temporary directory holding a
-/// single `DATA_SIZE`-byte file.
-fn prepare_fs() -> (PassthroughFs<()>, TempDir) {
-    let source = TempDir::new().unwrap();
-    std::fs::write(
-        source.as_path().join(TEST_FILE),
-        vec![0xa5u8; DATA_SIZE as usize],
-    )
-    .unwrap();
-
-    let cfg = Config {
-        root_dir: source.as_path().to_str().unwrap().to_string(),
-        do_import: true,
-        ..Default::default()
-    };
-    let fs = PassthroughFs::<()>::new(cfg).unwrap();
-    fs.import().unwrap();
-    fs.init(FsOptions::all()).unwrap();
-    (fs, source)
-}
-
-fn prepare_context() -> Context {
-    Context {
-        uid: unsafe { libc::getuid() },
-        gid: unsafe { libc::getgid() },
-        pid: unsafe { libc::getpid() },
-        ..Default::default()
-    }
-}
-
 fn bench_lookup_getattr(c: &mut Criterion) {
-    let (fs, _source) = prepare_fs();
+    let (fs, _source) = prepare_fs(DATA_SIZE as usize);
     let ctx = prepare_context();
     let name = CString::new(TEST_FILE).unwrap();
     let rt = Runtime::new();
@@ -198,7 +169,7 @@ fn bench_lookup_getattr(c: &mut Criterion) {
 }
 
 fn bench_read(c: &mut Criterion) {
-    let (fs, _source) = prepare_fs();
+    let (fs, _source) = prepare_fs(DATA_SIZE as usize);
     let ctx = prepare_context();
     let name = CString::new(TEST_FILE).unwrap();
     let rt = Runtime::new();
@@ -271,7 +242,7 @@ fn bench_read(c: &mut Criterion) {
 }
 
 fn bench_write(c: &mut Criterion) {
-    let (fs, _source) = prepare_fs();
+    let (fs, _source) = prepare_fs(DATA_SIZE as usize);
     let ctx = prepare_context();
     let name = CString::new(TEST_FILE).unwrap();
     let rt = Runtime::new();
@@ -339,7 +310,7 @@ fn bench_write(c: &mut Criterion) {
 }
 
 fn bench_create_unlink(c: &mut Criterion) {
-    let (fs, _source) = prepare_fs();
+    let (fs, _source) = prepare_fs(DATA_SIZE as usize);
     let ctx = prepare_context();
     let name = CString::new("benchtmp").unwrap();
     let args = CreateIn {

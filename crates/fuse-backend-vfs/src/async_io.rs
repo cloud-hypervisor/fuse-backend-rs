@@ -36,7 +36,7 @@ impl AsyncFileSystem for Vfs {
         ctx: &Context,
         inode: <Self as FileSystem>::Inode,
         handle: Option<<Self as FileSystem>::Handle>,
-    ) -> Result<(libc::stat64, Duration)> {
+    ) -> Result<(stat64, Duration)> {
         match self.get_real_rootfs(inode)? {
             (Left(fs), idata) => fs.getattr(ctx, idata.ino(), handle),
             (Right(fs), idata) => fs
@@ -50,10 +50,10 @@ impl AsyncFileSystem for Vfs {
         &self,
         ctx: &Context,
         inode: <Self as FileSystem>::Inode,
-        attr: libc::stat64,
+        attr: stat64,
         handle: Option<<Self as FileSystem>::Handle>,
         valid: SetattrValid,
-    ) -> Result<(libc::stat64, Duration)> {
+    ) -> Result<(stat64, Duration)> {
         match self.get_real_rootfs(inode)? {
             (Left(fs), idata) => fs.setattr(ctx, idata.ino(), attr, handle, valid),
             (Right(fs), idata) => {
@@ -73,15 +73,15 @@ impl AsyncFileSystem for Vfs {
         flags: u32,
         fuse_flags: u32,
     ) -> Result<(Option<<Self as FileSystem>::Handle>, OpenOptions)> {
+        #[cfg(target_os = "linux")]
         if self.opts.load().no_open {
-            Err(Error::from_raw_os_error(libc::ENOSYS))
-        } else {
-            match self.get_real_rootfs(inode)? {
-                (Left(fs), idata) => fs
-                    .open(ctx, idata.ino(), flags, fuse_flags)
-                    .map(|(a, b, _)| (a, b)),
-                (Right(fs), idata) => fs.async_open(ctx, idata.ino(), flags, fuse_flags).await,
-            }
+            return Err(Error::from_raw_os_error(libc::ENOSYS));
+        }
+        match self.get_real_rootfs(inode)? {
+            (Left(fs), idata) => fs
+                .open(ctx, idata.ino(), flags, fuse_flags)
+                .map(|(a, b, _)| (a, b)),
+            (Right(fs), idata) => fs.async_open(ctx, idata.ino(), flags, fuse_flags).await,
         }
     }
 

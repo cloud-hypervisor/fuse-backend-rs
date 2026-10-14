@@ -29,8 +29,39 @@
   FUSE-over-io_uring transport (kernel 6.14+). Both join the `FuseServing` interface, so a daemon
   can pick its transport at runtime behind `Box<dyn FuseServing>` and fall back to the classic
   transport on `Error::UringNotSupported`.
+- `async_runtime::set_runtime_type()` selects the asynchronous runtime type in code, because
+  setting `FUSE_BACKEND_RS_ASYNC_RUNTIME` from a running program isn't safe.
+  `async_runtime::runtime_type()` returns the type in effect, and `RuntimeType` is now public.
+- `Server::init_state()` and `Server::restore_init()` let a new server take over a connection
+  that another server initialized. `abi::fuse_abi::UNIQUE_RESEND` is the bit that the kernel
+  sets in requests it sends again after `notify_resend()`.
+- `RuntimeType::file_io_blocks()` tells whether async file IO on a runtime type blocks the
+  calling thread, as it does on tokio.
 
 ### Changed
+- With the tokio runtime, `FuseDevTask` no longer retries reads in a loop. It waits for requests
+  through the IO driver of the tokio runtime that polls it, and checks its state flag every 100ms
+  while idle. Polling it on a tokio runtime without IO enabled panics. `fuse-backend-fusedev`
+  needs tokio 1.53.3.
+- `async-io` builds on macOS, where it runs on tokio. `fuse-backend-core` now depends on
+  `io-uring` only on Linux, like `tokio-uring`.
+- If io-uring isn't available, `set_runtime_type(RuntimeType::Uring)` returns the probe's
+  error, and the fallback warning includes it.
+- On the tokio runtime, the vectored reads and writes of `async_file::File` make one
+  `preadv()`/`pwritev()` call for all buffers instead of one call per buffer.
+  `async_file::preadv()` and `pwritev()` accept more than 1024 buffers and make one call per
+  1024.
+- `PassthroughFs::enable_async_thread_pool(true)` also moves READ and WRITE
+  requests that would block the runtime thread to the blocking thread pool.
+  These are the O_DIRECT and WRITE_KILL_PRIV requests, and on the tokio
+  runtime also READ cache misses and every WRITE. On a file system without
+  `RWF_NOWAIT`, such as tmpfs, overlayfs or FUSE, every READ counts as a cache
+  miss. Each of these requests costs one more copy and a thread handoff.
+- The umbrella crate's `async-io` no longer turns on the `fusedev` and `virtiofs`
+  transports. Code that uses the items they gate, such as `abi::virtio_fs`, has
+  to enable them. A crate that depends on a transport crate directly must enable
+  that crate's `async-io` too, or its writers fail asynchronous replies with
+  `EINVAL`.
 - [254](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/254): `fuse-backend-rs` is now a thin facade re-exporting the sub-crates. Every
   historical `fuse_backend_rs::{abi, api, buffer, common, transport, passthrough,
   overlayfs}` import path and cargo feature name (`fusedev`, `virtiofs`,

@@ -24,6 +24,24 @@ Note that the async numbers include the runtime dispatch cost
 of delegation itself; they do not predict end-to-end throughput, because the
 fuse transport and request concurrency dominate there.
 
+`benches/async_io_microbench.rs` measures the asynchronous data path:
+
+- `vectored/*` moves data between a file and 1, 16 or 256 buffers of
+  4 KiB, as a virtio-fs descriptor chain hands them over.
+- `passthrough/*` serves `PassthroughFs` READ and WRITE of 4 KiB, 128 KiB
+  and 1 MiB, with the blocking thread pool off (`inline`) and on (`pool`).
+  The READ reply buffer fails the inline page cache attempt, so READ
+  measures the path that serves cache misses.
+
+The runtime type comes from `FUSE_BACKEND_RS_ASYNC_RUNTIME`, and the data
+lives under `TMPDIR`:
+
+```sh
+cd tests/benchmark
+FUSE_BACKEND_RS_ASYNC_RUNTIME=tokio cargo bench --bench async_io_microbench
+FUSE_BACKEND_RS_ASYNC_RUNTIME=uring cargo bench --bench async_io_microbench
+```
+
 ## 2. End-to-end comparison with fio
 
 `tests/scripts/bench_sync_async.sh` mounts the `fuse-backend-rs-benchmark`
@@ -32,7 +50,8 @@ fuse channel each; the daemon's `--sync-blocking` flag switches them to
 blocking channels cloned with `FUSE_DEV_IOC_CLONE`), async mode (N
 asynchronous workers through `AsyncFuseServing`, each with
 its own `/dev/fuse` file description and async runtime, tokio-uring when
-io_uring is available) and uring mode (the experimental
+io_uring is available), pool mode (the async mode with
+`PassthroughFs::enable_async_thread_pool()`) and uring mode (the experimental
 FUSE-over-io_uring transport, requires kernel 6.14+ and is skipped
 otherwise) — and runs identical fio workloads:
 
