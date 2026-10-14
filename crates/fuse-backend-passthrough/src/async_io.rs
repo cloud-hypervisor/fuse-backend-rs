@@ -236,6 +236,24 @@ impl<S: BitmapSlice + Send + Sync + 'static> PassthroughFs<S> {
         join_blocking(&mut task.0).await
     }
 
+    /// Like `run_on_pool()`, for a handler that creates state the kernel has
+    /// to release, such as a lookup count or a handle. If this future is
+    /// dropped while a pool thread runs `f`, nobody receives its result, and
+    /// `undo` releases that state on whichever thread drops the result.
+    async fn run_on_pool_undo<T, F, U>(fs: Arc<Self>, ctx: &Context, f: F, undo: U) -> io::Result<T>
+    where
+        T: Send + 'static,
+        F: FnOnce(&Self, Context) -> io::Result<T> + Send + 'static,
+        U: FnOnce(&Self, T) + Send + 'static,
+    {
+        Self::run_on_pool(fs, ctx, move |fs, ctx| {
+            let value = f(&fs, ctx)?;
+            Ok(Unclaimed(Some((value, move |value| undo(&fs, value)))))
+        })
+        .await
+        .map(Unclaimed::claim)
+    }
+
     /// Serve a READ with `do_read()` on the blocking thread pool, and copy
     /// the data into `w`.
     ///
@@ -336,6 +354,26 @@ struct AbortOnDrop<T>(tokio::task::JoinHandle<T>);
 impl<T> Drop for AbortOnDrop<T> {
     fn drop(&mut self) {
         self.0.abort();
+    }
+}
+
+/// The result of a pool task, which runs its undo function if it's dropped
+/// before `claim()`, see `PassthroughFs::run_on_pool_undo()`. If the task
+/// ends after its `JoinHandle` was dropped, tokio drops the result on the
+/// pool thread. Otherwise the thread that drops the `JoinHandle` drops it.
+struct Unclaimed<T, U: FnOnce(T)>(Option<(T, U)>);
+
+impl<T, U: FnOnce(T)> Unclaimed<T, U> {
+    fn claim(mut self) -> T {
+        self.0.take().unwrap().0
+    }
+}
+
+impl<T, U: FnOnce(T)> Drop for Unclaimed<T, U> {
+    fn drop(&mut self) {
+        if let Some((value, undo)) = self.0.take() {
+            undo(value);
+        }
     }
 }
 
@@ -659,16 +697,44 @@ impl FileReadWriteVolatile for PayloadSink<'_> {
 /// otherwise. `$capture` rebinds the borrowed request arguments to owned
 /// copies which can be moved into the pool closure, and `$pool_fn` is a
 /// `move` closure taking the file system and the request context by value.
+/// A handler whose result holds a lookup count or a handle passes `undo`,
+/// which releases them if the request is dropped, see `run_on_pool_undo()`.
+/// Its `$pool_fn` and `undo` borrow the file system instead.
 macro_rules! async_relay {
-    ($self:expr, $ctx:expr, [$($capture:tt)*], $inline_call:expr, $pool_fn:expr) => {
+    ($self:expr, $ctx:expr, [$($capture:tt)*], $inline_call:expr, $pool_fn:expr $(, undo: $undo:expr)?) => {
         match $self.pool_fs() {
             Some(fs) => {
                 $($capture)*
-                Self::run_on_pool(fs, $ctx, $pool_fn).await
+                async_relay!(@pool fs, $ctx, $pool_fn $(, $undo)?).await
             }
             None => $inline_call,
         }
     };
+    (@pool $fs:ident, $ctx:expr, $pool_fn:expr) => {
+        Self::run_on_pool($fs, $ctx, $pool_fn)
+    };
+    (@pool $fs:ident, $ctx:expr, $pool_fn:expr, $undo:expr) => {
+        Self::run_on_pool_undo($fs, $ctx, $pool_fn, $undo)
+    };
+}
+
+// The undo functions of requests that were dropped before their reply.
+// `release()` and `forget()` ignore the context.
+
+/// Release a handle that `open()` or `create()` returned.
+fn undo_open<S: BitmapSlice + Send + Sync>(
+    fs: &PassthroughFs<S>,
+    inode: Inode,
+    handle: Option<Handle>,
+) {
+    if let Some(handle) = handle {
+        let _ = fs.release(&Context::default(), inode, 0, handle, false, false, None);
+    }
+}
+
+/// Drop the lookup count that `lookup()` or `create()` took.
+fn undo_lookup<S: BitmapSlice + Send + Sync>(fs: &PassthroughFs<S>, inode: Inode) {
+    fs.forget(&Context::default(), inode, 1);
 }
 
 impl<S: BitmapSlice + Send + Sync + 'static> BackendFileSystem for PassthroughFs<S> {
@@ -695,7 +761,8 @@ impl<S: BitmapSlice + Send + Sync + 'static> AsyncFileSystem for PassthroughFs<S
             ctx,
             [let name = name.to_owned();],
             self.lookup(ctx, parent, name),
-            move |fs: Arc<Self>, ctx: Context| fs.lookup(&ctx, parent, &name)
+            move |fs: &Self, ctx: Context| fs.lookup(&ctx, parent, &name),
+            undo: |fs: &Self, entry: Entry| undo_lookup(fs, entry.inode)
         )
     }
 
@@ -744,10 +811,11 @@ impl<S: BitmapSlice + Send + Sync + 'static> AsyncFileSystem for PassthroughFs<S
             [],
             self.open(ctx, inode, flags, fuse_flags)
                 .map(|(handle, opts, _)| (handle, opts)),
-            move |fs: Arc<Self>, ctx: Context| {
+            move |fs: &Self, ctx: Context| {
                 fs.open(&ctx, inode, flags, fuse_flags)
                     .map(|(handle, opts, _)| (handle, opts))
-            }
+            },
+            undo: move |fs: &Self, (handle, _)| undo_open(fs, inode, handle)
         )
     }
 
@@ -764,9 +832,13 @@ impl<S: BitmapSlice + Send + Sync + 'static> AsyncFileSystem for PassthroughFs<S
             [let name = name.to_owned();],
             self.create(ctx, parent, name, args)
                 .map(|(entry, handle, opts, _)| (entry, handle, opts)),
-            move |fs: Arc<Self>, ctx: Context| {
+            move |fs: &Self, ctx: Context| {
                 fs.create(&ctx, parent, &name, args)
                     .map(|(entry, handle, opts, _)| (entry, handle, opts))
+            },
+            undo: |fs: &Self, (entry, handle, _): (Entry, _, _)| {
+                undo_open(fs, entry.inode, handle);
+                undo_lookup(fs, entry.inode);
             }
         )
     }
@@ -1906,6 +1978,109 @@ mod tests {
                 .len(),
             4096
         );
+    }
+
+    /// The number of file descriptors of this process that refer to `path`.
+    fn fds_to(path: &std::path::Path) -> usize {
+        std::fs::read_dir("/proc/self/fd")
+            .unwrap()
+            .filter_map(|e| std::fs::read_link(e.ok()?.path()).ok())
+            .filter(|p| p == path)
+            .count()
+    }
+
+    /// Wait until `cond` holds, for up to 10 seconds.
+    fn wait_for(cond: impl Fn() -> bool) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !cond() {
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    /// Start `request` and drop it while a pool thread serves it. The thread
+    /// opens `path` and then waits for the lock that `guard` holds.
+    async fn drop_while_running<F: Future, G>(request: F, path: &std::path::Path, guard: G) {
+        let mut request = Box::pin(request);
+        let fds = fds_to(path);
+        let pending = std::future::poll_fn(|cx| {
+            std::task::Poll::Ready(request.as_mut().poll(cx).is_pending())
+        });
+        assert!(pending.await);
+        wait_for(|| fds_to(path) > fds);
+        drop(request);
+        drop(guard);
+    }
+
+    // An OPEN or CREATE that is dropped while a pool thread serves it, for
+    // example for a takeover, releases the handle and the lookup count it
+    // created.
+    #[test]
+    fn test_async_pool_dropped_open_create() {
+        let (fs, source) = prepare_async_fs_shared(true);
+        let ctx = prepare_context();
+        let path = source.as_path().canonicalize().unwrap().join("file");
+        std::fs::write(&path, b"").unwrap();
+        let name = CString::new("file").unwrap();
+        let inode = fs.lookup(&ctx, ROOT_ID, &name).unwrap().inode;
+        let released = || {
+            fs.handle_map.handles.read().unwrap().is_empty()
+                && fs
+                    .inode_map
+                    .get(inode)
+                    .unwrap()
+                    .refcount
+                    .load(Ordering::Acquire)
+                    == 1
+        };
+        let flags = libc::O_RDWR as u32;
+        let args = CreateIn {
+            flags,
+            mode: 0o600,
+            umask: 0,
+            fuse_flags: 0,
+        };
+
+        // Dropping the runtime waits for its pool threads, so one runtime
+        // serves both requests.
+        async_runtime::block_on(async {
+            let open = fs.async_open(&ctx, inode, flags, 0);
+            drop_while_running(open, &path, fs.handle_map.handles.read().unwrap()).await;
+            wait_for(released);
+            let create = fs.async_create(&ctx, ROOT_ID, &name, args);
+            drop_while_running(create, &path, fs.handle_map.handles.read().unwrap()).await;
+            wait_for(released);
+        });
+    }
+
+    // A LOOKUP of a new inode that is dropped while a pool thread serves it
+    // drops the lookup count it took.
+    #[test]
+    fn test_async_pool_dropped_lookup() {
+        let (fs, source) = prepare_async_fs_shared(true);
+        let ctx = prepare_context();
+        let path = source.as_path().canonicalize().unwrap().join("file");
+        std::fs::write(&path, b"").unwrap();
+        let name = CString::new("file").unwrap();
+        let fds = fds_to(&path);
+
+        async_runtime::block_on(async {
+            // The pool thread opens the file and then waits for the inode
+            // map to insert the new inode.
+            let lookup = fs.async_lookup(&ctx, ROOT_ID, &name);
+            drop_while_running(lookup, &path, fs.inode_map.inodes.read().unwrap()).await;
+            // The pool thread closes its file descriptor when the lookup
+            // returns, or when the undo removes the inode it inserted.
+            wait_for(|| fds_to(&path) == fds);
+            // Once the undo has run, each lookup here takes the only count.
+            wait_for(|| {
+                let entry = fs.lookup(&ctx, ROOT_ID, &name).unwrap();
+                let data = fs.inode_map.get(entry.inode).unwrap();
+                let count = data.refcount.load(Ordering::Acquire);
+                fs.forget(&ctx, entry.inode, 1);
+                count == 1
+            });
+        });
     }
 
     // With the thread pool enabled, READ and WRITE work on either runtime.
