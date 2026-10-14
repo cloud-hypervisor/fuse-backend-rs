@@ -43,6 +43,8 @@
   needs tokio 1.53.3.
 - `async-io` builds on macOS, where it runs on tokio. `fuse-backend-core` now depends on
   `io-uring` only on Linux, like `tokio-uring`.
+- If io-uring isn't available, `set_runtime_type(RuntimeType::Uring)` returns the probe's
+  error, and the fallback warning includes it.
 - The umbrella crate's `async-io` no longer turns on the `fusedev` and `virtiofs`
   transports. Code that uses the items they gate, such as `abi::virtio_fs`, has
   to enable them. A crate that depends on a transport crate directly must enable
