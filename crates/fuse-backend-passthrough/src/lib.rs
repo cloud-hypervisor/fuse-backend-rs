@@ -1996,16 +1996,6 @@ mod tests {
     #[test]
     #[cfg(target_os = "linux")]
     fn test_kernel_passthrough_cache_always() {
-        struct Files;
-        impl BackingFiles for Files {
-            fn open(&self, _fd: BorrowedFd<'_>) -> io::Result<u32> {
-                Ok(1)
-            }
-            fn close(&self, _backing_id: u32) -> io::Result<()> {
-                Ok(())
-            }
-        }
-
         let tmpdir = TempDir::new().expect("Cannot create temporary directory.");
         let fs_cfg = Config {
             do_import: false,
@@ -2014,7 +2004,7 @@ mod tests {
             ..Default::default()
         };
         let mut fs = PassthroughFs::<()>::new(fs_cfg).unwrap();
-        fs.set_backing_files(Arc::new(Files));
+        fs.set_backing_files(Arc::new(OneIdFiles));
         fs.import().unwrap();
         fs.init(FsOptions::PASSTHROUGH).unwrap();
 
@@ -2041,6 +2031,61 @@ mod tests {
         assert_eq!(opts, OpenOptions::KEEP_CACHE | OpenOptions::CACHE_DIR);
     }
 
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn test_kernel_passthrough_o_direct() {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        let tmpdir = TempDir::new().expect("Cannot create temporary directory.");
+        let probe = tmpdir.as_path().join("probe");
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .custom_flags(libc::O_DIRECT)
+            .open(&probe)
+        {
+            Ok(_) => std::fs::remove_file(&probe).unwrap(),
+            Err(e) if e.raw_os_error() == Some(libc::EINVAL) => {
+                eprintln!(
+                    "skipping test_kernel_passthrough_o_direct: no O_DIRECT in {:?}",
+                    tmpdir.as_path()
+                );
+                return;
+            }
+            Err(e) => panic!("unexpected error opening {:?} with O_DIRECT: {}", probe, e),
+        }
+        let fs_cfg = Config {
+            do_import: false,
+            allow_direct_io: true,
+            root_dir: tmpdir.as_path().to_string_lossy().to_string(),
+            ..Default::default()
+        };
+        let mut fs = PassthroughFs::<()>::new(fs_cfg).unwrap();
+        fs.set_backing_files(Arc::new(OneIdFiles));
+        fs.import().unwrap();
+        fs.init(FsOptions::PASSTHROUGH).unwrap();
+
+        // An O_DIRECT create gets DIRECT_IO like an O_DIRECT open. Both keep the backing id,
+        // because the kernel fails an open without passthrough of an inode open in passthrough
+        // mode.
+        let ctx = Context::default();
+        let flags = libc::O_RDWR as u32 | libc::O_DIRECT as u32;
+        let createin = CreateIn {
+            flags: flags | libc::O_CREAT as u32,
+            mode: 0o644,
+            umask: 0,
+            fuse_flags: 0,
+        };
+        let name = CString::new("file").unwrap();
+        let (entry, _, opts, id) = fs.create(&ctx, ROOT_ID, &name, createin).unwrap();
+        assert_eq!(id, Some(1));
+        assert_eq!(opts, OpenOptions::DIRECT_IO | OpenOptions::PASSTHROUGH);
+        let (_, opts, id) = fs.open(&ctx, entry.inode, flags, 0).unwrap();
+        assert_eq!(id, Some(1));
+        assert_eq!(opts, OpenOptions::DIRECT_IO | OpenOptions::PASSTHROUGH);
+    }
+
     /// Backing files for tests in which passthrough stays off.
     #[cfg(target_os = "linux")]
     struct UnusedFiles;
@@ -2052,6 +2097,20 @@ mod tests {
         }
         fn close(&self, _backing_id: u32) -> io::Result<()> {
             unreachable!()
+        }
+    }
+
+    /// Backing files that hand out the id 1 for every file.
+    #[cfg(target_os = "linux")]
+    struct OneIdFiles;
+
+    #[cfg(target_os = "linux")]
+    impl BackingFiles for OneIdFiles {
+        fn open(&self, _fd: BorrowedFd<'_>) -> io::Result<u32> {
+            Ok(1)
+        }
+        fn close(&self, _backing_id: u32) -> io::Result<()> {
+            Ok(())
         }
     }
 
