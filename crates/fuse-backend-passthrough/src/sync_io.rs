@@ -1776,8 +1776,14 @@ impl<S: BitmapSlice + Send + Sync> FileSystem for PassthroughFs<S> {
         // Let the Arc<HandleData> in scope, otherwise fd may get invalid.
         let data = self.handle_map.get(handle, inode)?;
 
-        // Acquire the lock to get exclusive access, otherwise it may break do_readdir().
-        let (_guard, file) = data.get_file_mut();
+        // `do_readdir()` seeks and reads the directory under the write lock, so
+        // the read lock keeps this seek out of the middle of a readdir. The
+        // kernel sends LSEEK only for regular files, so that's a precaution.
+        // READ and WRITE use positioned IO and hold the read lock, so this
+        // doesn't wait for them unless one changes the O_DIRECT flag.
+        let (_guard, file) = data.get_file_shared();
+        // A seek makes the directory's cached readdir cookie stale.
+        self.handle_map.remove_cookie(handle);
 
         // TODO: `offset as off64_t` truncates high-bit NFS directory cookies
         // the same way as the old do_readdir code.  SEEK_SET with offset >
@@ -2890,6 +2896,35 @@ mod tests {
                 assert_eq!(first, None);
             }
         }
+    }
+
+    // An LSEEK doesn't wait for a READ or WRITE that holds the handle's read
+    // lock, for example on a pool thread.
+    #[test]
+    fn test_lseek_during_io() {
+        let (fs, source) = prepare_fs_writeback_no_handles();
+        let ctx = prepare_context();
+        std::fs::write(source.as_path().join("seekfile"), b"0123456789").unwrap();
+        let name = CString::new("seekfile").unwrap();
+        let inode = fs.lookup(&ctx, ROOT_ID, &name).unwrap().inode;
+        let handle = fs
+            .open(&ctx, inode, libc::O_RDWR as u32, 0)
+            .unwrap()
+            .0
+            .unwrap();
+        let data = fs.handle_map.get(handle, inode).unwrap();
+
+        let io = data.open_flags.read().unwrap();
+        std::thread::scope(|s| {
+            let (tx, rx) = std::sync::mpsc::channel();
+            s.spawn(move || {
+                let _ = tx.send(fs.lseek(&ctx, inode, handle, 0, libc::SEEK_DATA as u32));
+            });
+            let res = rx.recv_timeout(std::time::Duration::from_secs(10));
+            // Let a blocked LSEEK finish, so the scope can end.
+            drop(io);
+            assert_eq!(res.expect("LSEEK waited for the IO").unwrap(), 0);
+        });
     }
 
     #[test]
