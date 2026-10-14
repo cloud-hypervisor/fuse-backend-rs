@@ -41,6 +41,8 @@
   through the IO driver of the tokio runtime that polls it, and checks its state flag every 100ms
   while idle. Polling it on a tokio runtime without IO enabled panics. `fuse-backend-fusedev`
   needs tokio 1.53.3.
+- `async-io` builds on macOS, where it runs on tokio. `fuse-backend-core` now depends on
+  `io-uring` only on Linux, like `tokio-uring`.
 - The umbrella crate's `async-io` no longer turns on the `fusedev` and `virtiofs`
   transports. Code that uses the items they gate, such as `abi::virtio_fs`, has
   to enable them. A crate that depends on a transport crate directly must enable
