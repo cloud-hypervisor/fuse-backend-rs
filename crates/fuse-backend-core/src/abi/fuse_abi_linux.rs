@@ -821,6 +821,10 @@ impl From<u32> for Opcode {
     }
 }
 
+/// Bit that the kernel sets in the unique id of a request it sends again after a
+/// `NotifyOpcode::Resend` notification.
+pub const UNIQUE_RESEND: u64 = 1 << 63;
+
 #[repr(u32)]
 #[derive(Debug, Copy, Clone)]
 pub enum NotifyOpcode {
