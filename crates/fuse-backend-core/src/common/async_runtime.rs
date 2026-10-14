@@ -39,6 +39,10 @@ pub(crate) static RUNTIME_TYPE: LazyLock<RuntimeType> = LazyLock::new(RuntimeTyp
 /// environment variable.
 static REQUESTED_RUNTIME_TYPE: OnceLock<RuntimeType> = OnceLock::new();
 
+/// The error of the failed io-uring probe, which `set_runtime_type()` reports.
+#[cfg(target_os = "linux")]
+static PROBE_ERROR: OnceLock<io::Error> = OnceLock::new();
+
 /// Type of the asynchronous runtime used by this crate.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RuntimeType {
@@ -53,18 +57,24 @@ pub enum RuntimeType {
 ///
 /// The crate fixes the type on first use, so call this before creating a [`Runtime`], an
 /// `async_file::File` or a `FuseDevTask`. It overrides `FUSE_BACKEND_RS_ASYNC_RUNTIME`. It
-/// returns an error if the type in effect is a different one, for example because io-uring
-/// isn't available.
+/// returns an error if the type in effect is a different one. If io-uring isn't available, the
+/// error says why.
 pub fn set_runtime_type(runtime_type: RuntimeType) -> io::Result<()> {
     let _ = REQUESTED_RUNTIME_TYPE.set(runtime_type);
     let current = *RUNTIME_TYPE;
     if current == runtime_type {
-        Ok(())
-    } else {
-        Err(io::Error::other(format!(
-            "async runtime type is {current:?}, not {runtime_type:?}"
-        )))
+        return Ok(());
     }
+    #[cfg(target_os = "linux")]
+    if let (RuntimeType::Uring, Some(e)) = (runtime_type, PROBE_ERROR.get()) {
+        return Err(io::Error::new(
+            e.kind(),
+            format!("io-uring isn't available: {e}"),
+        ));
+    }
+    Err(io::Error::other(format!(
+        "async runtime type is {current:?}, not {runtime_type:?}"
+    )))
 }
 
 /// Get the runtime type used by this crate, detecting it if it isn't fixed yet.
@@ -81,17 +91,16 @@ impl RuntimeType {
         match requested {
             Some(RuntimeType::Tokio) => Self::Tokio,
             #[cfg(target_os = "linux")]
-            _ if Self::probe_io_uring() => Self::Uring,
-            #[cfg(target_os = "linux")]
-            Some(RuntimeType::Uring) => {
-                warn!("'uring' is requested but io-uring isn't available, falling back to tokio");
-                Self::Tokio
-            }
-            None => {
-                #[cfg(target_os = "linux")]
-                warn!("io-uring isn't available, falling back to the tokio runtime");
-                Self::Tokio
-            }
+            _ => match Self::probe_io_uring() {
+                Ok(()) => Self::Uring,
+                Err(e) => {
+                    warn!("io-uring isn't available, falling back to tokio: {}", e);
+                    let _ = PROBE_ERROR.set(e);
+                    Self::Tokio
+                }
+            },
+            #[cfg(not(target_os = "linux"))]
+            None => Self::Tokio,
         }
     }
 
@@ -117,52 +126,43 @@ impl RuntimeType {
         }
     }
 
+    /// Check that io-uring works here and supports the operations this crate uses.
     #[cfg(target_os = "linux")]
-    fn probe_io_uring() -> bool {
+    fn probe_io_uring() -> io::Result<()> {
         use io_uring::{opcode, IoUring, Probe};
 
         // Create the ring with the same number of entries as the real runtimes,
         // because ring memory is accounted against `RLIMIT_MEMLOCK` and probing
         // with a smaller ring may succeed where `Runtime::new()` would fail.
-        let io_uring = match IoUring::new(RING_ENTRIES) {
-            Ok(io_uring) => io_uring,
-            Err(e) => {
-                warn!(
-                    "failed to create an io-uring instance with {} entries: {}. \
-                     Check `RLIMIT_MEMLOCK` if the error is ENOMEM",
-                    RING_ENTRIES, e
-                );
-                return false;
-            }
-        };
-        let submitter = io_uring.submitter();
+        let io_uring = IoUring::new(RING_ENTRIES).map_err(|e| {
+            io::Error::new(
+                e.kind(),
+                format!(
+                    "can't create a ring with {RING_ENTRIES} entries ({e}). \
+                     Check RLIMIT_MEMLOCK if the error is ENOMEM"
+                ),
+            )
+        })?;
 
         let mut probe = Probe::new();
+        io_uring
+            .submitter()
+            .register_probe(&mut probe)
+            .map_err(|e| io::Error::new(e.kind(), format!("can't register a probe ({e})")))?;
 
-        // Check we can register a probe to validate supported operations.
-        if let Err(e) = submitter.register_probe(&mut probe) {
-            warn!("failed to register an io-uring probe: {}", e);
-            return false;
+        for (code, name) in [
+            (opcode::Fsync::CODE, "FSYNC"),
+            (opcode::Read::CODE, "READ"),
+            (opcode::Write::CODE, "WRITE"),
+        ] {
+            if !probe.is_supported(code) {
+                return Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    format!("the {name} operation isn't supported"),
+                ));
+            }
         }
-
-        // Check IORING_OP_FSYNC is supported
-        if !probe.is_supported(opcode::Fsync::CODE) {
-            warn!("io-uring doesn't support the FSYNC operation");
-            return false;
-        }
-
-        // Check IORING_OP_READ is supported
-        if !probe.is_supported(opcode::Read::CODE) {
-            warn!("io-uring doesn't support the READ operation");
-            return false;
-        }
-
-        // Check IORING_OP_WRITE is supported
-        if !probe.is_supported(opcode::Write::CODE) {
-            warn!("io-uring doesn't support the WRITE operation");
-            return false;
-        }
-        true
+        Ok(())
     }
 }
 
