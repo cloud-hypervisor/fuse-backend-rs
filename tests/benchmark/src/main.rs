@@ -6,7 +6,7 @@
 //! A minimal fusedev passthrough daemon used to benchmark the synchronous
 //! and asynchronous IO paths with external tools such as fio.
 //!
-//! Usage: `fuse-backend-rs-benchmark <src> <mountpoint> [--async|--uring] [--threads N] [--sync-blocking]`
+//! Usage: `fuse-backend-rs-benchmark <src> <mountpoint> [--async|--uring] [--threads N] [--sync-blocking] [--thread-pool]`
 //!
 //! - default (sync) mode: requests are served by `N` worker threads of the
 //!   `SyncFuseServing` serving layer, each reading from its own fuse channel
@@ -15,7 +15,9 @@
 //! - `--async` mode: requests are served by `N` asynchronous workers
 //!   (`AsyncFuseServing`), each running a `FuseDevTask` on its own async
 //!   runtime (tokio-uring when io_uring is available) and its own
-//!   `/dev/fuse` file description.
+//!   `/dev/fuse` file description. `--thread-pool` lets `PassthroughFs`
+//!   offload blocking work to the runtime's blocking thread pool, see
+//!   `PassthroughFs::enable_async_thread_pool()`.
 //! - `--uring` mode: requests are served through the FUSE-over-io_uring
 //!   transport (`UringFuseServing`, experimental, requires kernel 6.14+);
 //!   `N` limits the number of io_uring worker threads.
@@ -46,12 +48,13 @@ mod daemon {
         as_async: bool,
         as_uring: bool,
         sync_blocking: bool,
+        thread_pool: bool,
         thread_cnt: u32,
     }
 
     fn help() {
         println!(
-            "Usage:\n   fuse-backend-rs-benchmark <src> <mountpoint> [--async|--uring] [--threads N] [--sync-blocking]\n"
+            "Usage:\n   fuse-backend-rs-benchmark <src> <mountpoint> [--async|--uring] [--threads N] [--sync-blocking] [--thread-pool]\n"
         );
     }
 
@@ -67,6 +70,7 @@ mod daemon {
             as_async: false,
             as_uring: false,
             sync_blocking: false,
+            thread_pool: false,
             thread_cnt: 4,
         };
         let mut idx = 3;
@@ -75,6 +79,7 @@ mod daemon {
                 "--async" => res.as_async = true,
                 "--uring" => res.as_uring = true,
                 "--sync-blocking" => res.sync_blocking = true,
+                "--thread-pool" => res.thread_pool = true,
                 "--threads" => {
                     idx += 1;
                     if idx >= args.len() {
@@ -102,6 +107,11 @@ mod daemon {
             help();
             return Err(Error::from_raw_os_error(libc::EINVAL));
         }
+        // The blocking thread pool belongs to the async runtime.
+        if res.thread_pool && !res.as_async {
+            help();
+            return Err(Error::from_raw_os_error(libc::EINVAL));
+        }
         if res.as_async && res.as_uring {
             help();
             return Err(Error::from_raw_os_error(libc::EINVAL));
@@ -109,7 +119,7 @@ mod daemon {
         Ok(res)
     }
 
-    fn create_server(src: &str) -> Arc<Server<Arc<Vfs>>> {
+    fn create_server(src: &str, thread_pool: bool) -> Arc<Server<Arc<Vfs>>> {
         let vfs = Vfs::new(VfsOptions {
             no_open: false,
             no_opendir: false,
@@ -121,9 +131,10 @@ mod daemon {
             do_import: false,
             ..Default::default()
         };
-        let fs = PassthroughFs::<()>::new(cfg).unwrap();
+        // Offloading to the thread pool needs a file system shared between threads.
+        let fs = PassthroughFs::<()>::new_shared(cfg).unwrap();
         fs.import().unwrap();
-
+        fs.enable_async_thread_pool(thread_pool);
         vfs.mount(Box::new(fs), "/").unwrap();
         Arc::new(Server::new(Arc::new(vfs)))
     }
@@ -223,7 +234,7 @@ mod daemon {
             }
         }
         info!(
-            "passthrough src {} mountpoint {} mode {} threads {}",
+            "passthrough src {} mountpoint {} mode {} threads {} thread pool {}",
             args.src,
             args.dest,
             if args.as_uring {
@@ -236,9 +247,10 @@ mod daemon {
                 "sync"
             },
             args.thread_cnt,
+            args.thread_pool,
         );
 
-        let server = create_server(&args.src);
+        let server = create_server(&args.src, args.thread_pool);
         let mut se = FuseSession::new(Path::new(&args.dest), "bench_passthru", "", false).unwrap();
         se.mount().unwrap();
 
