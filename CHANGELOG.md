@@ -31,6 +31,8 @@
   transport on `Error::UringNotSupported`.
 - `AsyncFileSystem` methods default to calling their `FileSystem` counterparts, so a
   file system only implements the handlers it serves asynchronously.
+- `FuseSession::detach()` lazily unmounts a Linux session through `&self`, so the owner of a
+  serving layer can start the teardown while another thread waits in `FuseServing::wait()`.
 
 ### Changed
 - The FUSE-over-io_uring transport answers opcodes it doesn't know with ENOSYS instead of EIO.

@@ -272,4 +272,45 @@ mod tests {
         drop(serving);
         assert!(std::fs::read(mnt.as_path().join("hello")).is_err());
     }
+
+    #[test]
+    fn test_async_serving_detach() {
+        let src = TempDir::new().unwrap();
+        std::fs::write(src.as_path().join("hello"), b"detach").unwrap();
+        let mnt = TempDir::new().unwrap();
+
+        let fs = PassthroughFs::<()>::new(Config {
+            root_dir: src.as_path().to_string_lossy().to_string(),
+            do_import: false,
+            ..Default::default()
+        })
+        .unwrap();
+        fs.import().unwrap();
+        let server = Arc::new(Server::new(fs));
+
+        let mut se = FuseSession::new(mnt.as_path(), "async_serving_test", "", false).unwrap();
+        se.mount().unwrap();
+        let serving =
+            Arc::new(AsyncFuseServing::new(se, server, AsyncServingConfig::default()).unwrap());
+        assert_eq!(
+            std::fs::read(mnt.as_path().join("hello")).unwrap(),
+            b"detach"
+        );
+
+        // Detaching through the shared serving layer stops the workers, so
+        // a thread waiting for them returns.
+        let (tx, rx) = std::sync::mpsc::channel();
+        let waiter = {
+            let serving = serving.clone();
+            std::thread::spawn(move || {
+                serving.wait();
+                tx.send(()).unwrap();
+            })
+        };
+        serving.session().detach().unwrap();
+        rx.recv_timeout(std::time::Duration::from_secs(5))
+            .expect("the workers didn't stop after detach()");
+        waiter.join().unwrap();
+        assert!(std::fs::read(mnt.as_path().join("hello")).is_err());
+    }
 }
