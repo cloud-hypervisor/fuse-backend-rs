@@ -276,6 +276,11 @@ impl HandleData {
         &self.file
     }
 
+    fn get_file_shared(&self) -> (FileFlagGuard<'_, u32>, &File) {
+        let guard = self.open_flags.read().unwrap();
+        (FileFlagGuard::Reader(guard), &self.file)
+    }
+
     fn get_file_mut(&self) -> (FileFlagGuard<'_, u32>, &File) {
         let guard = self.open_flags.write().unwrap();
         (FileFlagGuard::Writer(guard), &self.file)
