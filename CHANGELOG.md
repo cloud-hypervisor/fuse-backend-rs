@@ -73,6 +73,10 @@
   pre-split `vhost-user-fs` build carried but never referenced; `vhost-user-fs`
   is now an alias for the `virtiofs` build.
 
+### Fixed
+- For a session mounted with `set_target_mntns()`, `FuseSession::umount()` unmounts in that
+  mount namespace. It no longer follows a symlink at the mountpoint.
+
 ## [0.14.0]
 ### Added
 - [261](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/216): feat(fusedev): add try_with_writer on FuseSession
