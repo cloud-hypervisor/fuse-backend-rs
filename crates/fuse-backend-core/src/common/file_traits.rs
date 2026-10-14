@@ -447,15 +447,14 @@ macro_rules! volatile_impl {
 
 volatile_impl!(File);
 
-#[cfg(all(target_os = "linux", feature = "async-io"))]
+#[cfg(feature = "async-io")]
 pub use async_io::AsyncFileReadWriteVolatile;
 
-#[cfg(all(target_os = "linux", feature = "async-io"))]
+#[cfg(feature = "async-io")]
 mod async_io {
     use std::sync::Arc;
 
     use tokio::join;
-    use tokio_uring::buf::IoBuf;
 
     use super::*;
     use crate::async_file::File;
@@ -536,13 +535,13 @@ mod async_io {
             let mut pos = 0;
             while bufs.len() - pos >= 4 {
                 let op1 = self.async_read_at_volatile(bufs[pos], offset);
-                offset += bufs[pos].bytes_total() as u64;
+                offset += bufs[pos].cap() as u64;
                 let op2 = self.async_read_at_volatile(bufs[pos + 1], offset);
-                offset += bufs[pos + 1].bytes_total() as u64;
+                offset += bufs[pos + 1].cap() as u64;
                 let op3 = self.async_read_at_volatile(bufs[pos + 2], offset);
-                offset += bufs[pos + 2].bytes_total() as u64;
+                offset += bufs[pos + 2].cap() as u64;
                 let op4 = self.async_read_at_volatile(bufs[pos + 3], offset);
-                offset += bufs[pos + 3].bytes_total() as u64;
+                offset += bufs[pos + 3].cap() as u64;
                 let (res1, res2, res3, res4) = join!(op1, op2, op3, op4);
 
                 match res1 {
@@ -550,7 +549,7 @@ mod async_io {
                     (Ok(cnt), buf) => {
                         count += cnt;
                         bufs[pos] = buf;
-                        if cnt < bufs[pos].bytes_total() {
+                        if cnt < bufs[pos].cap() {
                             return (Ok(count), bufs);
                         }
                     }
@@ -560,7 +559,7 @@ mod async_io {
                     (Ok(cnt), buf) => {
                         count += cnt;
                         bufs[pos + 1] = buf;
-                        if cnt < bufs[pos + 1].bytes_total() {
+                        if cnt < bufs[pos + 1].cap() {
                             return (Ok(count), bufs);
                         }
                     }
@@ -570,7 +569,7 @@ mod async_io {
                     (Ok(cnt), buf) => {
                         count += cnt;
                         bufs[pos + 2] = buf;
-                        if cnt < bufs[pos + 2].bytes_total() {
+                        if cnt < bufs[pos + 2].cap() {
                             return (Ok(count), bufs);
                         }
                     }
@@ -580,7 +579,7 @@ mod async_io {
                     (Ok(cnt), buf) => {
                         count += cnt;
                         bufs[pos + 3] = buf;
-                        if cnt < bufs[pos + 3].bytes_total() {
+                        if cnt < bufs[pos + 3].cap() {
                             return (Ok(count), bufs);
                         }
                     }
@@ -590,9 +589,9 @@ mod async_io {
 
             if bufs.len() - pos == 3 {
                 let op1 = self.async_read_at_volatile(bufs[pos], offset);
-                offset += bufs[pos].bytes_total() as u64;
+                offset += bufs[pos].cap() as u64;
                 let op2 = self.async_read_at_volatile(bufs[pos + 1], offset);
-                offset += bufs[pos + 1].bytes_total() as u64;
+                offset += bufs[pos + 1].cap() as u64;
                 let op3 = self.async_read_at_volatile(bufs[pos + 2], offset);
                 let (res1, res2, res3) = join!(op1, op2, op3);
 
@@ -600,7 +599,7 @@ mod async_io {
                     (Ok(cnt), buf) => {
                         count += cnt;
                         bufs[pos] = buf;
-                        if cnt < bufs[pos].bytes_total() {
+                        if cnt < bufs[pos].cap() {
                             return (Ok(count), bufs);
                         }
                     }
@@ -610,7 +609,7 @@ mod async_io {
                     (Ok(cnt), buf) => {
                         count += cnt;
                         bufs[pos + 1] = buf;
-                        if cnt < bufs[pos + 1].bytes_total() {
+                        if cnt < bufs[pos + 1].cap() {
                             return (Ok(count), bufs);
                         }
                     }
@@ -620,7 +619,7 @@ mod async_io {
                     (Ok(cnt), buf) => {
                         count += cnt;
                         bufs[pos + 2] = buf;
-                        if cnt < bufs[pos + 2].bytes_total() {
+                        if cnt < bufs[pos + 2].cap() {
                             return (Ok(count), bufs);
                         }
                     }
@@ -628,7 +627,7 @@ mod async_io {
                 }
             } else if bufs.len() - pos == 2 {
                 let op1 = self.async_read_at_volatile(bufs[pos], offset);
-                offset += bufs[pos].bytes_total() as u64;
+                offset += bufs[pos].cap() as u64;
                 let op2 = self.async_read_at_volatile(bufs[pos + 1], offset);
                 let (res1, res2) = join!(op1, op2);
 
@@ -636,7 +635,7 @@ mod async_io {
                     (Ok(cnt), buf) => {
                         count += cnt;
                         bufs[pos] = buf;
-                        if cnt < bufs[pos].bytes_total() {
+                        if cnt < bufs[pos].cap() {
                             return (Ok(count), bufs);
                         }
                     }
@@ -646,7 +645,7 @@ mod async_io {
                     (Ok(cnt), buf) => {
                         count += cnt;
                         bufs[pos + 1] = buf;
-                        if cnt < bufs[pos + 1].bytes_total() {
+                        if cnt < bufs[pos + 1].cap() {
                             return (Ok(count), bufs);
                         }
                     }
@@ -658,7 +657,7 @@ mod async_io {
                     (Ok(cnt), buf) => {
                         count += cnt;
                         bufs[pos] = buf;
-                        if cnt < bufs[pos].bytes_total() {
+                        if cnt < bufs[pos].cap() {
                             return (Ok(count), bufs);
                         }
                     }
@@ -694,13 +693,13 @@ mod async_io {
             let mut pos = 0;
             while bufs.len() - pos >= 4 {
                 let op1 = self.async_write_at_volatile(bufs[pos], offset);
-                offset += bufs[pos].bytes_total() as u64;
+                offset += bufs[pos].cap() as u64;
                 let op2 = self.async_write_at_volatile(bufs[pos + 1], offset);
-                offset += bufs[pos + 1].bytes_total() as u64;
+                offset += bufs[pos + 1].cap() as u64;
                 let op3 = self.async_write_at_volatile(bufs[pos + 2], offset);
-                offset += bufs[pos + 2].bytes_total() as u64;
+                offset += bufs[pos + 2].cap() as u64;
                 let op4 = self.async_write_at_volatile(bufs[pos + 3], offset);
-                offset += bufs[pos + 3].bytes_total() as u64;
+                offset += bufs[pos + 3].cap() as u64;
                 let (res1, res2, res3, res4) = join!(op1, op2, op3, op4);
 
                 match res1 {
@@ -708,7 +707,7 @@ mod async_io {
                     (Ok(cnt), buf) => {
                         count += cnt;
                         bufs[pos] = buf;
-                        if cnt < bufs[pos].bytes_total() {
+                        if cnt < bufs[pos].cap() {
                             return (Ok(count), bufs);
                         }
                     }
@@ -718,7 +717,7 @@ mod async_io {
                     (Ok(cnt), buf) => {
                         count += cnt;
                         bufs[pos + 1] = buf;
-                        if cnt < bufs[pos + 1].bytes_total() {
+                        if cnt < bufs[pos + 1].cap() {
                             return (Ok(count), bufs);
                         }
                     }
@@ -728,7 +727,7 @@ mod async_io {
                     (Ok(cnt), buf) => {
                         count += cnt;
                         bufs[pos + 2] = buf;
-                        if cnt < bufs[pos + 2].bytes_total() {
+                        if cnt < bufs[pos + 2].cap() {
                             return (Ok(count), bufs);
                         }
                     }
@@ -738,7 +737,7 @@ mod async_io {
                     (Ok(cnt), buf) => {
                         count += cnt;
                         bufs[pos + 3] = buf;
-                        if cnt < bufs[pos + 3].bytes_total() {
+                        if cnt < bufs[pos + 3].cap() {
                             return (Ok(count), bufs);
                         }
                     }
@@ -748,9 +747,9 @@ mod async_io {
 
             if bufs.len() - pos == 3 {
                 let op1 = self.async_write_at_volatile(bufs[pos], offset);
-                offset += bufs[pos].bytes_total() as u64;
+                offset += bufs[pos].cap() as u64;
                 let op2 = self.async_write_at_volatile(bufs[pos + 1], offset);
-                offset += bufs[pos + 1].bytes_total() as u64;
+                offset += bufs[pos + 1].cap() as u64;
                 let op3 = self.async_write_at_volatile(bufs[pos + 2], offset);
                 let (res1, res2, res3) = join!(op1, op2, op3);
 
@@ -758,7 +757,7 @@ mod async_io {
                     (Ok(cnt), buf) => {
                         count += cnt;
                         bufs[pos] = buf;
-                        if cnt < bufs[pos].bytes_total() {
+                        if cnt < bufs[pos].cap() {
                             return (Ok(count), bufs);
                         }
                     }
@@ -768,7 +767,7 @@ mod async_io {
                     (Ok(cnt), buf) => {
                         count += cnt;
                         bufs[pos + 1] = buf;
-                        if cnt < bufs[pos + 1].bytes_total() {
+                        if cnt < bufs[pos + 1].cap() {
                             return (Ok(count), bufs);
                         }
                     }
@@ -778,7 +777,7 @@ mod async_io {
                     (Ok(cnt), buf) => {
                         count += cnt;
                         bufs[pos + 2] = buf;
-                        if cnt < bufs[pos + 2].bytes_total() {
+                        if cnt < bufs[pos + 2].cap() {
                             return (Ok(count), bufs);
                         }
                     }
@@ -786,7 +785,7 @@ mod async_io {
                 }
             } else if bufs.len() - pos == 2 {
                 let op1 = self.async_write_at_volatile(bufs[pos], offset);
-                offset += bufs[pos].bytes_total() as u64;
+                offset += bufs[pos].cap() as u64;
                 let op2 = self.async_write_at_volatile(bufs[pos + 1], offset);
                 let (res1, res2) = join!(op1, op2);
 
@@ -794,7 +793,7 @@ mod async_io {
                     (Ok(cnt), buf) => {
                         count += cnt;
                         bufs[pos] = buf;
-                        if cnt < bufs[pos].bytes_total() {
+                        if cnt < bufs[pos].cap() {
                             return (Ok(count), bufs);
                         }
                     }
@@ -804,7 +803,7 @@ mod async_io {
                     (Ok(cnt), buf) => {
                         count += cnt;
                         bufs[pos + 1] = buf;
-                        if cnt < bufs[pos + 1].bytes_total() {
+                        if cnt < bufs[pos + 1].cap() {
                             return (Ok(count), bufs);
                         }
                     }
@@ -816,7 +815,7 @@ mod async_io {
                     (Ok(cnt), buf) => {
                         count += cnt;
                         bufs[pos] = buf;
-                        if cnt < bufs[pos].bytes_total() {
+                        if cnt < bufs[pos].cap() {
                             return (Ok(count), bufs);
                         }
                     }
@@ -888,7 +887,7 @@ mod async_io {
                 let file = File::async_open(&path, false, false).await.unwrap();
                 let (res, vbuf) = file.async_read_at_volatile(vbuf, 4).await;
                 assert_eq!(res.unwrap(), 10);
-                assert_eq!(vbuf.bytes_init(), 10);
+                assert_eq!(vbuf.len(), 10);
             });
             assert_eq!(buf[0], b' ');
             assert_eq!(buf[9], b't');
@@ -934,8 +933,8 @@ mod async_io {
                 let (res, vbufs) = file.async_read_vectored_at_volatile(vbufs, 4).await;
                 assert_eq!(res.unwrap(), 10);
                 assert_eq!(vbufs.len(), 2);
-                assert_eq!(vbufs[0].bytes_init(), 10);
-                assert_eq!(vbufs[1].bytes_init(), 0);
+                assert_eq!(vbufs[0].len(), 10);
+                assert_eq!(vbufs[1].len(), 0);
             });
             assert_eq!(buf1[0], b' ');
             assert_eq!(buf1[9], b't');
