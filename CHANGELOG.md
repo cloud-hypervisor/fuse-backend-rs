@@ -29,6 +29,10 @@
   FUSE-over-io_uring transport (kernel 6.14+). Both join the `FuseServing` interface, so a daemon
   can pick its transport at runtime behind `Box<dyn FuseServing>` and fall back to the classic
   transport on `Error::UringNotSupported`.
+- `AsyncFileSystem` methods default to calling their `FileSystem` counterparts, so a
+  file system only implements the handlers it serves asynchronously.
+- `FuseSession::detach()` lazily unmounts a Linux session through `&self`, so the owner of a
+  serving layer can start the teardown while another thread waits in `FuseServing::wait()`.
 
 ### Changed
 - [254](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/254): `fuse-backend-rs` is now a thin facade re-exporting the sub-crates. Every
@@ -70,6 +74,10 @@
 - [254](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/254): Drop the vestigial `vhost` and `virtio-bindings` dependencies that the
   pre-split `vhost-user-fs` build carried but never referenced; `vhost-user-fs`
   is now an alias for the `virtiofs` build.
+
+### Fixed
+- For a session mounted with `set_target_mntns()`, `FuseSession::umount()` unmounts in that
+  mount namespace. It no longer follows a symlink at the mountpoint.
 
 ## [0.14.0]
 ### Added
