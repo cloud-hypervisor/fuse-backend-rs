@@ -235,8 +235,8 @@ impl<S: BitmapSlice + Send + Sync + 'static> PassthroughFs<S> {
         join_blocking(&mut task.0).await
     }
 
-    /// Serve a READ with the synchronous handler on the blocking thread
-    /// pool, and copy the data into `w`.
+    /// Serve a READ with `do_read()` on the blocking thread pool, and copy
+    /// the data into `w`.
     ///
     /// `w` writes into a transport buffer that the request owns, and nothing
     /// keeps that buffer alive after the request future is dropped, for
@@ -245,23 +245,19 @@ impl<S: BitmapSlice + Send + Sync + 'static> PassthroughFs<S> {
     /// `JoinHandle`. The runtime thread then copies it into `w`, while this
     /// future, and so `w`, is still alive. If the future is dropped first, a
     /// pool task that already runs reads into its own buffer and frees it,
-    /// see `run_on_pool()`. The closure's `Arc` of the file system keeps the
-    /// handle map alive, and the handler's handle data keeps the file
-    /// descriptor open until the read returns.
+    /// see `run_on_pool()`. `data`, the handle data that the caller looked
+    /// up, keeps the file descriptor open until the read returns.
     ///
     /// The server doesn't bound the size of a READ, so a READ larger than the
     /// room in `w` fails before the pool task allocates for it, as the
     /// transports' writers would fail it.
-    #[allow(clippy::too_many_arguments)]
     async fn read_on_pool(
         fs: Arc<Self>,
         ctx: &Context,
-        inode: Inode,
-        handle: Handle,
+        data: Arc<HandleData>,
         w: &mut (dyn AsyncZeroCopyWriter + Send),
         size: u32,
         offset: u64,
-        lock_owner: Option<u64>,
         flags: u32,
     ) -> io::Result<usize> {
         if size as usize > w.available_bytes() {
@@ -274,16 +270,14 @@ impl<S: BitmapSlice + Send + Sync + 'static> PassthroughFs<S> {
                 ),
             ));
         }
-        let data = Self::run_on_pool(fs, ctx, move |fs, ctx| {
+        let buf = Self::run_on_pool(fs, ctx, move |fs, _ctx| {
             let mut buf = OwnedWriter::new(size as usize)?;
-            fs.read(
-                &ctx, inode, handle, &mut buf, size, offset, lock_owner, flags,
-            )?;
+            fs.do_read(&data, &mut buf, size, offset, flags)?;
             Ok(buf.data)
         })
         .await?;
-        w.write_all(&data)?;
-        Ok(data.len())
+        w.write_all(&buf)?;
+        Ok(buf.len())
     }
 
     /// Copy the payload of a WRITE out of `r`, and serve the WRITE with the
@@ -763,31 +757,26 @@ impl<S: BitmapSlice + Send + Sync + 'static> AsyncFileSystem for PassthroughFs<S
         w: &mut (dyn AsyncZeroCopyWriter + Send),
         size: u32,
         offset: u64,
-        lock_owner: Option<u64>,
+        _lock_owner: Option<u64>,
         flags: u32,
     ) -> io::Result<usize> {
-        // O_DIRECT requests are relayed to the synchronous handler: the
-        // native asynchronous path submits IO directly into the transport
-        // buffer, whose payload offset right after the reply header doesn't
-        // satisfy the alignment constraints of direct IO (buffer address,
-        // length and file offset must all be multiples of the logical block
-        // size), so alignment-enforcing filesystems like ext4/XFS reject it
-        // with `EINVAL`. The synchronous handler stages the data through a
-        // page-aligned bounce buffer instead (`read_direct()`). The relayed
-        // handler blocks the thread it runs on for the duration of the read.
+        // O_DIRECT requests go to the synchronous `do_read()`. The native
+        // asynchronous path submits IO directly into the transport buffer,
+        // whose payload offset right after the reply header doesn't satisfy
+        // the alignment constraints of direct IO (buffer address, length and
+        // file offset must all be multiples of the logical block size), so
+        // ext4 and XFS reject it with `EINVAL`. `do_read()` stages the data
+        // through a page-aligned bounce buffer instead (`read_direct()`), and
+        // blocks the thread it runs on for the duration of the read.
         // With the thread pool enabled, that's a pool thread, see
         // `read_on_pool()`, and otherwise the runtime thread.
+        let data = self.get_data(handle, inode, libc::O_RDONLY)?;
         if flags & (libc::O_DIRECT as u32) != 0 {
             return match self.pool_fs() {
-                Some(fs) => {
-                    Self::read_on_pool(fs, ctx, inode, handle, w, size, offset, lock_owner, flags)
-                        .await
-                }
-                None => self.read(ctx, inode, handle, w, size, offset, lock_owner, flags),
+                Some(fs) => Self::read_on_pool(fs, ctx, data, w, size, offset, flags).await,
+                None => self.do_read(&data, w, size, offset, flags),
             };
         }
-
-        let data = self.get_data(handle, inode, libc::O_RDONLY)?;
 
         // Buffered requests first try an inline non-blocking read: the
         // page cache serves them without a round trip through the
@@ -805,12 +794,10 @@ impl<S: BitmapSlice + Send + Sync + 'static> AsyncFileSystem for PassthroughFs<S
                 let n = Self::read_on_pool(
                     fs,
                     ctx,
-                    inode,
-                    handle,
+                    data,
                     w,
                     size - served as u32,
                     offset + served as u64,
-                    lock_owner,
                     flags,
                 )
                 .await?;
