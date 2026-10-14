@@ -668,6 +668,35 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
         }
     }
 
+    /// Serve a READ on the handle data that `get_data()` returned.
+    pub(super) fn do_read(
+        &self,
+        data: &Arc<HandleData>,
+        w: &mut dyn ZeroCopyWriter,
+        size: u32,
+        offset: u64,
+        flags: u32,
+    ) -> io::Result<usize> {
+        let fd = data.borrow_fd();
+
+        // Hold the guard over the whole IO operation, so that no other request
+        // can change the O_DIRECT flag of the fd while we are using it.
+        let _flags_guard = self.ensure_file_flags(data, &fd, flags)?;
+
+        // Manually implement File::try_clone() by borrowing fd of data.file instead of dup().
+        // It's safe because `data` outlives this function, so data.file won't be closed.
+        let mut f = unsafe { ManuallyDrop::new(File::from_raw_fd(fd.as_raw_fd())) };
+
+        // The backing file was opened with O_DIRECT (see `open_inode()`), whose
+        // alignment constraints the transport buffers don't satisfy, so stage
+        // the data through an aligned bounce buffer.
+        if self.cfg.allow_direct_io && flags & (libc::O_DIRECT as u32) != 0 {
+            return self.read_direct(&f, w, size as usize, offset);
+        }
+
+        w.write_from(&mut *f, size as usize, offset)
+    }
+
     pub(super) fn get_data(
         &self,
         handle: Handle,
@@ -1078,25 +1107,7 @@ impl<S: BitmapSlice + Send + Sync> FileSystem for PassthroughFs<S> {
         flags: u32,
     ) -> io::Result<usize> {
         let data = self.get_data(handle, inode, libc::O_RDONLY)?;
-        let fd = data.borrow_fd();
-
-        // Hold the guard over the whole IO operation, so that no other request
-        // can change the O_DIRECT flag of the fd while we are using it.
-        let _flags_guard = self.ensure_file_flags(&data, &fd, flags)?;
-
-        // Manually implement File::try_clone() by borrowing fd of data.file instead of dup().
-        // It's safe because the `data` variable's lifetime spans the whole function,
-        // so data.file won't be closed.
-        let mut f = unsafe { ManuallyDrop::new(File::from_raw_fd(fd.as_raw_fd())) };
-
-        // The backing file was opened with O_DIRECT (see `open_inode()`), whose
-        // alignment constraints the transport buffers don't satisfy, so stage
-        // the data through an aligned bounce buffer.
-        if self.cfg.allow_direct_io && flags & (libc::O_DIRECT as u32) != 0 {
-            return self.read_direct(&f, w, size as usize, offset);
-        }
-
-        w.write_from(&mut *f, size as usize, offset)
+        self.do_read(&data, w, size, offset, flags)
     }
 
     fn write(
