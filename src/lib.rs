@@ -47,8 +47,8 @@
 //!   at what ever is suitable. A default ["passthrough"](passthrough/index.html) filesystem
 //!   driver is implemented as a sample.
 //! * Async IO (Experimental). An optional `async-io` cargo feature adds an asynchronous IO
-//!   path based on tokio-uring/io_uring, which is only available on Linux and may change
-//!   in future releases.
+//!   path. It runs on tokio-uring on Linux when io_uring is available, and on tokio
+//!   otherwise. It may change in future releases.
 //!
 //! The transport-neutral layers (ABI, API, buffers, common utilities) are
 //! implemented by the [`fuse-backend-core`] crate, the `Vfs` union multiplexer

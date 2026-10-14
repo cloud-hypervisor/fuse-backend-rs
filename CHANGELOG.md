@@ -46,6 +46,8 @@
   needs tokio 1.53.3.
 - The async fusedev server retries a read that fails with `ENOENT` and stops the task on read
   errors it doesn't know, like the synchronous server. It used to log them and read again.
+- `async-io` builds on macOS, where it runs on tokio. `fuse-backend-core` now depends on
+  `io-uring` only on Linux, like `tokio-uring`.
 - The umbrella crate's `async-io` no longer turns on the `fusedev` and `virtiofs`
   transports. Code that uses the items they gate, such as `abi::virtio_fs`, has
   to enable them. A crate that depends on a transport crate directly must enable

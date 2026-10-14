@@ -77,9 +77,11 @@ fuse-backend-rs = { git = "https://github.com/cloud-hypervisor/fuse-backend-rs",
 The `async-io` feature is not part of a released crate version yet, so depend
 on the git repository directly. Please note that the feature is still
 **experimental**:
-- It depends on [tokio-uring](https://github.com/tokio-rs/tokio-uring) and
-  [io_uring](https://kernel.dk/io_uring.pdf), so it's only available on Linux.
-  Builds with the feature enabled will fail on other platforms.
+- On Linux it runs on [tokio-uring](https://github.com/tokio-rs/tokio-uring)
+  when the kernel supports [io_uring](https://kernel.dk/io_uring.pdf), and on a
+  [tokio](https://tokio.rs) runtime otherwise. Other platforms always use tokio.
+  The asynchronous fusedev transport (`FuseDevTask`, `AsyncFuseServing`) is
+  Linux-only.
 - The asynchronous interfaces and behavior may change in future releases.
 - The asynchronous handlers of `PassthroughFs` currently relay requests to their
   synchronous counterparts, so the blocking syscalls run in the context of the
