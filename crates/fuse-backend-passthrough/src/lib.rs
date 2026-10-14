@@ -648,10 +648,11 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
     /// set `no_writeback`, and set `no_open` to false, because `VfsOptions` enables it by default.
     ///
     /// It stays off with `Config::seal_size`, because passthrough writes don't reach the size
-    /// check, and with `CachePolicy::Never` and `CachePolicy::Metadata`. Those open files with
-    /// `OpenOptions::DIRECT_IO`, which takes precedence over passthrough for reads and writes.
-    /// It also stays off when `Config::allow_direct_io` is false, because the kernel opens the
-    /// backing file with the client's `O_DIRECT`.
+    /// check, and with `CachePolicy::Never` and `CachePolicy::Metadata`, which open files with
+    /// `OpenOptions::DIRECT_IO` to keep file data out of the page cache. Passthrough opens drop
+    /// `DIRECT_IO`, so the host page cache would serve their reads and writes. It also stays off
+    /// when `Config::allow_direct_io` is false, because the kernel opens the backing file with the
+    /// client's `O_DIRECT`.
     ///
     /// Registering a backing file needs `CAP_SYS_ADMIN`, and a host file on a stacked file system
     /// such as overlayfs needs `Server::set_max_stack_depth(2)`. Otherwise the kernel rejects the
@@ -2066,9 +2067,8 @@ mod tests {
         fs.import().unwrap();
         fs.init(FsOptions::PASSTHROUGH).unwrap();
 
-        // An O_DIRECT create gets DIRECT_IO like an O_DIRECT open. Both keep the backing id,
-        // because the kernel fails an open without passthrough of an inode open in passthrough
-        // mode.
+        // O_DIRECT creates and opens pass through without DIRECT_IO, which would send their IO
+        // through the daemon. The backing file gets the client's O_DIRECT instead.
         let ctx = Context::default();
         let flags = libc::O_RDWR as u32 | libc::O_DIRECT as u32;
         let createin = CreateIn {
@@ -2080,10 +2080,22 @@ mod tests {
         let name = CString::new("file").unwrap();
         let (entry, _, opts, id) = fs.create(&ctx, ROOT_ID, &name, createin).unwrap();
         assert_eq!(id, Some(1));
-        assert_eq!(opts, OpenOptions::DIRECT_IO | OpenOptions::PASSTHROUGH);
+        assert_eq!(opts, OpenOptions::PASSTHROUGH);
         let (_, opts, id) = fs.open(&ctx, entry.inode, flags, 0).unwrap();
         assert_eq!(id, Some(1));
-        assert_eq!(opts, OpenOptions::DIRECT_IO | OpenOptions::PASSTHROUGH);
+        assert_eq!(opts, OpenOptions::PASSTHROUGH);
+
+        // Without passthrough, both get DIRECT_IO.
+        let fs = PassthroughFs::<()>::new(fs.cfg.clone()).unwrap();
+        fs.import().unwrap();
+        fs.init(FsOptions::empty()).unwrap();
+        let name = CString::new("other").unwrap();
+        let (entry, _, opts, id) = fs.create(&ctx, ROOT_ID, &name, createin).unwrap();
+        assert_eq!(id, None);
+        assert_eq!(opts, OpenOptions::DIRECT_IO);
+        let (_, opts, id) = fs.open(&ctx, entry.inode, flags, 0).unwrap();
+        assert_eq!(id, None);
+        assert_eq!(opts, OpenOptions::DIRECT_IO);
     }
 
     /// Backing files for tests in which passthrough stays off.

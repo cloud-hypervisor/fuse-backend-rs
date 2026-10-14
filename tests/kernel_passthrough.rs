@@ -1,25 +1,29 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! Mounts a filesystem with one file whose reads are passed through to a backing file, served
-//! by the sync server and, with `async-io`, by `FuseDevTask`. Needs root in the initial user
-//! namespace and a kernel with CONFIG_FUSE_PASSTHROUGH, and is skipped without them.
+//! Mounts file systems whose open files pass through to backing files. A test file system with
+//! one file is served by the sync server and, with `async-io`, by `FuseDevTask`, and a
+//! `PassthroughFs` serves a file opened with O_DIRECT. Needs root in the initial user namespace
+//! and a kernel with CONFIG_FUSE_PASSTHROUGH, and is skipped without them.
 
 #[cfg(all(feature = "fusedev", target_os = "linux"))]
 mod fusedev_tests {
     use std::ffi::CStr;
     use std::fs::File;
     use std::io::{self, Write};
-    use std::os::unix::fs::MetadataExt;
-    use std::os::unix::io::AsRawFd;
-    use std::sync::atomic::{AtomicBool, Ordering};
-    use std::sync::{Arc, OnceLock};
-    use std::thread;
+    use std::os::unix::fs::{FileExt, MetadataExt, OpenOptionsExt};
+    use std::os::unix::io::{AsRawFd, BorrowedFd};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use std::thread::{self, JoinHandle};
     use std::time::Duration;
 
-    use fuse_backend_rs::abi::fuse_abi::{stat64, FsOptions, OpenOptions, ROOT_ID};
+    use fuse_backend_rs::abi::fuse_abi::{
+        stat64, FsOptions, InHeader, Opcode, OpenOptions, OutHeader, ROOT_ID,
+    };
     use fuse_backend_rs::api::filesystem::{Context, Entry, FileSystem};
-    use fuse_backend_rs::api::server::Server;
-    use fuse_backend_rs::transport::{fuse_backing_open, FuseSession};
+    use fuse_backend_rs::api::server::{MetricsHook, Server};
+    use fuse_backend_rs::passthrough::{BackingFiles, Config, PassthroughFs};
+    use fuse_backend_rs::transport::{fuse_backing_close, fuse_backing_open, FuseSession};
     use vmm_sys_util::tempdir::TempDir;
     use vmm_sys_util::tempfile::TempFile;
 
@@ -27,7 +31,7 @@ mod fusedev_tests {
 
     struct Fs {
         backing: File,
-        fuse_file: OnceLock<File>,
+        fuse_file: File,
         passthrough: AtomicBool,
     }
 
@@ -88,32 +92,80 @@ mod fusedev_tests {
             _flags: u32,
             _fuse_flags: u32,
         ) -> io::Result<(Option<u64>, OpenOptions, Option<u32>)> {
-            let id = fuse_backing_open(self.fuse_file.get().unwrap(), self.backing.as_raw_fd())?;
+            let id = fuse_backing_open(&self.fuse_file, self.backing.as_raw_fd())?;
             Ok((None, OpenOptions::PASSTHROUGH, Some(id)))
         }
     }
 
-    /// Mount a filesystem with one file, or return `None` when not root.
-    fn mount() -> Option<(Arc<Fs>, FuseSession, TempDir)> {
+    /// Mount a session and return it with its mount point and a clone of its FUSE device, or
+    /// return `None` when not root.
+    fn mount_session(readonly: bool) -> Option<(FuseSession, TempDir, File)> {
         if unsafe { libc::geteuid() } != 0 {
             eprintln!("not root, skipping");
             return None;
         }
+        let mountpoint = TempDir::new().unwrap();
+        let mut se = FuseSession::new(mountpoint.as_path(), "passthrough", "", readonly).unwrap();
+        se.mount().unwrap();
+        let fuse_file = se.get_fuse_file().unwrap().try_clone().unwrap();
+        Some((se, mountpoint, fuse_file))
+    }
 
+    /// Mount a filesystem with one file, or return `None` when not root.
+    fn mount() -> Option<(Arc<Fs>, FuseSession, TempDir)> {
+        let (se, mountpoint, fuse_file) = mount_session(true)?;
         let mut backing = TempFile::new().unwrap().into_file();
         backing.write_all(b"passed through").unwrap();
         let fs = Arc::new(Fs {
             backing,
-            fuse_file: OnceLock::new(),
+            fuse_file,
             passthrough: AtomicBool::new(false),
         });
-
-        let mountpoint = TempDir::new().unwrap();
-        let mut se = FuseSession::new(mountpoint.as_path(), "passthrough", "", true).unwrap();
-        se.mount().unwrap();
-        let fuse_file = se.get_fuse_file().unwrap().try_clone().unwrap();
-        fs.fuse_file.set(fuse_file).unwrap();
         Some((fs, se, mountpoint))
+    }
+
+    /// Counts the READ and WRITE requests the server handles.
+    #[derive(Default)]
+    struct DataRequests(AtomicUsize);
+
+    impl MetricsHook for DataRequests {
+        fn collect(&self, ih: &InHeader) {
+            if ih.opcode == Opcode::Read as u32 || ih.opcode == Opcode::Write as u32 {
+                self.0.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+
+        fn release(&self, _oh: Option<&OutHeader>) {}
+    }
+
+    /// Serve the requests of `se` with the sync server on a thread, counting the READ and WRITE
+    /// requests.
+    fn serve<F: FileSystem + Send + Sync + 'static>(
+        se: &FuseSession,
+        fs: Arc<F>,
+    ) -> (JoinHandle<()>, Arc<DataRequests>) {
+        let server = Server::new(fs);
+        server.set_max_stack_depth(2).unwrap();
+        let requests = Arc::new(DataRequests::default());
+        let hook = requests.clone();
+        let mut ch = se.new_channel().unwrap();
+        let handle = thread::spawn(move || {
+            while let Ok(Some((reader, writer))) = ch.get_request() {
+                if server
+                    .handle_message(reader, writer, None, Some(&*hook))
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
+        (handle, requests)
+    }
+
+    fn stop(mut se: FuseSession, handle: JoinHandle<()>) {
+        se.umount().unwrap();
+        se.wake().unwrap();
+        handle.join().unwrap();
     }
 
     /// Read the file, or return `None` if the kernel doesn't offer passthrough.
@@ -127,43 +179,122 @@ mod fusedev_tests {
         }
     }
 
-    fn check(result: Option<io::Result<Vec<u8>>>) {
+    /// Pass the result of using a file to `ok`. Skip on `None`, when the kernel doesn't offer
+    /// passthrough, and on EPERM, when the process can't register backing files.
+    fn check_with<T>(result: Option<io::Result<T>>, ok: impl FnOnce(T)) {
         match result {
-            // The default `read` returns ENOSYS, so the data can only come from the backing file.
-            Some(Ok(data)) => assert_eq!(data, b"passed through"),
+            Some(Ok(value)) => ok(value),
             // Registering a backing file needs CAP_SYS_ADMIN in the initial user namespace, which
             // root in another one, such as from `unshare -r`, doesn't have.
             Some(Err(e)) if e.raw_os_error() == Some(libc::EPERM) => {
                 eprintln!("no CAP_SYS_ADMIN in the initial user namespace, skipping")
             }
-            Some(Err(e)) => panic!("failed to read the file: {}", e),
+            Some(Err(e)) => panic!("failed to use the file: {}", e),
             None => eprintln!("kernel without FUSE passthrough, skipping"),
         }
     }
 
+    fn check(result: Option<io::Result<Vec<u8>>>) {
+        // The default `read` returns ENOSYS, so the data can only come from the backing file.
+        check_with(result, |data| assert_eq!(data, b"passed through"));
+    }
+
     #[test]
     fn integration_kernel_passthrough() {
-        let Some((fs, mut se, mountpoint)) = mount() else {
+        let Some((fs, se, mountpoint)) = mount() else {
             return;
         };
-
-        let server = Arc::new(Server::new(fs.clone()));
-        server.set_max_stack_depth(2).unwrap();
-        let mut ch = se.new_channel().unwrap();
-        let handle = thread::spawn(move || {
-            while let Ok(Some((reader, writer))) = ch.get_request() {
-                if server.handle_message(reader, writer, None, None).is_err() {
-                    break;
-                }
-            }
-        });
-
+        let (handle, _) = serve(&se, fs.clone());
         let result = read_file(&fs, &mountpoint);
-
-        se.umount().unwrap();
-        se.wake().unwrap();
-        handle.join().unwrap();
+        stop(se, handle);
         check(result);
+    }
+
+    /// Registers backing files on a FUSE device and counts the registrations.
+    struct DeviceFiles {
+        fuse_file: File,
+        opened: AtomicUsize,
+    }
+
+    impl BackingFiles for DeviceFiles {
+        fn open(&self, fd: BorrowedFd<'_>) -> io::Result<u32> {
+            let id = fuse_backing_open(&self.fuse_file, fd.as_raw_fd())?;
+            self.opened.fetch_add(1, Ordering::Relaxed);
+            Ok(id)
+        }
+
+        fn close(&self, backing_id: u32) -> io::Result<()> {
+            fuse_backing_close(&self.fuse_file, backing_id)
+        }
+    }
+
+    #[repr(align(4096))]
+    struct Block([u8; 4096]);
+
+    /// An O_DIRECT open of a `PassthroughFs` file passes reads and writes through to the host
+    /// file instead of sending them to the server.
+    #[test]
+    fn integration_kernel_passthrough_o_direct() {
+        let source = TempDir::new().unwrap();
+        let host_path = source.as_path().join("file");
+        std::fs::write(&host_path, [1u8; 4096]).unwrap();
+        // tmpfs supports O_DIRECT only since Linux 6.6.
+        match std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECT)
+            .open(&host_path)
+        {
+            Ok(_) => {}
+            Err(e) if e.raw_os_error() == Some(libc::EINVAL) => {
+                eprintln!("no O_DIRECT in {:?}, skipping", source.as_path());
+                return;
+            }
+            Err(e) => panic!("failed to open {:?} with O_DIRECT: {}", host_path, e),
+        }
+
+        let Some((se, mountpoint, fuse_file)) = mount_session(false) else {
+            return;
+        };
+        let files = Arc::new(DeviceFiles {
+            fuse_file,
+            opened: AtomicUsize::new(0),
+        });
+        let mut fs = PassthroughFs::<()>::new(Config {
+            root_dir: source.as_path().to_string_lossy().to_string(),
+            allow_direct_io: true,
+            ..Default::default()
+        })
+        .unwrap();
+        fs.set_backing_files(files.clone());
+        let (handle, requests) = serve(&se, Arc::new(fs));
+
+        // Read the first block and write a second one. No other file is open, so the server
+        // handles no READ or WRITE at all if the handle passes through.
+        let result = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(libc::O_DIRECT)
+            .open(mountpoint.as_path().join("file"))
+            .and_then(|file| {
+                let mut block = Block([0; 4096]);
+                file.read_exact_at(&mut block.0, 0)?;
+                file.write_all_at(&Block([2; 4096]).0, 4096)?;
+                Ok(block)
+            });
+        // Without passthrough the open succeeds without registering the file.
+        let result = match result {
+            Ok(_) if files.opened.load(Ordering::Relaxed) == 0 => None,
+            result => Some(result),
+        };
+        let data_requests = requests.0.load(Ordering::Relaxed);
+
+        stop(se, handle);
+        check_with(result, |block| {
+            assert_eq!(block.0, [1; 4096]);
+            assert_eq!(data_requests, 0);
+            let data = std::fs::read(&host_path).unwrap();
+            assert_eq!(data[4096..], [2; 4096]);
+        });
     }
 
     #[cfg(feature = "async-io")]
