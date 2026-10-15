@@ -902,14 +902,14 @@ impl<S: BitmapSlice + Send + Sync> FileSystem for PassthroughFs<S> {
             let ino = entry.inode;
             dir_entry.ino = entry.attr.st_ino;
 
-            add_entry(dir_entry, entry).inspect(|&r| {
-                // true when size is not large enough to hold entry.
-                if r == 0 {
-                    // Release the refcount acquired by self.do_lookup().
-                    let mut inodes = self.inode_map.get_map_mut();
-                    self.forget_one(&mut inodes, ino, 1);
-                }
-            })
+            let res = add_entry(dir_entry, entry);
+            // Release the refcount acquired by self.do_lookup() if the entry didn't make it into
+            // the reply, because the buffer was full or the callback failed.
+            if matches!(res, Ok(0) | Err(_)) {
+                let mut inodes = self.inode_map.get_map_mut();
+                self.forget_one(&mut inodes, ino, 1);
+            }
+            res
         })
     }
 
@@ -3402,6 +3402,46 @@ mod readdir_tests {
         // The undelivered entry was looked up and forgotten again.
         assert_eq!(refcount(&fs, first_ino), None);
         assert_ne!(first_ino, 0, "an inode must have been observed");
+
+        fs.releasedir(&ctx, ROOT_ID, 0, handle).unwrap();
+    }
+
+    // An entry the callback fails is forgotten again too, because the
+    // kernel never sees it and so never sends a FORGET for it.
+    #[test]
+    fn readdirplus_error_forgets_undelivered() {
+        let (fs, source) = prepare_fs();
+        let ctx = prepare_context();
+        create_backing_files(&source, 4);
+
+        let handle = open_root(&fs, &ctx);
+        let mut first_ino = 0;
+        fs.readdirplus(&ctx, ROOT_ID, handle, 8192, 0, &mut |_e, entry| {
+            first_ino = entry.inode;
+            Err(io::Error::from_raw_os_error(libc::EIO))
+        })
+        .unwrap_err();
+
+        assert_ne!(first_ino, 0, "an inode must have been observed");
+        assert_eq!(refcount(&fs, first_ino), None);
+
+        // A failure after an entry was delivered returns Ok(()), but the
+        // failed entry is still forgotten while the delivered one keeps its
+        // reference.
+        let mut inos = Vec::new();
+        fs.readdirplus(&ctx, ROOT_ID, handle, 8192, 0, &mut |_e, entry| {
+            inos.push(entry.inode);
+            if inos.len() == 1 {
+                Ok(1)
+            } else {
+                Err(io::Error::from_raw_os_error(libc::EIO))
+            }
+        })
+        .unwrap();
+
+        assert_eq!(inos.len(), 2);
+        assert_eq!(refcount(&fs, inos[0]), Some(1));
+        assert_eq!(refcount(&fs, inos[1]), None);
 
         fs.releasedir(&ctx, ROOT_ID, 0, handle).unwrap();
     }
