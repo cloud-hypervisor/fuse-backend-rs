@@ -480,7 +480,8 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
         }
 
         let mut rem = &buf[..];
-        let orig_rem_len = rem.len();
+        // Whether the callback stored an entry yet.
+        let mut stored = false;
         while !rem.is_empty() {
             // We only use debug asserts here because these values are coming from the kernel and we
             // trust them implicitly.
@@ -499,12 +500,19 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
                 "fuse: back is smaller than `namelen`"
             );
 
+            debug_assert!(
+                rem.len() >= dirent64.d_reclen as usize,
+                "fuse: rem is smaller than `d_reclen`"
+            );
+
             let name = &back[..namelen];
-            let res = if name.starts_with(CURRENT_DIR_CSTR) || name.starts_with(PARENT_DIR_CSTR) {
-                // We don't want to report the "." and ".." entries. However, returning `Ok(0)` will
-                // break the loop so return `Ok` with a non-zero value instead.
-                Ok(1)
-            } else {
+            if name.starts_with(CURRENT_DIR_CSTR) || name.starts_with(PARENT_DIR_CSTR) {
+                // We don't report the "." and ".." entries.
+                rem = &rem[dirent64.d_reclen as usize..];
+                continue;
+            }
+
+            let res = {
                 // The Sys_getdents64 in kernel will pad the name with '\0'
                 // bytes up to 8-byte alignment, so @name may contain a few null
                 // terminators.  This causes an extra lookup from fuse when
@@ -530,19 +538,17 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
                 )
             };
 
-            debug_assert!(
-                rem.len() >= dirent64.d_reclen as usize,
-                "fuse: rem is smaller than `d_reclen`"
-            );
-
             match res {
                 Ok(0) => break,
-                Ok(_) => rem = &rem[dirent64.d_reclen as usize..],
+                Ok(_) => {
+                    stored = true;
+                    rem = &rem[dirent64.d_reclen as usize..];
+                }
                 // If there's an error, we can only signal it if we haven't
                 // stored any entries yet - otherwise we'd end up with wrong
                 // lookup counts for the entries that are already in the
                 // buffer. So we return what we've collected until that point.
-                Err(e) if rem.len() == orig_rem_len => return Err(e),
+                Err(e) if !stored => return Err(e),
                 Err(_) => return Ok(()),
             }
         }
@@ -1995,7 +2001,7 @@ mod tests {
         // with EACCES.
         if unsafe { libc::geteuid() } == 0 {
             // DAC checks are bypassed when running as root, so there is nothing to observe.
-            eprintln!("skipping test_open_writeback_ordrw_keeps_failing: not running as root");
+            eprintln!("skipping test_open_writeback_ordrw_keeps_failing: running as root");
             return;
         }
         let (fs, source) = prepare_fs_writeback_no_handles();
@@ -3403,10 +3409,7 @@ mod readdir_tests {
     // Error contract of the reply loop: an error before any entry was
     // stored propagates to the caller; an error after at least one entry
     // was stored returns Ok(()) with the partial delivery, because the
-    // entries already handed out cannot be taken back. A fresh stream
-    // always begins with "." and "..", which are filtered without the
-    // callback, so the propagate case is exercised on a resumed stream
-    // whose first record is a real entry.
+    // entries already handed out cannot be taken back.
     #[test]
     fn readdir_error_contract() {
         let (fs, source) = prepare_fs();
@@ -3443,6 +3446,32 @@ mod readdir_tests {
             delivered, 2,
             "callbacks: one entry delivered, then the error"
         );
+
+        fs.releasedir(&ctx, ROOT_ID, 0, handle).unwrap();
+    }
+
+    // An error on the first entry of a batch propagates even when "." or
+    // ".." came before it, because skipping them stores nothing. ext4 can
+    // put the dots anywhere in a small directory, so fail the first entry
+    // at the start and after every entry. Wherever the dots are, one of
+    // these batches starts with a dot that a real entry follows.
+    #[test]
+    fn readdir_error_after_dots_propagates() {
+        let (fs, source) = prepare_fs();
+        let ctx = prepare_context();
+        create_backing_files(&source, 4);
+
+        let handle = open_root(&fs, &ctx);
+        let entries = readdir_all(&fs, &ctx, handle, 8192);
+        let resumes = std::iter::once(0).chain(entries.iter().map(|e| e.offset));
+        for offset in resumes.take(entries.len()) {
+            let err = fs
+                .readdir(&ctx, ROOT_ID, handle, 8192, offset, &mut |_| {
+                    Err(io::Error::from_raw_os_error(libc::EIO))
+                })
+                .unwrap_err();
+            assert_eq!(err.raw_os_error(), Some(libc::EIO), "offset {}", offset);
+        }
 
         fs.releasedir(&ctx, ROOT_ID, 0, handle).unwrap();
     }
