@@ -31,7 +31,7 @@ pub use fuse_backend_fusedev as fusedev;
 pub use fuse_backend_virtiofs as virtiofs;
 
 #[cfg(all(target_os = "linux", feature = "fusedev"))]
-pub use self::fusedev::BlockingFuseChannel;
+pub use self::fusedev::{fuse_backing_close, fuse_backing_open, BlockingFuseChannel};
 #[cfg(all(target_os = "linux", feature = "fusedev", feature = "async-io"))]
 pub use self::fusedev::{AsyncFuseServing, AsyncServingConfig, FuseDevTask};
 #[cfg(feature = "fusedev")]

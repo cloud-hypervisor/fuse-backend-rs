@@ -20,15 +20,15 @@ use std::ffi::CStr;
 use std::io::{self, Read};
 use std::marker::PhantomData;
 use std::mem::size_of;
-use std::sync::atomic::AtomicU64;
+#[cfg(target_os = "linux")]
+use std::sync::atomic::AtomicU32;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::abi::fuse_abi::*;
 use crate::api::filesystem::{Context, FileSystem, ZeroCopyReader, ZeroCopyWriter};
 use crate::buffer::{Reader, Writer};
 use crate::file_traits::FileReadWriteVolatile;
 use crate::{bytes_to_cstr, BitmapSlice, Error, Result};
-#[cfg(all(target_os = "linux", feature = "fusedev-uring"))]
-use std::sync::atomic::Ordering;
 
 #[cfg(feature = "async-io")]
 mod async_io;
@@ -65,6 +65,9 @@ pub struct Server<F: FileSystem + Sync> {
     /// Capability flags actually enabled by the INIT exchange.
     #[cfg(all(target_os = "linux", feature = "fusedev-uring"))]
     negotiated_init_flags: AtomicU64,
+    /// Max stack depth sent in the INIT reply with `FsOptions::PASSTHROUGH`.
+    #[cfg(target_os = "linux")]
+    max_stack_depth: AtomicU32,
 }
 
 impl<F: FileSystem + Sync> Server<F> {
@@ -78,7 +81,61 @@ impl<F: FileSystem + Sync> Server<F> {
             extra_init_flags: AtomicU64::new(0),
             #[cfg(all(target_os = "linux", feature = "fusedev-uring"))]
             negotiated_init_flags: AtomicU64::new(0),
+            #[cfg(target_os = "linux")]
+            max_stack_depth: AtomicU32::new(1),
         }
+    }
+
+    /// Set the max stack depth of the filesystem sent in the INIT reply when
+    /// `FsOptions::PASSTHROUGH` is enabled. The default of 1 allows backing files on a
+    /// filesystem that isn't stacked, and 2 allows them on a stacked one such as overlayfs.
+    /// Call it before the server handles the INIT request.
+    ///
+    /// Fails with `EINVAL` for other depths. The kernel turns passthrough off for them, and
+    /// every `fuse_backing_open()` would then fail.
+    #[cfg(target_os = "linux")]
+    pub fn set_max_stack_depth(&self, depth: u32) -> io::Result<()> {
+        // FILESYSTEM_MAX_STACK_DEPTH in the kernel is 2.
+        if !(1..=2).contains(&depth) {
+            return Err(io::Error::from_raw_os_error(libc::EINVAL));
+        }
+        self.max_stack_depth.store(depth, Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// Get the protocol version and the options enabled at INIT, for `restore_init()`. Before
+    /// INIT, the options are empty.
+    pub fn init_state(&self) -> (ServerVersion, FsOptions) {
+        let version = decode_version(self.vers.load(Ordering::Acquire));
+        let options = FsOptions::from_bits_truncate(self.options.load(Ordering::Acquire));
+        (version, options)
+    }
+
+    /// Restore the protocol version and options from another server's `init_state()`.
+    ///
+    /// A server that takes over a FUSE connection never sees INIT, so call this before it
+    /// serves requests. This doesn't call `FileSystem::init()`, so the file system has to
+    /// restore its own INIT state. For a `Vfs`, `Vfs::restore_from_bytes()` restores the state
+    /// of the `Vfs` itself. Then call `init()` on each file system mounted on it, with the
+    /// restored `VfsOptions::out_opts`, before `Vfs::restore_mount()` mounts it again at its old
+    /// index. The inode numbers that the kernel holds refer to that index. For a file system
+    /// served without a `Vfs`, call `init()` with the options from `init_state()`.
+    ///
+    /// Then send `notify_resend()` to get back the requests that the old server didn't reply
+    /// to. Send it after the old server stops handling requests and before the new one reads
+    /// any. The kernel sends again every request read from the connection and not replied to
+    /// yet, so a request that a server is still handling would run twice. The kernel ends the
+    /// requests read from a FUSE device file description once that description is closed, so
+    /// the new server needs the file descriptions that the old one read from.
+    pub fn restore_init(&self, version: ServerVersion, options: FsOptions) {
+        self.vers.store(
+            encode_version(version.major, version.minor),
+            Ordering::Release,
+        );
+        self.options.store(options.bits(), Ordering::Release);
+        #[cfg(all(target_os = "linux", feature = "fusedev-uring"))]
+        self.negotiated_init_flags
+            .store(options.bits(), Ordering::Release);
     }
 
     /// Request serving FUSE requests over io_uring (experimental).

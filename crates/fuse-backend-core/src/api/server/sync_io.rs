@@ -113,6 +113,9 @@ pub(super) fn parse_create_extensions(_options: &FsOptions, _tail: &[u8]) -> Res
 impl<F: FileSystem + Sync> Server<F> {
     #[cfg(feature = "fusedev")]
     /// Use to send notify msg to kernel fuse
+    ///
+    /// The write waits for the lock of `parent`, which a lookup in it holds until its reply, so
+    /// don't call this from a thread that serves requests. Any fd of the connection works.
     pub fn notify_inval_entry<W: Writer>(
         &self,
         mut w: W,
@@ -178,6 +181,8 @@ impl<F: FileSystem + Sync> Server<F> {
     /// the crash recovery routine. Given that FUSE initialization does not occur again during recovery,
     /// the capability to support resend notifications may not be automatically detected. It is the responsibility
     /// of the upper layers to verify and persist the kernel's support for this feature upon the initial FUSE setup.
+    ///
+    /// Resent requests have `UNIQUE_RESEND` set in their unique id, which the reply keeps.
     pub fn notify_resend<W: Writer>(&self, mut w: W) -> Result<()> {
         let mut buffer_writer = w.split_at(0).map_err(Error::FailedToSplitWriter)?;
         let header = {
@@ -977,6 +982,10 @@ impl<F: FileSystem + Sync> Server<F> {
                     out.max_pages = MAX_REQ_PAGES;
                     out.max_write = MAX_REQ_PAGES as u32 * pagesize() as u32; // 1MB
                 }
+                #[cfg(target_os = "linux")]
+                if enabled.contains(FsOptions::PASSTHROUGH) {
+                    out.max_stack_depth = self.max_stack_depth.load(Ordering::Relaxed);
+                }
                 self.vers.store(
                     encode_version(version.major, version.minor),
                     Ordering::Release,
@@ -1726,10 +1735,10 @@ mod tests {
     use super::super::test_util::{MockFS, TestWriter};
     use super::*;
 
-    fn prepare_srvcontext<'a>(
+    fn prepare_srvcontext<'a, F: FileSystem>(
         read_buf: &'a mut [u8],
         write_buf: &'a mut [u8],
-    ) -> SrvContext<'a, MockFS, (), TestWriter<'a>> {
+    ) -> SrvContext<'a, F, (), TestWriter<'a>> {
         let reader = Reader::<()>::from_slice(read_buf);
         let writer = TestWriter::new(write_buf);
         let in_header = InHeader::default();
@@ -1963,21 +1972,21 @@ mod tests {
         assert_eq!(res, 80);
     }
 
+    // A file system negotiating FUSE_CREATE_SUPP_GROUP (bit 34) when the
+    // kernel offers it, like Vfs and PassthroughFs do.  Its other
+    // operations keep the default implementations.
+    struct SuppGroupFs;
+    impl FileSystem for SuppGroupFs {
+        type Inode = u64;
+        type Handle = u64;
+
+        fn init(&self, capable: FsOptions) -> io::Result<FsOptions> {
+            Ok(capable & FsOptions::CREATE_SUPP_GROUP)
+        }
+    }
+
     #[test]
     fn test_server_init_echoes_init_ext_for_64bit_caps() {
-        // A file system negotiating FUSE_CREATE_SUPP_GROUP (bit 34) when the
-        // kernel offers it, like Vfs and PassthroughFs do.  Its other
-        // operations keep the default implementations.
-        struct SuppGroupFs;
-        impl FileSystem for SuppGroupFs {
-            type Inode = u64;
-            type Handle = u64;
-
-            fn init(&self, capable: FsOptions) -> io::Result<FsOptions> {
-                Ok(capable & FsOptions::CREATE_SUPP_GROUP)
-            }
-        }
-
         // A kernel >= 6.3 sends the full 64-byte fuse_init_in: INIT_EXT in
         // flags and FUSE_CREATE_SUPP_GROUP in flags2.
         let mut read_buf = [0u8; size_of::<InitIn>() + size_of::<InitIn2>()];
@@ -2017,6 +2026,97 @@ mod tests {
             out.flags2 & (FsOptions::CREATE_SUPP_GROUP.bits() >> 32) as u32,
             0
         );
+    }
+
+    #[test]
+    fn test_server_restore_init() {
+        let init_in = InitIn {
+            major: KERNEL_VERSION,
+            minor: 40,
+            max_readahead: 0,
+            flags: FsOptions::INIT_EXT.bits() as u32,
+        };
+        let init_in2 = InitIn2 {
+            flags2: ((FsOptions::CREATE_SUPP_GROUP | FsOptions::HAS_RESEND).bits() >> 32) as u32,
+            unused: [0; 11],
+        };
+        let mut read_buf = [init_in.as_slice(), init_in2.as_slice()].concat();
+        let mut write_buf = [0u8; 4096];
+        let old = Server::new(SuppGroupFs);
+        old.init(prepare_srvcontext(&mut read_buf, &mut write_buf), |_| {})
+            .unwrap();
+        let (version, options) = old.init_state();
+        assert_eq!(version.minor, 40);
+        assert!(options.contains(FsOptions::CREATE_SUPP_GROUP | FsOptions::INIT_EXT));
+
+        let new = Server::new(SuppGroupFs);
+        assert!(new.init_state().1.is_empty());
+        new.restore_init(version.clone(), options);
+        assert_eq!(new.init_state(), (version, options));
+    }
+
+    #[test]
+    fn test_server_reply_keeps_unique_resend() {
+        let server = Server::new(MockFS);
+        let unique = UNIQUE_RESEND | 42;
+        let header = InHeader {
+            len: (size_of::<InHeader>() + size_of::<GetattrIn>()) as u32,
+            opcode: Opcode::Getattr as u32,
+            unique,
+            nodeid: ROOT_ID,
+            ..Default::default()
+        };
+        let mut read_buf = [header.as_slice(), GetattrIn::default().as_slice()].concat();
+        let mut write_buf = [0u8; 4096];
+        let reader = Reader::<()>::from_slice(&mut read_buf);
+        let writer = TestWriter::new(&mut write_buf);
+        server.handle_message(reader, writer, None, None).unwrap();
+        let out = OutHeader::from_slice(&write_buf[..size_of::<OutHeader>()]).unwrap();
+        assert_eq!(out.unique, unique);
+    }
+
+    #[test]
+    fn test_server_init_passthrough() {
+        struct PassthroughFs;
+        impl FileSystem for PassthroughFs {
+            type Inode = u64;
+            type Handle = u64;
+
+            fn init(&self, _capable: FsOptions) -> io::Result<FsOptions> {
+                Ok(FsOptions::PASSTHROUGH)
+            }
+        }
+
+        let server = Server::new(PassthroughFs);
+        // The kernel turns passthrough off for depths other than 1 and 2.
+        assert!(server.set_max_stack_depth(0).is_err());
+        assert!(server.set_max_stack_depth(3).is_err());
+        server.set_max_stack_depth(2).unwrap();
+
+        let init_in = InitIn {
+            major: KERNEL_VERSION,
+            minor: 40,
+            max_readahead: 0,
+            flags: FsOptions::INIT_EXT.bits() as u32,
+        };
+        let init_in2 = InitIn2 {
+            flags2: (FsOptions::PASSTHROUGH.bits() >> 32) as u32,
+            unused: [0; 11],
+        };
+        let mut read_buf = [init_in.as_slice(), init_in2.as_slice()].concat();
+        let mut write_buf = [0u8; 4096];
+        let ctx = {
+            let reader = Reader::<()>::from_slice(&mut read_buf);
+            let writer = TestWriter::new(&mut write_buf);
+            SrvContext::new(InHeader::default(), reader, writer)
+        };
+        let res = server.init(ctx, |_| {}).unwrap();
+        assert_eq!(res, size_of::<OutHeader>() + size_of::<InitOut>());
+
+        let out = InitOut::from_slice(&write_buf[size_of::<OutHeader>()..res]).unwrap();
+        assert_ne!(out.flags as u64 & FsOptions::INIT_EXT.bits(), 0);
+        assert_eq!((out.flags2 as u64) << 32, FsOptions::PASSTHROUGH.bits());
+        assert_eq!(out.max_stack_depth, 2);
     }
 
     #[cfg(feature = "fusedev-uring")]

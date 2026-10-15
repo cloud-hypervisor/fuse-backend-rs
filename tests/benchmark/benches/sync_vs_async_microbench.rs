@@ -237,7 +237,7 @@ fn bench_read(c: &mut Criterion) {
     c.bench_function("open+read4k+release/async", |b| {
         b.iter(|| {
             rt.block_on(async {
-                let (handle, _opts) = fs
+                let (handle, _opts, _) = fs
                     .async_open(&ctx, inode, libc::O_RDONLY as u32, 0)
                     .await
                     .unwrap();
@@ -309,7 +309,7 @@ fn bench_write(c: &mut Criterion) {
             || MemReader(vec![0x5au8; DATA_SIZE as usize]),
             |mut r| {
                 rt.block_on(async {
-                    let (handle, _opts) = fs
+                    let (handle, _opts, _) = fs
                         .async_open(&ctx, inode, libc::O_RDWR as u32, 0)
                         .await
                         .unwrap();
@@ -364,7 +364,7 @@ fn bench_create_unlink(c: &mut Criterion) {
     c.bench_function("create+release+unlink/async", |b| {
         b.iter(|| {
             rt.block_on(async {
-                let (entry, handle, _opts) =
+                let (entry, handle, _opts, _) =
                     fs.async_create(&ctx, ROOT_ID, &name, args).await.unwrap();
                 if let Some(handle) = handle {
                     fs.release(&ctx, entry.inode, args.flags, handle, false, false, None)

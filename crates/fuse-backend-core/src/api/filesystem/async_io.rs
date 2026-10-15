@@ -303,6 +303,9 @@ pub trait AsyncFileSystem: FileSystem {
     /// The returned `OpenOptions` allow the file system to change the way the opened file is
     /// handled by the kernel. See the documentation of `OpenOptions` for more information.
     ///
+    /// With `OpenOptions::PASSTHROUGH`, the returned `u32` is the id of the backing file to pass
+    /// reads, writes and mmap through to, as returned by `fuse_backing_open()`.
+    ///
     /// If the `FsOptions::ZERO_MESSAGE_OPEN` feature is enabled by both the file system
     /// implementation and the kernel, then the file system may return an error of `ENOSYS`. This
     /// will be interpreted by the kernel as success and future calls to `open` and `release` will
@@ -313,7 +316,7 @@ pub trait AsyncFileSystem: FileSystem {
         inode: Self::Inode,
         flags: u32,
         fuse_flags: u32,
-    ) -> io::Result<(Option<Self::Handle>, OpenOptions)>;
+    ) -> io::Result<(Option<Self::Handle>, OpenOptions, Option<u32>)>;
 
     /// Create and open a file.
     ///
@@ -325,17 +328,17 @@ pub trait AsyncFileSystem: FileSystem {
     /// unimplemented and all future calls to `create` will be handled by calling the `mknod` and
     /// `open` methods instead.
     ///
-    /// See the documentation for the `open` method for more information about opening the file. In
-    /// addition to the optional `Handle` and the `OpenOptions`, the file system must also return an
-    /// `Entry` for the file. This increases the lookup count for the `Inode` associated with the
-    /// file by 1.
+    /// See the documentation for the `open` method for more information about opening the file,
+    /// including the optional backing id. In addition to the optional `Handle`, the `OpenOptions`
+    /// and the optional backing id, the file system must also return an `Entry` for the file.
+    /// This increases the lookup count for the `Inode` associated with the file by 1.
     async fn async_create(
         &self,
         ctx: &Context,
         parent: Self::Inode,
         name: &CStr,
         args: CreateIn,
-    ) -> io::Result<(Entry, Option<Self::Handle>, OpenOptions)>;
+    ) -> io::Result<(Entry, Option<Self::Handle>, OpenOptions, Option<u32>)>;
 
     /// Read data from a file.
     ///
@@ -863,10 +866,14 @@ pub trait AsyncFileSystem: FileSystem {
 
 type AttrFuture<'async_trait> =
     Box<dyn Future<Output = io::Result<(stat64, Duration)>> + Send + 'async_trait>;
-type OpenFuture<'async_trait, H> =
-    Box<dyn Future<Output = io::Result<(Option<H>, OpenOptions)>> + Send + 'async_trait>;
-type CreateFuture<'async_trait, H> =
-    Box<dyn Future<Output = io::Result<(Entry, Option<H>, OpenOptions)>> + Send + 'async_trait>;
+type OpenFuture<'async_trait, H> = Box<
+    dyn Future<Output = io::Result<(Option<H>, OpenOptions, Option<u32>)>> + Send + 'async_trait,
+>;
+type CreateFuture<'async_trait, H> = Box<
+    dyn Future<Output = io::Result<(Entry, Option<H>, OpenOptions, Option<u32>)>>
+        + Send
+        + 'async_trait,
+>;
 
 impl<FS: AsyncFileSystem> AsyncFileSystem for Arc<FS> {
     fn async_lookup<'a, 'b, 'c, 'async_trait>(

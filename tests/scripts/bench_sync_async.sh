@@ -34,6 +34,8 @@
 #            daemon of this repository in release mode); used by the CI
 #            pipeline to benchmark different code variants with an
 #            identical workload definition
+#   DAEMON_ARGS extra arguments for the daemon in every mode, such as
+#            --kernel-passthrough
 #   RESULTS_DIR where to store results (default a fresh mktemp directory)
 
 set -euo pipefail
@@ -50,6 +52,7 @@ SIZE=${SIZE:-256M}
 RUNTIME=${RUNTIME:-30}
 NRFILES=${NRFILES:-50000}
 MODES=${MODES:-"sync async"}
+DAEMON_ARGS=${DAEMON_ARGS:-}
 RESULTS_DIR=${RESULTS_DIR:-$(mktemp -d /tmp/fuse-bench-results.XXXXXX)}
 SRC_DIR="${RESULTS_DIR}/source"
 MNT_DIR="${RESULTS_DIR}/mount"
@@ -113,7 +116,7 @@ trap cleanup EXIT
 start_daemon() {
     local mode_args=$1
     # shellcheck disable=SC2086
-    "${DAEMON}" "${SRC_DIR}" "${MNT_DIR}" ${mode_args} --threads "${THREADS}" &
+    "${DAEMON}" "${SRC_DIR}" "${MNT_DIR}" ${mode_args} --threads "${THREADS}" ${DAEMON_ARGS} &
     DAEMON_PID=$!
     for _ in $(seq 50); do
         # A daemon that mounted and immediately died (rejected session)

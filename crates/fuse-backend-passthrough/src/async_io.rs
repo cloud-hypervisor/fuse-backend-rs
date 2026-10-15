@@ -58,19 +58,23 @@ use fuse_backend_core::file_buf::FileVolatileSlice;
 use fuse_backend_core::file_traits::{AsyncFileReadWriteVolatile, FileReadWriteVolatile};
 
 impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
-    /// Create a Passthrough file system instance shared between threads.
+    /// Create a Passthrough file system instance shared between threads,
+    /// see `into_shared()`.
+    pub fn new_shared(cfg: Config) -> io::Result<Arc<Self>> {
+        Ok(Self::new(cfg)?.into_shared())
+    }
+
+    /// Share a file system created with `PassthroughFs::new()` between
+    /// threads. Call `set_backing_files()` before this. The shared instance
+    /// holds a weak reference to itself, so `Arc::get_mut()` fails on it.
     ///
     /// A shared instance can offload its synchronous handlers to the
-    /// blocking thread pool, see `enable_async_thread_pool()`. A file
-    /// system created with `PassthroughFs::new()` always serves its async
-    /// requests inline.
-    pub fn new_shared(cfg: Config) -> io::Result<Arc<Self>> {
-        let mut fs = Self::new(cfg)?;
-
-        Ok(Arc::new_cyclic(|weak| {
-            fs.shared_ref = weak.clone();
-            fs
-        }))
+    /// blocking thread pool, see `enable_async_thread_pool()`.
+    pub fn into_shared(mut self) -> Arc<Self> {
+        Arc::new_cyclic(|weak| {
+            self.shared_ref = weak.clone();
+            self
+        })
     }
 
     /// Enable or disable offloading the synchronous handlers to the
@@ -82,8 +86,9 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
     /// runtime's blocking thread pool instead, so the async task can keep
     /// receiving and dispatching requests while the blocking syscalls
     /// execute in parallel on pool threads. Note that the offloading
-    /// requires the file system to be created with `new_shared()`,
-    /// requests of other instances are served inline.
+    /// requires a file system from `new_shared()` or `into_shared()`.
+    /// Other instances, even one wrapped in a plain `Arc::new()`, serve
+    /// their requests inline.
     ///
     /// The blocking pool is a tokio runtime property configured when the
     /// runtime is created, this method only selects between the two modes
@@ -187,8 +192,8 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
 }
 
 // `BackendFileSystem` is implemented for `Arc<FS>` by a blanket impl in
-// `fuse-backend_core::api::filesystem`, so a shared instance created with
-// `new_shared()` can be mounted to a `Vfs` directly; `as_any()` exposes the
+// `fuse_backend_core::api::filesystem`, so a shared instance from
+// `into_shared()` can be mounted to a `Vfs` directly. `as_any()` exposes the
 // wrapped instance, keeping downcasts identical for both forms.
 
 /// Await the result of a task offloaded to the blocking thread pool.
@@ -317,7 +322,7 @@ impl FileReadWriteVolatile for NowaitFile<'_> {
 
 /// Relay a synchronous handler according to the `async_thread_pool_enabled`
 /// setting: offload it to the runtime's blocking thread pool if the setting
-/// is enabled and the file system was created with `PassthroughFs::new_shared()`
+/// is enabled and the file system was shared with `PassthroughFs::into_shared()`
 /// (so the handler can hold a reference to it across threads), otherwise
 /// execute it inline. `$capture` rebinds the borrowed request arguments to
 /// owned copies which can be moved into the pool closure, and `$pool_fn`
@@ -402,17 +407,17 @@ impl<S: BitmapSlice + Send + Sync + 'static> AsyncFileSystem for PassthroughFs<S
         inode: <Self as FileSystem>::Inode,
         flags: u32,
         fuse_flags: u32,
-    ) -> io::Result<(Option<<Self as FileSystem>::Handle>, OpenOptions)> {
+    ) -> io::Result<(
+        Option<<Self as FileSystem>::Handle>,
+        OpenOptions,
+        Option<u32>,
+    )> {
         async_relay!(
             self,
             ctx,
             [],
-            self.open(ctx, inode, flags, fuse_flags)
-                .map(|(handle, opts, _)| (handle, opts)),
-            move |fs: Arc<Self>, ctx: Context| {
-                fs.open(&ctx, inode, flags, fuse_flags)
-                    .map(|(handle, opts, _)| (handle, opts))
-            }
+            self.open(ctx, inode, flags, fuse_flags),
+            move |fs: Arc<Self>, ctx: Context| fs.open(&ctx, inode, flags, fuse_flags)
         )
     }
 
@@ -422,17 +427,18 @@ impl<S: BitmapSlice + Send + Sync + 'static> AsyncFileSystem for PassthroughFs<S
         parent: <Self as FileSystem>::Inode,
         name: &CStr,
         args: CreateIn,
-    ) -> io::Result<(Entry, Option<<Self as FileSystem>::Handle>, OpenOptions)> {
+    ) -> io::Result<(
+        Entry,
+        Option<<Self as FileSystem>::Handle>,
+        OpenOptions,
+        Option<u32>,
+    )> {
         async_relay!(
             self,
             ctx,
             [let name = name.to_owned();],
-            self.create(ctx, parent, name, args)
-                .map(|(entry, handle, opts, _)| (entry, handle, opts)),
-            move |fs: Arc<Self>, ctx: Context| {
-                fs.create(&ctx, parent, &name, args)
-                    .map(|(entry, handle, opts, _)| (entry, handle, opts))
-            }
+            self.create(ctx, parent, name, args),
+            move |fs: Arc<Self>, ctx: Context| fs.create(&ctx, parent, &name, args)
         )
     }
 
@@ -951,7 +957,7 @@ mod tests {
 
         async_runtime::block_on(async {
             let entry = fs.async_lookup(&ctx, ROOT_ID, &name).await.unwrap();
-            let (handle, _opts) = fs
+            let (handle, _opts, _) = fs
                 .async_open(&ctx, entry.inode, libc::O_RDONLY as u32, 0)
                 .await
                 .unwrap();
@@ -988,7 +994,7 @@ mod tests {
 
         async_runtime::block_on(async {
             let entry = fs.async_lookup(&ctx, ROOT_ID, &name).await.unwrap();
-            let (handle, _opts) = fs
+            let (handle, _opts, _) = fs
                 .async_open(&ctx, entry.inode, libc::O_RDONLY as u32, 0)
                 .await
                 .unwrap();
@@ -1023,7 +1029,7 @@ mod tests {
 
         async_runtime::block_on(async {
             let entry = fs.async_lookup(&ctx, ROOT_ID, &name).await.unwrap();
-            let (handle, _opts) = fs
+            let (handle, _opts, _) = fs
                 .async_open(&ctx, entry.inode, libc::O_RDONLY as u32, 0)
                 .await
                 .unwrap();
@@ -1061,7 +1067,7 @@ mod tests {
 
         async_runtime::block_on(async {
             let entry = fs.async_lookup(&ctx, ROOT_ID, &name).await.unwrap();
-            let (handle, _opts) = fs
+            let (handle, _opts, _) = fs
                 .async_open(&ctx, entry.inode, libc::O_RDONLY as u32, 0)
                 .await
                 .unwrap();
@@ -1098,7 +1104,7 @@ mod tests {
 
         async_runtime::block_on(async {
             let entry = fs.async_lookup(&ctx, ROOT_ID, &name).await.unwrap();
-            let (handle, _opts) = fs
+            let (handle, _opts, _) = fs
                 .async_open(&ctx, entry.inode, libc::O_RDONLY as u32, 0)
                 .await
                 .unwrap();
@@ -1140,7 +1146,7 @@ mod tests {
 
         async_runtime::block_on(async {
             let entry = fs.async_lookup(&ctx, ROOT_ID, &name).await.unwrap();
-            let (handle, _opts) = fs
+            let (handle, _opts, _) = fs
                 .async_open(&ctx, entry.inode, libc::O_RDONLY as u32, 0)
                 .await
                 .unwrap();
@@ -1179,7 +1185,8 @@ mod tests {
                 umask: 0,
                 fuse_flags: 0,
             };
-            let (entry, handle, _opts) = fs.async_create(&ctx, ROOT_ID, &name, args).await.unwrap();
+            let (entry, handle, _opts, _) =
+                fs.async_create(&ctx, ROOT_ID, &name, args).await.unwrap();
             let handle = handle.unwrap();
 
             let mut r = MemReader(b"async data".to_vec());
@@ -1276,7 +1283,8 @@ mod tests {
                 umask: 0,
                 fuse_flags: 0,
             };
-            let (entry, handle, _opts) = fs.async_create(&ctx, ROOT_ID, &name, args).await.unwrap();
+            let (entry, handle, _opts, _) =
+                fs.async_create(&ctx, ROOT_ID, &name, args).await.unwrap();
             let handle = handle.unwrap();
 
             // A direct-IO write: relayed to `write_direct()`, which stages
@@ -1335,7 +1343,7 @@ mod tests {
                 umask: 0,
                 fuse_flags: 0,
             };
-            let (killpriv_entry, killpriv_handle, _opts) = fs
+            let (killpriv_entry, killpriv_handle, _opts, _) = fs
                 .async_create(&ctx, ROOT_ID, &killpriv_name, args)
                 .await
                 .unwrap();
@@ -1374,7 +1382,7 @@ mod tests {
 
         async_runtime::block_on(async {
             let entry = fs.async_lookup(&ctx, ROOT_ID, &name).await.unwrap();
-            let (handle, _opts) = fs
+            let (handle, _opts, _) = fs
                 .async_open(&ctx, entry.inode, libc::O_RDWR as u32, 0)
                 .await
                 .unwrap();
@@ -1423,13 +1431,14 @@ mod tests {
                 umask: 0,
                 fuse_flags: 0,
             };
-            let (entry, handle, _opts) = fs.async_create(&ctx, ROOT_ID, &name, args).await.unwrap();
+            let (entry, handle, _opts, _) =
+                fs.async_create(&ctx, ROOT_ID, &name, args).await.unwrap();
             let handle = handle.unwrap();
             fs.async_fsync(&ctx, entry.inode, true, handle)
                 .await
                 .unwrap();
 
-            let (handle, _opts) = fs
+            let (handle, _opts, _) = fs
                 .async_open(&ctx, entry.inode, libc::O_RDWR as u32, 0)
                 .await
                 .unwrap();
@@ -1460,6 +1469,50 @@ mod tests {
             let entry = fs.async_lookup(&ctx, ROOT_ID, &name).await.unwrap();
             let (attr, _) = fs.async_getattr(&ctx, entry.inode, None).await.unwrap();
             assert_eq!(attr.st_size, 5);
+        });
+    }
+
+    // A file system shared with `into_shared()` keeps the backing files set
+    // before, and registers them on a pool thread.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn test_async_pool_kernel_passthrough() {
+        // `block_on()` polls its future on the test thread with both
+        // runtimes, so an OPEN on that thread didn't use the pool.
+        struct Files(std::thread::ThreadId);
+        impl BackingFiles for Files {
+            fn open(&self, _fd: BorrowedFd<'_>) -> io::Result<u32> {
+                assert_ne!(std::thread::current().id(), self.0, "OPEN ran inline");
+                Ok(1)
+            }
+            fn close(&self, _backing_id: u32) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let source = TempDir::new().expect("Cannot create temporary directory.");
+        std::fs::write(source.as_path().join("testfile"), b"hello").unwrap();
+        let cfg = Config {
+            root_dir: source.as_path().to_str().unwrap().to_string(),
+            do_import: false,
+            ..Default::default()
+        };
+        let mut fs = PassthroughFs::<()>::new(cfg).unwrap();
+        fs.set_backing_files(Arc::new(Files(std::thread::current().id())));
+        let fs = fs.into_shared();
+        fs.import().unwrap();
+        fs.init(FsOptions::PASSTHROUGH).unwrap();
+        fs.enable_async_thread_pool(true);
+        let ctx = prepare_context();
+        let name = CString::new("testfile").unwrap();
+
+        async_runtime::block_on(async {
+            let entry = fs.async_lookup(&ctx, ROOT_ID, &name).await.unwrap();
+            let (_, _, id) = fs
+                .async_open(&ctx, entry.inode, libc::O_RDONLY as u32, 0)
+                .await
+                .unwrap();
+            assert_eq!(id, Some(1));
         });
     }
 
