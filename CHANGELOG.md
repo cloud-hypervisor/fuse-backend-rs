@@ -31,6 +31,9 @@
   transport on `Error::UringNotSupported`.
 
 ### Changed
+- The FUSE-over-io_uring transport answers opcodes it doesn't know with ENOSYS instead of EIO.
+  Kernels that send `FUSE_STATX` only fall back to `FUSE_GETATTR` after ENOSYS, so `statx()`
+  calls that ask for more than the basic fields, like the birth time `stat(1)` shows, failed.
 - [254](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/254): `fuse-backend-rs` is now a thin facade re-exporting the sub-crates. Every
   historical `fuse_backend_rs::{abi, api, buffer, common, transport, passthrough,
   overlayfs}` import path and cargo feature name (`fusedev`, `virtiofs`,

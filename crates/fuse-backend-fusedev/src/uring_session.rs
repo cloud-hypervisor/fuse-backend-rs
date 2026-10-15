@@ -132,7 +132,7 @@ fn possible_cpu_count() -> Result<usize> {
 /// slot, for reassembling the classic wire layout. The kernel copies
 /// `in_args[0]` (the per-op header) into `op_in` and the remaining
 /// arguments into the payload area, so `Some(0)` means a known opcode
-/// without a fixed header; `None` marks opcodes the daemon cannot serve.
+/// without a fixed header; `None` marks opcodes this table doesn't know.
 fn in_args_len(opcode: u32) -> Option<usize> {
     let len = match opcode {
         1 => 0,        // LOOKUP: name only
@@ -177,8 +177,9 @@ fn in_args_len(opcode: u32) -> Option<usize> {
         46 => 24,      // LSEEK: LseekIn
         47 => 56,      // COPY_FILE_RANGE: CopyFileRangeIn
         // SETUPMAPPING/REMOVEMAPPING only exist on the virtiofs DAX window
-        // path and are never delivered through /dev/fuse, and opcodes 0, 7,
-        // 19 and beyond 49 are undefined or reserved.
+        // path and are never delivered through /dev/fuse, opcodes 0, 7 and
+        // 19 are undefined, and process() answers the rest, such as
+        // SYNCFS, TMPFILE and STATX, with ENOSYS.
         _ => return None,
     };
     Some(len)
@@ -529,10 +530,10 @@ impl UringEntry {
         sqe.user_data(user_data)
     }
 
-    /// Stage a `-EIO` error reply after a failed `process()`, so that the
-    /// subsequent `COMMIT_AND_FETCH` hands the client a proper error instead
-    /// of the request data still sitting in the entry areas.
-    fn stage_error_reply(&mut self) {
+    /// Stage a `-errno` error reply, so that the subsequent
+    /// `COMMIT_AND_FETCH` hands the client a proper error instead of the
+    /// request data still sitting in the entry areas.
+    fn stage_error_reply(&mut self, errno: i32) {
         let header = self.header_mut();
         let mut in_hdr = InHeader::default();
         in_hdr
@@ -540,7 +541,7 @@ impl UringEntry {
             .copy_from_slice(&header.in_out[..IN_HEADER_SIZE]);
         let out = OutHeader {
             len: OUT_HEADER_SIZE as u32,
-            error: -libc::EIO,
+            error: -errno,
             unique: in_hdr.unique,
         };
         header.in_out[..OUT_HEADER_SIZE].copy_from_slice(out.as_slice());
@@ -623,7 +624,7 @@ impl<F: FileSystem + Send + Sync + 'static> UringWorker<F> {
 
                 if let Err(e) = self.process(entry) {
                     warn!("uring worker: failed to handle request: {e}");
-                    entry.stage_error_reply();
+                    entry.stage_error_reply(libc::EIO);
                 }
 
                 let ent: FuseUringEntInOut = entry.header().ring_ent_in_out;
@@ -664,12 +665,13 @@ impl<F: FileSystem + Send + Sync + 'static> UringWorker<F> {
                 .copy_from_slice(&header.in_out[..IN_HEADER_SIZE]);
             hdr
         };
-        let args_len = in_args_len(in_header.opcode).ok_or_else(|| {
-            SessionFailure(format!(
-                "uring: unsupported opcode {} for queue {}",
-                in_header.opcode, entry.qid
-            ))
-        })?;
+        // Answer an opcode the table doesn't know with ENOSYS here, rather
+        // than dispatch it without its arguments. The kernel then stops
+        // sending it, as it does with FUSE_STATX.
+        let Some(args_len) = in_args_len(in_header.opcode) else {
+            entry.stage_error_reply(libc::ENOSYS);
+            return Ok(());
+        };
         let payload_sz = entry.header().ring_ent_in_out.payload_sz as usize;
         if args_len > FUSE_URING_IN_OUT_HEADER_SZ || payload_sz > entry.payload_cap {
             return Err(SessionFailure(format!(
@@ -1070,8 +1072,8 @@ mod tests {
         for &(op, len) in expected {
             assert_eq!(in_args_len(op), Some(len), "opcode {}", op);
         }
-        // Everything else (holes, virtiofs-only and undefined opcodes)
-        // must be rejected.
+        // Everything else (holes, virtiofs-only and newer opcodes) isn't in
+        // the table.
         for op in 0..=64u32 {
             if !expected.iter().any(|&(e, _)| e == op) {
                 assert_eq!(in_args_len(op), None, "opcode {}", op);
@@ -1342,15 +1344,27 @@ mod tests {
     }
 
     #[test]
-    fn test_process_rejects_invalid_requests() {
+    fn test_process_unknown_opcode_gets_enosys() {
+        /// The STATX opcode, which the transport's table doesn't know.
+        const FUSE_STATX: u32 = 52;
         let (worker, _source) = make_worker();
         let mut entry = UringEntry::new(0, worker.payload_cap);
 
-        // Undefined opcodes are rejected.
-        plant_request(&mut entry, 50, &[], &[]);
-        assert!(worker.process(&mut entry).is_err());
+        // The kernel only falls back to GETATTR after ENOSYS.
+        plant_request(&mut entry, FUSE_STATX, &[0u8; 24], &[]);
+        worker.process(&mut entry).unwrap();
+        assert_eq!(parse_out_header(&entry).error, -libc::ENOSYS);
+        assert_eq!(entry.header().ring_ent_in_out.payload_sz, 0);
+    }
 
-        // A payload larger than the registered area is rejected.
+    #[test]
+    fn test_stage_error_reply_after_rejected_request() {
+        let (worker, _source) = make_worker();
+        let mut entry = UringEntry::new(0, worker.payload_cap);
+
+        // Simulate the kernel delivering a request with a payload larger
+        // than the entry: process() fails, and the worker must commit a
+        // proper error reply rather than echoing the request data back.
         plant_request(
             &mut entry,
             Opcode::Getattr as u32,
@@ -1359,19 +1373,7 @@ mod tests {
         );
         entry.header_mut().ring_ent_in_out.payload_sz = (worker.payload_cap + 1) as u32;
         assert!(worker.process(&mut entry).is_err());
-    }
-
-    #[test]
-    fn test_stage_error_reply_after_rejected_request() {
-        let (worker, _source) = make_worker();
-        let mut entry = UringEntry::new(0, worker.payload_cap);
-
-        // Simulate the kernel delivering a request with an undefined
-        // opcode: process() fails, and the worker must commit a proper
-        // error reply rather than echoing the request data back.
-        plant_request(&mut entry, 50, &[], &[]);
-        assert!(worker.process(&mut entry).is_err());
-        entry.stage_error_reply();
+        entry.stage_error_reply(libc::EIO);
 
         let out = parse_out_header(&entry);
         assert_eq!(out.len, OUT_HEADER_SIZE as u32);
