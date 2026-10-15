@@ -24,6 +24,9 @@ log = "0.4.6"
 radix_trie = "0.2.1"
 vmm-sys-util = { workspace = true }
 
+[dev-dependencies]
+fuse-backend-passthrough = { path = "../fuse-backend-passthrough", version = "0.14.0" }
+
 [features]
 default = []
 async-io = ["fuse-backend-core/async-io"]

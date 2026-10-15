@@ -1446,8 +1446,14 @@ impl OverlayFs {
 
         for (index, (name, child)) in (0_u64..).zip(childrens) {
             if index >= offset {
+                // An error drops the reply, so once entries are in the
+                // buffer, return them instead.
+                let st = match child.stat64(ctx) {
+                    Ok(st) => st,
+                    Err(_) if len > 0 => return Ok(()),
+                    Err(e) => return Err(e),
+                };
                 // make struct DireEntry and Entry
-                let st = child.stat64(ctx)?;
                 let dir_entry = DirEntry {
                     ino: st.st_ino,
                     offset: index + 1,
@@ -1456,7 +1462,6 @@ impl OverlayFs {
                 };
 
                 let entry = if is_readdirplus {
-                    child.lookups.fetch_add(1, Ordering::Relaxed);
                     Some(Entry {
                         inode: child.inode,
                         generation: 0,
@@ -1471,6 +1476,13 @@ impl OverlayFs {
                 match add_entry(dir_entry, entry) {
                     Ok(0) => break,
                     Ok(l) => {
+                        // The kernel links each READDIRPLUS entry in the
+                        // reply and forgets it later, except "." and "..",
+                        // which it skips. The reply goes out after this
+                        // returns, so counting here can't race the forget.
+                        if is_readdirplus && name != CURRENT_DIR && name != PARENT_DIR {
+                            child.lookups.fetch_add(1, Ordering::Relaxed);
+                        }
                         len += l;
                         if len as u32 >= size {
                             // no more space, stop here
@@ -2806,6 +2818,8 @@ impl BackendFileSystem for OverlayFs {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fuse_backend_core::api::filesystem::FileSystem;
+    use vmm_sys_util::tempdir::TempDir;
 
     fn stat_with(mode: u32, nlink: u64) -> stat64 {
         // Safe: an all-zero stat64 is a valid stat of a hidden file.
@@ -2829,5 +2843,107 @@ mod tests {
 
         // Symlinks can be hard linked too.
         assert!(is_multi_link_file(stat_with(libc::S_IFLNK | 0o777, 2)));
+    }
+
+    /// An overlay of an empty upper layer over a lower layer with a
+    /// directory "d" of four files.
+    fn readdirplus_fs() -> (OverlayFs, TempDir, TempDir) {
+        use fuse_backend_passthrough::{Config as PassthroughConfig, PassthroughFs};
+
+        let lower = TempDir::new().unwrap();
+        let upper = TempDir::new().unwrap();
+        let dir = lower.as_path().join("d");
+        std::fs::create_dir(&dir).unwrap();
+        for i in 0..4 {
+            std::fs::File::create(dir.join(format!("f{}", i))).unwrap();
+        }
+        let layer = |root: &TempDir| -> Arc<BoxedLayer> {
+            let fs = PassthroughFs::<()>::new(PassthroughConfig {
+                root_dir: root.as_path().to_str().unwrap().to_string(),
+                xattr: true,
+                ..Default::default()
+            })
+            .unwrap();
+            fs.import().unwrap();
+            Arc::new(Box::new(fs))
+        };
+        let fs = OverlayFs::new(
+            Some(layer(&upper)),
+            vec![layer(&lower)],
+            Config {
+                do_import: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        fs.import().unwrap();
+        (fs, lower, upper)
+    }
+
+    /// The lookup counts of the root, of `dir` and of its children.
+    fn lookup_counts(fs: &OverlayFs, dir: Inode) -> Vec<(String, u64)> {
+        let node = fs.get_all_inode(dir).unwrap();
+        let mut counts = vec![
+            (
+                "/".to_string(),
+                fs.root_node().lookups.load(Ordering::Relaxed),
+            ),
+            (".".to_string(), node.lookups.load(Ordering::Relaxed)),
+        ];
+        for (name, child) in node.childrens.lock().unwrap().iter() {
+            counts.push((name.clone(), child.lookups.load(Ordering::Relaxed)));
+        }
+        counts.sort();
+        counts
+    }
+
+    // READDIRPLUS takes a lookup of each entry it delivers, which the kernel
+    // forgets later. It takes none of "." and "..", which the kernel never
+    // forgets, and none of an entry that doesn't make it into the reply.
+    #[test]
+    fn test_readdirplus_lookups() {
+        let (fs, _lower, _upper) = readdirplus_fs();
+        let ctx = Context::default();
+        let name = CString::new("d").unwrap();
+        let dir = fs.lookup(&ctx, FUSE_ROOT_ID, &name).unwrap().inode;
+        let handle = fs.opendir(&ctx, dir, 0).unwrap().0.unwrap();
+        let before = lookup_counts(&fs, dir);
+        let is_dot = |name: &[u8]| name == b"." || name == b"..";
+
+        // The buffer fills up on the first entry after the dots.
+        fs.readdirplus(&ctx, dir, handle, 8192, 0, &mut |e, _| {
+            Ok(if is_dot(e.name) { 1 } else { 0 })
+        })
+        .unwrap();
+        assert_eq!(lookup_counts(&fs, dir), before);
+
+        // The callback fails on the first entry after the dots.
+        let err = fs
+            .readdirplus(&ctx, dir, handle, 8192, 2, &mut |_, _| {
+                Err(Error::from_raw_os_error(libc::EIO))
+            })
+            .unwrap_err();
+        assert_eq!(err.raw_os_error(), Some(libc::EIO));
+        assert_eq!(lookup_counts(&fs, dir), before);
+
+        // A full listing takes one lookup of each child, and none of the
+        // dots.
+        let mut delivered = 0;
+        fs.readdirplus(&ctx, dir, handle, 8192, 0, &mut |e, _| {
+            delivered += 1;
+            Ok(e.name.len())
+        })
+        .unwrap();
+        assert_eq!(delivered, 6);
+        let expected: Vec<_> = before
+            .iter()
+            .map(|(name, n)| match name.as_str() {
+                "/" | "." => (name.clone(), *n),
+                _ => (name.clone(), n + 1),
+            })
+            .collect();
+        assert_eq!(lookup_counts(&fs, dir), expected);
+
+        fs.releasedir(&ctx, dir, 0, handle).unwrap();
     }
 }
