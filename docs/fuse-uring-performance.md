@@ -116,24 +116,59 @@ This optimization will eliminate cross-core wakeup latency for sequential I/O.
 
 This will eliminate the workqueue deferral overhead.
 
+## Buffer pools
+
+Before Linux 7.3, every ring entry registers a payload buffer of the
+connection's maximum payload size, 1 MiB with the default INIT reply. With
+16 entries per queue on a machine with 24 possible CPUs, that is 384
+buffers, and a workload that keeps many requests in flight on every CPU
+touches all of them.
+
+On Linux 7.3 and later, `UringFuseServing` gives each queue a pool of
+`UringConfig::bufs_per_queue` buffers with `FUSE_IO_URING_CMD_ADD_QUEUE`
+and `FUSE_IO_URING_CMD_ADD_BUFPOOL` before any entry registers. The kernel
+lends a buffer to an entry while it serves a request that has a payload or
+a reply body, and reports the buffer's offset in the entry header. A
+request waits in the kernel while all buffers of its queue are busy. A
+kernel before 7.3 doesn't offer buffer pools at INIT, and its entries keep
+a buffer each. If the kernel offered them and a command fails, the mount
+fails.
+
+Memory and throughput of the benchmark daemon with `--uring`, 4 workers
+and 16 entries per queue, on a 24-CPU machine with Linux 7.3-rc7. The
+workload is random 1 MiB direct reads with libaio at depth 16, from one
+fio job pinned to each CPU, for 8 seconds. The two settings alternated
+three times:
+
+| Buffers per queue | VmSize | VmRSS after | Read throughput |
+|-------------------|--------|-------------|-----------------|
+| own per entry | 1492 MiB | 393 MiB | 1518-1728 MiB/s |
+| 4 | 431 MiB | 106 MiB | 1588-1709 MiB/s |
+
+VmSize also counts the request and reply scratch areas of each entry,
+which are as large as its own payload buffer, so a pooled entry saves
+those too. Random 4 KiB reads in the same setup ran at 44.5k to 46.8k
+IOPS with and without pools. VmRSS counts only the pages that requests
+touched, so workloads with fewer requests in flight use far less memory
+than this.
+
 ## Implementation Notes
 
 ### Current State
 
-This implementation targets the stable FUSE_URING protocol 7.42 (kernel 6.14+):
+This implementation targets the stable FUSE_URING protocol 7.42 (kernel 6.14+),
+and uses the buffer pools of protocol 7.46 (kernel 7.3) when the kernel has them:
 
 - Scatter Reader/Writer eliminates all userspace memcpy
 - Per-CPU queue model with configurable entries_per_queue
+- Buffer pools with configurable bufs_per_queue, see "Buffer pools" above
 - Fallback to classic `/dev/fuse` for notifications/interrupts
 
 ### Future Work
 
 When Linux 7.3+ is available on target systems:
 
-1. **Buffer pool registration**: Reduce memory overhead by sharing a contiguous
-   pool across requests instead of per-entry buffers.
-
-2. **Zero-copy mode**: Enable direct page access (requires CAP_SYS_ADMIN) to
+1. **Zero-copy mode**: Enable direct page access (requires CAP_SYS_ADMIN) to
    eliminate kernel-side copies entirely.
 
 ### Tuning Recommendations
@@ -141,6 +176,10 @@ When Linux 7.3+ is available on target systems:
 - `entries_per_queue`: Default is 4. Increasing to 16+ does not help
   sequential I/O (bottleneck is elsewhere), but may help high-concurrency
   metadata workloads.
+
+- `bufs_per_queue`: Default is 4. On Linux 7.3 and later it caps the
+  requests with a payload or reply body that one queue serves at once, and
+  with it the memory of the payload buffers.
 
 - Thread count: The per-CPU queue model means optimal performance when
   worker threads match available CPU cores.

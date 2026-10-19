@@ -29,6 +29,12 @@
   FUSE-over-io_uring transport (kernel 6.14+). Both join the `FuseServing` interface, so a daemon
   can pick its transport at runtime behind `Box<dyn FuseServing>` and fall back to the classic
   transport on `Error::UringNotSupported`.
+- On Linux 7.3 and later, `UringFuseServing` gives each kernel queue a buffer pool of
+  `UringConfig::bufs_per_queue` payload buffers. The kernel lends them to the queue's ring entries
+  while they serve a request, so with fewer buffers than entries a mount needs less memory.
+  `bufs_per_queue` defaults to 4, the default number of entries, and counts as at most
+  `entries_per_queue`. 0 keeps a buffer per entry, as on older kernels. `UringConfig` has a new
+  field, so struct literals need `..Default::default()`.
 - `abi::fuse_uring` has the commands, INIT flag and fields of protocol 7.46 for buffer pools.
   `Server::uring_bufpool_supported()` tells whether the kernel offered them at INIT, and
   `Server::uring_payload_size()` returns the size of the kernel's payload buffers.
