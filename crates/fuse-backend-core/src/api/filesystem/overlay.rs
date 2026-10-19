@@ -149,7 +149,16 @@ pub trait Layer: FileSystem {
                 }
                 Err(e) => {
                     if let Some(raw_error) = e.raw_os_error() {
-                        if raw_error == libc::ENODATA {
+                        // ENODATA means the xattr is absent. EOPNOTSUPP and
+                        // ENOSYS mean the filesystem has no xattr support at
+                        // all: tmpfs answers EOPNOTSUPP to user.* xattrs
+                        // before Linux 6.12 and a layer with xattr support
+                        // disabled answers ENOSYS. Such a filesystem can
+                        // never hold an opaque xattr, so treat all of them
+                        // as not opaque instead of failing. (ENOTSUP is not
+                        // listed: it is the same errno as EOPNOTSUPP on
+                        // Linux.)
+                        if matches!(raw_error, libc::ENODATA | libc::EOPNOTSUPP | libc::ENOSYS) {
                             return Ok(false);
                         }
                     }
@@ -202,4 +211,120 @@ pub(crate) fn is_whiteout(st: stat64) -> bool {
 
 pub(crate) fn to_cstring(name: &str) -> Result<CString> {
     CString::new(name).map_err(|e| Error::new(ErrorKind::InvalidData, e))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    // Test double for a Layer: getattr reports a file of <mode> and getxattr
+    // answers from a closure, so is_opaque()'s handling of the getxattr
+    // errnos can be checked without any backing filesystem.
+    struct MockLayer<F: Fn(&CStr) -> Result<GetxattrReply>> {
+        mode: u32,
+        getxattr: F,
+    }
+
+    impl<F: Fn(&CStr) -> Result<GetxattrReply>> FileSystem for MockLayer<F> {
+        type Inode = u64;
+        type Handle = u64;
+
+        fn getattr(
+            &self,
+            _ctx: &Context,
+            _inode: Self::Inode,
+            _handle: Option<Self::Handle>,
+        ) -> Result<(stat64, Duration)> {
+            // Safe: an all-zero stat64 is a valid stat of a hidden file.
+            let mut st: stat64 = unsafe { std::mem::zeroed() };
+            st.st_mode = self.mode;
+            Ok((st, Duration::ZERO))
+        }
+
+        fn getxattr(
+            &self,
+            _ctx: &Context,
+            _inode: Self::Inode,
+            name: &CStr,
+            _size: u32,
+        ) -> Result<GetxattrReply> {
+            (self.getxattr)(name)
+        }
+    }
+
+    impl<F: Fn(&CStr) -> Result<GetxattrReply>> Layer for MockLayer<F> {
+        fn root_inode(&self) -> Self::Inode {
+            1
+        }
+    }
+
+    fn is_opaque_with(
+        mode: u32,
+        getxattr: impl Fn(&CStr) -> Result<GetxattrReply>,
+    ) -> Result<bool> {
+        MockLayer { mode, getxattr }.is_opaque(&Context::default(), 1)
+    }
+
+    // ENODATA means the xattr is absent. EOPNOTSUPP/ENOTSUP and ENOSYS mean
+    // the filesystem has no xattr support at all: tmpfs answers EOPNOTSUPP
+    // to user.* xattrs before Linux 6.12, and a layer with xattr support
+    // disabled answers ENOSYS. Such a filesystem can never be opaque.
+    #[test]
+    fn test_is_opaque_xattr_unsupported() {
+        for errno in [libc::ENODATA, libc::EOPNOTSUPP, libc::ENOTSUP, libc::ENOSYS] {
+            let opaque =
+                is_opaque_with(libc::S_IFDIR, |_| Err(Error::from_raw_os_error(errno))).unwrap();
+            assert!(!opaque, "errno {} must mean not opaque", errno);
+        }
+    }
+
+    // Any of the three opaque xattrs set to "y" marks the directory opaque.
+    #[test]
+    fn test_is_opaque_with_xattr_set() {
+        for name in [
+            OPAQUE_XATTR,
+            PRIVILEGED_OPAQUE_XATTR,
+            UNPRIVILEGED_OPAQUE_XATTR,
+        ] {
+            let cname = CString::new(name).unwrap();
+            let opaque = is_opaque_with(libc::S_IFDIR, move |probe| {
+                if probe == cname.as_c_str() {
+                    Ok(GetxattrReply::Value(b"y".to_vec()))
+                } else {
+                    Err(Error::from_raw_os_error(libc::ENODATA))
+                }
+            })
+            .unwrap();
+            assert!(opaque, "{} must mean opaque", name);
+        }
+    }
+
+    // An xattr holding anything other than "y" does not make it opaque.
+    #[test]
+    fn test_is_opaque_with_other_value() {
+        let opaque =
+            is_opaque_with(libc::S_IFDIR, |_| Ok(GetxattrReply::Value(b"n".to_vec()))).unwrap();
+        assert!(!opaque);
+    }
+
+    // Errors other than the absent/unsupported ones still fail the check.
+    #[test]
+    fn test_is_opaque_propagates_other_errors() {
+        let e = is_opaque_with(libc::S_IFDIR, |_| {
+            Err(Error::from_raw_os_error(libc::EPERM))
+        })
+        .unwrap_err();
+        assert_eq!(e.raw_os_error(), Some(libc::EPERM));
+    }
+
+    // Only a directory can be checked for opacity.
+    #[test]
+    fn test_is_opaque_rejects_non_directory() {
+        let e = is_opaque_with(libc::S_IFREG, |_| {
+            Err(Error::from_raw_os_error(libc::ENODATA))
+        })
+        .unwrap_err();
+        assert_eq!(e.raw_os_error(), Some(libc::ENOTDIR));
+    }
 }

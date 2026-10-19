@@ -66,6 +66,13 @@
   writers for equality was never meaningful (they wrap a mutable reply buffer)
   and no code in the workspace relied on it.
 
+### Fixed
+- [278](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/278): Treat `EOPNOTSUPP`/`ENOTSUP` and `ENOSYS` from `getxattr` as "not opaque"
+  in `Layer::is_opaque()`, so `OverlayFs::import()` no longer aborts when a layer's
+  backing filesystem has no xattr support at all (tmpfs answers `EOPNOTSUPP` to
+  `user.*` xattrs before Linux 6.12, and a `PassthroughFs` layer with `xattr`
+  disabled answers `ENOSYS`).
+
 ### Removed
 - [254](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/254): Drop the vestigial `vhost` and `virtio-bindings` dependencies that the
   pre-split `vhost-user-fs` build carried but never referenced; `vhost-user-fs`
