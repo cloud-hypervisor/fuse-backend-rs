@@ -572,18 +572,17 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
         let file = self.open_inode(inode, flags as i32)?;
         drop(killpriv);
 
-        let data = HandleData::new(inode, file, flags);
         // Only regular files pass through, `opendir` also gets here.
-        #[cfg(target_os = "linux")]
         let backing_id = if flags & (libc::O_DIRECTORY as u32) == 0 {
-            self.acquire_backing_id(inode, &data.file)?
+            self.acquire_backing_id(inode, &file)
         } else {
             None
         };
-        #[cfg(not(target_os = "linux"))]
-        let backing_id = None;
         let handle = self.next_handle.fetch_add(1, Ordering::Relaxed);
-        self.handle_map.insert(handle, data);
+        self.handle_map.insert(
+            handle,
+            HandleData::new(inode, file, flags, backing_id.is_some()),
+        );
 
         let mut opts = OpenOptions::empty();
         // If the client requested O_DIRECT and we honor it, `open_inode()`
@@ -682,7 +681,7 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
             self.handle_map.get(handle, inode)
         } else {
             let file = self.open_inode(inode, flags | libc::O_DIRECTORY)?;
-            Ok(Arc::new(HandleData::new(inode, file, flags as u32)))
+            Ok(Arc::new(HandleData::new(inode, file, flags as u32, false)))
         }
     }
 
@@ -797,7 +796,7 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
             self.handle_map.get(handle, inode)
         } else {
             let file = self.open_inode(inode, flags)?;
-            Ok(Arc::new(HandleData::new(inode, file, flags as u32)))
+            Ok(Arc::new(HandleData::new(inode, file, flags as u32, false)))
         }
     }
 }
@@ -1155,24 +1154,14 @@ impl<S: BitmapSlice + Send + Sync> FileSystem for PassthroughFs<S> {
             }
         };
 
-        #[allow(unused_mut)]
         let mut backing_id = None;
         let ret_handle = if !self.no_open.load(Ordering::Relaxed) {
-            let data = HandleData::new(entry.inode, file, args.flags);
-            #[cfg(target_os = "linux")]
-            {
-                backing_id = match self.acquire_backing_id(entry.inode, &data.file) {
-                    Ok(id) => id,
-                    Err(e) => {
-                        // Drop the lookup count of the entry that the kernel won't get.
-                        let mut inodes = self.inode_map.get_map_mut();
-                        self.forget_one(&mut inodes, entry.inode, 1);
-                        return Err(e);
-                    }
-                };
-            }
+            backing_id = self.acquire_backing_id(entry.inode, &file);
             let handle = self.next_handle.fetch_add(1, Ordering::Relaxed);
-            self.handle_map.insert(handle, data);
+            self.handle_map.insert(
+                handle,
+                HandleData::new(entry.inode, file, args.flags, backing_id.is_some()),
+            );
             Some(handle)
         } else {
             None
