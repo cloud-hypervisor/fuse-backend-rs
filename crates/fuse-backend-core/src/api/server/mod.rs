@@ -21,6 +21,8 @@ use std::io::{self, Read};
 use std::marker::PhantomData;
 use std::mem::size_of;
 use std::sync::atomic::AtomicU64;
+#[cfg(all(target_os = "linux", feature = "fusedev-uring"))]
+use std::sync::atomic::{AtomicBool, AtomicU32};
 
 use crate::abi::fuse_abi::*;
 use crate::api::filesystem::{Context, FileSystem, ZeroCopyReader, ZeroCopyWriter};
@@ -65,6 +67,15 @@ pub struct Server<F: FileSystem + Sync> {
     /// Capability flags actually enabled by the INIT exchange.
     #[cfg(all(target_os = "linux", feature = "fusedev-uring"))]
     negotiated_init_flags: AtomicU64,
+    /// Whether the kernel offered io_uring buffer pools in INIT.
+    #[cfg(all(target_os = "linux", feature = "fusedev-uring"))]
+    uring_bufpool: AtomicBool,
+    /// `max_write` of the INIT reply.
+    #[cfg(all(target_os = "linux", feature = "fusedev-uring"))]
+    init_max_write: AtomicU32,
+    /// `max_pages` of the INIT reply, 0 if it doesn't set `FUSE_MAX_PAGES`.
+    #[cfg(all(target_os = "linux", feature = "fusedev-uring"))]
+    init_max_pages: AtomicU32,
 }
 
 impl<F: FileSystem + Sync> Server<F> {
@@ -78,6 +89,12 @@ impl<F: FileSystem + Sync> Server<F> {
             extra_init_flags: AtomicU64::new(0),
             #[cfg(all(target_os = "linux", feature = "fusedev-uring"))]
             negotiated_init_flags: AtomicU64::new(0),
+            #[cfg(all(target_os = "linux", feature = "fusedev-uring"))]
+            uring_bufpool: AtomicBool::new(false),
+            #[cfg(all(target_os = "linux", feature = "fusedev-uring"))]
+            init_max_write: AtomicU32::new(0),
+            #[cfg(all(target_os = "linux", feature = "fusedev-uring"))]
+            init_max_pages: AtomicU32::new(0),
         }
     }
 
@@ -102,6 +119,51 @@ impl<F: FileSystem + Sync> Server<F> {
     #[cfg(all(target_os = "linux", feature = "fusedev-uring"))]
     pub fn uring_enabled(&self) -> bool {
         self.negotiated_init_flags.load(Ordering::Acquire) & FsOptions::OVER_IO_URING.bits() != 0
+    }
+
+    /// Report whether the kernel offered buffer pools for FUSE-over-io_uring
+    /// in INIT (`FUSE_HAS_IO_URING_BUFPOOL`, Linux 7.3). Returns false before
+    /// INIT completes.
+    #[cfg(all(target_os = "linux", feature = "fusedev-uring"))]
+    pub fn uring_bufpool_supported(&self) -> bool {
+        self.uring_bufpool.load(Ordering::Acquire)
+    }
+
+    /// The size of the payload buffer the kernel needs for one
+    /// FUSE-over-io_uring request on this connection, and the size of each
+    /// buffer it cuts from a buffer pool. It follows `fuse_uring_create()`:
+    /// the largest of `FUSE_MIN_READ_BUFFER`, `max_write` and `max_pages`
+    /// pages. The kernel can lower `max_pages` to its `max_pages_limit`
+    /// sysctl, but the INIT reply sets `max_write` to at least `max_pages`
+    /// pages, so that doesn't change the size. Meaningful only after INIT.
+    #[cfg(all(target_os = "linux", feature = "fusedev-uring"))]
+    pub fn uring_payload_size(&self) -> usize {
+        // The defaults of process_init_reply() and fuse_conn_init().
+        const MIN_MAX_WRITE: usize = 4096;
+        const DEFAULT_MAX_PAGES: usize = 32;
+        let max_write = self.init_max_write.load(Ordering::Acquire) as usize;
+        let max_pages = match self.init_max_pages.load(Ordering::Acquire) as usize {
+            0 => DEFAULT_MAX_PAGES,
+            n => n,
+        };
+        (MIN_READ_BUFFER as usize)
+            .max(max_write.max(MIN_MAX_WRITE))
+            .max(max_pages * crate::buffer::pagesize())
+    }
+
+    /// Remember what FUSE-over-io_uring needs from INIT: whether the kernel
+    /// offered buffer pools in `kernel_flags`, and the `max_write` and
+    /// `max_pages` of the reply.
+    #[cfg(all(target_os = "linux", feature = "fusedev-uring"))]
+    fn record_uring_init(&self, kernel_flags: u64, max_write: u32, max_pages: u16) {
+        use crate::abi::fuse_uring::FUSE_HAS_IO_URING_BUFPOOL;
+        self.uring_bufpool.store(
+            kernel_flags & FUSE_HAS_IO_URING_BUFPOOL != 0,
+            Ordering::Release,
+        );
+        self.init_max_write.store(max_write, Ordering::Release);
+        self.init_max_pages
+            .store(u32::from(max_pages), Ordering::Release);
     }
 
     /// OR the extra INIT flags requested through `set_uring()` into the

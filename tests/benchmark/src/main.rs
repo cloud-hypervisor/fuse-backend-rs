@@ -6,7 +6,7 @@
 //! A minimal fusedev passthrough daemon used to benchmark the synchronous
 //! and asynchronous IO paths with external tools such as fio.
 //!
-//! Usage: `fuse-backend-rs-benchmark <src> <mountpoint> [--async|--uring] [--threads N] [--sync-blocking]`
+//! Usage: `fuse-backend-rs-benchmark <src> <mountpoint> [--async|--uring] [--threads N] [--sync-blocking] [--uring-bufs N]`
 //!
 //! - default (sync) mode: requests are served by `N` worker threads of the
 //!   `SyncFuseServing` serving layer, each reading from its own fuse channel
@@ -18,7 +18,10 @@
 //!   `/dev/fuse` file description.
 //! - `--uring` mode: requests are served through the FUSE-over-io_uring
 //!   transport (`UringFuseServing`, experimental, requires kernel 6.14+);
-//!   `N` limits the number of io_uring worker threads.
+//!   `N` limits the number of io_uring worker threads. `--uring-bufs N`
+//!   sets `UringConfig::bufs_per_queue`, the number of buffers in each
+//!   queue's buffer pool on kernels with buffer pools. `0` gives every ring
+//!   entry a buffer of its own.
 
 #[cfg(target_os = "linux")]
 mod daemon {
@@ -47,11 +50,12 @@ mod daemon {
         as_uring: bool,
         sync_blocking: bool,
         thread_cnt: u32,
+        uring_bufs: usize,
     }
 
     fn help() {
         println!(
-            "Usage:\n   fuse-backend-rs-benchmark <src> <mountpoint> [--async|--uring] [--threads N] [--sync-blocking]\n"
+            "Usage:\n   fuse-backend-rs-benchmark <src> <mountpoint> [--async|--uring] [--threads N] [--sync-blocking] [--uring-bufs N]\n"
         );
     }
 
@@ -68,6 +72,7 @@ mod daemon {
             as_uring: false,
             sync_blocking: false,
             thread_cnt: 4,
+            uring_bufs: UringConfig::default().bufs_per_queue,
         };
         let mut idx = 3;
         while idx < args.len() {
@@ -85,6 +90,14 @@ mod daemon {
                         help();
                         Error::from_raw_os_error(libc::EINVAL)
                     })?;
+                }
+                "--uring-bufs" => {
+                    idx += 1;
+                    res.uring_bufs =
+                        args.get(idx).and_then(|v| v.parse().ok()).ok_or_else(|| {
+                            help();
+                            Error::from_raw_os_error(libc::EINVAL)
+                        })?;
                 }
                 _ => {
                     help();
@@ -176,13 +189,19 @@ mod daemon {
     /// termination signal is received. Requires kernel 6.14+ with the
     /// fuse module parameter enable_uring turned on; `UringFuseServing::new()`
     /// fails otherwise.
-    fn run_uring(server: Arc<Server<Arc<Vfs>>>, se: FuseSession, thread_cnt: u32) {
+    fn run_uring(
+        server: Arc<Server<Arc<Vfs>>>,
+        se: FuseSession,
+        thread_cnt: u32,
+        bufs_per_queue: usize,
+    ) {
         // set_uring() must be called before the INIT handshake, which
         // UringFuseServing::new() performs on the mounted session.
         server.set_uring(true);
         let cfg = UringConfig {
             workers: thread_cnt as usize,
             entries_per_queue: 16,
+            bufs_per_queue,
         };
         let serving = match UringFuseServing::new(se, server, cfg) {
             Ok(serving) => serving,
@@ -243,7 +262,7 @@ mod daemon {
         se.mount().unwrap();
 
         if args.as_uring {
-            run_uring(server, se, args.thread_cnt);
+            run_uring(server, se, args.thread_cnt, args.uring_bufs);
         } else if args.as_async {
             run_async(server, se, args.thread_cnt);
         } else {
