@@ -572,6 +572,7 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
         let file = self.open_inode(inode, flags as i32)?;
         drop(killpriv);
 
+        let zero_copy = self.zero_copy_option(flags);
         let data = HandleData::new(inode, file, flags);
         let handle = self.next_handle.fetch_add(1, Ordering::Relaxed);
         self.handle_map.insert(handle, data);
@@ -609,8 +610,24 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
             }
             _ => {}
         };
+        opts |= zero_copy;
 
         Ok((Some(handle), opts, None))
+    }
+
+    /// The option that asks for FUSE-over-io_uring zero-copy on a file opened
+    /// with `flags`, if the config wants it. Reads and writes of a backing
+    /// file opened with O_DIRECT go through an aligned bounce buffer, so
+    /// zero-copy data would take a slower copy through memory.
+    fn zero_copy_option(&self, flags: u32) -> OpenOptions {
+        #[cfg(target_os = "linux")]
+        if self.cfg.uring_zero_copy
+            && flags & (libc::O_DIRECTORY as u32) == 0
+            && !(self.cfg.allow_direct_io && flags & (libc::O_DIRECT as u32) != 0)
+        {
+            return OpenOptions::IO_URING_ZERO_COPY;
+        }
+        OpenOptions::empty()
     }
 
     fn do_getattr(
@@ -1002,6 +1019,7 @@ impl<S: BitmapSlice + Send + Sync> FileSystem for PassthroughFs<S> {
             }
         };
 
+        let zero_copy = self.zero_copy_option(args.flags);
         let ret_handle = if !self.no_open.load(Ordering::Relaxed) {
             let handle = self.next_handle.fetch_add(1, Ordering::Relaxed);
             let data = HandleData::new(entry.inode, file, args.flags);
@@ -1019,6 +1037,7 @@ impl<S: BitmapSlice + Send + Sync> FileSystem for PassthroughFs<S> {
             CachePolicy::Always => opts |= OpenOptions::KEEP_CACHE,
             _ => {}
         };
+        opts |= zero_copy;
 
         Ok((entry, ret_handle, opts, None))
     }

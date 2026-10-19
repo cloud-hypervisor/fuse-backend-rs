@@ -116,31 +116,114 @@ This optimization will eliminate cross-core wakeup latency for sequential I/O.
 
 This will eliminate the workqueue deferral overhead.
 
+## Buffer pools
+
+Before Linux 7.3, every ring entry registers a payload buffer of the
+connection's maximum payload size, 1 MiB with the default INIT reply. With
+16 entries per queue on a machine with 24 possible CPUs, that is 384
+buffers, and a workload that keeps many requests in flight on every CPU
+touches all of them.
+
+On Linux 7.3 and later, `UringFuseServing` gives each queue a pool of
+`UringConfig::bufs_per_queue` buffers with `FUSE_IO_URING_CMD_ADD_QUEUE`
+and `FUSE_IO_URING_CMD_ADD_BUFPOOL` before any entry registers. The kernel
+lends a buffer to an entry while it serves a request that has a payload or
+a reply body, and reports the buffer's offset in the entry header. A
+request waits in the kernel while all buffers of its queue are busy. A
+kernel before 7.3 doesn't offer buffer pools at INIT, and its entries keep
+a buffer each. If the kernel offered them and a command fails, the mount
+fails.
+
+Memory and throughput of the benchmark daemon with `--uring`, 4 workers
+and 16 entries per queue, on a 24-CPU machine with Linux 7.3-rc7. The
+workload is random 1 MiB direct reads with libaio at depth 16, from one
+fio job pinned to each CPU, for 8 seconds. The two settings alternated
+three times:
+
+| Buffers per queue | VmSize | VmRSS after | Read throughput |
+|-------------------|--------|-------------|-----------------|
+| own per entry | 1492 MiB | 393 MiB | 1518-1728 MiB/s |
+| 4 | 431 MiB | 106 MiB | 1588-1709 MiB/s |
+
+VmSize also counts the request and reply scratch areas of each entry,
+which are as large as its own payload buffer, so a pooled entry saves
+those too. Random 4 KiB reads in the same setup ran at 44.5k to 46.8k
+IOPS with and without pools. VmRSS counts only the pages that requests
+touched, so workloads with fewer requests in flight use far less memory
+than this.
+
+## Zero-copy
+
+On Linux 7.3 and later, a queue with a buffer pool can also serve reads
+and writes with zero-copy. The kernel then registers the client's pages
+of a READ or WRITE in the server's io_uring buffer table instead of
+copying them into a payload buffer, and the server moves the data
+between those pages and a file with `IORING_OP_READ_FIXED` and
+`IORING_OP_WRITE_FIXED`. It needs CAP_SYS_ADMIN, and the file system
+asks for it per open with `OpenOptions::IO_URING_ZERO_COPY`.
+
+With `UringConfig::zero_copy`, `UringFuseServing` adds the queues with
+`FUSE_URING_ZERO_COPY` and gives each worker ring an empty buffer table
+with a slot per entry. A zero-copy READ gets a reply body that only the
+transport can fill, and `write_from()` runs `READ_FIXED` from the file
+into the slot. A zero-copy WRITE gets a `Reader` whose data only the
+transport can move, and `read_to()` runs `WRITE_FIXED` from the slot
+into the file. Both run on the worker's ring and wait for the result
+there, because the kernel registered the pages in that ring's table. If the
+kernel refuses zero-copy, `UringFuseServing` adds the queues without it.
+
+A file system that reads or writes zero-copy data through memory, or
+with a file that has no descriptor, still works, but slower. The worker
+then copies the data through a memory file that it keeps mapped. It runs
+`WRITE_FIXED` from the client pages into the file and hands over the
+mapped bytes, or fills the mapping and runs `READ_FIXED` from the file
+into the client pages.
+
+The table shows the throughput of the benchmark daemon with `--uring
+--no-backing-direct-io`, 4 workers and 16 entries per queue, on a 24-CPU
+machine with Linux 7.3-rc7, serving 4 files of 1 GiB from a tmpfs as
+root. fio ran direct random IO with libaio, 4 jobs at depth 16, for 8
+seconds, and the two settings alternated three times:
+
+| Workload | Copy | Zero-copy |
+|----------|------|-----------|
+| 1 MiB reads | 9966-10651 MiB/s | 13896-15202 MiB/s |
+| 1 MiB writes | 8164-9070 MiB/s | 12299-12883 MiB/s |
+| 128 KiB reads | 15579-17626 MiB/s | 15565-17028 MiB/s |
+| 128 KiB writes | 12700-14037 MiB/s | 11911-13249 MiB/s |
+
+Zero-copy saves the copy of the payload, which matters for large
+requests. At 128 KiB the two runs overlap.
+
 ## Implementation Notes
 
 ### Current State
 
-This implementation targets the stable FUSE_URING protocol 7.42 (kernel 6.14+):
+This implementation targets the stable FUSE_URING protocol 7.42 (kernel 6.14+),
+and uses the buffer pools of protocol 7.46 (kernel 7.3) when the kernel has them:
 
 - Scatter Reader/Writer eliminates all userspace memcpy
 - Per-CPU queue model with configurable entries_per_queue
+- Buffer pools with configurable bufs_per_queue, see "Buffer pools" above
+- Zero-copy for opens that ask for it, see "Zero-copy" above
 - Fallback to classic `/dev/fuse` for notifications/interrupts
 
 ### Future Work
 
-When Linux 7.3+ is available on target systems:
-
-1. **Buffer pool registration**: Reduce memory overhead by sharing a contiguous
-   pool across requests instead of per-entry buffers.
-
-2. **Zero-copy mode**: Enable direct page access (requires CAP_SYS_ADMIN) to
-   eliminate kernel-side copies entirely.
+1. **Async zero-copy**: `ZeroCopySource` and the zero-copy reply wait
+   synchronously on the worker's ring, which suits the synchronous
+   handlers. Serving `AsyncFileSystem` handlers over io_uring needs
+   asynchronous versions.
 
 ### Tuning Recommendations
 
 - `entries_per_queue`: Default is 4. Increasing to 16+ does not help
   sequential I/O (bottleneck is elsewhere), but may help high-concurrency
   metadata workloads.
+
+- `bufs_per_queue`: Default is 4. On Linux 7.3 and later it caps the
+  requests with a payload or reply body that one queue serves at once, and
+  with it the memory of the payload buffers.
 
 - Thread count: The per-CPU queue model means optimal performance when
   worker threads match available CPU cores.
