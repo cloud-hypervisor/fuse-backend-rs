@@ -7,9 +7,10 @@
 //! By default the runtime type is auto-detected: `tokio-uring` is used if io-uring is
 //! available, otherwise the tokio current-thread runtime is used. The detection result
 //! may be overridden with the `FUSE_BACKEND_RS_ASYNC_RUNTIME` environment variable,
-//! which accepts `tokio` or `uring`. This is useful when asynchronous futures created
-//! by this crate (e.g. `FuseDevTask::poll_handler()`) are driven by the application's
-//! own tokio runtime, where `tokio-uring` objects can't be polled.
+//! which accepts `tokio` or `uring`, or by calling [`set_runtime_type()`] before any
+//! other function of this module or `async_file`. This is useful when the application's
+//! own tokio runtime drives futures from this crate, such as `FuseDevTask::poll_handler()`,
+//! because a plain tokio runtime can't poll `tokio-uring` objects.
 //!
 //! Note: creating io-uring rings locks kernel memory accounted against `RLIMIT_MEMLOCK`
 //! (see `account_memlock()` in the kernel). If the limit is too low (e.g. the default
@@ -18,7 +19,8 @@
 //! runtime with `FUSE_BACKEND_RS_ASYNC_RUNTIME=tokio` instead.
 
 use std::future::Future;
-use std::sync::LazyLock;
+use std::io;
+use std::sync::{LazyLock, OnceLock};
 
 /// Environment variable to select the asynchronous runtime type, `tokio` or `uring`.
 pub const RUNTIME_TYPE_ENV: &str = "FUSE_BACKEND_RS_ASYNC_RUNTIME";
@@ -33,44 +35,77 @@ const RING_ENTRIES: u32 = 256;
 
 pub(crate) static RUNTIME_TYPE: LazyLock<RuntimeType> = LazyLock::new(RuntimeType::new);
 
-pub(crate) enum RuntimeType {
+/// The runtime type requested with `set_runtime_type()`, which takes precedence over the
+/// environment variable.
+static REQUESTED_RUNTIME_TYPE: OnceLock<RuntimeType> = OnceLock::new();
+
+/// Type of the asynchronous runtime used by this crate.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RuntimeType {
+    /// The tokio current-thread runtime, with plain syscalls for file IO.
     Tokio,
+    /// The tokio-uring runtime, with io-uring for file IO.
     #[cfg(target_os = "linux")]
     Uring,
 }
 
+/// Select the runtime type instead of detecting it.
+///
+/// The crate fixes the type on first use, so call this before creating a [`Runtime`], an
+/// `async_file::File` or a `FuseDevTask`. It overrides `FUSE_BACKEND_RS_ASYNC_RUNTIME`. It
+/// returns an error if the type in effect is a different one, for example because io-uring
+/// isn't available.
+pub fn set_runtime_type(runtime_type: RuntimeType) -> io::Result<()> {
+    let _ = REQUESTED_RUNTIME_TYPE.set(runtime_type);
+    let current = *RUNTIME_TYPE;
+    if current == runtime_type {
+        Ok(())
+    } else {
+        Err(io::Error::other(format!(
+            "async runtime type is {current:?}, not {runtime_type:?}"
+        )))
+    }
+}
+
+/// Get the runtime type used by this crate, detecting it if it isn't fixed yet.
+pub fn runtime_type() -> RuntimeType {
+    *RUNTIME_TYPE
+}
+
 impl RuntimeType {
     fn new() -> Self {
-        if let Ok(val) = std::env::var(RUNTIME_TYPE_ENV) {
-            match Self::parse_env(&val) {
-                Some(RuntimeType::Tokio) => return Self::Tokio,
+        let requested = REQUESTED_RUNTIME_TYPE
+            .get()
+            .copied()
+            .or_else(Self::from_env);
+        match requested {
+            Some(RuntimeType::Tokio) => Self::Tokio,
+            #[cfg(target_os = "linux")]
+            _ if Self::probe_io_uring() => Self::Uring,
+            #[cfg(target_os = "linux")]
+            Some(RuntimeType::Uring) => {
+                warn!("'uring' is requested but io-uring isn't available, falling back to tokio");
+                Self::Tokio
+            }
+            None => {
                 #[cfg(target_os = "linux")]
-                Some(RuntimeType::Uring) => {
-                    if Self::probe_io_uring() {
-                        return Self::Uring;
-                    }
-                    warn!(
-                        "'uring' is requested via {} but io-uring isn't available, falling back to tokio",
-                        RUNTIME_TYPE_ENV
-                    );
-                }
-                None => {
-                    warn!(
-                        "unknown value '{}' for environment variable {}, ignored",
-                        val, RUNTIME_TYPE_ENV
-                    );
-                }
+                warn!("io-uring isn't available, falling back to the tokio runtime");
+                Self::Tokio
             }
         }
+    }
 
-        #[cfg(target_os = "linux")]
-        {
-            if Self::probe_io_uring() {
-                return Self::Uring;
-            }
-            warn!("io-uring isn't available, falling back to the tokio runtime");
+    /// The runtime type requested with `FUSE_BACKEND_RS_ASYNC_RUNTIME`, if any.
+    fn from_env() -> Option<Self> {
+        let val = std::env::var(RUNTIME_TYPE_ENV).ok()?;
+        let requested = Self::parse_env(&val);
+        if requested.is_none() {
+            warn!(
+                "unknown value '{}' for environment variable {}, ignored",
+                val, RUNTIME_TYPE_ENV
+            );
         }
-        Self::Tokio
+        requested
     }
 
     fn parse_env(val: &str) -> Option<Self> {

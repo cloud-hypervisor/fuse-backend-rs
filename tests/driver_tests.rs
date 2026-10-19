@@ -251,7 +251,7 @@ mod vfs_async {
             assert_eq!(attr.st_size, 9);
 
             // Open and read the file back through the Vfs layer.
-            let (handle, _opts) = vfs
+            let (handle, _opts, _) = vfs
                 .async_open(&ctx, entry.inode.into(), libc::O_RDONLY as u32, 0)
                 .await
                 .unwrap();

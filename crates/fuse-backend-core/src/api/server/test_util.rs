@@ -135,4 +135,32 @@ impl Writer for TestWriter<'_> {
         // Writes go straight into the buffer, so there's nothing to commit.
         Ok(0)
     }
+
+    #[cfg(feature = "async-io")]
+    async fn async_write(&mut self, data: &[u8]) -> io::Result<usize> {
+        io::Write::write(self, data)
+    }
+
+    #[cfg(feature = "async-io")]
+    async fn async_write2(&mut self, data: &[u8], data2: &[u8]) -> io::Result<usize> {
+        io::Write::write_vectored(self, &[IoSlice::new(data), IoSlice::new(data2)])
+    }
+
+    #[cfg(feature = "async-io")]
+    async fn async_write3(&mut self, data: &[u8], data2: &[u8], data3: &[u8]) -> io::Result<usize> {
+        io::Write::write_vectored(
+            self,
+            &[IoSlice::new(data), IoSlice::new(data2), IoSlice::new(data3)],
+        )
+    }
+
+    #[cfg(feature = "async-io")]
+    async fn async_write_all(&mut self, buf: &[u8]) -> io::Result<()> {
+        io::Write::write_all(self, buf)
+    }
+
+    #[cfg(feature = "async-io")]
+    async fn async_commit(&mut self, _other: Option<&Self>) -> io::Result<usize> {
+        Ok(0)
+    }
 }
