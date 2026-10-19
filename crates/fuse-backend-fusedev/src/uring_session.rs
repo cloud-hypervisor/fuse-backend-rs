@@ -23,7 +23,6 @@ use std::collections::VecDeque;
 use std::fs::File;
 use std::io::{self, IoSlice, Write};
 use std::mem::ManuallyDrop;
-use std::os::unix::fs::FileExt;
 use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
 use std::ptr::NonNull;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -269,6 +268,17 @@ trait ZeroCopySink: Sync {
     /// Copy `data` into the client pages, starting `pos` bytes into them.
     /// This is the slow way, for replies built in memory.
     fn write_from_memory(&self, pos: usize, data: &[u8]) -> io::Result<()>;
+
+    /// Let `fill` put up to `count` bytes into memory, and copy what it
+    /// returns into the client pages, starting `pos` bytes into them.
+    /// Returns how many bytes it copied. This is the slow way, for files
+    /// without a descriptor.
+    fn fill_from(
+        &self,
+        pos: usize,
+        count: usize,
+        fill: &mut dyn FnMut(&mut [u8]) -> io::Result<usize>,
+    ) -> io::Result<usize>;
 }
 
 /// The reply data of a zero-copy READ: up to `cap` bytes that `sink` reads
@@ -485,12 +495,12 @@ impl<'a, S: BitmapSlice> UringWriter<'a, S> {
             let Some(fd) = src.raw_fd() else {
                 // Without a file descriptor, read the file into memory and
                 // copy that into the client pages.
-                let mut buf = vec![0u8; count];
-                // Safe because `buf` outlives the slice, and nothing else
-                // uses it.
-                let slice = unsafe { FileVolatileSlice::from_mut_slice(&mut buf) };
-                let cnt = src.read_at_volatile(slice, off)?.min(count);
-                zc.push_memory(&buf[..cnt])?;
+                let cnt = zc.sink.fill_from(zc.len, count, &mut |buf| {
+                    // Safe because the slice covers `buf`, which outlives it.
+                    let slice = unsafe { FileVolatileSlice::from_mut_slice(buf) };
+                    src.read_at_volatile(slice, off)
+                })?;
+                zc.len += cnt;
                 return Ok(cnt);
             };
             let cnt = zc.sink.read_from_file(zc.len, fd, count, off)?.min(count);
@@ -847,7 +857,46 @@ struct ZeroCopyIo<'r> {
     slot: u16,
     /// The worker's memory file, which the copies through memory go
     /// through. The lock keeps two copies from using it at once.
-    bounce: Mutex<&'r File>,
+    bounce: Mutex<&'r BounceBuf>,
+}
+
+/// The memory file that a worker's copies of zero-copy data through memory
+/// go through, and a mapping of it. Fixed-buffer operations move data
+/// between the file and the client pages, and the worker reaches the same
+/// pages through the mapping.
+struct BounceBuf {
+    map: MmapRegion<()>,
+}
+
+impl BounceBuf {
+    /// A memory file of `len` bytes, the most one copy moves.
+    fn new(len: usize) -> io::Result<BounceBuf> {
+        use nix::sys::memfd::{memfd_create, MemFdCreateFlag};
+        let name = std::ffi::CStr::from_bytes_with_nul(b"fuse-uring-zero-copy\0").unwrap();
+        let fd = memfd_create(name, MemFdCreateFlag::MFD_CLOEXEC).map_err(io::Error::from)?;
+        // Safe because the fd is new and nothing else owns it.
+        let file = unsafe { File::from_raw_fd(fd) };
+        file.set_len(len as u64)?;
+        let map = MmapRegion::from_file(vm_memory::FileOffset::new(file, 0), len)
+            .map_err(io::Error::other)?;
+        Ok(BounceBuf { map })
+    }
+
+    /// The descriptor of the file.
+    fn fd(&self) -> RawFd {
+        // The mapping was built from the file, so it has one.
+        self.map.file_offset().unwrap().file().as_raw_fd()
+    }
+
+    /// The mapped pages of the file.
+    ///
+    /// # Safety
+    /// The caller must hold the lock around the `BounceBuf`, so that nothing
+    /// else uses the pages.
+    #[allow(clippy::mut_from_ref)]
+    unsafe fn pages(&self) -> &mut [u8] {
+        std::slice::from_raw_parts_mut(self.map.as_ptr(), self.map.size())
+    }
 }
 
 impl ZeroCopyIo<'_> {
@@ -883,6 +932,23 @@ fn fixed_len(count: usize) -> u32 {
 
 // The kernel registers the client pages from address 0 of the slot, so
 // `pos` is the address of the first byte to move.
+impl ZeroCopyIo<'_> {
+    /// Read `len` bytes of the memory file into the client pages, starting
+    /// `pos` bytes into them.
+    fn read_bounce(&self, bounce: &BounceBuf, pos: usize, len: usize) -> io::Result<()> {
+        let fd = bounce.fd();
+        let mut done = 0;
+        while done < len {
+            let n = self.read_from_file(pos + done, fd, len - done, done as u64)?;
+            if n == 0 {
+                return Err(io::Error::from(io::ErrorKind::UnexpectedEof));
+            }
+            done += n;
+        }
+        Ok(())
+    }
+}
+
 impl ZeroCopySink for ZeroCopyIo<'_> {
     fn read_from_file(&self, pos: usize, fd: RawFd, count: usize, off: u64) -> io::Result<usize> {
         let buf = pos as *mut u8;
@@ -894,6 +960,23 @@ impl ZeroCopySink for ZeroCopyIo<'_> {
     }
 
     fn write_from_memory(&self, pos: usize, data: &[u8]) -> io::Result<()> {
+        let mut done = 0;
+        while done < data.len() {
+            done += self.fill_from(pos + done, data.len() - done, &mut |buf| {
+                let n = buf.len().min(data.len() - done);
+                buf[..n].copy_from_slice(&data[done..done + n]);
+                Ok(n)
+            })?;
+        }
+        Ok(())
+    }
+
+    fn fill_from(
+        &self,
+        pos: usize,
+        count: usize,
+        fill: &mut dyn FnMut(&mut [u8]) -> io::Result<usize>,
+    ) -> io::Result<usize> {
         #[cfg(test)]
         ZERO_COPY_BOUNCES.fetch_add(1, Ordering::Relaxed);
         // Through the memory file into the client pages, which only
@@ -902,56 +985,54 @@ impl ZeroCopySink for ZeroCopyIo<'_> {
             .bounce
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        bounce.write_all_at(data, 0)?;
-        let mut done = 0;
-        while done < data.len() {
-            let n = self.read_from_file(
-                pos + done,
-                bounce.as_raw_fd(),
-                data.len() - done,
-                done as u64,
-            )?;
-            if n == 0 {
-                return Err(io::Error::from(io::ErrorKind::UnexpectedEof));
-            }
-            done += n;
-        }
-        Ok(())
-    }
-}
-
-impl ZeroCopySource for ZeroCopyIo<'_> {
-    fn write_to_file(&self, pos: usize, fd: RawFd, count: usize, off: u64) -> io::Result<usize> {
-        let buf = pos as *const u8;
-        self.run(
-            opcode::WriteFixed::new(types::Fd(fd), buf, fixed_len(count), self.slot)
-                .offset(off as libc::off_t)
-                .build(),
-        )
-    }
-
-    fn read_to_memory(&self, pos: usize, buf: &mut [u8]) -> io::Result<usize> {
-        #[cfg(test)]
-        ZERO_COPY_BOUNCES.fetch_add(1, Ordering::Relaxed);
-        // From the client pages into the memory file, then into `buf`.
-        let bounce = self
-            .bounce
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let n = self.write_to_file(pos, bounce.as_raw_fd(), buf.len(), 0)?;
-        bounce.read_exact_at(&mut buf[..n], 0)?;
+        // Safe because this holds the lock.
+        let pages = unsafe { bounce.pages() };
+        let len = count.min(pages.len());
+        let n = fill(&mut pages[..len])?.min(len);
+        self.read_bounce(&bounce, pos, n)?;
         Ok(n)
     }
 }
 
-/// Create the memory file that a worker's copies of zero-copy data through
-/// memory go through.
-fn bounce_file() -> io::Result<File> {
-    use nix::sys::memfd::{memfd_create, MemFdCreateFlag};
-    let name = std::ffi::CStr::from_bytes_with_nul(b"fuse-uring-zero-copy\0").unwrap();
-    let fd = memfd_create(name, MemFdCreateFlag::MFD_CLOEXEC).map_err(io::Error::from)?;
-    // Safe because the fd is new and nothing else owns it.
-    Ok(unsafe { File::from_raw_fd(fd) })
+impl ZeroCopySource for ZeroCopyIo<'_> {
+    fn write_to_file(
+        &self,
+        pos: usize,
+        fd: RawFd,
+        count: usize,
+        off: Option<u64>,
+    ) -> io::Result<usize> {
+        let buf = pos as *const u8;
+        // Offset -1 writes at the file's position.
+        let off = off.map_or(-1, |off| off as libc::off_t);
+        self.run(
+            opcode::WriteFixed::new(types::Fd(fd), buf, fixed_len(count), self.slot)
+                .offset(off)
+                .build(),
+        )
+    }
+
+    fn read_to_memory(
+        &self,
+        pos: usize,
+        count: usize,
+        take: &mut dyn FnMut(&[u8]) -> io::Result<usize>,
+    ) -> io::Result<usize> {
+        #[cfg(test)]
+        ZERO_COPY_BOUNCES.fetch_add(1, Ordering::Relaxed);
+        // From the client pages into the memory file, then to `take`
+        // through the mapping.
+        let bounce = self
+            .bounce
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let len = count.min(bounce.map.size());
+        let n = self.write_to_file(pos, bounce.fd(), len, Some(0))?.min(len);
+        // Safe because this holds the lock, and the kernel is done writing
+        // the pages.
+        let pages = unsafe { bounce.pages() };
+        take(&pages[..n])
+    }
 }
 
 /// Give `ring` an empty table of `nr` fixed buffers, where the kernel
@@ -1140,7 +1221,7 @@ struct UringWorker<F: FileSystem + Send + Sync + 'static> {
     pools: Option<Arc<BufPools>>,
     /// The memory file that copies of zero-copy data through memory go
     /// through, if the queues have zero-copy.
-    bounce: Option<File>,
+    bounce: Option<BounceBuf>,
     server: Arc<Server<F>>,
 }
 
@@ -1665,12 +1746,12 @@ impl<F: FileSystem + Send + Sync + 'static> UringFuseServing<F> {
                 entries_per_queue: cfg.entries_per_queue,
                 payload_cap,
                 pools: pools.clone(),
-                bounce: if zero_copy {
-                    Some(bounce_file().map_err(|e| {
+                // Zero-copy comes only with buffer pools.
+                bounce: match pools.as_ref().filter(|_| zero_copy) {
+                    Some(pools) => Some(BounceBuf::new(pools.buf_size).map_err(|e| {
                         SessionFailure(format!("uring: creating the zero-copy memory file: {e}"))
-                    })?)
-                } else {
-                    None
+                    })?),
+                    None => None,
                 },
                 server: server.clone(),
             });
@@ -2378,6 +2459,18 @@ mod tests {
         fn write_from_memory(&self, pos: usize, data: &[u8]) -> io::Result<()> {
             self.writes.lock().unwrap().push((pos, data.to_vec()));
             Ok(())
+        }
+
+        fn fill_from(
+            &self,
+            pos: usize,
+            count: usize,
+            fill: &mut dyn FnMut(&mut [u8]) -> io::Result<usize>,
+        ) -> io::Result<usize> {
+            let mut buf = vec![0u8; count];
+            let n = fill(&mut buf)?;
+            self.write_from_memory(pos, &buf[..n])?;
+            Ok(n)
         }
     }
 
