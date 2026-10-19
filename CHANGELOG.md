@@ -74,6 +74,9 @@
   its fusectl `abort` file. Its queues had no entries left, so requests from those CPUs waited
   forever, and so did requests it had taken but not answered. Now they fail, the other workers
   stop, and `FuseServing::wait()` returns.
+- A `UringFuseServing` worker whose request handler panics ends the connection the same way and
+  waits for the kernel to give its ring entries back before the panic goes on. Before, unwinding
+  freed entries the kernel could still copy a request into.
 - A `UringFuseServing` worker that stops frees its ring entries only after the kernel has given
   them all back, and leaks them if that takes more than a second. A worker that stopped on an
   error while the connection was up freed entries the kernel could still copy requests into. A
