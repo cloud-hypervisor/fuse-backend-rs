@@ -32,6 +32,8 @@ pub use fuse_backend_virtiofs as virtiofs;
 
 #[cfg(all(target_os = "linux", feature = "fusedev"))]
 pub use self::fusedev::BlockingFuseChannel;
+#[cfg(all(target_os = "linux", feature = "fusedev-uring"))]
+pub use self::fusedev::{uring_available, UringConfig, UringFuseServing, UringWriter};
 #[cfg(all(target_os = "linux", feature = "fusedev", feature = "async-io"))]
 pub use self::fusedev::{AsyncFuseServing, AsyncServingConfig, FuseDevTask};
 #[cfg(feature = "fusedev")]
@@ -39,8 +41,6 @@ pub use self::fusedev::{
     FuseBuf, FuseChannel, FuseChannelExt, FuseDevReaderExt, FuseDevWriter, FuseServing,
     FuseSession, FuseSessionExt, SyncFuseServing, SyncServingConfig,
 };
-#[cfg(all(target_os = "linux", feature = "fusedev-uring"))]
-pub use self::fusedev::{UringConfig, UringFuseServing, UringWriter};
 #[cfg(feature = "virtiofs")]
 pub use self::virtiofs::{VirtioFsReaderExt, VirtioFsWriter};
 

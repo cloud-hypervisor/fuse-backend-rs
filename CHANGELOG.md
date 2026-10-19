@@ -1,6 +1,9 @@
 # Changelog
 ## [Unreleased]
 ### Added
+- `uring_available()` tells whether the kernel lets the process serve FUSE over io_uring: the
+  fuse module's `enable_uring` parameter is on and the process may create an io_uring. Checking
+  it before mounting saves a mount that would fall back to `/dev/fuse`.
 - [254](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/254): Split the library into a layered Cargo workspace and break the layers out into
   their own crates — `fuse-backend-core` (ABI, API/server, buffers),
   `fuse-backend-fusedev` and `fuse-backend-virtiofs` (transports), and
