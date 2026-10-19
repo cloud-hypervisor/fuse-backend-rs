@@ -711,6 +711,9 @@ impl<F: FileSystem + Send + Sync + 'static> UringWorker<F> {
         registered?;
         // The number of entries whose command the kernel hasn't completed.
         let mut armed = entries.len();
+        // A handler that panics stops the worker like an error, and the
+        // panic goes on once the kernel has given the entries back.
+        let mut panic = None;
 
         let result = 'serve: loop {
             if let Err(e) = submit_and_wait(&mut ring, 1) {
@@ -747,9 +750,17 @@ impl<F: FileSystem + Send + Sync + 'static> UringWorker<F> {
                     break 'serve Err(io::Error::from_raw_os_error(-res));
                 }
 
-                if let Err(e) = self.process(entry) {
-                    warn!("uring worker: failed to handle request: {e}");
-                    entry.stage_error_reply(libc::EIO);
+                match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.process(entry)))
+                {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => {
+                        warn!("uring worker: failed to handle request: {e}");
+                        entry.stage_error_reply(libc::EIO);
+                    }
+                    Err(payload) => {
+                        panic = Some(payload);
+                        break 'serve Err(io::Error::other("a request handler panicked"));
+                    }
                 }
 
                 let ent: FuseUringEntInOut = entry.header().ring_ent_in_out;
@@ -787,6 +798,10 @@ impl<F: FileSystem + Send + Sync + 'static> UringWorker<F> {
             self.abort.abort();
         }
         release_entries(ring, entries, armed);
+        if let Some(payload) = panic {
+            error!("uring worker: a request handler panicked");
+            std::panic::resume_unwind(payload);
+        }
         result
     }
 
@@ -1798,6 +1813,79 @@ mod tests {
         // Special characters are octal escapes.
         let info = "97 30 0:88 / /tmp/a\\040b rw - fuse.x x rw\n";
         assert_eq!(mount_minor(info, "/tmp/a b".as_ref()), Some(88));
+    }
+
+    /// A file system whose LOOKUP panics.
+    struct PanicFs;
+
+    impl FileSystem for PanicFs {
+        type Inode = u64;
+        type Handle = u64;
+
+        fn lookup(
+            &self,
+            _ctx: &fuse_backend_core::api::filesystem::Context,
+            _parent: u64,
+            _name: &std::ffi::CStr,
+        ) -> io::Result<fuse_backend_core::api::filesystem::Entry> {
+            panic!("LOOKUP panics");
+        }
+
+        fn getattr(
+            &self,
+            _ctx: &fuse_backend_core::api::filesystem::Context,
+            inode: u64,
+            _handle: Option<u64>,
+        ) -> io::Result<(fuse_backend_core::abi::fuse_abi::stat64, Duration)> {
+            // Safe because stat64 is plain data.
+            let mut st: fuse_backend_core::abi::fuse_abi::stat64 = unsafe { std::mem::zeroed() };
+            st.st_ino = inode;
+            st.st_nlink = 1;
+            st.st_mode = libc::S_IFDIR | 0o755;
+            Ok((st, Duration::ZERO))
+        }
+    }
+
+    /// A worker whose handler panics ends the connection, so the request
+    /// fails instead of waiting forever, and `wait()` returns.
+    #[test]
+    fn test_uring_serving_handler_panic() {
+        let mnt = TempDir::new().unwrap();
+        let server = Arc::new(Server::new(PanicFs));
+        server.set_uring(true);
+        let mut se = FuseSession::new(mnt.as_path(), "uring_panic_test", "", false).unwrap();
+        se.mount().unwrap();
+        if ConnectionAbort::new(se.mountpoint()).path.is_none() {
+            eprintln!("fusectl isn't mounted, skipping");
+            return;
+        }
+        let cfg = UringConfig {
+            workers: 1,
+            entries_per_queue: 1,
+        };
+        let serving = match UringFuseServing::new(se, server, cfg) {
+            Ok(serving) => Arc::new(serving),
+            Err(UringNotSupported) => {
+                eprintln!("FUSE-over-io_uring is not available, skipping");
+                return;
+            }
+            Err(e) => panic!("uring serving failed: {}", e),
+        };
+
+        let (tx, rx) = channel();
+        let path = mnt.as_path().join("panics");
+        std::thread::spawn(move || {
+            let _ = tx.send(std::fs::metadata(path).is_err());
+        });
+        assert_eq!(rx.recv_timeout(Duration::from_secs(5)), Ok(true));
+        let (tx, rx) = channel();
+        let waiting = serving.clone();
+        std::thread::spawn(move || {
+            waiting.wait();
+            let _ = tx.send(());
+        });
+        rx.recv_timeout(Duration::from_secs(5))
+            .expect("the worker didn't end the connection after the panic");
     }
 
     /// Ending the connection, as a failed worker does, stops every worker,
