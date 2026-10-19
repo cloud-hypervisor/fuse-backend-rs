@@ -41,6 +41,17 @@ pub const FUSE_IO_URING_CMD_ADD_QUEUE: u32 = 3;
 /// not have registered entries with their own payload buffers yet.
 pub const FUSE_IO_URING_CMD_ADD_BUFPOOL: u32 = 4;
 
+/// `FuseUringCmdReq::flags` of ADD_QUEUE: serve the queue's reads and writes
+/// with zero-copy (protocol 7.46). The kernel then registers the client's
+/// pages of such a request in the server's io_uring buffer table, at the
+/// index the entry gave at REGISTER, and the server moves the data with
+/// fixed-buffer operations. Needs a buffer pool and CAP_SYS_ADMIN.
+pub const FUSE_URING_ZERO_COPY: u64 = 1;
+
+/// `FuseUringEntInOut::flags` of a request whose pages the kernel
+/// registered for zero-copy instead of copying them (protocol 7.46).
+pub const FUSE_URING_ENT_ZERO_COPY: u64 = 1;
+
 /// Shared in/out descriptor of one ring entry, embedded in `FuseUringReqHeader`.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
@@ -106,6 +117,21 @@ pub struct FuseUringBufpool {
     /// Length of the pool in bytes.
     pub len: u32,
     pub reserved: u32,
+}
+
+impl FuseUringCmdReq {
+    /// Set `ent_zero_copy_buf_index` of a REGISTER command for a queue with
+    /// zero-copy: the index in the server's io_uring buffer table where the
+    /// kernel registers the client's pages of the entry's requests. The
+    /// kernel puts it in a union with `bufpool`, at the same offset.
+    pub fn set_ent_zero_copy_buf_index(&mut self, index: u16) {
+        let mut uaddr = [0u8; 8];
+        uaddr[..2].copy_from_slice(&index.to_ne_bytes());
+        self.bufpool = FuseUringBufpool {
+            uaddr: u64::from_ne_bytes(uaddr),
+            ..Default::default()
+        };
+    }
 }
 
 // SAFETY: all four structs are `repr(C)` plain data types without padding
