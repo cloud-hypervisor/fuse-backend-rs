@@ -174,9 +174,10 @@ kernel refuses zero-copy, `UringFuseServing` adds the queues without it.
 
 A file system that reads or writes zero-copy data through memory, or
 with a file that has no descriptor, still works, but slower. The worker
-then copies the data through a memory file. It runs `WRITE_FIXED` from
-the client pages into the file and reads it back, or writes into the
-file and runs `READ_FIXED` from it into the client pages.
+then copies the data through a memory file that it keeps mapped. It runs
+`WRITE_FIXED` from the client pages into the file and hands over the
+mapped bytes, or fills the mapping and runs `READ_FIXED` from the file
+into the client pages.
 
 The table shows the throughput of the benchmark daemon with `--uring
 --no-backing-direct-io`, 4 workers and 16 entries per queue, on a 24-CPU

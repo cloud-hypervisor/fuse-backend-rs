@@ -431,17 +431,27 @@ impl<S: Clone> Clone for Reader<'_, S> {
 /// `Reader::with_zero_copy()`.
 pub trait ZeroCopySource: Sync {
     /// Write `count` bytes of the data, starting `pos` bytes into it, to
-    /// the file `fd` at offset `off`. Returns how many bytes it wrote.
-    fn write_to_file(&self, pos: usize, fd: RawFd, count: usize, off: u64) -> io::Result<usize>;
+    /// the file `fd`, at offset `off`, or at the file's position if `off`
+    /// is `None`. Returns how many bytes it wrote.
+    fn write_to_file(
+        &self,
+        pos: usize,
+        fd: RawFd,
+        count: usize,
+        off: Option<u64>,
+    ) -> io::Result<usize>;
 
-    /// Copy the data, starting `pos` bytes into it, into `buf`. Returns how
-    /// many bytes it copied. This is the slow way, for readers without a
-    /// file descriptor.
-    fn read_to_memory(&self, pos: usize, buf: &mut [u8]) -> io::Result<usize>;
+    /// Copy up to `count` bytes of the data, starting `pos` bytes into it,
+    /// into memory, and hand them to `take`, which returns how many it
+    /// took. Returns that number. This is the slow way, for readers without
+    /// a file descriptor.
+    fn read_to_memory(
+        &self,
+        pos: usize,
+        count: usize,
+        take: &mut dyn FnMut(&[u8]) -> io::Result<usize>,
+    ) -> io::Result<usize>;
 }
-
-/// The most bytes of zero-copy data one bounce through memory copies.
-const ZERO_COPY_BOUNCE: usize = 1 << 20;
 
 /// The zero-copy data of a request, and how much of it was read.
 #[derive(Clone, Copy)]
@@ -459,7 +469,20 @@ impl ZeroCopyData<'_> {
     /// Copy the next bytes into `buf`, and count them as read.
     fn copy_to(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         let len = buf.len().min(self.remaining());
-        let n = self.src.read_to_memory(self.pos, &mut buf[..len])?.min(len);
+        let n = self.src.read_to_memory(self.pos, len, &mut |data| {
+            let n = data.len().min(len);
+            buf[..n].copy_from_slice(&data[..n]);
+            Ok(n)
+        })?;
+        self.pos += n;
+        Ok(n)
+    }
+
+    /// Have the source write up to `count` bytes to the file `fd`, at `off`
+    /// or at its position, and count them as read.
+    fn write_to_file(&mut self, fd: RawFd, count: usize, off: Option<u64>) -> io::Result<usize> {
+        let count = count.min(self.remaining());
+        let n = self.src.write_to_file(self.pos, fd, count, off)?.min(count);
         self.pos += n;
         Ok(n)
     }
@@ -471,13 +494,20 @@ impl ZeroCopyData<'_> {
         count: usize,
         write: impl FnOnce(FileVolatileSlice) -> io::Result<usize>,
     ) -> io::Result<usize> {
-        let mut buf = vec![0u8; count.min(self.remaining()).min(ZERO_COPY_BOUNCE)];
-        let n = self.src.read_to_memory(self.pos, &mut buf)?.min(buf.len());
-        // Safe because `buf` outlives the slice, and nothing else uses it.
-        let slice = unsafe { FileVolatileSlice::from_mut_slice(&mut buf[..n]) };
-        let written = write(slice)?.min(n);
-        self.pos += written;
-        Ok(written)
+        let mut write = Some(write);
+        let count = count.min(self.remaining());
+        let n = self.src.read_to_memory(self.pos, count, &mut |data| {
+            let Some(write) = write.take() else {
+                return Ok(0);
+            };
+            // Safe because `write` only reads the slice, which `data`
+            // backs for the duration of the call.
+            let slice =
+                unsafe { FileVolatileSlice::from_raw_ptr(data.as_ptr() as *mut u8, data.len()) };
+            Ok(write(slice)?.min(data.len()))
+        })?;
+        self.pos += n;
+        Ok(n)
     }
 }
 
@@ -555,7 +585,10 @@ impl<'a, S: BitmapSlice> Reader<'a, S> {
         count: usize,
     ) -> io::Result<usize> {
         if let Some(zc) = self.zero_copy_left() {
-            return zc.bounce(count, |slice| dst.write_volatile(slice));
+            let Some(fd) = dst.raw_fd() else {
+                return zc.bounce(count, |slice| dst.write_volatile(slice));
+            };
+            return zc.write_to_file(fd, count, None);
         }
         self.buffers
             .consume_for_read(count, |bufs| dst.write_vectored_volatile(bufs))
@@ -583,10 +616,7 @@ impl<'a, S: BitmapSlice> Reader<'a, S> {
             let Some(fd) = dst.raw_fd() else {
                 return zc.bounce(count, |slice| dst.write_at_volatile(slice, off));
             };
-            let count = count.min(zc.remaining());
-            let n = zc.src.write_to_file(zc.pos, fd, count, off)?.min(count);
-            zc.pos += n;
-            return Ok(n);
+            return zc.write_to_file(fd, count, Some(off));
         }
         self.buffers
             .consume_for_read(count, |bufs| dst.write_vectored_at_volatile(bufs, off))
@@ -832,7 +862,9 @@ mod tests {
 
     /// A zero-copy source that records what it was asked to write.
     #[derive(Default)]
-    struct RecordingSource(std::sync::Mutex<Vec<(usize, std::os::unix::io::RawFd, usize, u64)>>);
+    struct RecordingSource(
+        std::sync::Mutex<Vec<(usize, std::os::unix::io::RawFd, usize, Option<u64>)>>,
+    );
 
     impl super::ZeroCopySource for RecordingSource {
         fn write_to_file(
@@ -840,19 +872,22 @@ mod tests {
             pos: usize,
             fd: std::os::unix::io::RawFd,
             count: usize,
-            off: u64,
+            off: Option<u64>,
         ) -> std::io::Result<usize> {
             self.0.lock().unwrap().push((pos, fd, count, off));
             // Write at most 5 bytes per call, like a short write.
             Ok(count.min(5))
         }
 
-        fn read_to_memory(&self, pos: usize, buf: &mut [u8]) -> std::io::Result<usize> {
+        fn read_to_memory(
+            &self,
+            pos: usize,
+            count: usize,
+            take: &mut dyn FnMut(&[u8]) -> std::io::Result<usize>,
+        ) -> std::io::Result<usize> {
             // The data is the byte sequence 100, 101, ...
-            for (i, b) in buf.iter_mut().enumerate() {
-                *b = (100 + pos + i) as u8;
-            }
-            Ok(buf.len())
+            let data: Vec<u8> = (0..count).map(|i| (100 + pos + i) as u8).collect();
+            take(&data)
         }
     }
 
@@ -869,6 +904,20 @@ mod tests {
         r.read_exact(&mut buf).unwrap();
         assert_eq!(buf, [7, 7, 100, 101]);
         assert_eq!(r.available_bytes(), 6);
+    }
+
+    #[test]
+    fn test_reader_zero_copy_read_to_position() {
+        use super::Reader;
+        use std::os::unix::io::AsRawFd;
+
+        // read_to() with a file descriptor writes at the file's position.
+        let src = RecordingSource::default();
+        let mut header = vec![0u8; 0];
+        let mut r = Reader::<()>::from_slice(&mut header).with_zero_copy(&src, 8);
+        let mut file = std::fs::File::open("/dev/null").unwrap();
+        assert_eq!(r.read_to(&mut file, 4).unwrap(), 4);
+        assert_eq!(*src.0.lock().unwrap(), vec![(0, file.as_raw_fd(), 4, None)]);
     }
 
     #[test]
@@ -898,7 +947,7 @@ mod tests {
         assert_eq!(r.bytes_read(), 12);
         assert_eq!(
             *src.0.lock().unwrap(),
-            vec![(0, fd, 8, 100), (5, fd, 3, 105)]
+            vec![(0, fd, 8, Some(100)), (5, fd, 3, Some(105))]
         );
 
         // A destination without a file descriptor gets a copy, and only the
