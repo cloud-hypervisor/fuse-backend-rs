@@ -70,6 +70,10 @@
   and no code in the workspace relied on it.
 
 ### Fixed
+- A `UringFuseServing` worker that fails while the connection is up ends the connection through
+  its fusectl `abort` file. Its queues had no entries left, so requests from those CPUs waited
+  forever, and so did requests it had taken but not answered. Now they fail, the other workers
+  stop, and `FuseServing::wait()` returns.
 - A `UringFuseServing` worker that stops frees its ring entries only after the kernel has given
   them all back, and leaks them if that takes more than a second. A worker that stopped on an
   error while the connection was up freed entries the kernel could still copy requests into. A

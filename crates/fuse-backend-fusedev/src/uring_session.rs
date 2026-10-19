@@ -558,6 +558,98 @@ struct UringWorker<F: FileSystem + Send + Sync + 'static> {
     entries_per_queue: usize,
     payload_cap: usize,
     server: Arc<Server<F>>,
+    /// Ends the connection when the worker fails.
+    abort: Arc<ConnectionAbort>,
+}
+
+/// Ends a FUSE connection, like `umount -f`, through its `abort` file in
+/// the fusectl file system. A worker that fails leaves its queues without
+/// entries, so requests that the kernel puts on them would wait forever.
+/// Ending the connection fails those requests and the other workers'
+/// commands instead, so every worker stops and `wait()` returns.
+struct ConnectionAbort {
+    /// `/sys/fs/fuse/connections/<minor>/abort`, if fusectl is mounted.
+    path: Option<std::path::PathBuf>,
+    /// Whether a worker ended the connection already.
+    done: AtomicBool,
+}
+
+/// The minor device number of the last mount at `mountpoint`, an
+/// absolute path, in `mountinfo`, the format of /proc/self/mountinfo.
+fn mount_minor(mountinfo: &str, mountpoint: &std::path::Path) -> Option<u32> {
+    // mountinfo writes space, tab, newline and backslash as octal escapes.
+    let mountpoint: String = mountpoint
+        .to_str()?
+        .chars()
+        .map(|c| match c {
+            ' ' | '\t' | '\n' | '\\' => format!("\\{:03o}", c as u32),
+            c => c.to_string(),
+        })
+        .collect();
+    mountinfo.lines().rev().find_map(|line| {
+        // ID, parent ID, major:minor, root, mount point, ...
+        let mut fields = line.split(' ');
+        let dev = fields.nth(2)?;
+        let point = fields.nth(1)?;
+        if point != mountpoint {
+            return None;
+        }
+        dev.split_once(':')?.1.parse().ok()
+    })
+}
+
+impl ConnectionAbort {
+    /// The abort file of the connection mounted at `mountpoint`. fusectl
+    /// names connections after the minor number of the mount's device,
+    /// which comes from /proc/self/mountinfo, because a stat() of the
+    /// mountpoint would wait for a FUSE request that nobody serves yet.
+    /// `FuseSession` keeps the mountpoint canonical, as mountinfo has it.
+    fn new(mountpoint: &std::path::Path) -> ConnectionAbort {
+        let path = std::fs::read_to_string("/proc/self/mountinfo")
+            .ok()
+            .and_then(|info| mount_minor(&info, mountpoint))
+            .map(|minor| {
+                std::path::PathBuf::from(format!("/sys/fs/fuse/connections/{minor}/abort"))
+            })
+            .filter(|path| path.exists());
+        ConnectionAbort {
+            path,
+            done: AtomicBool::new(false),
+        }
+    }
+
+    /// End the connection, unless another worker did.
+    fn abort(&self) {
+        if self.done.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let Some(path) = &self.path else {
+            error!("uring: can't end the FUSE connection without fusectl, unmount it by hand");
+            return;
+        };
+        if let Err(e) = std::fs::write(path, b"1") {
+            error!("uring: can't end the FUSE connection, unmount it by hand: {e}");
+        }
+    }
+}
+
+/// Whether a worker that stopped with `result` failed while the connection
+/// was up. Commands fail with ENOTCONN, ENODEV or ECANCELED once it ended,
+/// also through an unmount from outside, and its minor number may then
+/// belong to a new connection already.
+fn failed_while_connected(result: &io::Result<()>, exit: &AtomicBool) -> bool {
+    match result {
+        Ok(()) => false,
+        Err(e)
+            if matches!(
+                e.raw_os_error(),
+                Some(libc::ENOTCONN | libc::ENODEV | libc::ECANCELED)
+            ) =>
+        {
+            false
+        }
+        Err(_) => !exit.load(Ordering::Relaxed),
+    }
 }
 
 impl<F: FileSystem + Send + Sync + 'static> UringWorker<F> {
@@ -673,6 +765,10 @@ impl<F: FileSystem + Send + Sync + 'static> UringWorker<F> {
                 break 'serve Err(e);
             }
         };
+        // The kernel gives the entries back once the connection ends.
+        if failed_while_connected(&result, &exit) {
+            self.abort.abort();
+        }
         release_entries(ring, entries, armed);
         result
     }
@@ -924,6 +1020,7 @@ impl<F: FileSystem + Send + Sync + 'static> UringFuseServing<F> {
 
         // Build one worker per queue set, cloning the fuse fd up front so
         // cloning failures are reported before any thread is spawned.
+        let abort = Arc::new(ConnectionAbort::new(session.mountpoint()));
         let mut worker_list = Vec::with_capacity(workers);
         for ids in queue_ids {
             worker_list.push(UringWorker {
@@ -934,6 +1031,7 @@ impl<F: FileSystem + Send + Sync + 'static> UringFuseServing<F> {
                 entries_per_queue: cfg.entries_per_queue,
                 payload_cap,
                 server: server.clone(),
+                abort: abort.clone(),
             });
         }
 
@@ -1329,6 +1427,10 @@ mod tests {
             entries_per_queue: 1,
             payload_cap: 4096,
             server: Arc::new(Server::new(Arc::new(fs))),
+            abort: Arc::new(ConnectionAbort {
+                path: None,
+                done: AtomicBool::new(false),
+            }),
         };
         (worker, source)
     }
@@ -1585,5 +1687,69 @@ mod tests {
         drop(serving);
         assert!(start.elapsed() < RELEASE_TIMEOUT);
         assert!(std::fs::read(mnt.as_path().join("hello")).is_err());
+    }
+
+    #[test]
+    fn test_mount_minor() {
+        let info = "22 1 0:21 / /proc rw - proc proc rw\n\
+                    95 30 0:84 / /tmp/a rw - fuse.x x rw\n\
+                    96 30 0:86 / /tmp/a rw - fuse.x x rw\n";
+        // The last mount at a path is the one in effect.
+        assert_eq!(mount_minor(info, "/tmp/a".as_ref()), Some(86));
+        assert_eq!(mount_minor(info, "/tmp/b".as_ref()), None);
+        // Special characters are octal escapes.
+        let info = "97 30 0:88 / /tmp/a\\040b rw - fuse.x x rw\n";
+        assert_eq!(mount_minor(info, "/tmp/a b".as_ref()), Some(88));
+    }
+
+    /// Ending the connection, as a failed worker does, stops every worker,
+    /// so `wait()` returns instead of serving on with a hanging queue.
+    #[test]
+    fn test_uring_serving_connection_abort() {
+        let src = TempDir::new().unwrap();
+        // A mountpoint with a space, which mountinfo escapes.
+        let dir = TempDir::new().unwrap();
+        let mnt = dir.as_path().join("mount point");
+        std::fs::create_dir(&mnt).unwrap();
+        let fs = PassthroughFs::<()>::new(Config {
+            root_dir: src.as_path().to_string_lossy().to_string(),
+            do_import: false,
+            ..Default::default()
+        })
+        .unwrap();
+        fs.import().unwrap();
+        let server = Arc::new(Server::new(fs));
+        server.set_uring(true);
+        let mut se = FuseSession::new(mnt.as_path(), "uring_serving_test", "", false).unwrap();
+        se.mount().unwrap();
+        let abort = ConnectionAbort::new(se.mountpoint());
+        if abort.path.is_none() {
+            eprintln!("fusectl isn't mounted, skipping");
+            return;
+        }
+        let cfg = UringConfig {
+            workers: 2,
+            entries_per_queue: 2,
+        };
+        let serving = match UringFuseServing::new(se, server, cfg) {
+            Ok(serving) => Arc::new(serving),
+            Err(UringNotSupported) => {
+                eprintln!("FUSE-over-io_uring is not available, skipping");
+                return;
+            }
+            Err(e) => panic!("uring serving failed: {}", e),
+        };
+        std::fs::read_dir(mnt.as_path()).unwrap().for_each(drop);
+
+        abort.abort();
+        let (tx, rx) = channel();
+        let waiting = serving.clone();
+        std::thread::spawn(move || {
+            waiting.wait();
+            let _ = tx.send(());
+        });
+        rx.recv_timeout(Duration::from_secs(5))
+            .expect("the workers didn't stop after the connection ended");
+        assert!(std::fs::read_dir(mnt.as_path()).is_err());
     }
 }
