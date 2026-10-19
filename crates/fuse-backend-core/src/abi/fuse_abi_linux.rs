@@ -84,6 +84,10 @@ const FOPEN_CACHE_DIR: u32 = 8;
 /// the file is stream-like (no file position at all)
 const FOPEN_STREAM: u32 = 16;
 
+/// Serve reads and writes of this open file with FUSE-over-io_uring
+/// zero-copy, when the queue that serves them has it (Linux 7.3).
+const FOPEN_IO_URING_ZERO_COPY: u32 = 1 << 8;
+
 bitflags! {
     /// Options controlling the behavior of files opened by the server in response
     /// to an open or create request.
@@ -98,6 +102,15 @@ bitflags! {
         const CACHE_DIR = FOPEN_CACHE_DIR;
         /// the file is stream-like (no file position at all)
         const STREAM = FOPEN_STREAM;
+        /// Serve reads and writes of this open file with FUSE-over-io_uring
+        /// zero-copy, when the queue that serves them has it (Linux 7.3).
+        /// Other transports and queues copy the data as before. The data of
+        /// a zero-copy request stays in the client's pages, so the file
+        /// system must move it with `ZeroCopyWriter::write_from()` and
+        /// `ZeroCopyReader::read_to()`, into or out of a file that has a
+        /// descriptor (`FileReadWriteVolatile::raw_fd()`). Plain reads and
+        /// writes of it fail.
+        const IO_URING_ZERO_COPY = FOPEN_IO_URING_ZERO_COPY;
     }
 }
 
