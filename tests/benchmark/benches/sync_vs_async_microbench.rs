@@ -81,11 +81,21 @@ impl ZeroCopyWriter for MemWriter {
 impl AsyncZeroCopyWriter for MemWriter {
     async fn async_write_from(
         &mut self,
-        _f: Arc<dyn AsyncFileReadWriteVolatile>,
-        _count: usize,
-        _off: u64,
+        f: Arc<dyn AsyncFileReadWriteVolatile>,
+        count: usize,
+        off: u64,
     ) -> io::Result<usize> {
-        unreachable!("the synchronous delegation never uses the async zero-copy path")
+        if self.0.len() < count {
+            self.0.resize(count, 0);
+        }
+        // Safe because the buffer points into `self.0` and doesn't out-live it.
+        let buf = unsafe { FileVolatileBuf::from_raw_ptr(self.0.as_mut_ptr(), 0, count) };
+        let (res, _) = f.async_read_at_volatile(buf, off).await;
+        // Received data is always placed at the start of the buffer.
+        if let Ok(n) = &res {
+            self.0.truncate(*n);
+        }
+        res
     }
 }
 

@@ -102,6 +102,20 @@ smoke-all: smoke
 	${CARGO} test ${TARGET} --features="fusedev,persist" -- --nocapture --ignored
 	${CARGO} test ${TARGET} --features="fusedev,async-io" --no-default-features -- --nocapture --ignored
 
+# Drive every criterion microbench once (criterion --test mode: a single
+# iteration per bench, no warmup, no measurement).  The in-memory doubles in
+# tests/benchmark/benches are the only implementors of the zero-copy
+# reader/writer traits outside the library's own tests, and no other target
+# compiles them, so a call-pattern change can silently turn a stub into a
+# live panic mid-benchmark -- exactly what happened when native async WRITE
+# started calling the reader's async_read_to(): the bench panicked and every
+# group after it never ran again, undetected for weeks because the fio
+# pipeline exercises the daemon binary, not this crate.  The microbench
+# drives PassthroughFs directly against a temporary directory -- no mount, no
+# /dev/fuse, no privileges -- so this is safe wherever cargo runs.
+bench-smoke:
+	${CARGO} bench -p fuse-backend-rs-benchmark --bench sync_vs_async_microbench -- --test
+
 build-macos:
 	${CARGO} build --features="fusedev"
 	${CARGO} build --features="fusedev,fuse-t"
