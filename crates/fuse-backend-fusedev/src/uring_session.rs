@@ -90,6 +90,25 @@ impl Default for UringConfig {
     }
 }
 
+/// Whether the kernel lets this process serve FUSE over io_uring: the fuse
+/// module's `enable_uring` parameter is on, and the process may create an
+/// io_uring, which the `kernel.io_uring_disabled` sysctl can forbid.
+/// `UringFuseServing::new()` still fails with `Error::UringNotSupported` if
+/// the kernel refuses the transport at INIT, but checking first saves a
+/// mount that has to fall back to `/dev/fuse`.
+pub fn uring_available() -> bool {
+    const PARAM: &str = "/sys/module/fuse/parameters/enable_uring";
+    let read = || std::fs::read_to_string(PARAM);
+    let param = read().or_else(|e| {
+        // A fuse module that isn't loaded yet loads when /dev/fuse opens.
+        if e.kind() != io::ErrorKind::NotFound || File::open("/dev/fuse").is_err() {
+            return Err(e);
+        }
+        read()
+    });
+    param.is_ok_and(|v| v.trim() == "Y") && IoUring::new(1).is_ok()
+}
+
 /// Parse a CPU mask like "0-3,5,8-11" into the number of possible CPUs,
 /// which is the number of kernel fuse queues.
 fn parse_cpu_mask(content: &str) -> Result<usize> {
@@ -998,6 +1017,38 @@ mod tests {
     };
     use fuse_backend_core::api::filesystem::FsOptions;
     use fuse_backend_passthrough::{Config, PassthroughFs};
+
+    #[test]
+    fn test_uring_available() {
+        // When it says yes, a mount gets the transport.
+        if !uring_available() {
+            eprintln!("FUSE-over-io_uring is not available, skipping");
+            return;
+        }
+        let src = TempDir::new().unwrap();
+        let mnt = TempDir::new().unwrap();
+        let fs = PassthroughFs::<()>::new(Config {
+            root_dir: src.as_path().to_string_lossy().to_string(),
+            do_import: false,
+            ..Default::default()
+        })
+        .unwrap();
+        fs.import().unwrap();
+        let server = Arc::new(Server::new(fs));
+        server.set_uring(true);
+        let mut se = FuseSession::new(mnt.as_path(), "uring_available_test", "", false).unwrap();
+        if let Err(e) = se.mount() {
+            eprintln!("can't mount ({e}), skipping");
+            return;
+        }
+        let cfg = UringConfig {
+            workers: 1,
+            entries_per_queue: 1,
+        };
+        if let Err(e) = UringFuseServing::new(se, server, cfg) {
+            panic!("uring_available() said yes, but the mount got {}", e);
+        }
+    }
 
     #[test]
     fn test_parse_cpu_mask() {
