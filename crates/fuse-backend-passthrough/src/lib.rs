@@ -2071,6 +2071,36 @@ mod tests {
             .unwrap();
         assert_eq!(*files.closed.lock().unwrap(), vec![7]);
 
+        // An init() without passthrough turns it off again.
+        let tmpdir = TempDir::new().unwrap();
+        let files = Files::new(vec![Ok(3)]);
+        let fs = passthrough_fs(&tmpdir, files.clone());
+        let (entry, h1, opts1, _) = fs.create(&ctx, ROOT_ID, &name, createin).unwrap();
+        assert!(opts1.contains(OpenOptions::PASSTHROUGH));
+        assert!(!fs
+            .init(FsOptions::empty())
+            .unwrap()
+            .contains(FsOptions::PASSTHROUGH));
+        // A new file doesn't pass through.
+        let other = CString::new("other").unwrap();
+        let (_, _, opts_other, id_other) = fs.create(&ctx, ROOT_ID, &other, createin).unwrap();
+        assert!(!opts_other.contains(OpenOptions::PASSTHROUGH));
+        assert_eq!(id_other, None);
+        assert_eq!(files.calls.load(Ordering::Relaxed), 1);
+        // An inode with a handle from before still shares its id, because the kernel fails
+        // other opens of it.
+        let (h2, opts2, id2) = fs
+            .open(&ctx, entry.inode, libc::O_RDONLY as u32, 0)
+            .unwrap();
+        assert!(opts2.contains(OpenOptions::PASSTHROUGH));
+        assert_eq!(id2, Some(3));
+        fs.release(&ctx, entry.inode, 0, h1.unwrap(), false, false, None)
+            .unwrap();
+        assert!(files.closed.lock().unwrap().is_empty());
+        fs.release(&ctx, entry.inode, 0, h2.unwrap(), false, false, None)
+            .unwrap();
+        assert_eq!(*files.closed.lock().unwrap(), vec![3]);
+
         // EPERM turns passthrough off, so the next open doesn't try again.
         let tmpdir = TempDir::new().unwrap();
         let files = Files::new(vec![Err(io::Error::from_raw_os_error(libc::EPERM))]);

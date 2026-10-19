@@ -749,6 +749,10 @@ impl<S: BitmapSlice + Send + Sync> FileSystem for PassthroughFs<S> {
             self.perfile_dax.store(true, Ordering::Relaxed);
         }
 
+        // A takeover can call init() again with other options, so passthrough stays on only if
+        // this negotiation enables it again.
+        #[cfg(target_os = "linux")]
+        self.passthrough.store(false, Ordering::Relaxed);
         #[cfg(target_os = "linux")]
         if self.kernel_passthrough.is_some() && capable.contains(FsOptions::PASSTHROUGH) {
             // The kernel ignores FUSE_PASSTHROUGH along with FUSE_WRITEBACK_CACHE, and needs open
