@@ -176,6 +176,9 @@
   READDIR, READDIRPLUS and RELEASEDIR with them, so a file system that implements them can
   list a directory without blocking the worker. `Vfs` passes them on to the mounted file
   systems.
+- [281](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/281): `abi::fuse_uring` has the commands, INIT flag and fields of protocol 7.46 for buffer pools.
+  `Server::uring_bufpool_supported()` tells whether the kernel offered them at INIT, and
+  `Server::uring_payload_size()` returns the size of the kernel's payload buffers.
 
 ### Changed
 - [325](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/325): The `fuse-backend-fusedev` `uring` transport uses io-uring 0.6 instead of 0.5,
@@ -233,6 +236,7 @@
   to enable them. A crate that depends on a transport crate directly must enable
   that crate's `async-io` too, or its writers fail asynchronous replies with
   `EINVAL`.
+- [281](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/281): `FuseUringEntInOut::padding` is now `offset`, and `FuseUringCmdReq` has a new `bufpool` field.
 - [254](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/254): `fuse-backend-rs` is now a thin facade re-exporting the sub-crates. Every
   historical `fuse_backend_rs::{abi, api, buffer, common, transport, passthrough,
   overlayfs}` import path and cargo feature name (`fusedev`, `virtiofs`,
