@@ -83,7 +83,11 @@ async-io = [
 # Experimental: FUSE-over-io_uring transport (kernel >= 6.14, protocol 7.42).
 # The kernel interface is still evolving (queue-count reduction, bufpool
 # extensions); the API and ABI target may change between releases.
-uring = ["io-uring", "fuse-backend-core/fusedev-uring"]
+# The transport maps its buffers with vm-memory's `MmapRegion`, whose
+# `backend-mmap` feature doesn't build on FreeBSD. Only this feature turns it
+# on, because the workspace's version 1 resolver would turn on the features
+# of a Linux-only dependency entry for FreeBSD too.
+uring = ["io-uring", "fuse-backend-core/fusedev-uring", "vm-memory/backend-mmap"]
 # Serve through the fuse-t library (https://github.com/macos-fuse-t/fuse-t)
 # instead of macFUSE on macOS. Core applies fuse-t specific reply quirks
 # under its own `fuse-t` cfg.
