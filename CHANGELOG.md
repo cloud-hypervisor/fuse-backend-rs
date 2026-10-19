@@ -192,6 +192,10 @@
   gives the transport the file descriptor to move it to. Other reads get a copy through memory.
 - [282](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/282): `passthrough::Config::uring_zero_copy` asks for FUSE-over-io_uring zero-copy on the files that
   `PassthroughFs` opens, except files it opens with O_DIRECT.
+- [282](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/282): With `UringConfig::zero_copy` on Linux 7.3 and later, `UringFuseServing` serves the reads and
+  writes of opens that ask for it with zero-copy. It moves the data between the client's pages
+  and the file with io_uring fixed-buffer operations. It needs buffer pools and CAP_SYS_ADMIN,
+  and serves without it otherwise. `UringConfig` has a new field.
 
 ### Changed
 - [325](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/325): The `fuse-backend-fusedev` `uring` transport uses io-uring 0.6 instead of 0.5,
