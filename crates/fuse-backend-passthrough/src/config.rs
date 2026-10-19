@@ -181,6 +181,19 @@ pub struct Config {
     ///
     /// The default is `true`.
     pub allow_direct_io: bool,
+
+    /// Whether to ask for FUSE-over-io_uring zero-copy on the files it opens
+    /// (`OpenOptions::IO_URING_ZERO_COPY`, Linux 7.3). On a transport and
+    /// queue that support it, the kernel then lends the client's pages to
+    /// reads and writes, and the transport moves the data between them and
+    /// the backing file without copying it through memory. Elsewhere the
+    /// option changes nothing. Files that the backing store opens with
+    /// O_DIRECT don't get it, because their IO goes through an aligned
+    /// bounce buffer, which zero-copy data would reach only through a
+    /// slower copy.
+    ///
+    /// The default is `false`.
+    pub uring_zero_copy: bool,
 }
 
 impl Default for Config {
@@ -205,6 +218,7 @@ impl Default for Config {
             dir_attr_timeout: None,
             use_host_ino: false,
             allow_direct_io: true,
+            uring_zero_copy: false,
         }
     }
 }

@@ -43,6 +43,8 @@
   `Reader::with_zero_copy()` attaches request data that only the transport can move, through a
   `ZeroCopySource`, and `Reader::read_to_at()` hands it over. `FileReadWriteVolatile::raw_fd()`
   gives the transport the file descriptor to move it to. Other reads get a copy through memory.
+- `passthrough::Config::uring_zero_copy` asks for FUSE-over-io_uring zero-copy on the files that
+  `PassthroughFs` opens, except files it opens with O_DIRECT.
 
 ### Changed
 - The FUSE-over-io_uring transport answers opcodes it doesn't know with ENOSYS instead of EIO.
