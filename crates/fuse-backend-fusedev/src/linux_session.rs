@@ -920,9 +920,14 @@ mod asyncio {
     use std::os::unix::io::{AsRawFd, RawFd};
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
+    use std::time::Duration;
 
     use futures_util::stream::{FuturesUnordered, StreamExt};
     use nix::fcntl::{fcntl, FcntlArg, OFlag};
+    use nix::sys::time::TimeSpec;
+    use nix::sys::timerfd::{ClockId, Expiration, TimerFd, TimerFlags, TimerSetTimeFlags};
+    use tokio::io::unix::{AsyncFd, AsyncFdReadyGuard};
+    use tokio::io::Interest;
 
     use fuse_backend_core::api::filesystem::AsyncFileSystem;
     use fuse_backend_core::api::server::Server;
@@ -1001,8 +1006,11 @@ mod asyncio {
     /// // Run the task
     /// executor.spawn(async move { task.poll_handler().await });
     ///
-    /// // Stop the task
+    /// // Stop the task. It checks `state` before reading a request. An idle task checks it
+    /// // every 100ms with the tokio runtime, and with tokio-uring only once a request arrives
+    /// // or the session is torn down.
     /// state.store(true, Ordering::Relaxed);
+    /// session.umount().unwrap();
     /// ```
     pub struct FuseDevTask<F: AsyncFileSystem + Sync> {
         file: AsyncFile,
@@ -1028,9 +1036,9 @@ mod asyncio {
         ///   this size.
         /// - file: file object for the fuse device, ownership is taken by the task object
         /// - server: `Server` instance to serve requests from the fuse fd
-        /// - state: shared flag to control the task object. The task stops picking up
-        ///   new requests once it's set to `true`; the requests being processed are
-        ///   completed first.
+        /// - state: shared flag to control the task object. Once it's `true`, the task reads no
+        ///   more requests and returns after completing the requests in flight. How soon an idle
+        ///   task notices the flag depends on the runtime, as `poll_handler()` describes.
         pub fn new(
             buf_size: usize,
             file: std::fs::File,
@@ -1070,7 +1078,7 @@ mod asyncio {
             //   `preadv()`, which would block the whole single-threaded
             //   runtime (stalling in-flight request handling and teardown).
             //   With `O_NONBLOCK` the read fails with `EAGAIN` and
-            //   `poll_handler()` yields and retries instead.
+            //   `poll_handler()` waits for the fd to become readable instead.
             //
             // Note: `O_NONBLOCK` is a property of the file description, so the
             // fd must not be shared with other consumers of the same file
@@ -1115,18 +1123,73 @@ mod asyncio {
         /// its queue into the read buffer at any point, and canceling the read
         /// afterwards would silently lose that request.
         ///
-        /// The async fn repeatedly return Poll::Pending when polled until the state has been set
-        /// to quiesce mode, or the fuse session has been torn down (EOF/`ENODEV` from the
-        /// fuse device).
+        /// It returns when it finds `state` set, or when the fuse session is torn down (EOF or
+        /// `ENODEV` from the fuse device). With the tokio runtime, an idle task checks `state`
+        /// every 100ms. If it can't create the timer for that, it logs a warning. With
+        /// tokio-uring, a read waiting in the kernel usually completes only when a request
+        /// arrives or the session is torn down, and the task checks `state` then.
+        ///
+        /// To stop an idle task without tearing the session down, for example for a takeover
+        /// with `Server::restore_init()`, drop this future. Do this only with the tokio runtime,
+        /// where it's safe while the task waits for a request, because the task reads nothing
+        /// until the fd is readable. Requests that the task read but didn't answer stay pending
+        /// in the kernel as long as the file description they came from stays open, and
+        /// `notify_resend()` makes the kernel send them again. The task owns its fd, so before
+        /// `new()`, keep a duplicate from `File::try_clone()` to hand the file description to the
+        /// new server.
+        ///
+        /// Don't drop this future with tokio-uring while the session is up. tokio-uring doesn't
+        /// cancel the read pending in the kernel, so the kernel copies the next request into the
+        /// request buffer that the drop freed, and nothing answers that request until another
+        /// `notify_resend()`. To stop such a task, set `state` and let it serve one more request,
+        /// or tear the session down.
         ///
         /// Note: when driven by the tokio-uring runtime, io_uring submission queue entries
         /// are submitted to the kernel whenever the runtime parks, so the driving future
         /// must not busy-loop and should let the runtime park regularly (e.g. by running
         /// `poll_handler()` as a separate task). Otherwise requests may pile up in the
         /// kernel without being served.
+        ///
+        /// With the tokio runtime, the task waits for requests through the IO driver of the
+        /// tokio runtime that polls it, and panics if that runtime has IO disabled. If no tokio
+        /// runtime polls it, it retries reads in a loop.
         pub async fn poll_handler(&mut self) {
             // TODO: register the request buffers as io uring buffers.
             let fd = self.file.as_raw_fd();
+            // With the tokio runtime, `preadv()` fails with `EAGAIN` while no request is
+            // pending, so wait for the fd to become readable. A torn down connection
+            // reports only `EPOLLERR`, so wait for errors too.
+            //
+            // A task whose `state` is already set returns before it registers the fd.
+            // Registering needs a tokio runtime and a file that epoll supports. Without them,
+            // the task yields and retries reads instead.
+            if self.state.load(Ordering::Acquire) {
+                return;
+            }
+            let ready = match &self.file {
+                AsyncFile::Tokio(_) if tokio::runtime::Handle::try_current().is_err() => {
+                    warn!("not polled by a tokio runtime, retrying fuse device reads instead of waiting for requests");
+                    None
+                }
+                AsyncFile::Tokio(_) => {
+                    // SAFETY: `fd` belongs to `self.file`, which stays open for the whole
+                    // function, so it outlives the registration.
+                    let registered = unsafe {
+                        AsyncFd::register_with_interest(fd, Interest::READABLE | Interest::ERROR)
+                    };
+                    match registered {
+                        Ok(device) => Some(DeviceReadiness::new(device)),
+                        Err(e) => {
+                            warn!(
+                                "can't wait for the fuse device fd to become readable, retrying reads instead: {}",
+                                e
+                            );
+                            None
+                        }
+                    }
+                }
+                _ => None,
+            };
             let pool = BufferPool::new(self.buf_size, self.max_inflight);
             let mut inflight = FuturesUnordered::new();
 
@@ -1153,9 +1216,7 @@ mod asyncio {
                 // of the read future, so that its borrow of `buf` ends before
                 // the buffer is handed over to a request or the pool.
                 let read_result = {
-                    // Safe because `vbuf` doesn't out-live `buf`.
-                    let vbuf = unsafe { FileVolatileBuf::new(&mut buf) };
-                    let read = self.file.async_read_at(vbuf, 0);
+                    let read = read_request(&self.file, ready.as_ref(), &self.state, &mut buf);
                     tokio::pin!(read);
 
                     loop {
@@ -1167,7 +1228,7 @@ mod asyncio {
                                 // once a request future has completed.
                                 pool.release(res.unwrap());
                             }
-                            (result, _vbuf) = &mut read => {
+                            result = &mut read => {
                                 break result;
                             }
                         }
@@ -1177,12 +1238,13 @@ mod asyncio {
                 };
 
                 match read_result {
-                    Ok(0) => {
-                        // EOF, the fuse session has been torn down.
+                    Ok(None | Some(0)) => {
+                        // Either `state` stopped the task while it waited for a request, or
+                        // the read hit EOF because the fuse session is torn down.
                         pool.release(buf);
                         break 'serve;
                     }
-                    Ok(len) => {
+                    Ok(Some(len)) => {
                         let server = self.server.clone();
                         inflight.push(handle_request(server, fd, buf, len));
                     }
@@ -1195,27 +1257,35 @@ mod asyncio {
                                 // The fuse device was unmounted or the connection was aborted.
                                 break 'serve;
                             }
-                            Some(libc::EINTR) => {
-                                // Interrupted by a signal, retry the read.
+                            Some(libc::EINTR) | Some(libc::ENOENT) => {
+                                // Interrupted by a signal, or the kernel dropped
+                                // the request because it was interrupted. Retry
+                                // the read.
                                 continue 'serve;
                             }
                             Some(libc::EAGAIN) => {
-                                // No request is pending and the io_uring
-                                // read was issued on the nonblocking fuse
-                                // fd. Some kernels complete the read with
-                                // `EAGAIN` instead of arming poll on the
-                                // fuse device, so retrying immediately
-                                // would busy-loop without ever letting the
-                                // runtime park (which is when io_uring
-                                // submissions and reactor events are
-                                // processed). Yield to the runtime before
-                                // retrying instead.
+                                // No request is pending, and nothing waited
+                                // for the fd to become readable. This happens
+                                // with io_uring, where some kernels complete
+                                // the read with `EAGAIN` instead of arming
+                                // poll on the fuse device. It also happens
+                                // with a tokio task that couldn't register
+                                // the fd. Retrying immediately would
+                                // busy-loop without ever letting the runtime
+                                // park (which is when io_uring submissions
+                                // and reactor events are processed). Yield to
+                                // the runtime before retrying instead.
                                 tokio::task::yield_now().await;
                                 continue 'serve;
                             }
                             _ => {
-                                // TODO: error handling
+                                // The error isn't an OS error, for example because the
+                                // runtime is shutting down, or one that retrying won't
+                                // fix, such as EINVAL for a buffer smaller than the
+                                // kernel's requests. Retrying would spin on it, so stop
+                                // like the synchronous server does.
                                 error!("failed to read request from fuse device fd, {}", e);
+                                break 'serve;
                             }
                         }
                     }
@@ -1229,6 +1299,109 @@ mod asyncio {
             }
 
             // TODO: unregister the request buffers as io uring buffers.
+        }
+    }
+
+    /// How often a task waiting for a request checks its `state` flag.
+    const STATE_CHECK_INTERVAL: Duration = Duration::from_millis(100);
+
+    /// Waits for the fuse device to become readable. A periodic timer wakes
+    /// the wait, so an idle task still checks its `state` flag.
+    ///
+    /// The timer is a timerfd on tokio's IO driver, not a tokio timer. So the
+    /// runtime only needs IO enabled, and a runtime shutdown makes the wait
+    /// fail instead of panic.
+    struct DeviceReadiness {
+        device: AsyncFd<RawFd>,
+        // Without a timer, an idle task checks `state` once a request arrives.
+        tick: Option<AsyncFd<TimerFd>>,
+    }
+
+    impl DeviceReadiness {
+        fn new(device: AsyncFd<RawFd>) -> Self {
+            let tick = match Self::timer() {
+                Ok(tick) => Some(tick),
+                Err(e) => {
+                    warn!(
+                        "can't create a timer for the state checks of an idle task, checking when a request arrives instead: {}",
+                        e
+                    );
+                    None
+                }
+            };
+            DeviceReadiness { device, tick }
+        }
+
+        /// A timer that becomes readable every `STATE_CHECK_INTERVAL`.
+        fn timer() -> std::io::Result<AsyncFd<TimerFd>> {
+            let timer = TimerFd::new(
+                ClockId::CLOCK_MONOTONIC,
+                TimerFlags::TFD_NONBLOCK | TimerFlags::TFD_CLOEXEC,
+            )?;
+            timer.set(
+                Expiration::Interval(TimeSpec::from_duration(STATE_CHECK_INTERVAL)),
+                TimerSetTimeFlags::empty(),
+            )?;
+            // SAFETY: the `AsyncFd` owns `timer`, so its fd stays open for as
+            // long as the registration.
+            let tick = unsafe { AsyncFd::register_with_interest(timer, Interest::READABLE) }?;
+            Ok(tick)
+        }
+
+        /// Wait until the device is readable and return its guard, or return
+        /// `None` on the next tick of the timer.
+        async fn wait(&self) -> std::io::Result<Option<AsyncFdReadyGuard<'_, RawFd>>> {
+            let device = self.device.ready(Interest::READABLE | Interest::ERROR);
+            let Some(tick) = &self.tick else {
+                return device.await.map(Some);
+            };
+            tokio::select! {
+                biased;
+                ready = device => ready.map(Some),
+                ready = tick.ready(Interest::READABLE) => {
+                    let mut guard = ready?;
+                    // Consume the expirations, so the next one makes the timer
+                    // readable again. EAGAIN means there were none.
+                    let _ = tick.get_ref().wait();
+                    guard.clear_ready();
+                    Ok(None)
+                }
+            }
+        }
+    }
+
+    /// Read one request from the fuse device into `buf`, or return `None` if
+    /// `state` asks the task to stop while it waits for one.
+    ///
+    /// With `ready`, wait until the fd is readable before each read, and wait
+    /// again if the read finds no request.
+    async fn read_request(
+        file: &AsyncFile,
+        ready: Option<&DeviceReadiness>,
+        state: &AtomicBool,
+        buf: &mut [u8],
+    ) -> std::io::Result<Option<usize>> {
+        loop {
+            let guard = match ready {
+                Some(ready) => loop {
+                    if state.load(Ordering::Acquire) {
+                        return Ok(None);
+                    }
+                    if let Some(guard) = ready.wait().await? {
+                        break Some(guard);
+                    }
+                },
+                None => None,
+            };
+            // Safe because `vbuf` doesn't out-live `buf`.
+            let vbuf = unsafe { FileVolatileBuf::new(buf) };
+            let (result, _vbuf) = file.async_read_at(vbuf, 0).await;
+            match (result, guard) {
+                (Err(e), Some(mut guard)) if e.raw_os_error() == Some(libc::EAGAIN) => {
+                    guard.clear_ready();
+                }
+                (result, _) => return result.map(Some),
+            }
         }
     }
 

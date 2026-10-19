@@ -119,6 +119,7 @@ bench-smoke:
 build-macos:
 	${CARGO} build --features="fusedev"
 	${CARGO} build --features="fusedev,fuse-t"
+	${CARGO} build --features="fusedev,async-io"
 	${CARGO} build -p fuse-backend-core --no-default-features
 	${CARGO} build -p fuse-backend-vfs --no-default-features
 	${CARGO} build -p fuse-backend-vfs --no-default-features --features="fuse-backend-vfs/persist"
@@ -129,8 +130,12 @@ check-macos: build-macos
 	${CARGO} test --features="fusedev" -- --nocapture --skip integration
 	${CARGO} clippy --features="fusedev,fuse-t" -- -Dwarnings
 	${CARGO} test --features="fusedev,fuse-t" -- --nocapture --skip integration
+	${CARGO} clippy --features="fusedev,async-io" -- -Dwarnings
+	${CARGO} test --features="fusedev,async-io" -- --nocapture --skip integration
 	${CARGO} clippy -p fuse-backend-core --no-default-features -- -Dwarnings
 	${CARGO} test -p fuse-backend-core --no-default-features -- --nocapture --skip integration
+	${CARGO} clippy -p fuse-backend-core --no-default-features --features="async-io" -- -Dwarnings
+	${CARGO} test -p fuse-backend-core --no-default-features --features="async-io" -- --nocapture --skip integration
 	${CARGO} clippy -p fuse-backend-vfs --no-default-features -- -Dwarnings
 	${CARGO} test -p fuse-backend-vfs --no-default-features -- --nocapture --skip integration
 	${CARGO} test -p fuse-backend-vfs --no-default-features --features="fuse-backend-vfs/persist" -- --nocapture --skip integration
