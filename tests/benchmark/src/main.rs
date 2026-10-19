@@ -7,8 +7,8 @@
 //! and asynchronous IO paths with external tools such as fio.
 //!
 //! Usage: `fuse-backend-rs-benchmark <src> <mountpoint> [--async|--uring] [--threads N]
-//! [--sync-blocking] [--thread-pool] [--uring-bufs N] [--kernel-passthrough]
-//! [--no-writeback]`
+//! [--sync-blocking] [--thread-pool] [--uring-bufs N] [--uring-zero-copy]
+//! [--no-backing-direct-io] [--kernel-passthrough] [--no-writeback]`
 //!
 //! - default (sync) mode: requests are served by `N` worker threads of the
 //!   `SyncFuseServing` serving layer, each reading from its own fuse channel
@@ -25,7 +25,14 @@
 //!   `N` limits the number of io_uring worker threads. `--uring-bufs N`
 //!   sets `UringConfig::bufs_per_queue`, the number of buffers in each
 //!   queue's buffer pool on kernels with buffer pools. `0` gives every ring
-//!   entry a buffer of its own.
+//!   entry a buffer of its own. `--uring-zero-copy` serves reads and writes
+//!   with zero-copy (`UringConfig::zero_copy` and
+//!   `Config::uring_zero_copy`), which needs CAP_SYS_ADMIN.
+//!
+//! `--no-backing-direct-io` opens the backing files without O_DIRECT even when
+//! the client asks for it (`Config::allow_direct_io = false`). Requests of a
+//! client that opens with O_DIRECT still reach the daemon as direct IO, and
+//! opens without O_DIRECT on the backing file can use zero-copy.
 //!
 //! `--kernel-passthrough` makes the kernel pass reads, writes and mmap of open
 //! files through to the source files (Linux 6.9+, needs `CAP_SYS_ADMIN`), so
@@ -68,6 +75,8 @@ mod daemon {
         no_writeback: bool,
         thread_cnt: u32,
         uring_bufs: usize,
+        uring_zero_copy: bool,
+        backing_direct_io: bool,
     }
 
     /// Registers backing files on the FUSE device of the session, which is
@@ -89,7 +98,7 @@ mod daemon {
 
     fn help() {
         println!(
-            "Usage:\n   fuse-backend-rs-benchmark <src> <mountpoint> [--async|--uring] [--threads N] [--sync-blocking] [--thread-pool] [--uring-bufs N] [--kernel-passthrough] [--no-writeback]\n"
+            "Usage:\n   fuse-backend-rs-benchmark <src> <mountpoint> [--async|--uring] [--threads N] [--sync-blocking] [--thread-pool] [--uring-bufs N] [--uring-zero-copy] [--no-backing-direct-io] [--kernel-passthrough] [--no-writeback]\n"
         );
     }
 
@@ -110,6 +119,8 @@ mod daemon {
             no_writeback: false,
             thread_cnt: 4,
             uring_bufs: UringConfig::default().bufs_per_queue,
+            uring_zero_copy: false,
+            backing_direct_io: true,
         };
         let mut idx = 3;
         while idx < args.len() {
@@ -131,6 +142,8 @@ mod daemon {
                         Error::from_raw_os_error(libc::EINVAL)
                     })?;
                 }
+                "--uring-zero-copy" => res.uring_zero_copy = true,
+                "--no-backing-direct-io" => res.backing_direct_io = false,
                 "--uring-bufs" => {
                     idx += 1;
                     res.uring_bufs =
@@ -170,6 +183,8 @@ mod daemon {
     fn create_server(
         src: &str,
         thread_pool: bool,
+        uring_zero_copy: bool,
+        allow_direct_io: bool,
         backing_files: Option<Arc<FuseBackingFiles>>,
         no_writeback: bool,
     ) -> Arc<Server<Arc<Vfs>>> {
@@ -188,6 +203,8 @@ mod daemon {
         let cfg = Config {
             root_dir: src.to_string(),
             do_import: false,
+            uring_zero_copy,
+            allow_direct_io,
             ..Default::default()
         };
         let mut fs = PassthroughFs::<()>::new(cfg).unwrap();
@@ -261,6 +278,7 @@ mod daemon {
         se: FuseSession,
         thread_cnt: u32,
         bufs_per_queue: usize,
+        zero_copy: bool,
     ) {
         // set_uring() must be called before the INIT handshake, which
         // UringFuseServing::new() performs on the mounted session.
@@ -269,6 +287,7 @@ mod daemon {
             workers: thread_cnt as usize,
             entries_per_queue: 16,
             bufs_per_queue,
+            zero_copy,
         };
         let serving = match UringFuseServing::new(se, server, cfg) {
             Ok(serving) => serving,
@@ -333,6 +352,8 @@ mod daemon {
         let server = create_server(
             &args.src,
             args.thread_pool,
+            args.uring_zero_copy,
+            args.backing_direct_io,
             backing_files.clone(),
             args.no_writeback,
         );
@@ -344,7 +365,13 @@ mod daemon {
         }
 
         if args.as_uring {
-            run_uring(server, se, args.thread_cnt, args.uring_bufs);
+            run_uring(
+                server,
+                se,
+                args.thread_cnt,
+                args.uring_bufs,
+                args.uring_zero_copy,
+            );
         } else if args.as_async {
             run_async(server, se, args.thread_cnt);
         } else {

@@ -152,6 +152,48 @@ IOPS with and without pools. VmRSS counts only the pages that requests
 touched, so workloads with fewer requests in flight use far less memory
 than this.
 
+## Zero-copy
+
+On Linux 7.3 and later, a queue with a buffer pool can also serve reads
+and writes with zero-copy. The kernel then registers the client's pages
+of a READ or WRITE in the server's io_uring buffer table instead of
+copying them into a payload buffer, and the server moves the data
+between those pages and a file with `IORING_OP_READ_FIXED` and
+`IORING_OP_WRITE_FIXED`. It needs CAP_SYS_ADMIN, and the file system
+asks for it per open with `OpenOptions::IO_URING_ZERO_COPY`.
+
+With `UringConfig::zero_copy`, `UringFuseServing` adds the queues with
+`FUSE_URING_ZERO_COPY` and gives each worker ring an empty buffer table
+with a slot per entry. A zero-copy READ gets a reply body that only the
+transport can fill, and `write_from()` runs `READ_FIXED` from the file
+into the slot. A zero-copy WRITE gets a `Reader` whose data only the
+transport can move, and `read_to()` runs `WRITE_FIXED` from the slot
+into the file. Both run on the worker's ring and wait for the result
+there, because the kernel registered the pages in that ring's table. If the
+kernel refuses zero-copy, `UringFuseServing` adds the queues without it.
+
+A file system that reads or writes zero-copy data through memory, or
+with a file that has no descriptor, still works, but slower. The worker
+then copies the data through a memory file. It runs `WRITE_FIXED` from
+the client pages into the file and reads it back, or writes into the
+file and runs `READ_FIXED` from it into the client pages.
+
+The table shows the throughput of the benchmark daemon with `--uring
+--no-backing-direct-io`, 4 workers and 16 entries per queue, on a 24-CPU
+machine with Linux 7.3-rc7, serving 4 files of 1 GiB from a tmpfs as
+root. fio ran direct random IO with libaio, 4 jobs at depth 16, for 8
+seconds, and the two settings alternated three times:
+
+| Workload | Copy | Zero-copy |
+|----------|------|-----------|
+| 1 MiB reads | 9966-10651 MiB/s | 13896-15202 MiB/s |
+| 1 MiB writes | 8164-9070 MiB/s | 12299-12883 MiB/s |
+| 128 KiB reads | 15579-17626 MiB/s | 15565-17028 MiB/s |
+| 128 KiB writes | 12700-14037 MiB/s | 11911-13249 MiB/s |
+
+Zero-copy saves the copy of the payload, which matters for large
+requests. At 128 KiB the two runs overlap.
+
 ## Implementation Notes
 
 ### Current State
@@ -162,14 +204,15 @@ and uses the buffer pools of protocol 7.46 (kernel 7.3) when the kernel has them
 - Scatter Reader/Writer eliminates all userspace memcpy
 - Per-CPU queue model with configurable entries_per_queue
 - Buffer pools with configurable bufs_per_queue, see "Buffer pools" above
+- Zero-copy for opens that ask for it, see "Zero-copy" above
 - Fallback to classic `/dev/fuse` for notifications/interrupts
 
 ### Future Work
 
-When Linux 7.3+ is available on target systems:
-
-1. **Zero-copy mode**: Enable direct page access (requires CAP_SYS_ADMIN) to
-   eliminate kernel-side copies entirely.
+1. **Async zero-copy**: `ZeroCopySource` and the zero-copy reply wait
+   synchronously on the worker's ring, which suits the synchronous
+   handlers. Serving `AsyncFileSystem` handlers over io_uring needs
+   asynchronous versions.
 
 ### Tuning Recommendations
 
