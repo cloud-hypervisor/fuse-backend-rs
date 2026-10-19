@@ -19,6 +19,13 @@ cd tests/benchmark
 cargo bench
 ```
 
+For CI (and quick local checks) the same benches can be driven once each —
+one iteration, no warmup, no measurement — with `make bench-smoke` from the
+workspace root.  The doubles here are the only implementors of the zero-copy
+reader/writer traits outside the library's own tests, and this smoke run is
+what catches call-pattern changes that would turn a stub into a
+mid-benchmark panic; the full `cargo bench` above then only measures.
+
 Note that the async numbers include the runtime dispatch cost
 (`Runtime::block_on()` per operation). These numbers quantify the overhead
 of delegation itself; they do not predict end-to-end throughput, because the

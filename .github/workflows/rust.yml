@@ -50,6 +50,11 @@ jobs:
         # unprivileged before the privileged rows below re-run the whole
         # suite as root (the other link tests need open_by_handle_at()).
         ${CARGO_BIN} test -p fuse-backend-passthrough --no-default-features -- --nocapture test_link_symlink test_link_regular
+        # Drive each criterion microbench once (unprivileged: it exercises
+        # PassthroughFs directly, with no mount), so async call-pattern changes
+        # that turn a bench test-double stub into a live path fail the build
+        # here instead of panicking mid-benchmark.
+        make bench-smoke
         sudo -E CARGO=${CARGO_BIN} make test
         sudo -E CARGO=${CARGO_BIN} make smoke-all
         sudo chown -R $(id -u):$(id -g) "${HOME}/.cargo"
