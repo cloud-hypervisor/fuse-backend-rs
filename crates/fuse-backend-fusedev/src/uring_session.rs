@@ -19,29 +19,32 @@
 //!
 //! Experimental: the kernel interface is still evolving.
 
+use std::collections::VecDeque;
 use std::fs::File;
 use std::io::{self, IoSlice, Write};
 use std::mem::ManuallyDrop;
-use std::os::unix::io::{AsRawFd, RawFd};
+use std::os::unix::fs::FileExt;
+use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
 use std::ptr::NonNull;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Sender};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use io_uring::{cqueue, opcode, squeue, types, IoUring};
 use vm_memory::ByteValued;
 
-use fuse_backend_core::abi::fuse_abi::{InHeader, OutHeader};
+use fuse_backend_core::abi::fuse_abi::{InHeader, Opcode, OutHeader, ReadIn};
 use fuse_backend_core::abi::fuse_uring::{
     FuseUringBufpool, FuseUringCmdReq, FuseUringEntInOut, FuseUringReqHeader,
     FUSE_IO_URING_CMD_ADD_BUFPOOL, FUSE_IO_URING_CMD_ADD_QUEUE, FUSE_IO_URING_CMD_COMMIT_AND_FETCH,
-    FUSE_IO_URING_CMD_REGISTER, FUSE_URING_IN_OUT_HEADER_SZ, FUSE_URING_IOV_SEGS,
+    FUSE_IO_URING_CMD_REGISTER, FUSE_URING_ENT_ZERO_COPY, FUSE_URING_IN_OUT_HEADER_SZ,
+    FUSE_URING_IOV_SEGS, FUSE_URING_ZERO_COPY,
 };
 use fuse_backend_core::api::filesystem::FileSystem;
 use fuse_backend_core::api::server::Server;
-use fuse_backend_core::buffer::{Error::*, Reader, Result, Writer};
+use fuse_backend_core::buffer::{Error::*, Reader, Result, Writer, ZeroCopySource};
 use fuse_backend_core::file_buf::FileVolatileSlice;
 use fuse_backend_core::file_traits::FileReadWriteVolatile;
 use vm_memory::bitmap::BitmapSlice;
@@ -95,6 +98,16 @@ pub struct UringConfig {
     /// because each entry holds at most one. `0`, or a kernel without
     /// buffer pools, gives every entry a buffer of its own instead.
     pub bufs_per_queue: usize,
+    /// Serve the reads and writes of opens that ask for it with zero-copy
+    /// (`OpenOptions::IO_URING_ZERO_COPY`, Linux 7.3). The kernel lends the
+    /// client's pages to the request, and the transport moves the data
+    /// between them and the file the file system names with io_uring
+    /// fixed-buffer operations, without copying it through memory. It
+    /// needs buffer pools and CAP_SYS_ADMIN, and the transport serves
+    /// without it otherwise. File systems must pass reads and writes of
+    /// such opens to `ZeroCopyWriter::write_from()` and
+    /// `ZeroCopyReader::read_to()` with a file that has a descriptor.
+    pub zero_copy: bool,
 }
 
 impl Default for UringConfig {
@@ -103,6 +116,7 @@ impl Default for UringConfig {
             workers: 0,
             entries_per_queue: 4,
             bufs_per_queue: 4,
+            zero_copy: false,
         }
     }
 }
@@ -240,8 +254,58 @@ pub struct UringWriter<'a, S: BitmapSlice = ()> {
     header: ManuallyDrop<Vec<u8>>,
     /// Backed by the entry's payload area; receives the reply body.
     body: ManuallyDrop<Vec<u8>>,
+    /// The reply data of a zero-copy READ, which only the transport can
+    /// produce.
+    zero_copy: Option<ZeroCopyBody<'a>>,
     phantom: std::marker::PhantomData<&'a mut [S]>,
 }
+
+/// Reads a file into the client pages of a zero-copy READ.
+trait ZeroCopySink: Sync {
+    /// Read `count` bytes from the file `fd` at offset `off` into the client
+    /// pages, starting `pos` bytes into them. Returns how many it read.
+    fn read_from_file(&self, pos: usize, fd: RawFd, count: usize, off: u64) -> io::Result<usize>;
+
+    /// Copy `data` into the client pages, starting `pos` bytes into them.
+    /// This is the slow way, for replies built in memory.
+    fn write_from_memory(&self, pos: usize, data: &[u8]) -> io::Result<()>;
+}
+
+/// The reply data of a zero-copy READ: up to `cap` bytes that `sink` reads
+/// into the client pages, of which `len` are read.
+#[derive(Clone, Copy)]
+struct ZeroCopyBody<'a> {
+    sink: &'a dyn ZeroCopySink,
+    cap: usize,
+    len: usize,
+}
+
+impl ZeroCopyBody<'_> {
+    /// Copy `data` from memory into the client pages, after what is there.
+    fn push_memory(&mut self, data: &[u8]) -> io::Result<()> {
+        check_space(self.cap - self.len, data.len())?;
+        self.sink.write_from_memory(self.len, data)?;
+        self.len += data.len();
+        Ok(())
+    }
+}
+
+impl std::fmt::Debug for ZeroCopyBody<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ZeroCopyBody")
+            .field("cap", &self.cap)
+            .field("len", &self.len)
+            .finish()
+    }
+}
+
+impl PartialEq for ZeroCopyBody<'_> {
+    fn eq(&self, other: &Self) -> bool {
+        std::ptr::addr_eq(self.sink, other.sink) && self.cap == other.cap && self.len == other.len
+    }
+}
+
+impl Eq for ZeroCopyBody<'_> {}
 
 impl<'a, S: BitmapSlice> UringWriter<'a, S> {
     /// Construct a writer that routes the first `OUT_HEADER_SIZE` bytes
@@ -270,12 +334,22 @@ impl<'a, S: BitmapSlice> UringWriter<'a, S> {
         UringWriter {
             header,
             body,
+            zero_copy: None,
             phantom: std::marker::PhantomData,
         }
     }
 
+    /// Let `sink` produce up to `cap` bytes of reply data, for a zero-copy
+    /// READ. `write_from_at()` then reads the file into the client pages
+    /// instead of the body.
+    fn with_zero_copy(mut self, sink: &'a dyn ZeroCopySink, cap: usize) -> Self {
+        self.zero_copy = Some(ZeroCopyBody { sink, cap, len: 0 });
+        self
+    }
+
     /// Split the writer at `offset` bytes of the combined (header + body)
-    /// capacity.
+    /// capacity. The zero-copy reply data, which comes after the body, goes
+    /// to the returned writer.
     ///
     /// The two regions are non-contiguous, so the split redistributes
     /// capacity between `self` (first `offset` bytes) and the returned
@@ -323,6 +397,7 @@ impl<'a, S: BitmapSlice> UringWriter<'a, S> {
             Ok(UringWriter {
                 header: other_hdr,
                 body: other_body,
+                zero_copy: self.zero_copy.take(),
                 phantom: std::marker::PhantomData,
             })
         } else {
@@ -348,19 +423,22 @@ impl<'a, S: BitmapSlice> UringWriter<'a, S> {
                     ))
                 },
                 body: other_body,
+                zero_copy: self.zero_copy.take(),
                 phantom: std::marker::PhantomData,
             })
         }
     }
 
-    /// Total bytes written across both regions.
+    /// Total bytes written across both regions and the zero-copy data.
     pub fn bytes_written(&self) -> usize {
-        self.header.len() + self.body.len()
+        self.header.len() + self.body.len() + self.zero_copy.map_or(0, |zc| zc.len)
     }
 
-    /// Total capacity available across both regions.
+    /// Total capacity available across both regions and the zero-copy data.
     pub fn available_bytes(&self) -> usize {
-        (self.header.capacity() - self.header.len()) + (self.body.capacity() - self.body.len())
+        (self.header.capacity() - self.header.len())
+            + (self.body.capacity() - self.body.len())
+            + self.zero_copy.map_or(0, |zc| zc.cap - zc.len)
     }
 
     /// Account the bytes written by self and an optional split-off partner.
@@ -379,11 +457,17 @@ impl<'a, S: BitmapSlice> UringWriter<'a, S> {
         self.check_available_space(data.len())?;
         let hdr_remaining = self.header.capacity() - self.header.len();
         let to_hdr = data.len().min(hdr_remaining);
+        if to_hdr < data.len() {
+            match self.zero_copy.as_mut() {
+                // The reply data of a zero-copy READ goes into the client
+                // pages, through memory. That can fail, so it goes first,
+                // and a failed write leaves the header alone.
+                Some(zc) => zc.push_memory(&data[to_hdr..])?,
+                None => self.body.extend_from_slice(&data[to_hdr..]),
+            }
+        }
         if to_hdr > 0 {
             self.header.extend_from_slice(&data[..to_hdr]);
-        }
-        if to_hdr < data.len() {
-            self.body.extend_from_slice(&data[to_hdr..]);
         }
         Ok(data.len())
     }
@@ -396,6 +480,23 @@ impl<'a, S: BitmapSlice> UringWriter<'a, S> {
         count: usize,
         off: u64,
     ) -> io::Result<usize> {
+        if let Some(zc) = self.zero_copy.as_mut() {
+            check_space(zc.cap - zc.len, count)?;
+            let Some(fd) = src.raw_fd() else {
+                // Without a file descriptor, read the file into memory and
+                // copy that into the client pages.
+                let mut buf = vec![0u8; count];
+                // Safe because `buf` outlives the slice, and nothing else
+                // uses it.
+                let slice = unsafe { FileVolatileSlice::from_mut_slice(&mut buf) };
+                let cnt = src.read_at_volatile(slice, off)?.min(count);
+                zc.push_memory(&buf[..cnt])?;
+                return Ok(cnt);
+            };
+            let cnt = zc.sink.read_from_file(zc.len, fd, count, off)?.min(count);
+            zc.len += cnt;
+            return Ok(cnt);
+        }
         // File data only goes into the body, so free space in the header
         // slot doesn't count.
         check_space(self.body.capacity() - self.body.len(), count)?;
@@ -549,23 +650,63 @@ impl BufPools {
 /// Create a buffer pool for each kernel queue and hand them to the kernel
 /// with ADD_QUEUE and ADD_BUFPOOL, before any entry registers. The kernel
 /// offered buffer pools at INIT, so a failing command is an error.
+///
+/// With `zero_copy`, the queues also serve reads and writes with zero-copy,
+/// which needs CAP_SYS_ADMIN and a kernel with protocol 7.46. If the kernel
+/// refuses it with EPERM, or with EINVAL because it predates zero-copy, the
+/// queues are added without it. Returns the pools and whether the queues
+/// have zero-copy.
 fn add_bufpools(
     fd: RawFd,
     nr_queues: usize,
     bufs_per_queue: usize,
     buf_size: usize,
-) -> io::Result<BufPools> {
+    mut zero_copy: bool,
+) -> io::Result<(BufPools, bool)> {
     let pools = BufPools::new(nr_queues, bufs_per_queue, buf_size)?;
-    let mut ring = IoUring::<squeue::Entry128, cqueue::Entry>::generic_builder()
-        .build((nr_queues * 2) as u32)?;
+    let mut ring = FuseRing::generic_builder().build((nr_queues * 2).max(2) as u32)?;
+    let mut first = 0;
+    if zero_copy {
+        // Try the first queue alone, so a refusal leaves no queue with
+        // zero-copy. A kernel without zero-copy rejects the flag with
+        // EINVAL. ADD_QUEUE also answers EINVAL for a missing ring or a bad
+        // queue id, but INIT created the ring and queue 0 always exists.
+        match add_queues(&mut ring, fd, &pools, 0..1, FUSE_URING_ZERO_COPY) {
+            Err(e) if matches!(e.raw_os_error(), Some(libc::EPERM | libc::EINVAL)) => {
+                warn!("uring: the kernel refused zero-copy ({e}), serving without it");
+                zero_copy = false;
+            }
+            res => {
+                res?;
+                first = 1;
+            }
+        }
+    }
+    let flags = if zero_copy { FUSE_URING_ZERO_COPY } else { 0 };
+    add_queues(&mut ring, fd, &pools, first..nr_queues, flags)?;
+    Ok((pools, zero_copy))
+}
+
+/// Send ADD_QUEUE with `flags` and ADD_BUFPOOL for each queue in `qids`, and
+/// return the first error the kernel reports.
+fn add_queues(
+    ring: &mut FuseRing,
+    fd: RawFd,
+    pools: &BufPools,
+    qids: std::ops::Range<usize>,
+    flags: u64,
+) -> io::Result<()> {
+    let mut pending = 0;
     {
         let mut sq = ring.submission();
-        for qid in 0..nr_queues {
+        for qid in qids {
             let add_queue = FuseUringCmdReq {
                 qid: qid as u16,
+                flags,
                 ..Default::default()
             };
             let add_bufpool = FuseUringCmdReq {
+                flags: 0,
                 bufpool: pools.queue_pool(qid),
                 ..add_queue
             };
@@ -582,23 +723,26 @@ fn add_bufpools(
             // lives as long as the entries the kernel lends its buffers to.
             unsafe { sq.push_multiple(&sqes) }
                 .map_err(|_| io::Error::other("uring: setup ring full"))?;
+            pending += 2;
         }
     }
-    let mut pending = nr_queues * 2;
+    // The ADD_BUFPOOL of a failed ADD_QUEUE fails with ECANCELED, so report
+    // another error if there is one.
+    let mut error = None;
     while pending > 0 {
-        submit_and_wait(&mut ring, pending)?;
+        submit_and_wait(ring, pending)?;
         for cqe in ring.completion() {
             pending -= 1;
-            if cqe.result() < 0 {
-                return Err(io::Error::other(format!(
-                    "adding the buffer pool of queue {} failed: {}",
-                    cqe.user_data(),
-                    io::Error::from_raw_os_error(-cqe.result())
-                )));
+            let res = cqe.result();
+            if res < 0 && (error.is_none() || error == Some(libc::ECANCELED)) {
+                error = Some(-res);
             }
         }
     }
-    Ok(pools)
+    match error {
+        Some(errno) => Err(io::Error::from_raw_os_error(errno)),
+        None => Ok(()),
+    }
 }
 
 /// Build a uring command SQE for `cmd_op` with `req` as its command payload.
@@ -640,6 +784,215 @@ fn cmd_sqe(
     }
 }
 
+/// A FUSE ring. `IORING_OP_URING_CMD` with the FUSE command payload needs
+/// 128-byte SQEs.
+type FuseRing = IoUring<squeue::Entry128, cqueue::Entry>;
+
+/// The number of zero-copy requests served, for the tests.
+#[cfg(test)]
+static ZERO_COPY_REQUESTS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// The number of copies of zero-copy data through memory, for the tests.
+#[cfg(test)]
+static ZERO_COPY_BOUNCES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// `user_data` of a zero-copy fixed-buffer operation. Entry indexes never
+/// reach it.
+const ZERO_COPY_USER_DATA: u64 = u64::MAX;
+
+/// The completions of ring entries that a worker took off its ring and
+/// hasn't handled yet, and how many entries the kernel still holds.
+struct Completions {
+    queue: VecDeque<(usize, i32)>,
+    nr_entries: usize,
+    /// The number of entries whose command the kernel hasn't completed.
+    armed: usize,
+}
+
+impl Completions {
+    /// Take all completions off `ring`. The entries' completions join the
+    /// queue, and the result of a zero-copy operation is returned.
+    fn receive(&mut self, ring: &mut FuseRing) -> Option<i32> {
+        let mut zero_copy = None;
+        for cqe in ring.completion() {
+            let idx = cqe.user_data() as usize;
+            if cqe.user_data() == ZERO_COPY_USER_DATA {
+                zero_copy = Some(cqe.result());
+            } else if idx < self.nr_entries {
+                self.armed = self.armed.saturating_sub(1);
+                self.queue.push_back((idx, cqe.result()));
+            } else {
+                warn!("uring worker: CQE with unexpected user_data {}", idx);
+            }
+        }
+        zero_copy
+    }
+}
+
+/// How a zero-copy request moves its data.
+#[derive(Clone, Copy)]
+enum ZeroCopyKind {
+    /// A WRITE whose data, `len` bytes, is in the client pages.
+    Write { len: usize },
+    /// A READ that may put up to `cap` bytes into the client pages.
+    Read { cap: usize },
+}
+
+/// A worker's ring as a zero-copy request uses it: fixed-buffer reads and
+/// writes on the buffer table slot where the kernel registered the client's
+/// pages. Completions of ring entries that arrive meanwhile join the
+/// worker's queue.
+struct ZeroCopyIo<'r> {
+    ring: Mutex<(&'r mut FuseRing, &'r mut Completions)>,
+    slot: u16,
+    /// The worker's memory file, which the copies through memory go
+    /// through. The lock keeps two copies from using it at once.
+    bounce: Mutex<&'r File>,
+}
+
+impl ZeroCopyIo<'_> {
+    /// Run `sqe` on the ring and wait for its result.
+    fn run(&self, sqe: squeue::Entry) -> io::Result<usize> {
+        let sqe = squeue::Entry128::from(sqe.user_data(ZERO_COPY_USER_DATA));
+        let mut guard = self
+            .ring
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (ring, completions) = &mut *guard;
+        // Safe because the operation points at the registered buffer, which
+        // the kernel keeps until the entry commits, and the worker commits
+        // only after this returns.
+        while unsafe { ring.submission().push(&sqe) }.is_err() {
+            submit(ring)?;
+        }
+        loop {
+            submit_and_wait(ring, 1)?;
+            match completions.receive(ring) {
+                Some(res) if res < 0 => return Err(io::Error::from_raw_os_error(-res)),
+                Some(res) => return Ok(res as usize),
+                None => {}
+            }
+        }
+    }
+}
+
+/// The length of a fixed-buffer operation for `count` bytes.
+fn fixed_len(count: usize) -> u32 {
+    count.min(u32::MAX as usize) as u32
+}
+
+// The kernel registers the client pages from address 0 of the slot, so
+// `pos` is the address of the first byte to move.
+impl ZeroCopySink for ZeroCopyIo<'_> {
+    fn read_from_file(&self, pos: usize, fd: RawFd, count: usize, off: u64) -> io::Result<usize> {
+        let buf = pos as *mut u8;
+        self.run(
+            opcode::ReadFixed::new(types::Fd(fd), buf, fixed_len(count), self.slot)
+                .offset(off as libc::off_t)
+                .build(),
+        )
+    }
+
+    fn write_from_memory(&self, pos: usize, data: &[u8]) -> io::Result<()> {
+        #[cfg(test)]
+        ZERO_COPY_BOUNCES.fetch_add(1, Ordering::Relaxed);
+        // Through the memory file into the client pages, which only
+        // fixed-buffer operations reach.
+        let bounce = self
+            .bounce
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        bounce.write_all_at(data, 0)?;
+        let mut done = 0;
+        while done < data.len() {
+            let n = self.read_from_file(
+                pos + done,
+                bounce.as_raw_fd(),
+                data.len() - done,
+                done as u64,
+            )?;
+            if n == 0 {
+                return Err(io::Error::from(io::ErrorKind::UnexpectedEof));
+            }
+            done += n;
+        }
+        Ok(())
+    }
+}
+
+impl ZeroCopySource for ZeroCopyIo<'_> {
+    fn write_to_file(&self, pos: usize, fd: RawFd, count: usize, off: u64) -> io::Result<usize> {
+        let buf = pos as *const u8;
+        self.run(
+            opcode::WriteFixed::new(types::Fd(fd), buf, fixed_len(count), self.slot)
+                .offset(off as libc::off_t)
+                .build(),
+        )
+    }
+
+    fn read_to_memory(&self, pos: usize, buf: &mut [u8]) -> io::Result<usize> {
+        #[cfg(test)]
+        ZERO_COPY_BOUNCES.fetch_add(1, Ordering::Relaxed);
+        // From the client pages into the memory file, then into `buf`.
+        let bounce = self
+            .bounce
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let n = self.write_to_file(pos, bounce.as_raw_fd(), buf.len(), 0)?;
+        bounce.read_exact_at(&mut buf[..n], 0)?;
+        Ok(n)
+    }
+}
+
+/// Create the memory file that a worker's copies of zero-copy data through
+/// memory go through.
+fn bounce_file() -> io::Result<File> {
+    use nix::sys::memfd::{memfd_create, MemFdCreateFlag};
+    let name = std::ffi::CStr::from_bytes_with_nul(b"fuse-uring-zero-copy\0").unwrap();
+    let fd = memfd_create(name, MemFdCreateFlag::MFD_CLOEXEC).map_err(io::Error::from)?;
+    // Safe because the fd is new and nothing else owns it.
+    Ok(unsafe { File::from_raw_fd(fd) })
+}
+
+/// Give `ring` an empty table of `nr` fixed buffers, where the kernel
+/// registers the client pages of zero-copy requests. io-uring 0.5 has no
+/// `register_buffers_sparse()`, so this makes the `IORING_REGISTER_BUFFERS2`
+/// call itself, the way its `register_files_sparse()` does for files.
+fn register_sparse_buffers(ring: &FuseRing, nr: usize) -> io::Result<()> {
+    /// `struct io_uring_rsrc_register`.
+    #[repr(C)]
+    struct RsrcRegister {
+        nr: u32,
+        flags: u32,
+        resv2: u64,
+        data: u64,
+        tags: u64,
+    }
+    const IORING_REGISTER_BUFFERS2: libc::c_long = 15;
+    const IORING_RSRC_REGISTER_SPARSE: u32 = 1;
+    let reg = RsrcRegister {
+        nr: nr as u32,
+        flags: IORING_RSRC_REGISTER_SPARSE,
+        resv2: 0,
+        data: 0,
+        tags: 0,
+    };
+    // Safe because the kernel only reads `reg`, which outlives the call.
+    let ret = unsafe {
+        libc::syscall(
+            libc::SYS_io_uring_register,
+            ring.as_raw_fd(),
+            IORING_REGISTER_BUFFERS2,
+            &reg as *const RsrcRegister,
+            std::mem::size_of::<RsrcRegister>(),
+        )
+    };
+    if ret < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
 /// Where the payload buffers of an entry come from.
 enum Payload {
     /// The entry has a payload area of its own, of this many bytes.
@@ -657,6 +1010,10 @@ struct UringEntry {
     /// [FuseUringReqHeader][own payload area][request scratch][reply scratch].
     mem: Box<[u8]>,
     payload: Payload,
+    /// The slot of the worker's buffer table where the kernel registers the
+    /// client pages of the entry's zero-copy requests, if its queue has
+    /// zero-copy.
+    zero_copy_slot: Option<u16>,
     /// iovec array referenced by the SQEs, must stay at a stable address.
     iovecs: Box<[libc::iovec; FUSE_URING_IOV_SEGS]>,
 }
@@ -692,6 +1049,7 @@ impl UringEntry {
             qid,
             mem,
             payload,
+            zero_copy_slot: None,
             iovecs,
         }
     }
@@ -740,11 +1098,14 @@ impl UringEntry {
     /// Build the `FUSE_IO_URING_CMD_REGISTER`/`COMMIT_AND_FETCH` SQE for this
     /// entry, with `commit_id` set in the command payload.
     fn cmd_sqe(&self, fd: i32, cmd_op: u32, commit_id: u64, user_data: u64) -> squeue::Entry128 {
-        let req = FuseUringCmdReq {
+        let mut req = FuseUringCmdReq {
             qid: self.qid,
             commit_id,
             ..Default::default()
         };
+        if let Some(slot) = self.zero_copy_slot {
+            req.set_ent_zero_copy_buf_index(slot);
+        }
         cmd_sqe(fd, cmd_op, &req, Some(&self.iovecs)).user_data(user_data)
     }
 
@@ -777,15 +1138,24 @@ struct UringWorker<F: FileSystem + Send + Sync + 'static> {
     payload_cap: usize,
     /// The queues' buffer pools, if the kernel took them.
     pools: Option<Arc<BufPools>>,
+    /// The memory file that copies of zero-copy data through memory go
+    /// through, if the queues have zero-copy.
+    bounce: Option<File>,
     server: Arc<Server<F>>,
 }
 
 impl<F: FileSystem + Send + Sync + 'static> UringWorker<F> {
     fn run(self, exit: Arc<AtomicBool>, ready_tx: Sender<io::Result<()>>) -> io::Result<()> {
         let total_entries = self.qids.len() * self.entries_per_queue;
-        let mut ring: IoUring<squeue::Entry128, cqueue::Entry> =
-            IoUring::<squeue::Entry128, cqueue::Entry>::generic_builder()
-                .build((total_entries * 2) as u32)?;
+        let mut ring = FuseRing::generic_builder().build((total_entries * 2) as u32)?;
+        if self.bounce.is_some() {
+            if let Err(e) = register_sparse_buffers(&ring, total_entries) {
+                let _ = ready_tx.send(Err(io::Error::other(format!(
+                    "registering the zero-copy buffer table failed: {e}"
+                ))));
+                return Err(e);
+            }
+        }
         let fd = self.fd.as_raw_fd();
 
         let mut entries: Vec<UringEntry> = Vec::with_capacity(total_entries);
@@ -795,7 +1165,11 @@ impl<F: FileSystem + Send + Sync + 'static> UringWorker<F> {
                     Some(pools) => Payload::Pool(pools.clone()),
                     None => Payload::Own(self.payload_cap),
                 };
-                entries.push(UringEntry::new(*qid, payload));
+                let mut entry = UringEntry::new(*qid, payload);
+                if self.bounce.is_some() {
+                    entry.zero_copy_slot = Some(entries.len() as u16);
+                }
+                entries.push(entry);
             }
         }
 
@@ -818,34 +1192,21 @@ impl<F: FileSystem + Send + Sync + 'static> UringWorker<F> {
             Err(e) => Err(io::Error::other(e.to_string())),
         });
         registered?;
-        // The number of entries whose command the kernel hasn't completed.
-        let mut armed = entries.len();
 
+        let mut completions = Completions {
+            queue: VecDeque::new(),
+            nr_entries: entries.len(),
+            armed: entries.len(),
+        };
         let result = 'serve: loop {
             if let Err(e) = submit_and_wait(&mut ring, 1) {
                 break 'serve Err(e);
             }
+            // A zero-copy operation whose wait failed in ZeroCopyIo::run()
+            // completes late, with nothing left to do.
+            completions.receive(&mut ring);
 
-            // Drain the completion queue first so that its borrow is
-            // released before entries are processed and commits submitted.
-            let completed: Vec<(usize, i32)> = ring
-                .completion()
-                .map(|cqe| (cqe.user_data() as usize, cqe.result()))
-                .collect();
-            if completed.is_empty() {
-                continue;
-            }
-            let returned = completed
-                .iter()
-                .filter(|(idx, _)| *idx < entries.len())
-                .count();
-            armed = armed.saturating_sub(returned);
-
-            for (idx, res) in completed {
-                if idx >= entries.len() {
-                    warn!("uring worker: CQE with unexpected user_data {}", idx);
-                    continue;
-                }
+            while let Some((idx, res)) = completions.queue.pop_front() {
                 let entry = &mut entries[idx];
                 if res < 0 {
                     if exit.load(Ordering::Relaxed) {
@@ -856,7 +1217,7 @@ impl<F: FileSystem + Send + Sync + 'static> UringWorker<F> {
                     break 'serve Err(io::Error::from_raw_os_error(-res));
                 }
 
-                if let Err(e) = self.process(entry) {
+                if let Err(e) = self.process(entry, &mut ring, &mut completions) {
                     warn!("uring worker: failed to handle request: {e}");
                     entry.stage_error_reply(libc::EIO);
                 }
@@ -887,11 +1248,11 @@ impl<F: FileSystem + Send + Sync + 'static> UringWorker<F> {
                 }
                 // Count the commit once it is queued, because
                 // release_entries() submits anything still queued.
-                armed += 1;
+                completions.armed += 1;
             }
             // The wait at the top of the loop submits the queued commits.
         };
-        release_entries(ring, entries, armed);
+        release_entries(ring, entries, completions.armed);
         result
     }
 
@@ -899,7 +1260,16 @@ impl<F: FileSystem + Send + Sync + 'static> UringWorker<F> {
     /// request scratch, dispatch to the server with scatter types that
     /// reference the entry's payload area directly (zero-copy on the data
     /// path), and stage the reply straight into the entry areas.
-    fn process(&self, entry: &mut UringEntry) -> Result<()> {
+    ///
+    /// The client pages of a zero-copy request stay with the kernel, and
+    /// fixed-buffer operations on `ring` move the data between them and the
+    /// file. Ring completions that arrive meanwhile go to `stash`.
+    fn process(
+        &self,
+        entry: &mut UringEntry,
+        ring: &mut FuseRing,
+        completions: &mut Completions,
+    ) -> Result<()> {
         let in_header: InHeader = {
             let header = entry.header();
             let mut hdr = InHeader::default();
@@ -914,8 +1284,78 @@ impl<F: FileSystem + Send + Sync + 'static> UringWorker<F> {
             entry.stage_error_reply(libc::ENOSYS);
             return Ok(());
         };
-        let payload_sz = entry.header().ring_ent_in_out.payload_sz as usize;
-        let (payload_buf, payload_cap) = entry.payload_buffer(has_out_args, payload_sz)?;
+        let ent_in_out = entry.header().ring_ent_in_out;
+        let payload_sz = ent_in_out.payload_sz as usize;
+        if ent_in_out.flags & FUSE_URING_ENT_ZERO_COPY == 0 {
+            return self.process_copied(entry, in_header, args_len, has_out_args, payload_sz, None);
+        }
+
+        let kind = if in_header.opcode == Opcode::Read as u32 {
+            // The kernel lends no payload buffer, and the reply data is
+            // ReadIn.size bytes at most.
+            let read_in = ReadIn::from_slice(&entry.header().op_in[..size_of::<ReadIn>()])
+                .ok_or_else(|| SessionFailure("uring: malformed zero-copy READ".into()))?;
+            ZeroCopyKind::Read {
+                cap: read_in.size as usize,
+            }
+        } else if in_header.opcode == Opcode::Write as u32 {
+            // The kernel lends a payload buffer for WriteOut, and payload_sz
+            // counts the data in the client pages.
+            ZeroCopyKind::Write { len: payload_sz }
+        } else {
+            return Err(SessionFailure(format!(
+                "uring: zero-copy request with opcode {}",
+                in_header.opcode
+            )));
+        };
+        let (Some(slot), Some(bounce)) = (entry.zero_copy_slot, self.bounce.as_ref()) else {
+            return Err(SessionFailure(
+                "uring: zero-copy request on a worker without zero-copy".into(),
+            ));
+        };
+        #[cfg(test)]
+        ZERO_COPY_REQUESTS.fetch_add(1, Ordering::Relaxed);
+        let zc_io = ZeroCopyIo {
+            ring: Mutex::new((ring, completions)),
+            slot,
+            bounce: Mutex::new(bounce),
+        };
+        // The payload buffer holds no data of a zero-copy WRITE.
+        let payload_sz = match kind {
+            ZeroCopyKind::Write { .. } => 0,
+            ZeroCopyKind::Read { .. } => payload_sz,
+        };
+        self.process_copied(
+            entry,
+            in_header,
+            args_len,
+            has_out_args,
+            payload_sz,
+            Some((&zc_io, kind)),
+        )
+    }
+
+    /// Serve the request in `entry` whose payload buffer holds `payload_sz`
+    /// bytes, and move the data of a zero-copy request through `zero_copy`.
+    fn process_copied(
+        &self,
+        entry: &mut UringEntry,
+        in_header: InHeader,
+        args_len: usize,
+        has_out_args: bool,
+        payload_sz: usize,
+        zero_copy: Option<(&ZeroCopyIo<'_>, ZeroCopyKind)>,
+    ) -> Result<()> {
+        let zc_cap = match zero_copy {
+            Some((_, ZeroCopyKind::Read { cap })) => cap,
+            _ => 0,
+        };
+        let (payload_buf, payload_cap) = match zero_copy {
+            // A zero-copy READ has no payload buffer, even when it asks for
+            // 0 bytes.
+            Some((_, ZeroCopyKind::Read { .. })) => (NonNull::dangling(), 0),
+            _ => entry.payload_buffer(has_out_args, payload_sz)?,
+        };
         if args_len > FUSE_URING_IN_OUT_HEADER_SZ || payload_sz > payload_cap {
             return Err(SessionFailure(format!(
                 "uring: malformed request, opcode {} args {} payload {}",
@@ -983,6 +1423,10 @@ impl<F: FileSystem + Send + Sync + 'static> UringWorker<F> {
             } else {
                 Reader::<()>::from_fuse_buffer(FuseBuf::new(header_scratch))?
             };
+            let reader = match zero_copy {
+                Some((zc_io, ZeroCopyKind::Write { len })) => reader.with_zero_copy(zc_io, len),
+                _ => reader,
+            };
 
             // The reply header goes into entry.in_out[0..OUT_HEADER_SIZE] and
             // the reply body goes directly into the payload buffer.
@@ -991,6 +1435,10 @@ impl<F: FileSystem + Send + Sync + 'static> UringWorker<F> {
             let payload_area =
                 unsafe { std::slice::from_raw_parts_mut(payload_buf.as_ptr(), payload_cap) };
             let writer = UringWriter::<()>::new(in_out_header, payload_area);
+            let writer = match zero_copy {
+                Some((zc_io, ZeroCopyKind::Read { cap })) => writer.with_zero_copy(zc_io, cap),
+                _ => writer,
+            };
 
             self.server
                 .handle_message(reader, writer, None, None)
@@ -1005,7 +1453,7 @@ impl<F: FileSystem + Send + Sync + 'static> UringWorker<F> {
         if total > 0 {
             // The scatter writer already placed the reply directly in the
             // entry areas; just record the payload size and validate.
-            if total < OUT_HEADER_SIZE || total > OUT_HEADER_SIZE + payload_cap {
+            if total < OUT_HEADER_SIZE || total > OUT_HEADER_SIZE + payload_cap + zc_cap {
                 return Err(SessionFailure(format!(
                     "uring: malformed reply of {} bytes for unique 0x{:x}",
                     total, in_header.unique
@@ -1024,7 +1472,7 @@ impl<F: FileSystem + Send + Sync + 'static> UringWorker<F> {
 
 /// Submit what is queued on `ring`. A signal that interrupts the submit is
 /// no error, because whatever it left queued goes with the next submit.
-fn submit(ring: &mut IoUring<squeue::Entry128, cqueue::Entry>) -> io::Result<()> {
+fn submit(ring: &mut FuseRing) -> io::Result<()> {
     match ring.submit() {
         Ok(_) => Ok(()),
         Err(e) if e.raw_os_error() == Some(libc::EINTR) => Ok(()),
@@ -1034,10 +1482,7 @@ fn submit(ring: &mut IoUring<squeue::Entry128, cqueue::Entry>) -> io::Result<()>
 
 /// Submit what is queued on `ring` and wait for `want` completions, retrying
 /// when a signal interrupts the wait.
-fn submit_and_wait(
-    ring: &mut IoUring<squeue::Entry128, cqueue::Entry>,
-    want: usize,
-) -> io::Result<()> {
+fn submit_and_wait(ring: &mut FuseRing, want: usize) -> io::Result<()> {
     loop {
         match ring.submit_and_wait(want) {
             Ok(_) => return Ok(()),
@@ -1059,11 +1504,7 @@ const RELEASE_TIMEOUT: Duration = Duration::from_secs(1);
 /// which arrive quickly once the connection is torn down. If they don't
 /// arrive within `RELEASE_TIMEOUT`, leak the entries instead of freeing
 /// memory the kernel may still write to.
-fn release_entries(
-    mut ring: IoUring<squeue::Entry128, cqueue::Entry>,
-    entries: Vec<UringEntry>,
-    mut armed: usize,
-) {
+fn release_entries(mut ring: FuseRing, entries: Vec<UringEntry>, mut armed: usize) {
     let deadline = Instant::now() + RELEASE_TIMEOUT;
     while armed > 0 {
         let left = deadline.saturating_duration_since(Instant::now());
@@ -1112,6 +1553,9 @@ pub struct UringFuseServing<F: FileSystem + Send + Sync + 'static> {
     /// Whether the queues have buffer pools.
     #[cfg(test)]
     pooled: bool,
+    /// Whether the queues have zero-copy.
+    #[cfg(test)]
+    zero_copy: bool,
     _fs: std::marker::PhantomData<F>,
 }
 
@@ -1177,13 +1621,35 @@ impl<F: FileSystem + Send + Sync + 'static> UringFuseServing<F> {
         // A queue's entries hold at most one buffer each, so more buffers
         // than entries would never be lent.
         let bufs_per_queue = cfg.bufs_per_queue.min(cfg.entries_per_queue.max(1));
+        // The kernel takes a 16-bit buffer table slot per entry, and each
+        // entry of a worker gets its own slot.
+        let worker_entries =
+            queue_ids.iter().map(Vec::len).max().unwrap_or(0) * cfg.entries_per_queue;
+        let want_zero_copy = cfg.zero_copy && worker_entries <= u16::MAX as usize + 1;
+        if cfg.zero_copy && !want_zero_copy {
+            warn!("uring: zero-copy needs at most 65536 entries per worker, serving without it");
+        }
+        let mut zero_copy = false;
         let pools = if bufs_per_queue > 0 && server.uring_bufpool_supported() {
             let buf_size = server.uring_payload_size();
-            let pools = add_bufpools(file.as_raw_fd(), nr_queues, bufs_per_queue, buf_size)
-                .map_err(|e| SessionFailure(format!("uring: {e}")))?;
-            info!("uring: each queue has a pool of {bufs_per_queue} buffers of {buf_size} bytes");
+            let pools;
+            (pools, zero_copy) = add_bufpools(
+                file.as_raw_fd(),
+                nr_queues,
+                bufs_per_queue,
+                buf_size,
+                want_zero_copy,
+            )
+            .map_err(|e| SessionFailure(format!("uring: adding the buffer pools failed: {e}")))?;
+            info!(
+                "uring: each queue has a pool of {bufs_per_queue} buffers of {buf_size} bytes{}",
+                if zero_copy { ", and zero-copy" } else { "" }
+            );
             Some(Arc::new(pools))
         } else {
+            if cfg.zero_copy {
+                warn!("uring: zero-copy needs buffer pools, serving without it");
+            }
             None
         };
 
@@ -1199,6 +1665,13 @@ impl<F: FileSystem + Send + Sync + 'static> UringFuseServing<F> {
                 entries_per_queue: cfg.entries_per_queue,
                 payload_cap,
                 pools: pools.clone(),
+                bounce: if zero_copy {
+                    Some(bounce_file().map_err(|e| {
+                        SessionFailure(format!("uring: creating the zero-copy memory file: {e}"))
+                    })?)
+                } else {
+                    None
+                },
                 server: server.clone(),
             });
         }
@@ -1274,6 +1747,8 @@ impl<F: FileSystem + Send + Sync + 'static> UringFuseServing<F> {
             workers: set,
             #[cfg(test)]
             pooled: pools.is_some(),
+            #[cfg(test)]
+            zero_copy,
             _fs: std::marker::PhantomData,
         })
     }
@@ -1368,6 +1843,7 @@ mod tests {
             workers: 1,
             entries_per_queue: 1,
             bufs_per_queue: 0,
+            zero_copy: false,
         };
         if let Err(e) = UringFuseServing::new(se, server, cfg) {
             panic!("uring_available() said yes, but the mount got {}", e);
@@ -1657,6 +2133,7 @@ mod tests {
             entries_per_queue: 1,
             payload_cap: 4096,
             pools: None,
+            bounce: None,
             server: Arc::new(Server::new(Arc::new(fs))),
         };
         (worker, source)
@@ -1692,6 +2169,21 @@ mod tests {
         entry.header_mut().ring_ent_in_out.commit_id = 2;
     }
 
+    /// Serve the request planted in `entry` with `worker`, on a ring of its
+    /// own.
+    fn process_entry<F: FileSystem + Send + Sync + 'static>(
+        worker: &UringWorker<F>,
+        entry: &mut UringEntry,
+    ) -> Result<()> {
+        let mut ring = FuseRing::generic_builder().build(8).unwrap();
+        let mut completions = Completions {
+            queue: VecDeque::new(),
+            nr_entries: 1,
+            armed: 1,
+        };
+        worker.process(entry, &mut ring, &mut completions)
+    }
+
     fn parse_out_header(entry: &UringEntry) -> OutHeader {
         let mut out = OutHeader::default();
         out.as_mut_slice()
@@ -1706,7 +2198,7 @@ mod tests {
 
         let args = GetattrIn::default();
         plant_request(&mut entry, Opcode::Getattr as u32, args.as_slice(), &[]);
-        worker.process(&mut entry).unwrap();
+        process_entry(&worker, &mut entry).unwrap();
 
         let out = parse_out_header(&entry);
         assert_eq!(out.error, 0);
@@ -1729,7 +2221,7 @@ mod tests {
         plant_request(&mut entry, Opcode::Lookup as u32, &[], b"fuse-file\0");
         // Lookup fails with ENOENT on the empty directory, which still
         // exercises the payload reassembly; the reply must be an error.
-        worker.process(&mut entry).unwrap();
+        process_entry(&worker, &mut entry).unwrap();
         let out = parse_out_header(&entry);
         assert_eq!(out.error, -libc::ENOENT);
         assert_eq!(entry.header().ring_ent_in_out.payload_sz, 0);
@@ -1737,7 +2229,7 @@ mod tests {
         // And succeeds once the file exists.
         std::fs::write(_source.as_path().join("fuse-file"), "x").unwrap();
         plant_request(&mut entry, Opcode::Lookup as u32, &[], b"fuse-file\0");
-        worker.process(&mut entry).unwrap();
+        process_entry(&worker, &mut entry).unwrap();
         let out = parse_out_header(&entry);
         assert_eq!(out.error, 0);
         assert_eq!(
@@ -1755,7 +2247,7 @@ mod tests {
 
         // The kernel only falls back to GETATTR after ENOSYS.
         plant_request(&mut entry, FUSE_STATX, &[0u8; 24], &[]);
-        worker.process(&mut entry).unwrap();
+        process_entry(&worker, &mut entry).unwrap();
         assert_eq!(parse_out_header(&entry).error, -libc::ENOSYS);
         assert_eq!(entry.header().ring_ent_in_out.payload_sz, 0);
     }
@@ -1775,7 +2267,7 @@ mod tests {
             &[],
         );
         entry.header_mut().ring_ent_in_out.payload_sz = (worker.payload_cap + 1) as u32;
-        assert!(worker.process(&mut entry).is_err());
+        assert!(process_entry(&worker, &mut entry).is_err());
         entry.stage_error_reply(libc::EIO);
 
         let out = parse_out_header(&entry);
@@ -1823,7 +2315,7 @@ mod tests {
             &[],
         );
         entry.header_mut().ring_ent_in_out.offset = 4096;
-        worker.process(&mut entry).unwrap();
+        process_entry(&worker, &mut entry).unwrap();
         assert_eq!(parse_out_header(&entry).error, 0);
         let body = pools.buffer(0, 4096).unwrap().0.as_ptr();
         let mut attr = AttrOut::default();
@@ -1859,7 +2351,65 @@ mod tests {
             GetattrIn::default().as_slice(),
             &[],
         );
-        assert!(worker.process(&mut entry).is_err());
+        assert!(process_entry(&worker, &mut entry).is_err());
+    }
+
+    /// A zero-copy sink that records what it was asked to read.
+    #[derive(Default)]
+    struct RecordingSink {
+        /// The file reads: position, fd, count and offset.
+        reads: std::sync::Mutex<Vec<(usize, RawFd, usize, u64)>>,
+        /// The copies from memory: position and data.
+        writes: std::sync::Mutex<Vec<(usize, Vec<u8>)>>,
+    }
+
+    impl ZeroCopySink for RecordingSink {
+        fn read_from_file(
+            &self,
+            pos: usize,
+            fd: RawFd,
+            count: usize,
+            off: u64,
+        ) -> io::Result<usize> {
+            self.reads.lock().unwrap().push((pos, fd, count, off));
+            Ok(count)
+        }
+
+        fn write_from_memory(&self, pos: usize, data: &[u8]) -> io::Result<()> {
+            self.writes.lock().unwrap().push((pos, data.to_vec()));
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn test_uring_writer_zero_copy() {
+        let sink = RecordingSink::default();
+        let mut hdr = vec![0u8; OUT_HEADER_SIZE];
+        let mut w = UringWriter::<()>::new(&mut hdr, &mut []).with_zero_copy(&sink, 4096);
+        assert_eq!(w.available_bytes(), OUT_HEADER_SIZE + 4096);
+
+        // The server splits off the header first, and the data part keeps
+        // the zero-copy reply.
+        let mut data = w.split_at(OUT_HEADER_SIZE).unwrap();
+        assert_eq!(w.available_bytes(), OUT_HEADER_SIZE);
+        assert_eq!(data.available_bytes(), 4096);
+
+        let mut file = File::open("/dev/null").unwrap();
+        let fd = file.as_raw_fd();
+        assert_eq!(data.write_from_at(&mut file, 1000, 7).unwrap(), 1000);
+        assert_eq!(data.write_from_at(&mut file, 96, 1007).unwrap(), 96);
+        assert_eq!(
+            *sink.reads.lock().unwrap(),
+            vec![(0, fd, 1000, 7), (1000, fd, 96, 1007)]
+        );
+        assert!(data.write_from_at(&mut file, 4000, 0).is_err());
+        // Reply data built in memory reaches the client pages through the
+        // sink too.
+        data.write_all(&[1, 2, 3]).unwrap();
+        assert_eq!(*sink.writes.lock().unwrap(), vec![(1096, vec![1, 2, 3])]);
+
+        w.write_all(&[0u8; OUT_HEADER_SIZE]).unwrap();
+        assert_eq!(w.commit(Some(&data)).unwrap(), OUT_HEADER_SIZE + 1099);
     }
 
     #[test]
@@ -1926,17 +2476,76 @@ mod tests {
         assert_eq!(other.available_bytes(), 256 - 100);
     }
 
+    /// Turn O_DIRECT on for a file the mount opened without it, then write
+    /// and read it. With zero-copy, PassthroughFs then reads and writes the
+    /// data through its aligned bounce buffer, which zero-copy data reaches
+    /// only through a copy in memory. Skipped where the backing file system
+    /// lacks O_DIRECT. Returns whether it ran.
+    fn check_late_direct_io(src: &std::path::Path, mnt: &std::path::Path) -> bool {
+        use std::os::unix::fs::{FileExt, OpenOptionsExt};
+        let probe = src.join("direct-probe");
+        std::fs::write(&probe, b"").unwrap();
+        if std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECT)
+            .open(&probe)
+            .is_err()
+        {
+            eprintln!("the backing file system lacks O_DIRECT, skipping");
+            return false;
+        }
+
+        let f = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(mnt.join("late-direct"))
+            .unwrap();
+        // Safe because fcntl() only reads and sets the flags of the fd.
+        let flags = unsafe { libc::fcntl(f.as_raw_fd(), libc::F_GETFL) };
+        assert_eq!(
+            unsafe { libc::fcntl(f.as_raw_fd(), libc::F_SETFL, flags | libc::O_DIRECT) },
+            0
+        );
+        // O_DIRECT wants aligned memory.
+        #[repr(align(4096))]
+        struct Aligned([u8; 8192]);
+        let mut buf = Box::new(Aligned([0; 8192]));
+        let mut back = Box::new(Aligned([0; 8192]));
+        let (buf, back) = (&mut buf.0, &mut back.0);
+        for (i, b) in buf.iter_mut().enumerate() {
+            *b = (i % 251) as u8;
+        }
+        f.write_all_at(buf, 0).unwrap();
+        f.read_exact_at(back, 0).unwrap();
+        assert!(buf == back);
+        true
+    }
+
+    /// Whether this process runs as root in the initial user namespace,
+    /// which zero-copy needs.
+    fn real_root() -> bool {
+        // Safe because geteuid() is always valid.
+        let euid = unsafe { libc::geteuid() };
+        euid == 0
+            && std::fs::read_to_string("/proc/self/uid_map").is_ok_and(|map| {
+                map.split_whitespace().collect::<Vec<_>>() == ["0", "0", "4294967295"]
+            })
+    }
+
     /// Serve a PassthroughFs over io_uring with each queue's buffer pool
-    /// holding `bufs_per_queue` buffers, read and write through the mount,
-    /// then check that dropping the serving layer gets the ring entries
-    /// back from the kernel and unmounts.
-    fn check_passthrough_mount(bufs_per_queue: usize) {
+    /// holding `bufs_per_queue` buffers, and zero-copy if `zero_copy`, read
+    /// and write through the mount, then check that dropping the serving
+    /// layer gets the ring entries back from the kernel and unmounts.
+    fn check_passthrough_mount(bufs_per_queue: usize, zero_copy: bool) {
         let src = TempDir::new().unwrap();
         std::fs::write(src.as_path().join("hello"), b"over io_uring").unwrap();
         let mnt = TempDir::new().unwrap();
         let fs = PassthroughFs::<()>::new(Config {
             root_dir: src.as_path().to_string_lossy().to_string(),
             do_import: false,
+            uring_zero_copy: zero_copy,
             ..Default::default()
         })
         .unwrap();
@@ -1949,6 +2558,7 @@ mod tests {
             workers: 2,
             entries_per_queue: 2,
             bufs_per_queue,
+            zero_copy,
         };
         let serving = match UringFuseServing::new(se, server.clone(), cfg) {
             Ok(serving) => serving,
@@ -1958,10 +2568,18 @@ mod tests {
             }
             Err(e) => panic!("uring serving failed: {}", e),
         };
-        // Kernels with buffer pools must get them when the config asks.
+        // Kernels with buffer pools must get them when the config asks, and
+        // zero-copy too when the test runs as root.
         assert_eq!(
             serving.pooled,
             bufs_per_queue > 0 && server.uring_bufpool_supported()
+        );
+        if serving.pooled && zero_copy && real_root() {
+            assert!(serving.zero_copy);
+        }
+        eprintln!(
+            "uring mount: {bufs_per_queue} buffers per queue, zero-copy {}",
+            serving.zero_copy
         );
 
         assert_eq!(
@@ -1990,6 +2608,16 @@ mod tests {
             }
         });
 
+        // With zero-copy, the reads and writes above went through it.
+        if serving.zero_copy {
+            assert!(ZERO_COPY_REQUESTS.load(Ordering::Relaxed) > 0);
+        }
+        // A late O_DIRECT sends the data of zero-copy requests through
+        // memory.
+        if check_late_direct_io(src.as_path(), mnt.as_path()) && serving.zero_copy {
+            assert!(ZERO_COPY_BOUNCES.load(Ordering::Relaxed) > 0);
+        }
+
         // Tearing the connection down completes the commands of all armed
         // entries, so the workers get their entries back well within
         // RELEASE_TIMEOUT instead of waiting it out and leaking them.
@@ -2001,8 +2629,10 @@ mod tests {
 
     #[test]
     fn test_uring_serving_mount() {
-        for bufs_per_queue in [0, 1, 4] {
-            check_passthrough_mount(bufs_per_queue);
+        for (bufs_per_queue, zero_copy) in
+            [(0, false), (1, false), (4, false), (1, true), (4, true)]
+        {
+            check_passthrough_mount(bufs_per_queue, zero_copy);
         }
     }
 

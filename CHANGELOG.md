@@ -64,6 +64,10 @@
   gives the transport the file descriptor to move it to. Other reads get a copy through memory.
 - `passthrough::Config::uring_zero_copy` asks for FUSE-over-io_uring zero-copy on the files that
   `PassthroughFs` opens, except files it opens with O_DIRECT.
+- With `UringConfig::zero_copy` on Linux 7.3 and later, `UringFuseServing` serves the reads and
+  writes of opens that ask for it with zero-copy. It moves the data between the client's pages
+  and the file with io_uring fixed-buffer operations. It needs buffer pools and CAP_SYS_ADMIN,
+  and serves without it otherwise. `UringConfig` has a new field.
 
 ### Changed
 - Bump the declared minimum supported Rust version (MSRV) from 1.80 to 1.86.
