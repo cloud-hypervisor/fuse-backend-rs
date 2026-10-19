@@ -1334,8 +1334,10 @@ mod asyncio {
                                 // The fuse device was unmounted or the connection was aborted.
                                 break 'serve;
                             }
-                            Some(libc::EINTR) => {
-                                // Interrupted by a signal, retry the read.
+                            Some(libc::EINTR) | Some(libc::ENOENT) => {
+                                // Interrupted by a signal, or the kernel dropped
+                                // the request because it was interrupted. Retry
+                                // the read.
                                 continue 'serve;
                             }
                             Some(libc::EAGAIN) => {
@@ -1353,16 +1355,14 @@ mod asyncio {
                                 tokio::task::yield_now().await;
                                 continue 'serve;
                             }
-                            None => {
+                            _ => {
                                 // The error isn't an OS error, for example because the
-                                // runtime is shutting down. Waiting again would fail the
-                                // same way.
+                                // runtime is shutting down, or one that retrying won't
+                                // fix, such as EINVAL for a buffer smaller than the
+                                // kernel's requests. Retrying would spin on it, so stop
+                                // like the synchronous server does.
                                 error!("failed to read request from fuse device fd, {}", e);
                                 break 'serve;
-                            }
-                            _ => {
-                                // TODO: error handling
-                                error!("failed to read request from fuse device fd, {}", e);
                             }
                         }
                     }
