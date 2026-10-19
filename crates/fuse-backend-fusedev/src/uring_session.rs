@@ -351,18 +351,7 @@ impl<'a, S: BitmapSlice> UringWriter<'a, S> {
     }
 
     fn check_available_space(&self, sz: usize) -> io::Result<()> {
-        if sz > self.available_bytes() {
-            Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!(
-                    "data out of range, available {} requested {}",
-                    self.available_bytes(),
-                    sz,
-                ),
-            ))
-        } else {
-            Ok(())
-        }
+        check_space(self.available_bytes(), sz)
     }
 
     /// Write data, routing the first `OUT_HEADER_SIZE` bytes to the header
@@ -388,21 +377,36 @@ impl<'a, S: BitmapSlice> UringWriter<'a, S> {
         count: usize,
         off: u64,
     ) -> io::Result<usize> {
-        self.check_available_space(count)?;
-        let cnt = src.read_vectored_at_volatile(
-            // Safe because check_available_space() ensures capacity.
-            unsafe {
-                &[FileVolatileSlice::from_raw_ptr(
-                    self.body.as_mut_ptr().add(self.body.len()),
-                    count,
-                )]
-            },
-            off,
-        )?;
+        // File data only goes into the body, so free space in the header
+        // slot doesn't count.
+        check_space(self.body.capacity() - self.body.len(), count)?;
+        let cnt = src
+            .read_vectored_at_volatile(
+                // Safe because the body has room for count more bytes.
+                unsafe {
+                    &[FileVolatileSlice::from_raw_ptr(
+                        self.body.as_mut_ptr().add(self.body.len()),
+                        count,
+                    )]
+                },
+                off,
+            )?
+            .min(count);
         let new_len = self.body.len() + cnt;
-        // Safe because cnt <= count was checked above.
+        // Safe because the read placed cnt <= count bytes behind the body.
         unsafe { self.body.set_len(new_len) };
         Ok(cnt)
+    }
+}
+
+fn check_space(available: usize, requested: usize) -> io::Result<()> {
+    if requested > available {
+        Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("data out of range, available {available} requested {requested}"),
+        ))
+    } else {
+        Ok(())
     }
 }
 
@@ -1928,5 +1932,24 @@ mod tests {
         for bufs_per_queue in [0, 1, 4] {
             check_passthrough_mount(bufs_per_queue);
         }
+    }
+
+    #[test]
+    fn test_uring_writer_write_from_at_ignores_header_space() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.as_path().join("data");
+        std::fs::write(&path, [0u8; 64]).unwrap();
+
+        // The header slot is still empty, so the writer has room for 24
+        // bytes, but only 8 of them are in the body, where file data goes.
+        let mut hdr = vec![0u8; OUT_HEADER_SIZE];
+        let mut body = vec![0u8; 8];
+        let mut w = UringWriter::<'_, ()>::new(&mut hdr, &mut body);
+        assert_eq!(w.available_bytes(), OUT_HEADER_SIZE + 8);
+        assert!(w.write_from_at(File::open(&path).unwrap(), 16, 0).is_err());
+        assert_eq!(
+            w.write_from_at(File::open(&path).unwrap(), 8, 0).unwrap(),
+            8
+        );
     }
 }
