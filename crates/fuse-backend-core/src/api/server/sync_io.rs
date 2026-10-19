@@ -1038,8 +1038,8 @@ impl<F: FileSystem + Sync> Server<F> {
             fh, offset, size, ..
         } = ctx.r.read_obj().map_err(Error::DecodeMessage)?;
 
-        let available_bytes = ctx.w.available_bytes();
-        if available_bytes < size as usize {
+        // The entries go after the reply header.
+        if ctx.w.available_bytes() < size_of::<OutHeader>() + size as usize {
             return ctx.reply_error(io::Error::from_raw_os_error(libc::ENOMEM));
         }
 
@@ -2111,6 +2111,26 @@ mod tests {
 
         let res = server.do_readdir(ctx, true).unwrap();
         assert_eq!(res, 16);
+    }
+
+    #[test]
+    fn test_server_readdir_needs_room_after_header() {
+        let server = Server::new(MockFS);
+        let read_in = ReadIn {
+            size: 64,
+            ..Default::default()
+        };
+
+        // The writer holds the 16-byte reply header and 63 bytes, one short
+        // of the 64 bytes of entries the request asks for.
+        for (room, error) in [(63, libc::ENOMEM), (64, libc::ENOSYS)] {
+            let mut read_buf = read_in.as_slice().to_vec();
+            let mut write_buf = vec![0u8; size_of::<OutHeader>() + room];
+            let ctx = prepare_srvcontext(&mut read_buf, &mut write_buf);
+            server.do_readdir(ctx, false).unwrap();
+            let out = OutHeader::from_slice(&write_buf[..size_of::<OutHeader>()]).unwrap();
+            assert_eq!(out.error, -error, "room {room}");
+        }
     }
 
     #[test]
