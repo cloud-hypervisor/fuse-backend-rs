@@ -13,13 +13,17 @@
 //! route through io_uring (FUSE_INTERRUPT and requests queued before entries
 //! were registered), so a classic channel thread keeps serving in parallel.
 //!
-//! Experimental: the kernel interface is still evolving; only the minimal 7.42
-//! interface is implemented.
+//! On Linux 7.3 and later, the kernel can take the payload buffers from one
+//! buffer pool per queue instead of one buffer per entry. See
+//! `UringConfig::bufs_per_queue`.
+//!
+//! Experimental: the kernel interface is still evolving.
 
 use std::fs::File;
 use std::io::{self, IoSlice, Write};
 use std::mem::ManuallyDrop;
-use std::os::unix::io::AsRawFd;
+use std::os::unix::io::{AsRawFd, RawFd};
+use std::ptr::NonNull;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Sender};
 use std::sync::Arc;
@@ -31,7 +35,8 @@ use vm_memory::ByteValued;
 
 use fuse_backend_core::abi::fuse_abi::{InHeader, OutHeader};
 use fuse_backend_core::abi::fuse_uring::{
-    FuseUringCmdReq, FuseUringEntInOut, FuseUringReqHeader, FUSE_IO_URING_CMD_COMMIT_AND_FETCH,
+    FuseUringBufpool, FuseUringCmdReq, FuseUringEntInOut, FuseUringReqHeader,
+    FUSE_IO_URING_CMD_ADD_BUFPOOL, FUSE_IO_URING_CMD_ADD_QUEUE, FUSE_IO_URING_CMD_COMMIT_AND_FETCH,
     FUSE_IO_URING_CMD_REGISTER, FUSE_URING_IN_OUT_HEADER_SZ, FUSE_URING_IOV_SEGS,
 };
 use fuse_backend_core::api::filesystem::FileSystem;
@@ -40,6 +45,7 @@ use fuse_backend_core::buffer::{Error::*, Reader, Result, Writer};
 use fuse_backend_core::file_buf::FileVolatileSlice;
 use fuse_backend_core::file_traits::FileReadWriteVolatile;
 use vm_memory::bitmap::BitmapSlice;
+use vm_memory::mmap::MmapRegion;
 
 use crate::serving::{FuseServing, WorkerSet};
 use crate::{FuseBuf, FuseChannel, FuseDevReaderExt, FuseSession, FUSE_HEADER_SIZE};
@@ -80,6 +86,15 @@ pub struct UringConfig {
     /// Number of ring entries registered per kernel queue, i.e. the number
     /// of in-flight requests each queue may hold.
     pub entries_per_queue: usize,
+    /// Number of payload buffers in each queue's buffer pool, on kernels
+    /// that support buffer pools (Linux 7.3). The kernel lends a buffer to
+    /// an entry only while it serves a request that carries a payload or
+    /// takes a reply body, and it lends the free buffer with the lowest
+    /// address first. A request waits in the kernel while all buffers of its
+    /// queue are busy. A pool holds at most `entries_per_queue` buffers,
+    /// because each entry holds at most one. `0`, or a kernel without
+    /// buffer pools, gives every entry a buffer of its own instead.
+    pub bufs_per_queue: usize,
 }
 
 impl Default for UringConfig {
@@ -87,6 +102,7 @@ impl Default for UringConfig {
         UringConfig {
             workers: 0,
             entries_per_queue: 4,
+            bufs_per_queue: 4,
         }
     }
 }
@@ -148,61 +164,65 @@ fn possible_cpu_count() -> Result<usize> {
     parse_cpu_mask(&content)
 }
 
-/// Size of the per-opcode request arguments carried in the entry `op_in`
-/// slot, for reassembling the classic wire layout. The kernel copies
-/// `in_args[0]` (the per-op header) into `op_in` and the remaining
-/// arguments into the payload area, so `Some(0)` means a known opcode
-/// without a fixed header; `None` marks opcodes this table doesn't know.
-fn in_args_len(opcode: u32) -> Option<usize> {
-    let len = match opcode {
-        1 => 0,        // LOOKUP: name only
-        2 => 8,        // FORGET: ForgetIn
-        3 => 16,       // GETATTR: GetattrIn
-        4 => 88,       // SETATTR: SetattrIn
-        5 => 0,        // READLINK: no arguments
-        6 => 0,        // SYMLINK: name + linkname
-        8 => 16,       // MKNOD: MknodIn
-        9 => 8,        // MKDIR: MkdirIn
-        10 | 11 => 0,  // UNLINK/RMDIR: name only
-        12 => 8,       // RENAME: RenameIn
-        13 => 8,       // LINK: LinkIn
-        14 => 8,       // OPEN: OpenIn
-        15 => 40,      // READ: ReadIn
-        16 => 40,      // WRITE: WriteIn
-        17 => 0,       // STATFS: no arguments
-        18 => 24,      // RELEASE: ReleaseIn
-        20 => 16,      // FSYNC: FsyncIn
-        21 => 8,       // SETXATTR: SetxattrIn
-        22 => 8,       // GETXATTR: GetxattrIn
-        23 => 8,       // LISTXATTR: GetxattrIn
-        24 => 0,       // REMOVEXATTR: name only
-        25 => 24,      // FLUSH: FlushIn
-        26 => 16,      // INIT: InitIn
-        27 => 8,       // OPENDIR: OpenIn
-        28 | 44 => 40, // READDIR/READDIRPLUS: ReadIn
-        29 => 24,      // RELEASEDIR: ReleaseIn
-        30 => 16,      // FSYNCDIR: FsyncIn
-        31..=33 => 48, // GETLK/SETLK/SETLKW: LkIn
-        34 => 8,       // ACCESS: AccessIn
-        35 => 16,      // CREATE: CreateIn
-        36 => 8,       // INTERRUPT: InterruptIn
-        37 => 16,      // BMAP: BmapIn
-        38 => 0,       // DESTROY: no arguments
-        39 => 32,      // IOCTL: IoctlIn
-        40 => 24,      // POLL: PollIn
-        41 => 0,       // NOTIFY_REPLY: payload only
-        42 => 8,       // BATCH_FORGET: BatchForgetIn
-        43 => 32,      // FALLOCATE: FallocateIn
-        45 => 16,      // RENAME2: Rename2In
-        46 => 24,      // LSEEK: LseekIn
-        47 => 56,      // COPY_FILE_RANGE: CopyFileRangeIn
+/// What the transport needs to know about a request with this opcode: the
+/// size of the per-opcode arguments carried in the entry `op_in` slot, for
+/// reassembling the classic wire layout, and whether the request has out
+/// arguments, i.e. takes a reply body. The kernel copies `in_args[0]` (the
+/// per-op header) into `op_in` and the remaining arguments into the payload
+/// area, so a size of 0 means a known opcode without a fixed header. Over a
+/// buffer pool, the kernel lends no buffer to a request without a payload
+/// and without out arguments. `None` marks opcodes this table doesn't know.
+fn op_args(opcode: u32) -> Option<(usize, bool)> {
+    let args = match opcode {
+        1 => (0, true),         // LOOKUP: name only
+        2 => (8, false),        // FORGET: ForgetIn
+        3 => (16, true),        // GETATTR: GetattrIn
+        4 => (88, true),        // SETATTR: SetattrIn
+        5 => (0, true),         // READLINK: no arguments
+        6 => (0, true),         // SYMLINK: name + linkname
+        8 => (16, true),        // MKNOD: MknodIn
+        9 => (8, true),         // MKDIR: MkdirIn
+        10 | 11 => (0, false),  // UNLINK/RMDIR: name only
+        12 => (8, false),       // RENAME: RenameIn
+        13 => (8, true),        // LINK: LinkIn
+        14 => (8, true),        // OPEN: OpenIn
+        15 => (40, true),       // READ: ReadIn
+        16 => (40, true),       // WRITE: WriteIn
+        17 => (0, true),        // STATFS: no arguments
+        18 => (24, false),      // RELEASE: ReleaseIn
+        20 => (16, false),      // FSYNC: FsyncIn
+        21 => (8, false),       // SETXATTR: SetxattrIn
+        22 => (8, true),        // GETXATTR: GetxattrIn
+        23 => (8, true),        // LISTXATTR: GetxattrIn
+        24 => (0, false),       // REMOVEXATTR: name only
+        25 => (24, false),      // FLUSH: FlushIn
+        26 => (16, true),       // INIT: InitIn
+        27 => (8, true),        // OPENDIR: OpenIn
+        28 | 44 => (40, true),  // READDIR/READDIRPLUS: ReadIn
+        29 => (24, false),      // RELEASEDIR: ReleaseIn
+        30 => (16, false),      // FSYNCDIR: FsyncIn
+        31 => (48, true),       // GETLK: LkIn
+        32 | 33 => (48, false), // SETLK/SETLKW: LkIn
+        34 => (8, false),       // ACCESS: AccessIn
+        35 => (16, true),       // CREATE: CreateIn
+        36 => (8, false),       // INTERRUPT: InterruptIn
+        37 => (16, true),       // BMAP: BmapIn
+        38 => (0, false),       // DESTROY: no arguments
+        39 => (32, true),       // IOCTL: IoctlIn
+        40 => (24, true),       // POLL: PollIn
+        41 => (0, false),       // NOTIFY_REPLY: payload only
+        42 => (8, false),       // BATCH_FORGET: BatchForgetIn
+        43 => (32, false),      // FALLOCATE: FallocateIn
+        45 => (16, false),      // RENAME2: Rename2In
+        46 => (24, true),       // LSEEK: LseekIn
+        47 => (56, true),       // COPY_FILE_RANGE: CopyFileRangeIn
         // SETUPMAPPING/REMOVEMAPPING only exist on the virtiofs DAX window
         // path and are never delivered through /dev/fuse, opcodes 0, 7 and
-        // 19 are undefined, and process() answers the rest, such as
+        // 19 are undefined, and request() answers the rest, such as
         // SYNCFS, TMPFILE and STATX, with ENOSYS.
         _ => return None,
     };
-    Some(len)
+    Some(args)
 }
 
 /// A [Writer] for io_uring replies that routes the reply header and body
@@ -469,40 +489,239 @@ impl<'a, S: BitmapSlice> Writer for UringWriter<'a, S> {
 // UringWriter holds ManuallyDrop Vec shells, so dropping
 // the writer never frees the memory.
 
+/// The buffer pools of the kernel queues, in one anonymous mapping of
+/// `queue_len` bytes per queue. The kernel cuts each queue's pool into
+/// buffers of `buf_size` bytes and lends them to the queue's entries, which
+/// can sit on any worker. Only pages that a request touched take memory.
+struct BufPools {
+    region: MmapRegion<()>,
+    queue_len: usize,
+    buf_size: usize,
+}
+
+impl BufPools {
+    fn new(nr_queues: usize, bufs_per_queue: usize, buf_size: usize) -> io::Result<BufPools> {
+        let queue_len = bufs_per_queue
+            .checked_mul(buf_size)
+            .filter(|&n| n <= u32::MAX as usize)
+            .ok_or_else(|| io::Error::other("uring: buffer pool exceeds 4 GiB per queue"))?;
+        let region = MmapRegion::build(
+            None,
+            queue_len * nr_queues,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_NORESERVE,
+        )
+        .map_err(io::Error::other)?;
+        Ok(BufPools {
+            region,
+            queue_len,
+            buf_size,
+        })
+    }
+
+    /// The pool of queue `qid`, as the ADD_BUFPOOL command takes it.
+    fn queue_pool(&self, qid: usize) -> FuseUringBufpool {
+        FuseUringBufpool {
+            uaddr: self.region.as_ptr() as u64 + (qid * self.queue_len) as u64,
+            len: self.queue_len as u32,
+            reserved: 0,
+        }
+    }
+
+    /// The buffer at `offset` in the pool of queue `qid`, checked against
+    /// the pool's layout.
+    fn buffer(&self, qid: u16, offset: usize) -> Result<(NonNull<u8>, usize)> {
+        let start = qid as usize * self.queue_len + offset;
+        if offset % self.buf_size != 0
+            || offset + self.buf_size > self.queue_len
+            || start + self.buf_size > self.region.size()
+        {
+            return Err(SessionFailure(format!(
+                "uring: buffer offset {offset} outside the pool of queue {qid}"
+            )));
+        }
+        // Safe because the buffer lies inside the mapping, which isn't null.
+        let ptr = unsafe { NonNull::new_unchecked(self.region.as_ptr().add(start)) };
+        Ok((ptr, self.buf_size))
+    }
+}
+
+/// Create a buffer pool for each kernel queue and hand them to the kernel
+/// with ADD_QUEUE and ADD_BUFPOOL, before any entry registers. The kernel
+/// offered buffer pools at INIT, so a failing command is an error.
+fn add_bufpools(
+    fd: RawFd,
+    nr_queues: usize,
+    bufs_per_queue: usize,
+    buf_size: usize,
+) -> io::Result<BufPools> {
+    let pools = BufPools::new(nr_queues, bufs_per_queue, buf_size)?;
+    let mut ring = IoUring::<squeue::Entry128, cqueue::Entry>::generic_builder()
+        .build((nr_queues * 2) as u32)?;
+    {
+        let mut sq = ring.submission();
+        for qid in 0..nr_queues {
+            let add_queue = FuseUringCmdReq {
+                qid: qid as u16,
+                ..Default::default()
+            };
+            let add_bufpool = FuseUringCmdReq {
+                bufpool: pools.queue_pool(qid),
+                ..add_queue
+            };
+            // ADD_BUFPOOL needs the queue, so it runs after the ADD_QUEUE it
+            // is linked to, and the kernel cancels it if that fails.
+            let sqes = [
+                cmd_sqe(fd, FUSE_IO_URING_CMD_ADD_QUEUE, &add_queue, None)
+                    .flags(squeue::Flags::IO_LINK)
+                    .user_data(qid as u64),
+                cmd_sqe(fd, FUSE_IO_URING_CMD_ADD_BUFPOOL, &add_bufpool, None)
+                    .user_data(qid as u64),
+            ];
+            // Safe because the commands point at nothing but the pool, which
+            // lives as long as the entries the kernel lends its buffers to.
+            unsafe { sq.push_multiple(&sqes) }
+                .map_err(|_| io::Error::other("uring: setup ring full"))?;
+        }
+    }
+    let mut pending = nr_queues * 2;
+    while pending > 0 {
+        submit_and_wait(&mut ring, pending)?;
+        for cqe in ring.completion() {
+            pending -= 1;
+            if cqe.result() < 0 {
+                return Err(io::Error::other(format!(
+                    "adding the buffer pool of queue {} failed: {}",
+                    cqe.user_data(),
+                    io::Error::from_raw_os_error(-cqe.result())
+                )));
+            }
+        }
+    }
+    Ok(pools)
+}
+
+/// Build a uring command SQE for `cmd_op` with `req` as its command payload.
+/// `iovecs` is the iovec array of the entry the command registers or
+/// commits.
+fn cmd_sqe(
+    fd: RawFd,
+    cmd_op: u32,
+    req: &FuseUringCmdReq,
+    iovecs: Option<&[libc::iovec; FUSE_URING_IOV_SEGS]>,
+) -> squeue::Entry128 {
+    let mut bytes = [0u8; 80];
+    bytes[..std::mem::size_of::<FuseUringCmdReq>()].copy_from_slice(req.as_slice());
+
+    let sqe = opcode::UringCmd80::new(types::Fd(fd), cmd_op)
+        .cmd(bytes)
+        .build();
+    let Some(iovecs) = iovecs else {
+        return sqe;
+    };
+    // sqe->addr points to the iovec array and sqe->len to the segment
+    // count, as required by fuse_uring_get_iovec_from_sqe(). The crate
+    // exposes no accessor for them on URING_CMD entries, so patch them
+    // through a layout mirror of the SQE.
+    //
+    // Safe because SqeMirror mirrors the kernel ABI layout of
+    // io_uring_sqe and Entry128 is an SQE plus a 64-byte command area;
+    // the sizes are asserted below and only addr/len are overwritten.
+    unsafe {
+        assert_eq!(
+            std::mem::size_of::<(SqeMirror, [u8; 64])>(),
+            std::mem::size_of::<squeue::Entry128>()
+        );
+        let (mut inner, cmd_area) =
+            std::mem::transmute::<squeue::Entry128, (SqeMirror, [u8; 64])>(sqe);
+        inner.addr = iovecs.as_ptr() as u64;
+        inner.len = FUSE_URING_IOV_SEGS as u32;
+        std::mem::transmute::<(SqeMirror, [u8; 64]), squeue::Entry128>((inner, cmd_area))
+    }
+}
+
+/// Where the payload buffers of an entry come from.
+enum Payload {
+    /// The entry has a payload area of its own, of this many bytes.
+    Own(usize),
+    /// The entry's queue has a buffer pool in these pools, and the kernel
+    /// lends the entry a buffer per request.
+    Pool(Arc<BufPools>),
+}
+
 /// One ring entry: the memory areas the kernel reads/writes plus scratch
 /// regions used to reassemble requests and collect replies.
 struct UringEntry {
     qid: u16,
     /// Single allocation, laid out as
-    /// [FuseUringReqHeader][payload][request scratch][reply scratch].
+    /// [FuseUringReqHeader][own payload area][request scratch][reply scratch].
     mem: Box<[u8]>,
-    payload_cap: usize,
+    payload: Payload,
     /// iovec array referenced by the SQEs, must stay at a stable address.
     iovecs: Box<[libc::iovec; FUSE_URING_IOV_SEGS]>,
 }
 
 impl UringEntry {
-    fn new(qid: u16, payload_cap: usize) -> UringEntry {
-        let scratch = FUSE_HEADER_SIZE + payload_cap;
-        let total = std::mem::size_of::<FuseUringReqHeader>() + payload_cap + 2 * scratch;
-        let mem = vec![0u8; total].into_boxed_slice();
+    fn new(qid: u16, payload: Payload) -> UringEntry {
+        let own_cap = match payload {
+            Payload::Own(cap) => cap,
+            Payload::Pool(_) => 0,
+        };
+        let scratch = FUSE_HEADER_SIZE + own_cap;
+        let header_len = std::mem::size_of::<FuseUringReqHeader>();
+        let mem = vec![0u8; header_len + own_cap + 2 * scratch].into_boxed_slice();
         let base = mem.as_ptr();
+        // A queue with a buffer pool takes no payload buffer at REGISTER.
+        let own_payload = if own_cap == 0 {
+            std::ptr::null_mut()
+        } else {
+            // Safe because the payload area follows the header in `mem`.
+            unsafe { base.add(header_len) as *mut libc::c_void }
+        };
         let iovecs = Box::new([
             libc::iovec {
                 iov_base: base as *mut libc::c_void,
-                iov_len: std::mem::size_of::<FuseUringReqHeader>(),
+                iov_len: header_len,
             },
             libc::iovec {
-                iov_base: unsafe { base.add(std::mem::size_of::<FuseUringReqHeader>()) }
-                    as *mut libc::c_void,
-                iov_len: payload_cap,
+                iov_base: own_payload,
+                iov_len: own_cap,
             },
         ]);
         UringEntry {
             qid,
             mem,
-            payload_cap,
+            payload,
             iovecs,
+        }
+    }
+
+    /// Size of the entry's own payload area.
+    fn own_cap(&self) -> usize {
+        self.iovecs[1].iov_len
+    }
+
+    /// The payload buffer of the delivered request and its size. Over a
+    /// buffer pool, the kernel reports the offset of the buffer it lent, but
+    /// a request without a payload and without out arguments gets no buffer
+    /// and offset 0, the same as the first buffer. Such a request gets an
+    /// empty buffer, so its handler can't write into another entry's.
+    fn payload_buffer(
+        &mut self,
+        has_out_args: bool,
+        payload_sz: usize,
+    ) -> Result<(NonNull<u8>, usize)> {
+        match &self.payload {
+            Payload::Own(cap) => {
+                let header_len = std::mem::size_of::<FuseUringReqHeader>();
+                // Safe because the own payload area follows the header in `mem`.
+                let ptr = unsafe { NonNull::new_unchecked(self.mem.as_mut_ptr().add(header_len)) };
+                Ok((ptr, *cap))
+            }
+            Payload::Pool(_) if payload_sz == 0 && !has_out_args => Ok((NonNull::dangling(), 0)),
+            Payload::Pool(pools) => {
+                pools.buffer(self.qid, self.header().ring_ent_in_out.offset as usize)
+            }
         }
     }
 
@@ -521,37 +740,12 @@ impl UringEntry {
     /// Build the `FUSE_IO_URING_CMD_REGISTER`/`COMMIT_AND_FETCH` SQE for this
     /// entry, with `commit_id` set in the command payload.
     fn cmd_sqe(&self, fd: i32, cmd_op: u32, commit_id: u64, user_data: u64) -> squeue::Entry128 {
-        let cmd = FuseUringCmdReq {
+        let req = FuseUringCmdReq {
             qid: self.qid,
             commit_id,
             ..Default::default()
         };
-        let mut bytes = [0u8; 80];
-        bytes[..std::mem::size_of::<FuseUringCmdReq>()].copy_from_slice(cmd.as_slice());
-
-        let mut sqe = opcode::UringCmd80::new(types::Fd(fd), cmd_op)
-            .cmd(bytes)
-            .build();
-        // sqe->addr points to the iovec array and sqe->len to the segment
-        // count, as required by fuse_uring_get_iovec_from_sqe(). The crate
-        // exposes no accessor for them on URING_CMD entries, so patch them
-        // through a layout mirror of the SQE.
-        //
-        // Safe because SqeMirror mirrors the kernel ABI layout of
-        // io_uring_sqe and Entry128 is an SQE plus a 64-byte command area;
-        // the sizes are asserted below and only addr/len are overwritten.
-        unsafe {
-            assert_eq!(
-                std::mem::size_of::<(SqeMirror, [u8; 64])>(),
-                std::mem::size_of::<squeue::Entry128>()
-            );
-            let (mut inner, cmd_area) =
-                std::mem::transmute::<squeue::Entry128, (SqeMirror, [u8; 64])>(sqe);
-            inner.addr = self.iovecs.as_ptr() as u64;
-            inner.len = FUSE_URING_IOV_SEGS as u32;
-            sqe = std::mem::transmute::<(SqeMirror, [u8; 64]), squeue::Entry128>((inner, cmd_area));
-        }
-        sqe.user_data(user_data)
+        cmd_sqe(fd, cmd_op, &req, Some(&self.iovecs)).user_data(user_data)
     }
 
     /// Stage a `-errno` error reply, so that the subsequent
@@ -579,7 +773,10 @@ struct UringWorker<F: FileSystem + Send + Sync + 'static> {
     fd: File,
     qids: Vec<u16>,
     entries_per_queue: usize,
+    /// Size of the payload area of an entry whose queue has no buffer pool.
     payload_cap: usize,
+    /// The queues' buffer pools, if the kernel took them.
+    pools: Option<Arc<BufPools>>,
     server: Arc<Server<F>>,
 }
 
@@ -594,7 +791,11 @@ impl<F: FileSystem + Send + Sync + 'static> UringWorker<F> {
         let mut entries: Vec<UringEntry> = Vec::with_capacity(total_entries);
         for qid in &self.qids {
             for _ in 0..self.entries_per_queue {
-                entries.push(UringEntry::new(*qid, self.payload_cap));
+                let payload = match &self.pools {
+                    Some(pools) => Payload::Pool(pools.clone()),
+                    None => Payload::Own(self.payload_cap),
+                };
+                entries.push(UringEntry::new(*qid, payload));
             }
         }
 
@@ -709,12 +910,13 @@ impl<F: FileSystem + Send + Sync + 'static> UringWorker<F> {
         // Answer an opcode the table doesn't know with ENOSYS here, rather
         // than dispatch it without its arguments. The kernel then stops
         // sending it, as it does with FUSE_STATX.
-        let Some(args_len) = in_args_len(in_header.opcode) else {
+        let Some((args_len, has_out_args)) = op_args(in_header.opcode) else {
             entry.stage_error_reply(libc::ENOSYS);
             return Ok(());
         };
         let payload_sz = entry.header().ring_ent_in_out.payload_sz as usize;
-        if args_len > FUSE_URING_IN_OUT_HEADER_SZ || payload_sz > entry.payload_cap {
+        let (payload_buf, payload_cap) = entry.payload_buffer(has_out_args, payload_sz)?;
+        if args_len > FUSE_URING_IN_OUT_HEADER_SZ || payload_sz > payload_cap {
             return Err(SessionFailure(format!(
                 "uring: malformed request, opcode {} args {} payload {}",
                 in_header.opcode, args_len, payload_sz
@@ -722,7 +924,8 @@ impl<F: FileSystem + Send + Sync + 'static> UringWorker<F> {
         }
 
         let header_len = std::mem::size_of::<FuseUringReqHeader>();
-        let scratch = FUSE_HEADER_SIZE + entry.payload_cap;
+        let own_cap = entry.own_cap();
+        let scratch = FUSE_HEADER_SIZE + own_cap;
         let base = entry.mem.as_mut_ptr();
 
         // Assemble only the small header/args portion in the request scratch
@@ -735,7 +938,7 @@ impl<F: FileSystem + Send + Sync + 'static> UringWorker<F> {
         unsafe {
             let header = &*(base as *const FuseUringReqHeader);
             let req_scratch =
-                std::slice::from_raw_parts_mut(base.add(header_len + entry.payload_cap), scratch);
+                std::slice::from_raw_parts_mut(base.add(header_len + own_cap), scratch);
             let mut off = 0;
             req_scratch[off..off + IN_HEADER_SIZE]
                 .copy_from_slice(&header.in_out[..IN_HEADER_SIZE]);
@@ -746,24 +949,23 @@ impl<F: FileSystem + Send + Sync + 'static> UringWorker<F> {
         let total = {
             // Build a scatter Reader:
             //   Buffer 1 (header scratch): InHeader + opcode args
-            //   Buffer 2 (entry payload area): request payload — only when
+            //   Buffer 2 (payload buffer): request payload — only when
             //     payload_sz > 0, avoiding a copy of up to ~128K.
             //
             // Build a scatter Writer:
             //   Header slot (entry.in_out): fuse_out_header (16 bytes)
-            //   Body slot (entry payload area): reply body
+            //   Body slot (payload buffer): reply body
             // Both are written in place — no post-copy after handle_message.
             let header_args_len = IN_HEADER_SIZE + args_len;
             let header_scratch = unsafe {
-                std::slice::from_raw_parts_mut(
-                    base.add(header_len + entry.payload_cap),
-                    header_args_len,
-                )
+                std::slice::from_raw_parts_mut(base.add(header_len + own_cap), header_args_len)
             };
 
             let reader = if payload_sz > 0 {
                 // SAFETY: The Reader's buffer 2 and the Writer's body below
-                // both cover the entry's payload area (base + header_len).
+                // both cover the payload buffer, the entry's own or the one
+                // the kernel lent it, which the kernel doesn't touch until
+                // the entry commits.
                 // This is technically overlapping mutable borrows, but is
                 // sound because:
                 //   (1) The Reader is fully consumed during argument parsing
@@ -776,18 +978,18 @@ impl<F: FileSystem + Send + Sync + 'static> UringWorker<F> {
                 // A future refactor could eliminate this by using raw
                 // pointers in both Reader and Writer APIs.
                 let entry_payload =
-                    unsafe { std::slice::from_raw_parts_mut(base.add(header_len), payload_sz) };
+                    unsafe { std::slice::from_raw_parts_mut(payload_buf.as_ptr(), payload_sz) };
                 Reader::<()>::from_uring_buffers(header_scratch, entry_payload)?
             } else {
                 Reader::<()>::from_fuse_buffer(FuseBuf::new(header_scratch))?
             };
 
             // The reply header goes into entry.in_out[0..OUT_HEADER_SIZE] and
-            // the reply body goes directly into the entry's payload area.
+            // the reply body goes directly into the payload buffer.
             // See SAFETY comment above regarding overlap with Reader's buffer 2.
             let in_out_header = unsafe { std::slice::from_raw_parts_mut(base, OUT_HEADER_SIZE) };
             let payload_area =
-                unsafe { std::slice::from_raw_parts_mut(base.add(header_len), entry.payload_cap) };
+                unsafe { std::slice::from_raw_parts_mut(payload_buf.as_ptr(), payload_cap) };
             let writer = UringWriter::<()>::new(in_out_header, payload_area);
 
             self.server
@@ -803,7 +1005,7 @@ impl<F: FileSystem + Send + Sync + 'static> UringWorker<F> {
         if total > 0 {
             // The scatter writer already placed the reply directly in the
             // entry areas; just record the payload size and validate.
-            if total < OUT_HEADER_SIZE || total > OUT_HEADER_SIZE + entry.payload_cap {
+            if total < OUT_HEADER_SIZE || total > OUT_HEADER_SIZE + payload_cap {
                 return Err(SessionFailure(format!(
                     "uring: malformed reply of {} bytes for unique 0x{:x}",
                     total, in_header.unique
@@ -907,6 +1109,9 @@ fn release_entries(
 pub struct UringFuseServing<F: FileSystem + Send + Sync + 'static> {
     session: FuseSession,
     workers: WorkerSet,
+    /// Whether the queues have buffer pools.
+    #[cfg(test)]
+    pooled: bool,
     _fs: std::marker::PhantomData<F>,
 }
 
@@ -969,6 +1174,19 @@ impl<F: FileSystem + Send + Sync + 'static> UringFuseServing<F> {
             .try_clone()
             .map_err(|e| SessionFailure(format!("uring: dup fuse fd: {e}")))?;
 
+        // A queue's entries hold at most one buffer each, so more buffers
+        // than entries would never be lent.
+        let bufs_per_queue = cfg.bufs_per_queue.min(cfg.entries_per_queue.max(1));
+        let pools = if bufs_per_queue > 0 && server.uring_bufpool_supported() {
+            let buf_size = server.uring_payload_size();
+            let pools = add_bufpools(file.as_raw_fd(), nr_queues, bufs_per_queue, buf_size)
+                .map_err(|e| SessionFailure(format!("uring: {e}")))?;
+            info!("uring: each queue has a pool of {bufs_per_queue} buffers of {buf_size} bytes");
+            Some(Arc::new(pools))
+        } else {
+            None
+        };
+
         // Build one worker per queue set, cloning the fuse fd up front so
         // cloning failures are reported before any thread is spawned.
         let mut worker_list = Vec::with_capacity(workers);
@@ -980,6 +1198,7 @@ impl<F: FileSystem + Send + Sync + 'static> UringFuseServing<F> {
                 qids: ids,
                 entries_per_queue: cfg.entries_per_queue,
                 payload_cap,
+                pools: pools.clone(),
                 server: server.clone(),
             });
         }
@@ -1053,6 +1272,8 @@ impl<F: FileSystem + Send + Sync + 'static> UringFuseServing<F> {
         Ok(UringFuseServing {
             session,
             workers: set,
+            #[cfg(test)]
+            pooled: pools.is_some(),
             _fs: std::marker::PhantomData,
         })
     }
@@ -1146,6 +1367,7 @@ mod tests {
         let cfg = UringConfig {
             workers: 1,
             entries_per_queue: 1,
+            bufs_per_queue: 0,
         };
         if let Err(e) = UringFuseServing::new(se, server, cfg) {
             panic!("uring_available() said yes, but the mount got {}", e);
@@ -1165,7 +1387,7 @@ mod tests {
     }
 
     #[test]
-    fn test_in_args_len() {
+    fn test_op_args() {
         // Per-opcode argument sizes, derived from the *In structures of the
         // fuse ABI (which mirror the kernel's first in_arg per opcode) and
         // from the server-side request decoders.
@@ -1223,22 +1445,49 @@ mod tests {
             ),
         ];
         for &(op, len) in expected {
-            assert_eq!(in_args_len(op), Some(len), "opcode {}", op);
+            assert_eq!(op_args(op).map(|a| a.0), Some(len), "opcode {}", op);
         }
         // Everything else (holes, virtiofs-only and newer opcodes) isn't in
         // the table.
         for op in 0..=64u32 {
             if !expected.iter().any(|&(e, _)| e == op) {
-                assert_eq!(in_args_len(op), None, "opcode {}", op);
+                assert_eq!(op_args(op), None, "opcode {}", op);
             }
         }
-        assert_eq!(in_args_len(u32::MAX), None);
+        assert_eq!(op_args(u32::MAX), None);
+        // The requests without out arguments, which take no reply body.
+        let no_out_args = [
+            Opcode::Forget,
+            Opcode::Unlink,
+            Opcode::Rmdir,
+            Opcode::Rename,
+            Opcode::Release,
+            Opcode::Fsync,
+            Opcode::Setxattr,
+            Opcode::Removexattr,
+            Opcode::Flush,
+            Opcode::Releasedir,
+            Opcode::Fsyncdir,
+            Opcode::Setlk,
+            Opcode::Setlkw,
+            Opcode::Access,
+            Opcode::Interrupt,
+            Opcode::Destroy,
+            Opcode::NotifyReply,
+            Opcode::BatchForget,
+            Opcode::Fallocate,
+            Opcode::Rename2,
+        ];
+        for &(op, _) in expected {
+            let has_out_args = !no_out_args.iter().any(|&o| o as u32 == op);
+            assert_eq!(op_args(op).unwrap().1, has_out_args, "opcode {}", op);
+        }
     }
 
     #[test]
     fn test_uring_entry_layout() {
         let payload_cap = 4096;
-        let entry = UringEntry::new(3, payload_cap);
+        let entry = UringEntry::new(3, Payload::Own(payload_cap));
         assert_eq!(entry.qid, 3);
 
         let header_len = std::mem::size_of::<FuseUringReqHeader>();
@@ -1259,7 +1508,7 @@ mod tests {
 
     #[test]
     fn test_cmd_sqe() {
-        let entry = UringEntry::new(7, 64);
+        let entry = UringEntry::new(7, Payload::Own(64));
         let sqe = entry.cmd_sqe(42, FUSE_IO_URING_CMD_REGISTER, 0xdead_beef, 5);
 
         assert_eq!(
@@ -1407,6 +1656,7 @@ mod tests {
             qids: vec![0],
             entries_per_queue: 1,
             payload_cap: 4096,
+            pools: None,
             server: Arc::new(Server::new(Arc::new(fs))),
         };
         (worker, source)
@@ -1452,7 +1702,7 @@ mod tests {
     #[test]
     fn test_process_getattr() {
         let (worker, _source) = make_worker();
-        let mut entry = UringEntry::new(0, worker.payload_cap);
+        let mut entry = UringEntry::new(0, Payload::Own(worker.payload_cap));
 
         let args = GetattrIn::default();
         plant_request(&mut entry, Opcode::Getattr as u32, args.as_slice(), &[]);
@@ -1473,7 +1723,7 @@ mod tests {
     #[test]
     fn test_process_lookup_payload_only() {
         let (worker, _source) = make_worker();
-        let mut entry = UringEntry::new(0, worker.payload_cap);
+        let mut entry = UringEntry::new(0, Payload::Own(worker.payload_cap));
 
         // LOOKUP carries no fixed arguments, only the name in the payload.
         plant_request(&mut entry, Opcode::Lookup as u32, &[], b"fuse-file\0");
@@ -1501,7 +1751,7 @@ mod tests {
         /// The STATX opcode, which the transport's table doesn't know.
         const FUSE_STATX: u32 = 52;
         let (worker, _source) = make_worker();
-        let mut entry = UringEntry::new(0, worker.payload_cap);
+        let mut entry = UringEntry::new(0, Payload::Own(worker.payload_cap));
 
         // The kernel only falls back to GETATTR after ENOSYS.
         plant_request(&mut entry, FUSE_STATX, &[0u8; 24], &[]);
@@ -1513,7 +1763,7 @@ mod tests {
     #[test]
     fn test_stage_error_reply_after_rejected_request() {
         let (worker, _source) = make_worker();
-        let mut entry = UringEntry::new(0, worker.payload_cap);
+        let mut entry = UringEntry::new(0, Payload::Own(worker.payload_cap));
 
         // Simulate the kernel delivering a request with a payload larger
         // than the entry: process() fails, and the worker must commit a
@@ -1539,11 +1789,70 @@ mod tests {
     }
 
     #[test]
+    fn test_bufpools_buffer() {
+        let pools = BufPools::new(2, 3, 4096).unwrap();
+        let base = pools.region.as_ptr();
+        // The second buffer of queue 1 sits behind queue 0's three.
+        let (ptr, len) = pools.buffer(1, 4096).unwrap();
+        assert_eq!(ptr.as_ptr(), base.wrapping_add(4 * 4096));
+        assert_eq!(len, 4096);
+        assert_eq!(pools.queue_pool(1).uaddr, base as u64 + 3 * 4096);
+        assert_eq!(pools.queue_pool(1).len, 3 * 4096);
+        // Offsets between buffers or past the pool, and unknown queues.
+        assert!(pools.buffer(1, 100).is_err());
+        assert!(pools.buffer(1, 3 * 4096).is_err());
+        assert!(pools.buffer(2, 0).is_err());
+        // A pool must fit the 32-bit length of ADD_BUFPOOL.
+        assert!(BufPools::new(1, 4097, 1 << 20).is_err());
+    }
+
+    #[test]
+    fn test_process_pooled() {
+        let (worker, _source) = make_worker();
+        let pools = Arc::new(BufPools::new(1, 2, 4096).unwrap());
+        let mut entry = UringEntry::new(0, Payload::Pool(pools.clone()));
+        // REGISTER must not carry a payload buffer.
+        assert!(entry.iovecs[1].iov_base.is_null());
+        assert_eq!(entry.iovecs[1].iov_len, 0);
+
+        // The reply body goes into the buffer the kernel lent.
+        plant_request(
+            &mut entry,
+            Opcode::Getattr as u32,
+            GetattrIn::default().as_slice(),
+            &[],
+        );
+        entry.header_mut().ring_ent_in_out.offset = 4096;
+        worker.process(&mut entry).unwrap();
+        assert_eq!(parse_out_header(&entry).error, 0);
+        let body = pools.buffer(0, 4096).unwrap().0.as_ptr();
+        let mut attr = AttrOut::default();
+        // Safe because the pool's second buffer holds the reply body.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                body,
+                attr.as_mut_slice().as_mut_ptr(),
+                std::mem::size_of::<AttrOut>(),
+            )
+        };
+        assert_eq!(attr.attr.mode & libc::S_IFMT, libc::S_IFDIR);
+
+        // A request without a payload and without a reply body gets no
+        // buffer, even though offset 0 names the first one.
+        plant_request(&mut entry, Opcode::Fsync as u32, &[0u8; 16], &[]);
+        entry.header_mut().ring_ent_in_out.offset = 0;
+        assert_eq!(entry.payload_buffer(false, 0).unwrap().1, 0);
+        // Offset 0 with a reply body is the first buffer.
+        let (ptr, len) = entry.payload_buffer(true, 0).unwrap();
+        assert_eq!((ptr, len), pools.buffer(0, 0).unwrap());
+    }
+
+    #[test]
     fn test_process_rejects_oversized_reply() {
         let (worker, _source) = make_worker();
         // A payload area too small to hold the GETATTR reply body must be
         // rejected instead of panicking in the staging copy.
-        let mut entry = UringEntry::new(0, 8);
+        let mut entry = UringEntry::new(0, Payload::Own(8));
         plant_request(
             &mut entry,
             Opcode::Getattr as u32,
@@ -1617,11 +1926,11 @@ mod tests {
         assert_eq!(other.available_bytes(), 256 - 100);
     }
 
-    /// Serve a PassthroughFs over io_uring, read and write through the
-    /// mount, then check that dropping the serving layer gets the ring
-    /// entries back from the kernel and unmounts.
-    #[test]
-    fn test_uring_serving_mount() {
+    /// Serve a PassthroughFs over io_uring with each queue's buffer pool
+    /// holding `bufs_per_queue` buffers, read and write through the mount,
+    /// then check that dropping the serving layer gets the ring entries
+    /// back from the kernel and unmounts.
+    fn check_passthrough_mount(bufs_per_queue: usize) {
         let src = TempDir::new().unwrap();
         std::fs::write(src.as_path().join("hello"), b"over io_uring").unwrap();
         let mnt = TempDir::new().unwrap();
@@ -1639,8 +1948,9 @@ mod tests {
         let cfg = UringConfig {
             workers: 2,
             entries_per_queue: 2,
+            bufs_per_queue,
         };
-        let serving = match UringFuseServing::new(se, server, cfg) {
+        let serving = match UringFuseServing::new(se, server.clone(), cfg) {
             Ok(serving) => serving,
             Err(UringNotSupported) => {
                 eprintln!("FUSE-over-io_uring is not available, skipping");
@@ -1648,6 +1958,11 @@ mod tests {
             }
             Err(e) => panic!("uring serving failed: {}", e),
         };
+        // Kernels with buffer pools must get them when the config asks.
+        assert_eq!(
+            serving.pooled,
+            bufs_per_queue > 0 && server.uring_bufpool_supported()
+        );
 
         assert_eq!(
             std::fs::read(mnt.as_path().join("hello")).unwrap(),
@@ -1657,6 +1972,24 @@ mod tests {
         std::fs::write(&created, b"written over io_uring").unwrap();
         assert_eq!(std::fs::read(&created).unwrap(), b"written over io_uring");
 
+        // Writes and reads of whole payload buffers, from several threads
+        // so that requests wait for buffers when the pools are small.
+        std::thread::scope(|scope| {
+            for i in 0..4u8 {
+                let path = mnt.as_path().join(format!("big-{i}"));
+                scope.spawn(move || {
+                    let data: Vec<u8> = (0..3 << 20).map(|n: u32| (n as u8) ^ i).collect();
+                    let mut f = File::create(&path).unwrap();
+                    f.write_all(&data).unwrap();
+                    // FSYNC and RELEASE carry no payload and take no body.
+                    f.sync_all().unwrap();
+                    drop(f);
+                    assert!(std::fs::read(&path).unwrap() == data);
+                    std::fs::remove_file(&path).unwrap();
+                });
+            }
+        });
+
         // Tearing the connection down completes the commands of all armed
         // entries, so the workers get their entries back well within
         // RELEASE_TIMEOUT instead of waiting it out and leaking them.
@@ -1664,6 +1997,13 @@ mod tests {
         drop(serving);
         assert!(start.elapsed() < RELEASE_TIMEOUT);
         assert!(std::fs::read(mnt.as_path().join("hello")).is_err());
+    }
+
+    #[test]
+    fn test_uring_serving_mount() {
+        for bufs_per_queue in [0, 1, 4] {
+            check_passthrough_mount(bufs_per_queue);
+        }
     }
 
     #[test]

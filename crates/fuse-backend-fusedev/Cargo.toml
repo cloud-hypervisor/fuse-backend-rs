@@ -31,7 +31,7 @@ log = "0.4.6"
 mio = { version = "0.8", features = ["os-poll", "os-ext"] }
 nix = "0.24"
 tokio = { version = "1.53.3", optional = true }
-vm-memory = { workspace = true }
+vm-memory = { workspace = true, features = ["backend-mmap"] }
 vmm-sys-util = { workspace = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
