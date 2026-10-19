@@ -30,7 +30,12 @@
 #                  noise dominated
 #   BENCH_MODES    execution order of the modes (default "sync async"); the
 #                  second mode benefits from a warmer page cache, so run
-#                  both orders to cross-check the results
+#                  both orders to cross-check the results. The pool mode is
+#                  the async mode with PassthroughFs offloading blocking
+#                  work to the runtime's blocking thread pool.
+#                  bench_compare.py collects a mode by its file name prefix,
+#                  so no mode name may start with another mode name and a
+#                  dash.
 #   BENCH_DAEMON   path of a prebuilt benchmark daemon (default: build the
 #                  daemon of this repository in release mode); used by the
 #                  CI pipeline to benchmark different code variants with an
@@ -233,6 +238,7 @@ run_readdir_workload() {
 for mode in ${MODES}; do
     mode_args=""
     [ "${mode}" = "async" ] && mode_args="--async"
+    [ "${mode}" = "pool" ] && mode_args="--async --thread-pool"
     if [ "${mode}" = "uring" ]; then
         if ! kernel_at_least 6 14; then
             echo "warning: mode uring requires kernel 6.14+ ($(uname -r)), skipping" >&2
