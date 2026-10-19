@@ -977,6 +977,8 @@ impl<F: FileSystem + Sync> Server<F> {
                     out.max_pages = MAX_REQ_PAGES;
                     out.max_write = MAX_REQ_PAGES as u32 * pagesize() as u32; // 1MB
                 }
+                #[cfg(all(target_os = "linux", feature = "fusedev-uring"))]
+                self.record_uring_init(flags_u64, out.max_write, out.max_pages);
                 self.vers.store(
                     encode_version(version.major, version.minor),
                     Ordering::Release,
@@ -1726,10 +1728,10 @@ mod tests {
     use super::super::test_util::{MockFS, TestWriter};
     use super::*;
 
-    fn prepare_srvcontext<'a>(
+    fn prepare_srvcontext<'a, F: FileSystem>(
         read_buf: &'a mut [u8],
         write_buf: &'a mut [u8],
-    ) -> SrvContext<'a, MockFS, (), TestWriter<'a>> {
+    ) -> SrvContext<'a, F, (), TestWriter<'a>> {
         let reader = Reader::<()>::from_slice(read_buf);
         let writer = TestWriter::new(write_buf);
         let in_header = InHeader::default();
@@ -2017,6 +2019,77 @@ mod tests {
             out.flags2 & (FsOptions::CREATE_SUPP_GROUP.bits() >> 32) as u32,
             0
         );
+    }
+
+    #[cfg(feature = "fusedev-uring")]
+    #[test]
+    fn test_server_init_uring_bufpool() {
+        use crate::abi::fuse_uring::FUSE_HAS_IO_URING_BUFPOOL;
+
+        /// A file system that wants everything the kernel offers.
+        struct WantAll;
+        impl FileSystem for WantAll {
+            type Inode = u64;
+            type Handle = u64;
+            fn init(&self, capable: FsOptions) -> io::Result<FsOptions> {
+                Ok(capable)
+            }
+        }
+
+        // Run INIT with `flags` and `flags2` from the kernel, and return the
+        // server and the reply.
+        let init = |flags: FsOptions, flags2: u64| {
+            let mut read_buf = [0u8; size_of::<InitIn>() + size_of::<InitIn2>()];
+            let init_in = InitIn {
+                major: KERNEL_VERSION,
+                minor: KERNEL_MINOR_VERSION,
+                max_readahead: 0,
+                flags: (flags | FsOptions::INIT_EXT).bits() as u32,
+            };
+            read_buf[..size_of::<InitIn>()].copy_from_slice(init_in.as_slice());
+            let init_in2 = InitIn2 {
+                flags2: ((FsOptions::OVER_IO_URING.bits() | flags2) >> 32) as u32,
+                unused: [0; 11],
+            };
+            read_buf[size_of::<InitIn>()..].copy_from_slice(init_in2.as_slice());
+            let server = Server::new(WantAll);
+            server.set_uring(true);
+            let mut write_buf = [0u8; 4096];
+            let res = {
+                let ctx = prepare_srvcontext(&mut read_buf, &mut write_buf);
+                server.init(ctx, |_| {}).unwrap()
+            };
+            let mut out = InitOut::default();
+            out.as_mut_slice()
+                .copy_from_slice(&write_buf[size_of::<OutHeader>()..res]);
+            (server, out)
+        };
+
+        // The kernel's flag for buffer pools isn't an FsOptions flag, but
+        // the server still sees it.
+        let (server, _) = init(FsOptions::empty(), FUSE_HAS_IO_URING_BUFPOOL);
+        assert!(server.uring_bufpool_supported());
+        let (server, out) = init(FsOptions::empty(), 0);
+        assert!(!server.uring_bufpool_supported());
+        // Without FUSE_MAX_PAGES the kernel keeps 32 pages per request.
+        assert_eq!(out.max_pages, 0);
+        assert_eq!(
+            server.uring_payload_size(),
+            (MIN_READ_BUFFER as usize)
+                .max(out.max_write as usize)
+                .max(32 * pagesize())
+        );
+
+        // With FUSE_MAX_PAGES the kernel takes max_pages up to its limit.
+        let (server, out) = init(FsOptions::MAX_PAGES | FsOptions::BIG_WRITES, 0);
+        assert_eq!(out.max_pages, MAX_REQ_PAGES);
+        assert_eq!(
+            server.uring_payload_size(),
+            MAX_REQ_PAGES as usize * pagesize()
+        );
+        // The kernel's max_pages_limit can't change the size, because the
+        // reply's max_write covers max_pages pages.
+        assert!(out.max_write as usize >= MAX_REQ_PAGES as usize * pagesize());
     }
 
     #[cfg(feature = "fusedev-uring")]
