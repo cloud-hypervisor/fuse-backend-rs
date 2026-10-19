@@ -282,12 +282,19 @@ struct KernelPassthrough {
 
 #[cfg(target_os = "linux")]
 impl KernelPassthrough {
+    /// Get the backing id of `inode` for a new handle if the inode has one.
+    fn share(&self, inode: Inode) -> Option<u32> {
+        // Do not expect poisoned lock here, so safe to unwrap().
+        let mut ids = self.ids.lock().unwrap();
+        let (id, handles) = ids.get_mut(&inode)?;
+        *handles += 1;
+        Some(*id)
+    }
+
     /// Get the backing id of `inode` for a new handle, registering `file` if the inode has none.
     fn acquire(&self, inode: Inode, file: &File) -> io::Result<u32> {
-        // Do not expect poisoned lock here, so safe to unwrap().
-        if let Some((id, handles)) = self.ids.lock().unwrap().get_mut(&inode) {
-            *handles += 1;
-            return Ok(*id);
+        if let Some(id) = self.share(inode) {
+            return Ok(id);
         }
         // Register the file without the lock, so that a slow ioctl doesn't hold up the opens and
         // releases of other inodes.
@@ -357,14 +364,17 @@ struct HandleData {
     inode: Inode,
     file: File,
     open_flags: RwLock<u32>,
+    /// Whether the handle holds a reference to its inode's backing id.
+    has_backing_id: bool,
 }
 
 impl HandleData {
-    fn new(inode: Inode, file: File, flags: u32) -> Self {
+    fn new(inode: Inode, file: File, flags: u32, has_backing_id: bool) -> Self {
         HandleData {
             inode,
             file,
             open_flags: RwLock::new(flags),
+            has_backing_id,
         }
     }
 
@@ -421,7 +431,7 @@ impl HandleMap {
         self.handles.write().unwrap().insert(handle, Arc::new(data));
     }
 
-    fn release(&self, handle: Handle, inode: Inode) -> io::Result<()> {
+    fn release(&self, handle: Handle, inode: Inode) -> io::Result<Arc<HandleData>> {
         // Do not expect poisoned lock here, so safe to unwrap().
         let mut handles = self.handles.write().unwrap();
 
@@ -429,8 +439,7 @@ impl HandleMap {
             if e.get().inode == inode {
                 // We don't need to close the file here because that will happen automatically when
                 // the last `Arc` is dropped.
-                e.remove();
-                return Ok(());
+                return Ok(e.remove());
             }
         }
 
@@ -518,6 +527,9 @@ pub struct PassthroughFs<S: BitmapSlice + Send + Sync = ()> {
     // was called and `init` was called with `FsOptions::PASSTHROUGH`.
     #[cfg(target_os = "linux")]
     passthrough: AtomicBool,
+    // Whether a backing file the kernel refused was logged at warn level already.
+    #[cfg(target_os = "linux")]
+    backing_refusal_logged: AtomicBool,
 
     // Whether to offload the synchronous handlers to the blocking thread
     // pool with the async-io feature, see
@@ -594,6 +606,8 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
             kernel_passthrough: None,
             #[cfg(target_os = "linux")]
             passthrough: AtomicBool::new(false),
+            #[cfg(target_os = "linux")]
+            backing_refusal_logged: AtomicBool::new(false),
             #[cfg(feature = "async-io")]
             async_thread_pool_enabled: AtomicBool::new(false),
             #[cfg(feature = "async-io")]
@@ -677,14 +691,54 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
 
     /// Register the backing file of a new handle of `inode` if kernel passthrough is enabled, and
     /// return its backing id.
+    ///
+    /// If the kernel refuses the backing file, the handle opens without passthrough, so the
+    /// daemon serves its IO. That is safe because registering only fails when the inode has no
+    /// backing id yet, so none of its handles is open in passthrough mode. `EPERM` means the
+    /// daemon lacks `CAP_SYS_ADMIN` and every registration would fail, so it turns passthrough
+    /// off.
+    ///
+    /// With passthrough off, an inode that still has handles with a backing id keeps sharing it.
+    /// The kernel fails an open of an inode in passthrough mode unless the open uses the same
+    /// backing file.
     #[cfg(target_os = "linux")]
-    fn acquire_backing_id(&self, inode: Inode, file: &File) -> io::Result<Option<u32>> {
-        match &self.kernel_passthrough {
-            Some(kp) if self.passthrough.load(Ordering::Relaxed) => {
-                kp.acquire(inode, file).map(Some)
-            }
-            _ => Ok(None),
+    fn acquire_backing_id(&self, inode: Inode, file: &File) -> Option<u32> {
+        let kp = self.kernel_passthrough.as_ref()?;
+        if !self.passthrough.load(Ordering::Relaxed) {
+            return kp.share(inode);
         }
+        match kp.acquire(inode, file) {
+            Ok(id) => Some(id),
+            Err(e) if e.raw_os_error() == Some(libc::EPERM) => {
+                if self.passthrough.swap(false, Ordering::Relaxed) {
+                    warn!(
+                        "fuse: kernel passthrough needs CAP_SYS_ADMIN, serving IO in the daemon: {}",
+                        e
+                    );
+                }
+                None
+            }
+            Err(e) => {
+                // Log the first refusal as a warning, and the rest at debug level.
+                let level = if self.backing_refusal_logged.swap(true, Ordering::Relaxed) {
+                    log::Level::Debug
+                } else {
+                    log::Level::Warn
+                };
+                log::log!(
+                    level,
+                    "fuse: can't register the backing file of inode {}, opening it without passthrough: {}",
+                    inode,
+                    e
+                );
+                None
+            }
+        }
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn acquire_backing_id(&self, _inode: Inode, _file: &File) -> Option<u32> {
+        None
     }
 
     /// Get the list of file descriptors which should be reserved across live upgrade.
@@ -983,12 +1037,14 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
         // `HandleMap::clear()`.  If `release()` fails the cached cookie (if
         // any) is left behind; that is harmless and it will be dropped by
         // `destroy()`.
-        self.handle_map.release(handle, inode)?;
+        let data = self.handle_map.release(handle, inode)?;
         self.handle_map.remove_cookie(handle);
         // Directories and handles opened without passthrough have no backing id to release.
-        #[cfg(target_os = "linux")]
-        if let Some(kp) = &self.kernel_passthrough {
-            kp.release(inode);
+        if data.has_backing_id {
+            #[cfg(target_os = "linux")]
+            if let Some(kp) = &self.kernel_passthrough {
+                kp.release(inode);
+            }
         }
         Ok(())
     }
@@ -1939,6 +1995,95 @@ mod tests {
         // Destroying the file system, as `Vfs::umount()` does, closes the ids still open.
         fs.destroy();
         assert_eq!(*files.closed.lock().unwrap(), vec![1, 2]);
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn test_kernel_passthrough_falls_back() {
+        /// Answers registrations with `results` in order, and records the closed ids.
+        struct Files {
+            results: Mutex<Vec<io::Result<u32>>>,
+            calls: AtomicU64,
+            closed: Mutex<Vec<u32>>,
+        }
+        impl Files {
+            fn new(mut results: Vec<io::Result<u32>>) -> Arc<Self> {
+                results.reverse();
+                Arc::new(Files {
+                    results: Mutex::new(results),
+                    calls: AtomicU64::new(0),
+                    closed: Mutex::new(Vec::new()),
+                })
+            }
+        }
+        impl BackingFiles for Files {
+            fn open(&self, _fd: BorrowedFd<'_>) -> io::Result<u32> {
+                self.calls.fetch_add(1, Ordering::Relaxed);
+                self.results.lock().unwrap().pop().unwrap()
+            }
+            fn close(&self, backing_id: u32) -> io::Result<()> {
+                self.closed.lock().unwrap().push(backing_id);
+                Ok(())
+            }
+        }
+        fn passthrough_fs(tmpdir: &TempDir, files: Arc<Files>) -> PassthroughFs<()> {
+            let mut fs = PassthroughFs::<()>::new(Config {
+                do_import: false,
+                root_dir: tmpdir.as_path().to_string_lossy().to_string(),
+                ..Default::default()
+            })
+            .unwrap();
+            fs.set_backing_files(files);
+            fs.import().unwrap();
+            assert!(fs
+                .init(FsOptions::PASSTHROUGH)
+                .unwrap()
+                .contains(FsOptions::PASSTHROUGH));
+            fs
+        }
+        let ctx = Context::default();
+        let createin = CreateIn {
+            flags: libc::O_CREAT as u32 | libc::O_RDWR as u32,
+            mode: 0o644,
+            umask: 0,
+            fuse_flags: 0,
+        };
+        let name = CString::new("file").unwrap();
+
+        // A refused backing file opens without passthrough, and the next open of the inode tries
+        // again.
+        let tmpdir = TempDir::new().unwrap();
+        let files = Files::new(vec![Err(io::Error::from_raw_os_error(libc::ELOOP)), Ok(7)]);
+        let fs = passthrough_fs(&tmpdir, files.clone());
+        let (entry, h1, opts1, id1) = fs.create(&ctx, ROOT_ID, &name, createin).unwrap();
+        assert!(!opts1.contains(OpenOptions::PASSTHROUGH));
+        assert_eq!(id1, None);
+        let (h2, opts2, id2) = fs
+            .open(&ctx, entry.inode, libc::O_RDONLY as u32, 0)
+            .unwrap();
+        assert!(opts2.contains(OpenOptions::PASSTHROUGH));
+        assert_eq!(id2, Some(7));
+        // Releasing the handle without an id leaves the id of the other one alone.
+        fs.release(&ctx, entry.inode, 0, h1.unwrap(), false, false, None)
+            .unwrap();
+        assert!(files.closed.lock().unwrap().is_empty());
+        fs.release(&ctx, entry.inode, 0, h2.unwrap(), false, false, None)
+            .unwrap();
+        assert_eq!(*files.closed.lock().unwrap(), vec![7]);
+
+        // EPERM turns passthrough off, so the next open doesn't try again.
+        let tmpdir = TempDir::new().unwrap();
+        let files = Files::new(vec![Err(io::Error::from_raw_os_error(libc::EPERM))]);
+        let fs = passthrough_fs(&tmpdir, files.clone());
+        let (entry, _, opts1, id1) = fs.create(&ctx, ROOT_ID, &name, createin).unwrap();
+        assert!(!opts1.contains(OpenOptions::PASSTHROUGH));
+        assert_eq!(id1, None);
+        let (_, opts2, id2) = fs
+            .open(&ctx, entry.inode, libc::O_RDONLY as u32, 0)
+            .unwrap();
+        assert!(!opts2.contains(OpenOptions::PASSTHROUGH));
+        assert_eq!(id2, None);
+        assert_eq!(files.calls.load(Ordering::Relaxed), 1);
     }
 
     #[test]
