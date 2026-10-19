@@ -86,6 +86,9 @@ const FOPEN_STREAM: u32 = 16;
 
 /// Pass reads, writes and mmap through to the backing file.
 const FOPEN_PASSTHROUGH: u32 = 1 << 7;
+/// Serve reads and writes of this open file with FUSE-over-io_uring
+/// zero-copy, when the queue that serves them has it (Linux 7.3).
+const FOPEN_IO_URING_ZERO_COPY: u32 = 1 << 8;
 
 bitflags! {
     /// Options controlling the behavior of files opened by the server in response
@@ -104,6 +107,15 @@ bitflags! {
         /// Pass reads, writes and mmap through to the backing file whose id is returned along
         /// with this flag. Requires `FsOptions::PASSTHROUGH`.
         const PASSTHROUGH = FOPEN_PASSTHROUGH;
+        /// Serve reads and writes of this open file with FUSE-over-io_uring
+        /// zero-copy, when the queue that serves them has it (Linux 7.3).
+        /// Other transports and queues copy the data as before. The data of
+        /// a zero-copy request stays in the client's pages, so the file
+        /// system must move it with `ZeroCopyWriter::write_from()` and
+        /// `ZeroCopyReader::read_to()`, into or out of a file that has a
+        /// descriptor (`FileReadWriteVolatile::raw_fd()`). Plain reads and
+        /// writes of it fail.
+        const IO_URING_ZERO_COPY = FOPEN_IO_URING_ZERO_COPY;
     }
 }
 
