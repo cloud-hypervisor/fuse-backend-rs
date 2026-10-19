@@ -185,6 +185,11 @@
 - [281](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/281): `abi::fuse_uring` has the commands, INIT flag and fields of protocol 7.46 for buffer pools.
   `Server::uring_bufpool_supported()` tells whether the kernel offered them at INIT, and
   `Server::uring_payload_size()` returns the size of the kernel's payload buffers.
+- [282](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/282): `OpenOptions::IO_URING_ZERO_COPY` and the zero-copy flags of protocol 7.46 in
+  `abi::fuse_uring` let a file system ask for FUSE-over-io_uring zero-copy on an open.
+  `Reader::with_zero_copy()` attaches request data that only the transport can move, through a
+  `ZeroCopySource`, and `Reader::read_to_at()` hands it over. `FileReadWriteVolatile::raw_fd()`
+  gives the transport the file descriptor to move it to. Other reads get a copy through memory.
 
 ### Changed
 - [325](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/325): The `fuse-backend-fusedev` `uring` transport uses io-uring 0.6 instead of 0.5,
