@@ -29,10 +29,11 @@
   FUSE-over-io_uring transport (kernel 6.14+). Both join the `FuseServing` interface, so a daemon
   can pick its transport at runtime behind `Box<dyn FuseServing>` and fall back to the classic
   transport on `Error::UringNotSupported`.
-- `AsyncFileSystem` methods default to calling their `FileSystem` counterparts, so a
-  file system only implements the handlers it serves asynchronously.
-- `FuseSession::detach()` lazily unmounts a Linux session through `&self`, so the owner of a
-  serving layer can start the teardown while another thread waits in `FuseServing::wait()`.
+- [269](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/269): `AsyncFileSystem` methods default to calling their `FileSystem`
+  counterparts, so a file system only implements the handlers it serves asynchronously.
+- [269](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/269): `FuseSession::detach()` lazily unmounts a Linux session through `&self`,
+  so the owner of a serving layer can start the teardown while another thread waits in
+  `FuseServing::wait()`.
 
 ### Changed
 - Bump the declared minimum supported Rust version (MSRV) from 1.80 to 1.86.
@@ -86,15 +87,13 @@
   backing filesystem has no xattr support at all (tmpfs answers `EOPNOTSUPP` to
   `user.*` xattrs before Linux 6.12, and a `PassthroughFs` layer with `xattr`
   disabled answers `ENOSYS`).
+- [269](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/269): For a session mounted with `set_target_mntns()`,
+  `FuseSession::umount()` unmounts in that mount namespace. It no longer follows a symlink at the mountpoint.
 
 ### Removed
 - [254](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/254): Drop the vestigial `vhost` and `virtio-bindings` dependencies that the
   pre-split `vhost-user-fs` build carried but never referenced; `vhost-user-fs`
   is now an alias for the `virtiofs` build.
-
-### Fixed
-- For a session mounted with `set_target_mntns()`, `FuseSession::umount()` unmounts in that
-  mount namespace. It no longer follows a symlink at the mountpoint.
 
 ## [0.14.0]
 ### Added
