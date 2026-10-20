@@ -930,7 +930,7 @@ fn is_multi_link_file(stat: stat64) -> bool {
 //
 // The deprecated fetch_update() is kept behind this single allow: its
 // replacement try_update() only became stable in rustc 1.95, past the
-// crate's MSRV of 1.80. Migrate once the MSRV moves beyond 1.95.
+// crate's MSRV. Migrate once the MSRV moves beyond 1.95.
 #[allow(deprecated)]
 fn dec_lookups(lookups: &AtomicU64, count: u64) -> u64 {
     lookups

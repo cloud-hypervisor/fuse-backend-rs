@@ -35,6 +35,13 @@
   serving layer can start the teardown while another thread waits in `FuseServing::wait()`.
 
 ### Changed
+- Bump the declared minimum supported Rust version (MSRV) from 1.80 to 1.86.
+  Trait-object upcasting (stabilized in Rust 1.86) is required by the default
+  `AsyncFileSystem` read/write handlers and by the passthrough O_DIRECT relay,
+  so with the `async-io` feature enabled the workspace has not built on older
+  toolchains for a while — the 1.80 declaration was already inaccurate. CI
+  gains an MSRV job that checks the crates declaring `rust-version` with the
+  declared version, so the next accidental bump is caught.
 - The FUSE-over-io_uring transport answers opcodes it doesn't know with ENOSYS instead of EIO.
   Kernels that send `FUSE_STATX` only fall back to `FUSE_GETATTR` after ENOSYS, so `statx()`
   calls that ask for more than the basic fields, like the birth time `stat(1)` shows, failed.

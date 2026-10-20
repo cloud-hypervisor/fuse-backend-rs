@@ -146,7 +146,7 @@ smoke-macos: check-macos
 	${CARGO} test --features="fusedev,fuse-t" -- --nocapture
 
 docker-smoke:
-	docker run --env RUST_BACKTRACE=1 --rm --privileged --volume ${current_dir}:/fuse-rs rust:1.68 sh -c "rustup component add clippy rustfmt; cd /fuse-rs; make smoke-all"
+	docker run --env RUST_BACKTRACE=1 --rm --privileged --volume ${current_dir}:/fuse-rs rust:1.86 sh -c "rustup component add clippy rustfmt; cd /fuse-rs; make smoke-all"
 
 testoverlay:
 	${CARGO} build -p overlay
