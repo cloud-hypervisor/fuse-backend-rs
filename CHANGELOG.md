@@ -74,6 +74,17 @@
   and no code in the workspace relied on it.
 
 ### Fixed
+- A `UringFuseServing` worker that fails while the connection is up ends the connection through
+  its fusectl `abort` file. Its queues had no entries left, so requests from those CPUs waited
+  forever, and so did requests it had taken but not answered. Now they fail, the other workers
+  stop, and `FuseServing::wait()` returns.
+- A `UringFuseServing` worker whose request handler panics ends the connection the same way and
+  waits for the kernel to give its ring entries back before the panic goes on. Before, unwinding
+  freed entries the kernel could still copy a request into.
+- A `UringFuseServing` worker that stops frees its ring entries only after the kernel has given
+  them all back, and leaks them if that takes more than a second. A worker that stopped on an
+  error while the connection was up freed entries the kernel could still copy requests into. A
+  signal that interrupts the worker's wait no longer stops it.
 - [278](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/278): Treat `EOPNOTSUPP`/`ENOTSUP` and `ENOSYS` from `getxattr` as "not opaque"
   in `Layer::is_opaque()`, so `OverlayFs::import()` no longer aborts when a layer's
   backing filesystem has no xattr support at all (tmpfs answers `EOPNOTSUPP` to
