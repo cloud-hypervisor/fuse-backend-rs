@@ -24,6 +24,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Sender};
 use std::sync::Arc;
 use std::thread;
+use std::time::{Duration, Instant};
 
 use io_uring::{cqueue, opcode, squeue, types, IoUring};
 use vm_memory::ByteValued;
@@ -580,7 +581,8 @@ impl<F: FileSystem + Send + Sync + 'static> UringWorker<F> {
             let mut sq = ring.submission();
             for (idx, entry) in entries.iter().enumerate() {
                 let sqe = entry.cmd_sqe(fd, FUSE_IO_URING_CMD_REGISTER, 0, idx as u64);
-                // Safe because entries live for the whole lifetime of the loop.
+                // Safe because release_entries() keeps the entries alive
+                // while the kernel holds them.
                 unsafe { sq.push(&sqe) }
                     .map_err(|e| io::Error::other(format!("submission queue full: {e}")))?;
             }
@@ -593,9 +595,16 @@ impl<F: FileSystem + Send + Sync + 'static> UringWorker<F> {
             Err(e) => Err(io::Error::other(e.to_string())),
         });
         registered?;
+        // The number of entries whose command the kernel hasn't completed.
+        let mut armed = entries.len();
 
-        loop {
-            ring.submit_and_wait(1)?;
+        let result = 'serve: loop {
+            match ring.submit_and_wait(1) {
+                Ok(_) => {}
+                // A signal interrupted the wait, which is no reason to stop.
+                Err(e) if e.raw_os_error() == Some(libc::EINTR) => continue,
+                Err(e) => break 'serve Err(e),
+            }
 
             // Drain the completion queue first so that its borrow is
             // released before entries are processed and commits submitted.
@@ -606,6 +615,11 @@ impl<F: FileSystem + Send + Sync + 'static> UringWorker<F> {
             if completed.is_empty() {
                 continue;
             }
+            let returned = completed
+                .iter()
+                .filter(|(idx, _)| *idx < entries.len())
+                .count();
+            armed = armed.saturating_sub(returned);
 
             for (idx, res) in completed {
                 if idx >= entries.len() {
@@ -615,11 +629,11 @@ impl<F: FileSystem + Send + Sync + 'static> UringWorker<F> {
                 let entry = &mut entries[idx];
                 if res < 0 {
                     if exit.load(Ordering::Relaxed) {
-                        return Ok(());
+                        break 'serve Ok(());
                     }
                     // Registration/commit failures leave the entry in an
                     // undefined state; stop serving rather than guessing.
-                    return Err(io::Error::from_raw_os_error(-res));
+                    break 'serve Err(io::Error::from_raw_os_error(-res));
                 }
 
                 if let Err(e) = self.process(entry) {
@@ -637,7 +651,8 @@ impl<F: FileSystem + Send + Sync + 'static> UringWorker<F> {
                 loop {
                     let pushed = {
                         let mut sq = ring.submission();
-                        // Safe because the entry outlives the ring usage.
+                        // Safe because release_entries() keeps the entries
+                        // alive while the kernel holds them.
                         unsafe { sq.push(&sqe) }.is_ok()
                     };
                     if pushed {
@@ -646,11 +661,20 @@ impl<F: FileSystem + Send + Sync + 'static> UringWorker<F> {
                     // The submission queue can never hold more outstanding
                     // commits than completed entries, so submitting must
                     // eventually make room.
-                    ring.submit()?;
+                    if let Err(e) = ring.submit() {
+                        break 'serve Err(e);
+                    }
                 }
+                // Count the commit once it is queued, because
+                // release_entries() submits anything still queued.
+                armed += 1;
             }
-            ring.submit()?;
-        }
+            if let Err(e) = ring.submit() {
+                break 'serve Err(e);
+            }
+        };
+        release_entries(ring, entries, armed);
+        result
     }
 
     /// Handle one delivered request: reassemble the header/args in the
@@ -777,6 +801,56 @@ impl<F: FileSystem + Send + Sync + 'static> UringWorker<F> {
 
         Ok(())
     }
+}
+
+/// How long a stopping worker waits for the kernel to give back the ring
+/// entries it still holds.
+const RELEASE_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// Drop `ring` and `entries` once the kernel holds none of the entries.
+///
+/// The kernel may copy a request into an entry until it completes the
+/// entry's command, and closing the ring only cancels the commands later,
+/// from a workqueue. So wait for the `armed` outstanding completions first,
+/// which arrive quickly once the connection is torn down. If they don't
+/// arrive within `RELEASE_TIMEOUT`, leak the entries instead of freeing
+/// memory the kernel may still write to.
+fn release_entries(
+    mut ring: IoUring<squeue::Entry128, cqueue::Entry>,
+    entries: Vec<UringEntry>,
+    mut armed: usize,
+) {
+    let deadline = Instant::now() + RELEASE_TIMEOUT;
+    while armed > 0 {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            break;
+        }
+        let ts = types::Timespec::new()
+            .sec(left.as_secs())
+            .nsec(left.subsec_nanos());
+        let args = types::SubmitArgs::new().timespec(&ts);
+        match ring.submitter().submit_with_args(1, &args) {
+            Ok(_) => {}
+            Err(e)
+                if matches!(
+                    e.raw_os_error(),
+                    Some(libc::ETIME | libc::EINTR | libc::EBUSY | libc::EAGAIN)
+                ) => {}
+            Err(_) => break,
+        }
+        let len = entries.len();
+        armed = armed.saturating_sub(
+            ring.completion()
+                .filter(|cqe| (cqe.user_data() as usize) < len)
+                .count(),
+        );
+    }
+    if armed > 0 {
+        warn!("uring worker: leaking {armed} ring entries that the kernel still holds");
+        std::mem::forget(entries);
+    }
+    drop(ring);
 }
 
 /// Serve FUSE requests over io_uring (experimental).
@@ -1462,5 +1536,54 @@ mod tests {
         let other = w.split_at(offset).unwrap();
         assert_eq!(w.available_bytes(), offset);
         assert_eq!(other.available_bytes(), 256 - 100);
+    }
+
+    /// Serve a PassthroughFs over io_uring, read and write through the
+    /// mount, then check that dropping the serving layer gets the ring
+    /// entries back from the kernel and unmounts.
+    #[test]
+    fn test_uring_serving_mount() {
+        let src = TempDir::new().unwrap();
+        std::fs::write(src.as_path().join("hello"), b"over io_uring").unwrap();
+        let mnt = TempDir::new().unwrap();
+        let fs = PassthroughFs::<()>::new(Config {
+            root_dir: src.as_path().to_string_lossy().to_string(),
+            do_import: false,
+            ..Default::default()
+        })
+        .unwrap();
+        fs.import().unwrap();
+        let server = Arc::new(Server::new(fs));
+        server.set_uring(true);
+        let mut se = FuseSession::new(mnt.as_path(), "uring_serving_test", "", false).unwrap();
+        se.mount().unwrap();
+        let cfg = UringConfig {
+            workers: 2,
+            entries_per_queue: 2,
+        };
+        let serving = match UringFuseServing::new(se, server, cfg) {
+            Ok(serving) => serving,
+            Err(UringNotSupported) => {
+                eprintln!("FUSE-over-io_uring is not available, skipping");
+                return;
+            }
+            Err(e) => panic!("uring serving failed: {}", e),
+        };
+
+        assert_eq!(
+            std::fs::read(mnt.as_path().join("hello")).unwrap(),
+            b"over io_uring"
+        );
+        let created = mnt.as_path().join("created");
+        std::fs::write(&created, b"written over io_uring").unwrap();
+        assert_eq!(std::fs::read(&created).unwrap(), b"written over io_uring");
+
+        // Tearing the connection down completes the commands of all armed
+        // entries, so the workers get their entries back well within
+        // RELEASE_TIMEOUT instead of waiting it out and leaking them.
+        let start = Instant::now();
+        drop(serving);
+        assert!(start.elapsed() < RELEASE_TIMEOUT);
+        assert!(std::fs::read(mnt.as_path().join("hello")).is_err());
     }
 }
