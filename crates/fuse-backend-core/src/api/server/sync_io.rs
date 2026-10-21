@@ -816,14 +816,43 @@ impl<F: FileSystem + Sync> Server<F> {
         })?;
 
         match self.fs.getxattr(ctx.context(), ctx.nodeid(), name, size) {
-            Ok(GetxattrReply::Value(val)) => ctx.reply_ok(None::<u8>, Some(&val)),
+            Ok(GetxattrReply::Value(val)) => {
+                if size == 0 {
+                    // A zero size asks for the length only: the kernel has no
+                    // buffer for the value and expects the needed size in a
+                    // GetxattrOut, so answer with the length instead of a
+                    // reply the kernel would reject with EINVAL.
+                    let out = GetxattrOut {
+                        size: val.len() as u32,
+                        ..Default::default()
+                    };
+                    ctx.reply_ok(Some(out), None)
+                } else if val.len() > size as usize {
+                    // The kernel reads the value straight into the `size`
+                    // bytes the caller reserved and rejects a longer reply
+                    // with EINVAL, so answer with the ERANGE the xattr
+                    // protocol defines for a buffer too small to hold the
+                    // value.
+                    ctx.reply_error(io::Error::from_raw_os_error(libc::ERANGE))
+                } else {
+                    ctx.reply_ok(None::<u8>, Some(&val))
+                }
+            }
             Ok(GetxattrReply::Count(count)) => {
-                let out = GetxattrOut {
-                    size: count,
-                    ..Default::default()
-                };
+                if size == 0 {
+                    let out = GetxattrOut {
+                        size: count,
+                        ..Default::default()
+                    };
 
-                ctx.reply_ok(Some(out), None)
+                    ctx.reply_ok(Some(out), None)
+                } else {
+                    // A nonzero size asks for the value itself, which a
+                    // count reply carries none of; the kernel would copy
+                    // the 8-byte GetxattrOut out as the value. Answer with
+                    // the EINVAL the kernel would reject that reply with.
+                    ctx.reply_error(io::Error::from_raw_os_error(libc::EINVAL))
+                }
             }
             Err(e) => ctx.reply_error(e),
         }
@@ -836,14 +865,40 @@ impl<F: FileSystem + Sync> Server<F> {
         let GetxattrIn { size, .. } = ctx.r.read_obj().map_err(Error::DecodeMessage)?;
 
         match self.fs.listxattr(ctx.context(), ctx.nodeid(), size) {
-            Ok(ListxattrReply::Names(val)) => ctx.reply_ok(None::<u8>, Some(&val)),
+            Ok(ListxattrReply::Names(val)) => {
+                if size == 0 {
+                    // A zero size asks for the length only: the kernel has no
+                    // buffer for the name list and expects the needed size in
+                    // a GetxattrOut, so answer with the length instead of a
+                    // reply the kernel would reject with EINVAL.
+                    let out = GetxattrOut {
+                        size: val.len() as u32,
+                        ..Default::default()
+                    };
+                    ctx.reply_ok(Some(out), None)
+                } else if val.len() > size as usize {
+                    // Same ERANGE contract as getxattr: the kernel rejects a
+                    // name list longer than the requested size with EINVAL.
+                    ctx.reply_error(io::Error::from_raw_os_error(libc::ERANGE))
+                } else {
+                    ctx.reply_ok(None::<u8>, Some(&val))
+                }
+            }
             Ok(ListxattrReply::Count(count)) => {
-                let out = GetxattrOut {
-                    size: count,
-                    ..Default::default()
-                };
+                if size == 0 {
+                    let out = GetxattrOut {
+                        size: count,
+                        ..Default::default()
+                    };
 
-                ctx.reply_ok(Some(out), None)
+                    ctx.reply_ok(Some(out), None)
+                } else {
+                    // A nonzero size asks for the name list itself, which a
+                    // count reply carries none of; the kernel would copy the
+                    // 8-byte GetxattrOut out as the list. Answer with the
+                    // EINVAL the kernel would reject that reply with.
+                    ctx.reply_error(io::Error::from_raw_os_error(libc::EINVAL))
+                }
             }
             Err(e) => ctx.reply_error(e),
         }
@@ -2461,5 +2516,308 @@ mod tests {
         out.as_mut_slice()
             .copy_from_slice(&write_buf[..size_of::<OutHeader>()]);
         assert_eq!(out.error, -libc::ENOSYS);
+    }
+
+    #[test]
+    fn test_server_getxattr() {
+        use crate::api::filesystem::Context;
+        use std::ffi::CStr;
+
+        // Echoes the requested size back as the value content, so the size
+        // routing and the reply encoding can be verified together. The value
+        // is always 16 bytes: it fits a request for 16 bytes, is one byte
+        // too big for 15, is smaller than a request for 32, and answers a
+        // zero-size probe with the length.
+        struct GetxattrFs;
+        impl FileSystem for GetxattrFs {
+            type Inode = u64;
+            type Handle = u64;
+
+            fn getxattr(
+                &self,
+                _ctx: &Context,
+                _inode: Self::Inode,
+                name: &CStr,
+                size: u32,
+            ) -> io::Result<GetxattrReply> {
+                assert_eq!(name, CStr::from_bytes_with_nul(b"user.foo\0").unwrap());
+                Ok(GetxattrReply::Value(vec![size as u8; 16]))
+            }
+        }
+
+        let server = Server::new(GetxattrFs);
+
+        // A value that fits is replied as is, one that is a byte too big
+        // answers ERANGE, and one smaller than the request is replied at
+        // its own length, which the kernel accepts and shrinks.
+        for (size, error) in [(16, 0), (15, libc::ERANGE), (32, 0)] {
+            let mut read_buf = [0u8; size_of::<GetxattrIn>() + b"user.foo\0".len()];
+            read_buf[..size_of::<GetxattrIn>()]
+                .copy_from_slice(GetxattrIn { size, padding: 0 }.as_slice());
+            read_buf[size_of::<GetxattrIn>()..].copy_from_slice(b"user.foo\0");
+
+            let mut write_buf = [0u8; 4096];
+            let in_header = InHeader {
+                len: (size_of::<InHeader>() + read_buf.len()) as u32,
+                nodeid: 10,
+                ..Default::default()
+            };
+            let ctx = {
+                let reader = Reader::<()>::from_slice(&mut read_buf);
+                let writer = TestWriter::new(&mut write_buf);
+                SrvContext::new(in_header, reader, writer)
+            };
+
+            let res = server.getxattr(ctx).unwrap();
+            let out = OutHeader::from_slice(&write_buf[..size_of::<OutHeader>()]).unwrap();
+            assert_eq!(out.error, -error, "size {size}");
+
+            if error == 0 {
+                assert_eq!(res, size_of::<OutHeader>() + 16);
+                assert_eq!(&write_buf[size_of::<OutHeader>()..res], &[size as u8; 16]);
+            } else {
+                // ERANGE is a header-only error reply.
+                assert_eq!(res, size_of::<OutHeader>());
+            }
+        }
+
+        // A zero-size probe asks for the length only: the server converts
+        // the value to the needed size the kernel expects in a GetxattrOut.
+        let mut read_buf = [0u8; size_of::<GetxattrIn>() + b"user.foo\0".len()];
+        read_buf[..size_of::<GetxattrIn>()].copy_from_slice(
+            GetxattrIn {
+                size: 0,
+                padding: 0,
+            }
+            .as_slice(),
+        );
+        read_buf[size_of::<GetxattrIn>()..].copy_from_slice(b"user.foo\0");
+
+        let mut write_buf = [0u8; 4096];
+        let in_header = InHeader {
+            len: (size_of::<InHeader>() + read_buf.len()) as u32,
+            nodeid: 10,
+            ..Default::default()
+        };
+        let ctx = {
+            let reader = Reader::<()>::from_slice(&mut read_buf);
+            let writer = TestWriter::new(&mut write_buf);
+            SrvContext::new(in_header, reader, writer)
+        };
+
+        let res = server.getxattr(ctx).unwrap();
+        assert_eq!(res, size_of::<OutHeader>() + size_of::<GetxattrOut>());
+
+        let out = GetxattrOut::from_slice(&write_buf[size_of::<OutHeader>()..res]).unwrap();
+        assert_eq!(out.size, 16);
+        assert_eq!(out.padding, 0);
+    }
+
+    #[test]
+    fn test_server_getxattr_count() {
+        use crate::api::filesystem::Context;
+        use std::ffi::CStr;
+
+        // A count is only a valid answer to a zero-size probe: the server
+        // passes it through as GetxattrOut there, and answers a nonzero
+        // size with EINVAL, since the count carries no value the kernel
+        // could return to the caller.
+        struct GetxattrCountFs;
+        impl FileSystem for GetxattrCountFs {
+            type Inode = u64;
+            type Handle = u64;
+
+            fn getxattr(
+                &self,
+                _ctx: &Context,
+                _inode: Self::Inode,
+                _name: &CStr,
+                _size: u32,
+            ) -> io::Result<GetxattrReply> {
+                Ok(GetxattrReply::Count(16))
+            }
+        }
+
+        let server = Server::new(GetxattrCountFs);
+
+        for (size, error) in [(0, 0), (16, libc::EINVAL)] {
+            let mut read_buf = [0u8; size_of::<GetxattrIn>() + b"user.foo\0".len()];
+            read_buf[..size_of::<GetxattrIn>()]
+                .copy_from_slice(GetxattrIn { size, padding: 0 }.as_slice());
+            read_buf[size_of::<GetxattrIn>()..].copy_from_slice(b"user.foo\0");
+
+            let mut write_buf = [0u8; 4096];
+            let in_header = InHeader {
+                len: (size_of::<InHeader>() + read_buf.len()) as u32,
+                nodeid: 10,
+                ..Default::default()
+            };
+            let ctx = {
+                let reader = Reader::<()>::from_slice(&mut read_buf);
+                let writer = TestWriter::new(&mut write_buf);
+                SrvContext::new(in_header, reader, writer)
+            };
+
+            let res = server.getxattr(ctx).unwrap();
+            let out = OutHeader::from_slice(&write_buf[..size_of::<OutHeader>()]).unwrap();
+            assert_eq!(out.error, -error, "size {size}");
+
+            if error == 0 {
+                assert_eq!(res, size_of::<OutHeader>() + size_of::<GetxattrOut>());
+                let out = GetxattrOut::from_slice(&write_buf[size_of::<OutHeader>()..res]).unwrap();
+                assert_eq!(out.size, 16);
+                assert_eq!(out.padding, 0);
+            } else {
+                // EINVAL is a header-only error reply.
+                assert_eq!(res, size_of::<OutHeader>());
+            }
+        }
+    }
+
+    #[test]
+    fn test_server_listxattr() {
+        use crate::api::filesystem::Context;
+
+        // Echoes the requested size back as the name list content, so the
+        // size routing and the reply encoding can be verified together. The
+        // list is always 16 bytes: it fits a request for 16 bytes, is one
+        // byte too big for 15, is smaller than a request for 32, and
+        // answers a zero-size probe with the length.
+        struct ListxattrFs;
+        impl FileSystem for ListxattrFs {
+            type Inode = u64;
+            type Handle = u64;
+
+            fn listxattr(
+                &self,
+                _ctx: &Context,
+                _inode: Self::Inode,
+                size: u32,
+            ) -> io::Result<ListxattrReply> {
+                Ok(ListxattrReply::Names(vec![size as u8; 16]))
+            }
+        }
+
+        let server = Server::new(ListxattrFs);
+
+        // A list that fits is replied as is, one that is a byte too big
+        // answers ERANGE, and one smaller than the request is replied at
+        // its own length, which the kernel accepts and shrinks.
+        for (size, error) in [(16, 0), (15, libc::ERANGE), (32, 0)] {
+            let mut read_buf = [0u8; size_of::<GetxattrIn>()];
+            read_buf.copy_from_slice(GetxattrIn { size, padding: 0 }.as_slice());
+
+            let mut write_buf = [0u8; 4096];
+            let in_header = InHeader {
+                len: (size_of::<InHeader>() + read_buf.len()) as u32,
+                nodeid: 10,
+                ..Default::default()
+            };
+            let ctx = {
+                let reader = Reader::<()>::from_slice(&mut read_buf);
+                let writer = TestWriter::new(&mut write_buf);
+                SrvContext::new(in_header, reader, writer)
+            };
+
+            let res = server.listxattr(ctx).unwrap();
+            let out = OutHeader::from_slice(&write_buf[..size_of::<OutHeader>()]).unwrap();
+            assert_eq!(out.error, -error, "size {size}");
+
+            if error == 0 {
+                assert_eq!(res, size_of::<OutHeader>() + 16);
+                assert_eq!(&write_buf[size_of::<OutHeader>()..res], &[size as u8; 16]);
+            } else {
+                // ERANGE is a header-only error reply.
+                assert_eq!(res, size_of::<OutHeader>());
+            }
+        }
+
+        // A zero-size probe asks for the length only: the server converts
+        // the name list to the needed size the kernel expects in a
+        // GetxattrOut.
+        let mut read_buf = [0u8; size_of::<GetxattrIn>()];
+        read_buf.copy_from_slice(
+            GetxattrIn {
+                size: 0,
+                padding: 0,
+            }
+            .as_slice(),
+        );
+
+        let mut write_buf = [0u8; 4096];
+        let in_header = InHeader {
+            len: (size_of::<InHeader>() + read_buf.len()) as u32,
+            nodeid: 10,
+            ..Default::default()
+        };
+        let ctx = {
+            let reader = Reader::<()>::from_slice(&mut read_buf);
+            let writer = TestWriter::new(&mut write_buf);
+            SrvContext::new(in_header, reader, writer)
+        };
+
+        let res = server.listxattr(ctx).unwrap();
+        assert_eq!(res, size_of::<OutHeader>() + size_of::<GetxattrOut>());
+
+        let out = GetxattrOut::from_slice(&write_buf[size_of::<OutHeader>()..res]).unwrap();
+        assert_eq!(out.size, 16);
+        assert_eq!(out.padding, 0);
+    }
+
+    #[test]
+    fn test_server_listxattr_count() {
+        use crate::api::filesystem::Context;
+
+        // A count is only a valid answer to a zero-size probe: the server
+        // passes it through as GetxattrOut there, and answers a nonzero
+        // size with EINVAL, since the count carries no name list the
+        // kernel could return to the caller.
+        struct ListxattrCountFs;
+        impl FileSystem for ListxattrCountFs {
+            type Inode = u64;
+            type Handle = u64;
+
+            fn listxattr(
+                &self,
+                _ctx: &Context,
+                _inode: Self::Inode,
+                _size: u32,
+            ) -> io::Result<ListxattrReply> {
+                Ok(ListxattrReply::Count(16))
+            }
+        }
+
+        let server = Server::new(ListxattrCountFs);
+
+        for (size, error) in [(0, 0), (16, libc::EINVAL)] {
+            let mut read_buf = [0u8; size_of::<GetxattrIn>()];
+            read_buf.copy_from_slice(GetxattrIn { size, padding: 0 }.as_slice());
+
+            let mut write_buf = [0u8; 4096];
+            let in_header = InHeader {
+                len: (size_of::<InHeader>() + read_buf.len()) as u32,
+                nodeid: 10,
+                ..Default::default()
+            };
+            let ctx = {
+                let reader = Reader::<()>::from_slice(&mut read_buf);
+                let writer = TestWriter::new(&mut write_buf);
+                SrvContext::new(in_header, reader, writer)
+            };
+
+            let res = server.listxattr(ctx).unwrap();
+            let out = OutHeader::from_slice(&write_buf[..size_of::<OutHeader>()]).unwrap();
+            assert_eq!(out.error, -error, "size {size}");
+
+            if error == 0 {
+                assert_eq!(res, size_of::<OutHeader>() + size_of::<GetxattrOut>());
+                let out = GetxattrOut::from_slice(&write_buf[size_of::<OutHeader>()..res]).unwrap();
+                assert_eq!(out.size, 16);
+                assert_eq!(out.padding, 0);
+            } else {
+                // EINVAL is a header-only error reply.
+                assert_eq!(res, size_of::<OutHeader>());
+            }
+        }
     }
 }
