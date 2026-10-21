@@ -59,6 +59,53 @@ jobs:
         sudo -E CARGO=${CARGO_BIN} make smoke-all
         sudo chown -R $(id -u):$(id -g) "${HOME}/.cargo"
 
+  MSRV:
+    # `CI` builds on `stable` only, so nothing notices when a change quietly
+    # needs a newer rustc than the declared `rust-version`; the
+    # trait-object-upcasting requirement slipped in exactly that way. Check
+    # with the declared MSRV instead, on a native runner: `--all-features
+    # --all-targets` covers the async-io paths that needed the bump, plus the
+    # drivers, transports and persist stack on top. The dev-only binaries
+    # under tests/ declare no `rust-version` and track the latest
+    # dev-dependencies, whose MSRV is not ours to promise (today
+    # `simple_logger` 5.2 floors `time` at a release needing rustc 1.88), so
+    # they are excluded; the stable-toolchain jobs still build them (`CI`
+    # runs the benchmark smoke, `xfstests` and `benchmark` build the daemons).
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+    - uses: actions/checkout@v3
+    - name: Cache cargo
+      uses: Swatinem/rust-cache@v2.2.0
+      with:
+        cache-on-failure: true
+        key: ${{ runner.os }}-cargo-msrv
+    - name: Read declared MSRV
+      # Take the MSRV from the root manifest instead of pinning a second
+      # copy here: a pin left behind by a later bump would quietly check a
+      # version nobody declares anymore. Cargo still rejects a member whose
+      # own rust-version exceeds the toolchain, so the crate manifests
+      # cannot drift past what this job checks.
+      id: msrv
+      run: |
+        msrv=$(sed -n 's/^rust-version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+        echo "version=$msrv" >> "$GITHUB_OUTPUT"
+    - name: Install Rust
+      uses: actions-rs/toolchain@v1
+      with:
+        profile: minimal
+        toolchain: ${{ steps.msrv.outputs.version }}
+        override: true
+    - name: Check
+      # No Cargo.lock is tracked, so dependencies are resolved fresh here.
+      # The resolver's default (`allow`) keeps picking versions that need a
+      # newer rustc than the declared MSRV; `fallback` prefers versions the
+      # MSRV can compile, so the job survives a dependency raising its own
+      # rust-version.
+      env:
+        CARGO_RESOLVER_INCOMPATIBLE_RUST_VERSIONS: fallback
+      run: cargo check --workspace --all-features --all-targets --exclude passthrough --exclude overlay --exclude fuse-backend-rs-benchmark
+
   Macos-CI:
     runs-on: macos-latest
     steps:

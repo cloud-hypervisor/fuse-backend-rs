@@ -29,8 +29,20 @@
   FUSE-over-io_uring transport (kernel 6.14+). Both join the `FuseServing` interface, so a daemon
   can pick its transport at runtime behind `Box<dyn FuseServing>` and fall back to the classic
   transport on `Error::UringNotSupported`.
+- [269](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/269): `AsyncFileSystem` methods default to calling their `FileSystem`
+  counterparts, so a file system only implements the handlers it serves asynchronously.
+- [269](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/269): `FuseSession::detach()` lazily unmounts a Linux session through `&self`,
+  so the owner of a serving layer can start the teardown while another thread waits in
+  `FuseServing::wait()`.
 
 ### Changed
+- Bump the declared minimum supported Rust version (MSRV) from 1.80 to 1.86.
+  Trait-object upcasting (stabilized in Rust 1.86) is required by the default
+  `AsyncFileSystem` read/write handlers and by the passthrough O_DIRECT relay,
+  so with the `async-io` feature enabled the workspace has not built on older
+  toolchains for a while — the 1.80 declaration was already inaccurate. CI
+  gains an MSRV job that checks the crates declaring `rust-version` with the
+  declared version, so the next accidental bump is caught.
 - The FUSE-over-io_uring transport answers opcodes it doesn't know with ENOSYS instead of EIO.
   Kernels that send `FUSE_STATX` only fall back to `FUSE_GETATTR` after ENOSYS, so `statx()`
   calls that ask for more than the basic fields, like the birth time `stat(1)` shows, failed.
@@ -72,11 +84,16 @@
 ### Fixed
 - `UringWriter::write_from_at()` fails when the data doesn't fit into the reply body. It counted
   free space in the header slot too, and could read file data past the end of the body.
+- READDIR and READDIRPLUS answer ENOMEM when the reply can't hold the reply header plus the
+  requested size. The check left out the header, so a writer short by up to 16 bytes started the
+  listing and failed partway.
 - [278](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/278): Treat `EOPNOTSUPP`/`ENOTSUP` and `ENOSYS` from `getxattr` as "not opaque"
   in `Layer::is_opaque()`, so `OverlayFs::import()` no longer aborts when a layer's
   backing filesystem has no xattr support at all (tmpfs answers `EOPNOTSUPP` to
   `user.*` xattrs before Linux 6.12, and a `PassthroughFs` layer with `xattr`
   disabled answers `ENOSYS`).
+- [269](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/269): For a session mounted with `set_target_mntns()`,
+  `FuseSession::umount()` unmounts in that mount namespace. It no longer follows a symlink at the mountpoint.
 
 ### Removed
 - [254](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/254): Drop the vestigial `vhost` and `virtio-bindings` dependencies that the
