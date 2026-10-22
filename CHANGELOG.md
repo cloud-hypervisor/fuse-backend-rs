@@ -85,6 +85,8 @@
   and no code in the workspace relied on it.
 
 ### Fixed
+- `UringWriter::write_from_at()` fails when the data doesn't fit into the reply body. It counted
+  free space in the header slot too, and could read file data past the end of the body.
 - READDIR and READDIRPLUS answer ENOMEM when the reply can't hold the reply header plus the
   requested size. The check left out the header, so a writer short by up to 16 bytes started the
   listing and failed partway.
