@@ -58,7 +58,8 @@ pub enum RuntimeType {
 /// The crate fixes the type on first use, so call this before creating a [`Runtime`], an
 /// `async_file::File` or a `FuseDevTask`. It overrides `FUSE_BACKEND_RS_ASYNC_RUNTIME`. It
 /// returns an error if the type in effect is a different one. If io-uring isn't available, the
-/// error says why.
+/// error says why. It also fails when another thread used the crate first and fixed the type
+/// already.
 pub fn set_runtime_type(runtime_type: RuntimeType) -> io::Result<()> {
     let _ = REQUESTED_RUNTIME_TYPE.set(runtime_type);
     let current = *RUNTIME_TYPE;

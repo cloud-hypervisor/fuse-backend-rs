@@ -80,7 +80,9 @@ impl<F: FileSystem + Sync> Server<F> {
     }
 
     /// Get the protocol version and the options enabled at INIT, for `restore_init()`. Before
-    /// INIT, the options are empty.
+    /// INIT, the options are empty and the version is the crate default, so only call this on
+    /// a server that completed the INIT exchange: restoring that state installs the default
+    /// version and disables every negotiated capability.
     pub fn init_state(&self) -> (ServerVersion, FsOptions) {
         let version = decode_version(self.vers.load(Ordering::Acquire));
         let options = FsOptions::from_bits_truncate(self.options.load(Ordering::Acquire));
