@@ -32,10 +32,10 @@
   FUSE-over-io_uring transport (kernel 6.14+). Both join the `FuseServing` interface, so a daemon
   can pick its transport at runtime behind `Box<dyn FuseServing>` and fall back to the classic
   transport on `Error::UringNotSupported`.
-- `async_runtime::set_runtime_type()` selects the asynchronous runtime type in code, because
+- [267](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/267): `async_runtime::set_runtime_type()` selects the asynchronous runtime type in code, because
   setting `FUSE_BACKEND_RS_ASYNC_RUNTIME` from a running program isn't safe.
   `async_runtime::runtime_type()` returns the type in effect, and `RuntimeType` is now public.
-- `Server::init_state()` and `Server::restore_init()` let a new server take over a connection
+- [267](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/267): `Server::init_state()` and `Server::restore_init()` let a new server take over a connection
   that another server initialized. `abi::fuse_abi::UNIQUE_RESEND` is the bit that the kernel
   sets in requests it sends again after `notify_resend()`.
 - `RuntimeType::file_io_blocks()` tells whether async file IO on a runtime type blocks the
@@ -62,11 +62,11 @@
 - The FUSE-over-io_uring transport answers opcodes it doesn't know with ENOSYS instead of EIO.
   Kernels that send `FUSE_STATX` only fall back to `FUSE_GETATTR` after ENOSYS, so `statx()`
   calls that ask for more than the basic fields, like the birth time `stat(1)` shows, failed.
-- With the tokio runtime, `FuseDevTask` no longer retries reads in a loop. It waits for requests
+- [267](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/267): With the tokio runtime, `FuseDevTask` no longer retries reads in a loop. It waits for requests
   through the IO driver of the tokio runtime that polls it, and checks its state flag every 100ms
   while idle. Polling it on a tokio runtime without IO enabled panics. `fuse-backend-fusedev`
   needs tokio 1.53.3.
-- The async fusedev server retries a read that fails with `ENOENT` and stops the task on read
+- [267](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/267): The async fusedev server retries a read that fails with `ENOENT` and stops the task on read
   errors it doesn't know, like the synchronous server. It used to log them and read again.
 - `async-io` builds on macOS, where it runs on tokio. `fuse-backend-core` now depends on
   `io-uring` only on Linux, like `tokio-uring`.

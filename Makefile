@@ -47,6 +47,11 @@ check: build
 	${CARGO} clippy ${TARGET} --features="fusedev,virtiofs,async-io" --no-default-features -- -Dwarnings
 	${CARGO} clippy ${TARGET} -p fuse-backend-core --no-default-features -- -Dwarnings
 	${CARGO} clippy ${TARGET} -p fuse-backend-core --no-default-features --features="async-io" -- -Dwarnings
+	# The async-io test binaries that fix the process-global runtime type run
+	# in binaries of their own; lint them explicitly. `--all-targets` would
+	# also lint the in-crate unit tests, which still carry lint debt.
+	${CARGO} clippy ${TARGET} -p fuse-backend-core --no-default-features --features="async-io" --test runtime_type -- -Dwarnings
+	${CARGO} clippy ${TARGET} -p fuse-backend-fusedev --no-default-features --features="fuse-backend-fusedev/async-io" --test tokio_runtime -- -Dwarnings
 	${CARGO} clippy ${TARGET} -p fuse-backend-core --no-default-features --features="fusedev-uring" -- -Dwarnings
 	# `Vfs` used to be clippy'd as part of core (the rows above); now that it is
 	# its own crate, restore the same no-default + async-io lib coverage.
