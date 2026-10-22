@@ -1315,9 +1315,15 @@ mod asyncio {
                 };
 
                 match read_result {
-                    Ok(None | Some(0)) => {
-                        // Either `state` stopped the task while it waited for a request, or
-                        // the read hit EOF because the fuse session is torn down.
+                    Ok(None) => {
+                        // `state` stopped the task while it waited for a request.
+                        debug!("fuse dev task stopping: state flag set");
+                        pool.release(buf);
+                        break 'serve;
+                    }
+                    Ok(Some(0)) => {
+                        // EOF, the fuse session has been torn down.
+                        info!("fuse dev task stopping: fuse session torn down");
                         pool.release(buf);
                         break 'serve;
                     }
