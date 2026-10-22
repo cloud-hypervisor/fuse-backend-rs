@@ -94,6 +94,12 @@ impl Default for UringConfig {
 /// Whether the kernel lets this process serve FUSE over io_uring: the fuse
 /// module's `enable_uring` parameter is on, and the process may create an
 /// io_uring, which the `kernel.io_uring_disabled` sysctl can forbid.
+///
+/// Returns `false` also when the kernel has no FUSE-over-io_uring support
+/// (kernel < 6.14, so the `enable_uring` parameter does not exist) or the
+/// fuse module cannot be loaded. If the fuse module is not loaded yet, the
+/// check opens `/dev/fuse`, which loads it.
+///
 /// `UringFuseServing::new()` still fails with `Error::UringNotSupported` if
 /// the kernel refuses the transport at INIT, but checking first saves a
 /// mount that has to fall back to `/dev/fuse`.
@@ -1235,11 +1241,7 @@ mod tests {
 
     #[test]
     fn test_uring_available() {
-        // When it says yes, a mount gets the transport.
-        if !uring_available() {
-            eprintln!("FUSE-over-io_uring is not available, skipping");
-            return;
-        }
+        // The answer must match the transport the mount actually gets.
         let src = TempDir::new().unwrap();
         let mnt = TempDir::new().unwrap();
         let fs = PassthroughFs::<()>::new(Config {
@@ -1260,8 +1262,16 @@ mod tests {
             workers: 1,
             entries_per_queue: 1,
         };
-        if let Err(e) = UringFuseServing::new(se, server, cfg) {
-            panic!("uring_available() said yes, but the mount got {}", e);
+        let r = UringFuseServing::new(se, server, cfg);
+        if uring_available() {
+            if let Err(e) = r {
+                panic!("uring_available() said yes, but the mount got {}", e);
+            }
+        } else {
+            assert!(
+                r.is_err(),
+                "uring_available() said no, but the mount got the transport"
+            );
         }
     }
 
