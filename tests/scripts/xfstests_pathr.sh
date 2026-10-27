@@ -12,8 +12,13 @@ sudo apt-get install acl attr automake bc dbench dump e2fsprogs fio gawk \
 
 # clone xfstests and install.
 cd /tmp/
-git clone -b v2023.12.10 git://git.kernel.org/pub/scm/fs/xfs/xfstests-dev.git
+git clone -b v2026.10.15 git://git.kernel.org/pub/scm/fs/xfs/xfstests-dev.git
 cd xfstests-dev
+# Keep building with the long-standing gnu17 dialect: runners ship a GCC whose
+# default is C23, where an empty parameter list means (void), and the ltp-derived
+# helpers are not guaranteed C23-clean. configure picks up CFLAGS from the
+# environment, and builddefs appends the platform flags on top of it.
+export CFLAGS="-g -O2 -std=gnu17"
 make
 sudo make install
 # overwrite local config.
