@@ -3259,9 +3259,23 @@ mod readdir_tests {
         names.dedup();
         assert_eq!(names.len(), 64, "duplicate or lost entries");
         assert!(entries.iter().all(|e| e.offset != 0));
-        assert!(
-            entries.windows(2).all(|w| w[0].offset < w[1].offset),
-            "cookies must strictly increase across the stream"
+        // do_readdir() hands the raw getdents64 d_off through as the resume
+        // cookie, and neither POSIX telldir() nor the FUSE client attaches
+        // ordering meaning to it: the kernel only replays the cookie on
+        // resume and expects exactly the later entries. Whether d_off grows
+        // along the stream is a backing-filesystem property (byte positions
+        // on linear ext4, hash-derived or layer-encoded cookies elsewhere),
+        // and the Ubuntu 26.04 CI runner's kernel hands out unique but
+        // unordered d_off values. Pin the portable part of the contract
+        // instead: every cookie must be distinct, or a resume could skip or
+        // loop forever.
+        let mut cookies: Vec<u64> = entries.iter().map(|e| e.offset).collect();
+        cookies.sort_unstable();
+        cookies.dedup();
+        assert_eq!(
+            cookies.len(),
+            entries.len(),
+            "readdir cookies must be unique"
         );
         assert!(entries.iter().all(|e| e.ino != 0));
 
