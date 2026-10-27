@@ -110,7 +110,13 @@ jobs:
         run_variant() {
             local modes="sync async"
             [ "$1" = current ] && modes="sync async uring"
-            sudo -E PATH="$(dirname "${CARGO_BIN}"):${PATH}" CARGO_HOME="${CARGO_HOME}" \
+            # sudo -E is not supported by sudo-rs (the default sudo on
+            # Ubuntu 26.04 runners); route the environment through env(1)
+            # so it is applied after the privilege boundary and the env
+            # policy cannot drop PATH or the BENCH_* knobs. RUST_BACKTRACE
+            # matches the workflow-level env -E used to preserve.
+            sudo env PATH="$(dirname "${CARGO_BIN}"):${PATH}" CARGO_HOME="${CARGO_HOME}" \
+                RUST_BACKTRACE=1 \
                 BENCH_THREADS=${{ matrix.threads }} BENCH_RUNTIME=30 BENCH_MODES="${modes}" \
                 BENCH_DAEMON="${GITHUB_WORKSPACE}/variants/daemon-$1" \
                 BENCH_RESULTS_DIR="${GITHUB_WORKSPACE}/bench-$1" \

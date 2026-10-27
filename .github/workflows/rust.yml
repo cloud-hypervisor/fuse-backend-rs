@@ -55,8 +55,21 @@ jobs:
         # that turn a bench test-double stub into a live path fail the build
         # here instead of panicking mid-benchmark.
         make bench-smoke
-        sudo -E CARGO=${CARGO_BIN} make test
-        sudo -E CARGO=${CARGO_BIN} make smoke-all
+        # sudo -E is not supported by sudo-rs (the default sudo on Ubuntu
+        # 26.04 runners) and is silently ignored, which resets HOME and
+        # leaves the rustup shim at ~/.cargo/bin unable to resolve the
+        # default toolchain ("rustup could not choose a version of cargo").
+        # Route the environment through env(1) so it is applied after the
+        # privilege boundary, independent of the sudo env policy: HOME and
+        # RUSTUP_HOME let the cargo/rustc shims find the toolchain, PATH lets
+        # cargo re-resolve rustc through the shim directory.
+        run_privileged() {
+            sudo env HOME="${HOME}" RUSTUP_HOME="${HOME}/.rustup" \
+                CARGO_HOME="${HOME}/.cargo" PATH="${PATH}" \
+                RUST_BACKTRACE=1 CARGO="${CARGO_BIN}" "$@"
+        }
+        run_privileged make test
+        run_privileged make smoke-all
         sudo chown -R $(id -u):$(id -g) "${HOME}/.cargo"
 
   MSRV:

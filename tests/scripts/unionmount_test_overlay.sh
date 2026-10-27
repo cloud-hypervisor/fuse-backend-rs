@@ -86,7 +86,14 @@ unlink
 # rename-new-pop-dir
 # rename-pop-dir
 do
-	UNIONMOUNT_BASEDIR=/tmp/unionmount sudo -E ./run --ov --fuse=testoverlay --xdev $testcase
+	# sudo -E is not supported by sudo-rs, the default sudo on Ubuntu 26.04
+	# runners, which only prints a warning and drops the whole environment,
+	# so UNIONMOUNT_BASEDIR never reaches the harness and it falls back to
+	# the /lower mountpoint that is never created. Route the variable
+	# through env(1) instead: it applies after the privilege boundary and
+	# is not subject to the sudo env policy (unlike command-line VAR=value
+	# assignments).
+	sudo env UNIONMOUNT_BASEDIR=/tmp/unionmount ./run --ov --fuse=testoverlay --xdev $testcase
 	if [ $? -eq 0 ]
 	then
 		echo "===== SUCCESS: " $testcase >> /tmp/summary
