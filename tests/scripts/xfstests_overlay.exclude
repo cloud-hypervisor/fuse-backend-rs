@@ -22,3 +22,5 @@ generic/591 # Broken.
 generic/633 # Suppose to be FUSE compatibility issue.
 generic/697 # Suppose to be FUSE compatibility issue.
 generic/736
+generic/756 # Suppose to be FUSE compatibility issue: 'open_by_handle'
+generic/777 # Suppose to be FUSE compatibility issue: 'open_by_handle'
