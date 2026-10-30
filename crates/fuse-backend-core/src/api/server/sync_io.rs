@@ -103,6 +103,83 @@ pub(super) fn parse_create_extensions(options: &FsOptions, mut tail: &[u8]) -> R
     Ok(supp_gid)
 }
 
+/// The RENAME2 flags that the server passes on to the file system.
+pub(super) const RENAME2_FLAGS: u32 = RENAME_EXCHANGE | RENAME_NOREPLACE | RENAME_WHITEOUT;
+
+/// Splits a SETXATTR body into the name, with its '\0', and the value, which has to be `size`
+/// bytes long.
+pub(super) fn split_setxattr_body(buf: &[u8], size: u32) -> Result<(&[u8], &[u8])> {
+    // The name ends at the first '\0', and the value follows it.
+    let split_pos = buf
+        .iter()
+        .position(|c| *c == b'\0')
+        .map(|p| p + 1)
+        .ok_or(Error::MissingParameter)?;
+    let (name, value) = buf.split_at(split_pos);
+
+    if size != value.len() as u32 {
+        return Err(Error::InvalidXattrSize((size, value.len())));
+    }
+    Ok((name, value))
+}
+
+/// The `flush`, `flock_release` and `lock_owner` arguments of `release()` for a RELEASE request.
+pub(super) fn release_args(release_flags: u32, lock_owner: u64) -> (bool, bool, Option<u64>) {
+    let flush = release_flags & RELEASE_FLUSH != 0;
+    let flock_release = release_flags & RELEASE_FLOCK_UNLOCK != 0;
+    let lock_owner = (flush || flock_release).then_some(lock_owner);
+    (flush, flock_release, lock_owner)
+}
+
+/// The server's reply to a GETXATTR or LISTXATTR.
+pub(super) enum XattrReply {
+    /// The length the caller needs, in a `GetxattrOut`.
+    Size(u32),
+    /// The value or the name list.
+    Data(Vec<u8>),
+}
+
+impl From<GetxattrReply> for XattrReply {
+    fn from(reply: GetxattrReply) -> Self {
+        match reply {
+            GetxattrReply::Value(data) => XattrReply::Data(data),
+            GetxattrReply::Count(size) => XattrReply::Size(size),
+        }
+    }
+}
+
+impl From<ListxattrReply> for XattrReply {
+    fn from(reply: ListxattrReply) -> Self {
+        match reply {
+            ListxattrReply::Names(data) => XattrReply::Data(data),
+            ListxattrReply::Count(size) => XattrReply::Size(size),
+        }
+    }
+}
+
+impl XattrReply {
+    /// Applies the xattr size rules for a request whose buffer holds `size` bytes, so that the
+    /// kernel accepts the reply.
+    pub(super) fn fit(self, size: u32) -> io::Result<Self> {
+        match self {
+            // A zero size asks only for the length. The kernel has no buffer for the data,
+            // expects the needed size in a GetxattrOut, and would reject the data with EINVAL.
+            XattrReply::Data(data) if size == 0 => Ok(XattrReply::Size(data.len() as u32)),
+            // The kernel reads the data straight into the `size` bytes the caller reserved and
+            // rejects a longer reply with EINVAL, so answer with the ERANGE the xattr protocol
+            // defines for a buffer too small to hold it.
+            XattrReply::Data(data) if data.len() > size as usize => {
+                Err(io::Error::from_raw_os_error(libc::ERANGE))
+            }
+            // A nonzero size asks for the data, and a length reply has none. The kernel would
+            // copy the 8-byte GetxattrOut out as the data, so answer with the EINVAL it would
+            // reject that reply with.
+            XattrReply::Size(_) if size != 0 => Err(io::Error::from_raw_os_error(libc::EINVAL)),
+            reply => Ok(reply),
+        }
+    }
+}
+
 impl<F: FileSystem + Sync> Server<F> {
     #[cfg(feature = "fusedev")]
     /// Use to send notify msg to kernel fuse
@@ -401,7 +478,7 @@ impl<F: FileSystem + Sync> Server<F> {
         ctx.handle_attr_result(result)
     }
 
-    pub(super) fn readlink<S: BitmapSlice, W: Writer>(
+    fn readlink<S: BitmapSlice, W: Writer>(
         &self,
         ctx: &mut SrvContext<'_, F, S, W>,
     ) -> Result<usize> {
@@ -414,7 +491,7 @@ impl<F: FileSystem + Sync> Server<F> {
         }
     }
 
-    pub(super) fn symlink<S: BitmapSlice, W: Writer>(
+    fn symlink<S: BitmapSlice, W: Writer>(
         &self,
         ctx: &mut SrvContext<'_, F, S, W>,
     ) -> Result<usize> {
@@ -433,10 +510,7 @@ impl<F: FileSystem + Sync> Server<F> {
         }
     }
 
-    pub(super) fn mknod<S: BitmapSlice, W: Writer>(
-        &self,
-        ctx: &mut SrvContext<'_, F, S, W>,
-    ) -> Result<usize> {
+    fn mknod<S: BitmapSlice, W: Writer>(&self, ctx: &mut SrvContext<'_, F, S, W>) -> Result<usize> {
         let MknodIn {
             mode, rdev, umask, ..
         } = ctx.r.read_obj().map_err(Error::DecodeMessage)?;
@@ -460,10 +534,7 @@ impl<F: FileSystem + Sync> Server<F> {
         }
     }
 
-    pub(super) fn mkdir<S: BitmapSlice, W: Writer>(
-        &self,
-        ctx: &mut SrvContext<'_, F, S, W>,
-    ) -> Result<usize> {
+    fn mkdir<S: BitmapSlice, W: Writer>(&self, ctx: &mut SrvContext<'_, F, S, W>) -> Result<usize> {
         let MkdirIn { mode, umask } = ctx.r.read_obj().map_err(Error::DecodeMessage)?;
         let buf = ServerUtil::get_message_body(&mut ctx.r, &ctx.in_header, size_of::<MkdirIn>())?;
         let name = bytes_to_cstr(buf.as_ref()).map_err(|e| {
@@ -485,7 +556,7 @@ impl<F: FileSystem + Sync> Server<F> {
         }
     }
 
-    pub(super) fn unlink<S: BitmapSlice, W: Writer>(
+    fn unlink<S: BitmapSlice, W: Writer>(
         &self,
         ctx: &mut SrvContext<'_, F, S, W>,
     ) -> Result<usize> {
@@ -501,10 +572,7 @@ impl<F: FileSystem + Sync> Server<F> {
         }
     }
 
-    pub(super) fn rmdir<S: BitmapSlice, W: Writer>(
-        &self,
-        ctx: &mut SrvContext<'_, F, S, W>,
-    ) -> Result<usize> {
+    fn rmdir<S: BitmapSlice, W: Writer>(&self, ctx: &mut SrvContext<'_, F, S, W>) -> Result<usize> {
         let buf = ServerUtil::get_message_body(&mut ctx.r, &ctx.in_header, 0)?;
         let name = bytes_to_cstr(buf.as_ref()).map_err(|e| {
             debug!("fuse: bytes to cstr error: {:?}, {:?}", buf, e);
@@ -517,7 +585,7 @@ impl<F: FileSystem + Sync> Server<F> {
         }
     }
 
-    pub(super) fn do_rename<S: BitmapSlice, W: Writer>(
+    fn do_rename<S: BitmapSlice, W: Writer>(
         &self,
         ctx: &mut SrvContext<'_, F, S, W>,
         msg_size: usize,
@@ -540,7 +608,7 @@ impl<F: FileSystem + Sync> Server<F> {
         }
     }
 
-    pub(super) fn rename<S: BitmapSlice, W: Writer>(
+    fn rename<S: BitmapSlice, W: Writer>(
         &self,
         ctx: &mut SrvContext<'_, F, S, W>,
     ) -> Result<usize> {
@@ -549,21 +617,18 @@ impl<F: FileSystem + Sync> Server<F> {
         self.do_rename(ctx, size_of::<RenameIn>(), newdir, 0)
     }
 
-    pub(super) fn rename2<S: BitmapSlice, W: Writer>(
+    fn rename2<S: BitmapSlice, W: Writer>(
         &self,
         ctx: &mut SrvContext<'_, F, S, W>,
     ) -> Result<usize> {
         let Rename2In { newdir, flags, .. } = ctx.r.read_obj().map_err(Error::DecodeMessage)?;
 
-        let flags = flags & (RENAME_EXCHANGE | RENAME_NOREPLACE | RENAME_WHITEOUT);
+        let flags = flags & RENAME2_FLAGS;
 
         self.do_rename(ctx, size_of::<Rename2In>(), newdir, flags)
     }
 
-    pub(super) fn link<S: BitmapSlice, W: Writer>(
-        &self,
-        ctx: &mut SrvContext<'_, F, S, W>,
-    ) -> Result<usize> {
+    fn link<S: BitmapSlice, W: Writer>(&self, ctx: &mut SrvContext<'_, F, S, W>) -> Result<usize> {
         let LinkIn { oldnodeid } = ctx.r.read_obj().map_err(Error::DecodeMessage)?;
         let buf = ServerUtil::get_message_body(&mut ctx.r, &ctx.in_header, size_of::<LinkIn>())?;
         let name = bytes_to_cstr(buf.as_ref()).map_err(|e| {
@@ -681,7 +746,7 @@ impl<F: FileSystem + Sync> Server<F> {
         }
     }
 
-    pub(super) fn statfs<S: BitmapSlice, W: Writer>(
+    fn statfs<S: BitmapSlice, W: Writer>(
         &self,
         ctx: &mut SrvContext<'_, F, S, W>,
     ) -> Result<usize> {
@@ -691,7 +756,7 @@ impl<F: FileSystem + Sync> Server<F> {
         }
     }
 
-    pub(super) fn release<S: BitmapSlice, W: Writer>(
+    fn release<S: BitmapSlice, W: Writer>(
         &self,
         ctx: &mut SrvContext<'_, F, S, W>,
     ) -> Result<usize> {
@@ -702,13 +767,7 @@ impl<F: FileSystem + Sync> Server<F> {
             lock_owner,
         } = ctx.r.read_obj().map_err(Error::DecodeMessage)?;
 
-        let flush = release_flags & RELEASE_FLUSH != 0;
-        let flock_release = release_flags & RELEASE_FLOCK_UNLOCK != 0;
-        let lock_owner = if flush || flock_release {
-            Some(lock_owner)
-        } else {
-            None
-        };
+        let (flush, flock_release, lock_owner) = release_args(release_flags, lock_owner);
 
         match self.fs.release(
             ctx.context(),
@@ -739,7 +798,7 @@ impl<F: FileSystem + Sync> Server<F> {
         }
     }
 
-    pub(super) fn setxattr<S: BitmapSlice, W: Writer>(
+    fn setxattr<S: BitmapSlice, W: Writer>(
         &self,
         ctx: &mut SrvContext<'_, F, S, W>,
     ) -> Result<usize> {
@@ -747,16 +806,7 @@ impl<F: FileSystem + Sync> Server<F> {
         let buf =
             ServerUtil::get_message_body(&mut ctx.r, &ctx.in_header, size_of::<SetxattrIn>())?;
 
-        // The name and value and encoded one after another and separated by a '\0' character.
-        let split_pos = match buf.iter().position(|c| *c == b'\0').map(|p| p + 1) {
-            Some(p) => p,
-            None => return Err(Error::MissingParameter),
-        };
-        let (name, value) = buf.split_at(split_pos);
-
-        if size != value.len() as u32 {
-            return Err(Error::InvalidXattrSize((size, value.len())));
-        }
+        let (name, value) = split_setxattr_body(&buf, size)?;
         let name = bytes_to_cstr(name).map_err(|e| {
             debug!("fuse: bytes to cstr error: {:?}, {:?}", buf, e);
             e
@@ -771,7 +821,7 @@ impl<F: FileSystem + Sync> Server<F> {
         }
     }
 
-    pub(super) fn getxattr<S: BitmapSlice, W: Writer>(
+    fn getxattr<S: BitmapSlice, W: Writer>(
         &self,
         ctx: &mut SrvContext<'_, F, S, W>,
     ) -> Result<usize> {
@@ -784,96 +834,21 @@ impl<F: FileSystem + Sync> Server<F> {
             e
         })?;
 
-        match self.fs.getxattr(ctx.context(), ctx.nodeid(), name, size) {
-            Ok(GetxattrReply::Value(val)) => {
-                if size == 0 {
-                    // A zero size asks for the length only: the kernel has no
-                    // buffer for the value and expects the needed size in a
-                    // GetxattrOut, so answer with the length instead of a
-                    // reply the kernel would reject with EINVAL.
-                    let out = GetxattrOut {
-                        size: val.len() as u32,
-                        ..Default::default()
-                    };
-                    ctx.reply_ok(Some(out), None)
-                } else if val.len() > size as usize {
-                    // The kernel reads the value straight into the `size`
-                    // bytes the caller reserved and rejects a longer reply
-                    // with EINVAL, so answer with the ERANGE the xattr
-                    // protocol defines for a buffer too small to hold the
-                    // value.
-                    ctx.reply_error(io::Error::from_raw_os_error(libc::ERANGE))
-                } else {
-                    ctx.reply_ok(None::<u8>, Some(&val))
-                }
-            }
-            Ok(GetxattrReply::Count(count)) => {
-                if size == 0 {
-                    let out = GetxattrOut {
-                        size: count,
-                        ..Default::default()
-                    };
-
-                    ctx.reply_ok(Some(out), None)
-                } else {
-                    // A nonzero size asks for the value itself, which a
-                    // count reply carries none of; the kernel would copy
-                    // the 8-byte GetxattrOut out as the value. Answer with
-                    // the EINVAL the kernel would reject that reply with.
-                    ctx.reply_error(io::Error::from_raw_os_error(libc::EINVAL))
-                }
-            }
-            Err(e) => ctx.reply_error(e),
-        }
+        let result = self.fs.getxattr(ctx.context(), ctx.nodeid(), name, size);
+        ctx.handle_xattr_result(size, result)
     }
 
-    pub(super) fn listxattr<S: BitmapSlice, W: Writer>(
+    fn listxattr<S: BitmapSlice, W: Writer>(
         &self,
         ctx: &mut SrvContext<'_, F, S, W>,
     ) -> Result<usize> {
         let GetxattrIn { size, .. } = ctx.r.read_obj().map_err(Error::DecodeMessage)?;
 
-        match self.fs.listxattr(ctx.context(), ctx.nodeid(), size) {
-            Ok(ListxattrReply::Names(val)) => {
-                if size == 0 {
-                    // A zero size asks for the length only: the kernel has no
-                    // buffer for the name list and expects the needed size in
-                    // a GetxattrOut, so answer with the length instead of a
-                    // reply the kernel would reject with EINVAL.
-                    let out = GetxattrOut {
-                        size: val.len() as u32,
-                        ..Default::default()
-                    };
-                    ctx.reply_ok(Some(out), None)
-                } else if val.len() > size as usize {
-                    // Same ERANGE contract as getxattr: the kernel rejects a
-                    // name list longer than the requested size with EINVAL.
-                    ctx.reply_error(io::Error::from_raw_os_error(libc::ERANGE))
-                } else {
-                    ctx.reply_ok(None::<u8>, Some(&val))
-                }
-            }
-            Ok(ListxattrReply::Count(count)) => {
-                if size == 0 {
-                    let out = GetxattrOut {
-                        size: count,
-                        ..Default::default()
-                    };
-
-                    ctx.reply_ok(Some(out), None)
-                } else {
-                    // A nonzero size asks for the name list itself, which a
-                    // count reply carries none of; the kernel would copy the
-                    // 8-byte GetxattrOut out as the list. Answer with the
-                    // EINVAL the kernel would reject that reply with.
-                    ctx.reply_error(io::Error::from_raw_os_error(libc::EINVAL))
-                }
-            }
-            Err(e) => ctx.reply_error(e),
-        }
+        let result = self.fs.listxattr(ctx.context(), ctx.nodeid(), size);
+        ctx.handle_xattr_result(size, result)
     }
 
-    pub(super) fn removexattr<S: BitmapSlice, W: Writer>(
+    fn removexattr<S: BitmapSlice, W: Writer>(
         &self,
         ctx: &mut SrvContext<'_, F, S, W>,
     ) -> Result<usize> {
@@ -889,10 +864,7 @@ impl<F: FileSystem + Sync> Server<F> {
         }
     }
 
-    pub(super) fn flush<S: BitmapSlice, W: Writer>(
-        &self,
-        ctx: &mut SrvContext<'_, F, S, W>,
-    ) -> Result<usize> {
+    fn flush<S: BitmapSlice, W: Writer>(&self, ctx: &mut SrvContext<'_, F, S, W>) -> Result<usize> {
         let FlushIn { fh, lock_owner, .. } = ctx.r.read_obj().map_err(Error::DecodeMessage)?;
 
         match self
@@ -1235,7 +1207,7 @@ impl<F: FileSystem + Sync> Server<F> {
         }
     }
 
-    pub(super) fn access<S: BitmapSlice, W: Writer>(
+    fn access<S: BitmapSlice, W: Writer>(
         &self,
         ctx: &mut SrvContext<'_, F, S, W>,
     ) -> Result<usize> {
@@ -1460,10 +1432,7 @@ impl<F: FileSystem + Sync> Server<F> {
         }
     }
 
-    pub(super) fn lseek<S: BitmapSlice, W: Writer>(
-        &self,
-        ctx: &mut SrvContext<'_, F, S, W>,
-    ) -> Result<usize> {
+    fn lseek<S: BitmapSlice, W: Writer>(&self, ctx: &mut SrvContext<'_, F, S, W>) -> Result<usize> {
         let LseekIn {
             fh, offset, whence, ..
         } = ctx.r.read_obj().map_err(Error::DecodeMessage)?;
@@ -1481,7 +1450,7 @@ impl<F: FileSystem + Sync> Server<F> {
         }
     }
 
-    pub(super) fn copy_file_range<S: BitmapSlice, W: Writer>(
+    fn copy_file_range<S: BitmapSlice, W: Writer>(
         &self,
         ctx: &mut SrvContext<'_, F, S, W>,
     ) -> Result<usize> {
@@ -1727,6 +1696,25 @@ impl<F: FileSystem, S: BitmapSlice, W: Writer> SrvContext<'_, F, S, W> {
                     attr_valid_nsec: timeout.subsec_nanos(),
                     dummy: 0,
                     attr: st.into(),
+                };
+                self.reply_ok(Some(out), None)
+            }
+            Err(e) => self.reply_error(e),
+        }
+    }
+
+    /// Replies to a GETXATTR or LISTXATTR whose buffer holds `size` bytes.
+    fn handle_xattr_result(
+        &mut self,
+        size: u32,
+        result: io::Result<impl Into<XattrReply>>,
+    ) -> Result<usize> {
+        match result.map(Into::into).and_then(|reply| reply.fit(size)) {
+            Ok(XattrReply::Data(data)) => self.reply_ok(None::<u8>, Some(&data)),
+            Ok(XattrReply::Size(size)) => {
+                let out = GetxattrOut {
+                    size,
+                    ..Default::default()
                 };
                 self.reply_ok(Some(out), None)
             }

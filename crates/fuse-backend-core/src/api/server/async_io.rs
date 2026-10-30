@@ -1,6 +1,7 @@
 // Copyright (C) 2021-2022 Alibaba Cloud. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+use std::ffi::CStr;
 use std::io;
 use std::mem::size_of;
 use std::sync::atomic::Ordering;
@@ -10,12 +11,16 @@ use std::time::Duration;
 use async_trait::async_trait;
 use vm_memory::ByteValued;
 
-use super::sync_io::{add_dirent, parse_create_extensions};
+use super::sync_io::{
+    add_dirent, parse_create_extensions, release_args, split_setxattr_body, XattrReply,
+    RENAME2_FLAGS,
+};
 use crate::abi::fuse_abi::{
-    stat64, AttrOut, CreateIn, EntryOut, FallocateIn, FsOptions, FsyncIn, GetattrIn, Opcode,
-    OpenIn, OpenOut, OutHeader, ReadIn, ReleaseIn, SetattrIn, SetattrValid, WriteIn, WriteOut,
-    FATTR_FH, GETATTR_FH, KERNEL_MINOR_VERSION_LOOKUP_NEGATIVE_ENTRY_ZERO, READ_LOCKOWNER,
-    WRITE_CACHE, WRITE_LOCKOWNER,
+    stat64, AccessIn, AttrOut, CopyFileRangeIn, CreateIn, EntryOut, FallocateIn, FlushIn,
+    FsOptions, FsyncIn, GetattrIn, GetxattrIn, GetxattrOut, Kstatfs, LinkIn, LseekIn, LseekOut,
+    MkdirIn, MknodIn, Opcode, OpenIn, OpenOut, OutHeader, ReadIn, ReleaseIn, Rename2In, RenameIn,
+    SetattrIn, SetattrValid, SetxattrIn, WriteIn, WriteOut, FATTR_FH, GETATTR_FH,
+    KERNEL_MINOR_VERSION_LOOKUP_NEGATIVE_ENTRY_ZERO, READ_LOCKOWNER, WRITE_CACHE, WRITE_LOCKOWNER,
 };
 use crate::api::filesystem::FsCacheReqHandler;
 use crate::api::filesystem::{
@@ -182,25 +187,25 @@ impl<F: AsyncFileSystem + Sync> Server<F> {
             x if x == Opcode::Forget as u32 => self.forget(ctx), // No reply.
             x if x == Opcode::Getattr as u32 => self.async_getattr(ctx).await,
             x if x == Opcode::Setattr as u32 => self.async_setattr(ctx).await,
-            x if x == Opcode::Readlink as u32 => self.readlink(ctx),
-            x if x == Opcode::Symlink as u32 => self.symlink(ctx),
-            x if x == Opcode::Mknod as u32 => self.mknod(ctx),
-            x if x == Opcode::Mkdir as u32 => self.mkdir(ctx),
-            x if x == Opcode::Unlink as u32 => self.unlink(ctx),
-            x if x == Opcode::Rmdir as u32 => self.rmdir(ctx),
-            x if x == Opcode::Rename as u32 => self.rename(ctx),
-            x if x == Opcode::Link as u32 => self.link(ctx),
+            x if x == Opcode::Readlink as u32 => self.async_readlink(ctx).await,
+            x if x == Opcode::Symlink as u32 => self.async_symlink(ctx).await,
+            x if x == Opcode::Mknod as u32 => self.async_mknod(ctx).await,
+            x if x == Opcode::Mkdir as u32 => self.async_mkdir(ctx).await,
+            x if x == Opcode::Unlink as u32 => self.async_unlink(ctx).await,
+            x if x == Opcode::Rmdir as u32 => self.async_rmdir(ctx).await,
+            x if x == Opcode::Rename as u32 => self.async_rename(ctx).await,
+            x if x == Opcode::Link as u32 => self.async_link(ctx).await,
             x if x == Opcode::Open as u32 => self.async_open(ctx).await,
             x if x == Opcode::Read as u32 => self.async_read(ctx).await,
             x if x == Opcode::Write as u32 => self.async_write(ctx).await,
-            x if x == Opcode::Statfs as u32 => self.statfs(ctx),
-            x if x == Opcode::Release as u32 => self.release(ctx),
+            x if x == Opcode::Statfs as u32 => self.async_statfs(ctx).await,
+            x if x == Opcode::Release as u32 => self.async_release(ctx).await,
             x if x == Opcode::Fsync as u32 => self.async_fsync(ctx).await,
-            x if x == Opcode::Setxattr as u32 => self.setxattr(ctx),
-            x if x == Opcode::Getxattr as u32 => self.getxattr(ctx),
-            x if x == Opcode::Listxattr as u32 => self.listxattr(ctx),
-            x if x == Opcode::Removexattr as u32 => self.removexattr(ctx),
-            x if x == Opcode::Flush as u32 => self.flush(ctx),
+            x if x == Opcode::Setxattr as u32 => self.async_setxattr(ctx).await,
+            x if x == Opcode::Getxattr as u32 => self.async_getxattr(ctx).await,
+            x if x == Opcode::Listxattr as u32 => self.async_listxattr(ctx).await,
+            x if x == Opcode::Removexattr as u32 => self.async_removexattr(ctx).await,
+            x if x == Opcode::Flush as u32 => self.async_flush(ctx).await,
             x if x == Opcode::Init as u32 => self.init(ctx, |init_params: &InitParams| {
                 if let Some(h) = hook {
                     h.on_init_params(init_params);
@@ -213,7 +218,7 @@ impl<F: AsyncFileSystem + Sync> Server<F> {
             x if x == Opcode::Getlk as u32 => self.getlk(ctx),
             x if x == Opcode::Setlk as u32 => self.setlk(ctx),
             x if x == Opcode::Setlkw as u32 => self.setlkw(ctx),
-            x if x == Opcode::Access as u32 => self.access(ctx),
+            x if x == Opcode::Access as u32 => self.async_access(ctx).await,
             x if x == Opcode::Create as u32 => self.async_create(ctx).await,
             x if x == Opcode::Bmap as u32 => self.bmap(ctx),
             x if x == Opcode::Ioctl as u32 => self.ioctl(ctx),
@@ -222,9 +227,9 @@ impl<F: AsyncFileSystem + Sync> Server<F> {
             x if x == Opcode::BatchForget as u32 => self.batch_forget(ctx),
             x if x == Opcode::Fallocate as u32 => self.async_fallocate(ctx).await,
             x if x == Opcode::Readdirplus as u32 => self.async_do_readdir(ctx, true).await,
-            x if x == Opcode::Rename2 as u32 => self.rename2(ctx),
-            x if x == Opcode::Lseek as u32 => self.lseek(ctx),
-            x if x == Opcode::CopyFileRange as u32 => self.copy_file_range(ctx),
+            x if x == Opcode::Rename2 as u32 => self.async_rename2(ctx).await,
+            x if x == Opcode::Lseek as u32 => self.async_lseek(ctx).await,
+            x if x == Opcode::CopyFileRange as u32 => self.async_copy_file_range(ctx).await,
             #[cfg(feature = "virtiofs")]
             x if x == Opcode::SetupMapping as u32 => self.setupmapping(ctx, vu_req),
             #[cfg(feature = "virtiofs")]
@@ -261,10 +266,7 @@ impl<F: AsyncFileSystem + Sync> Server<F> {
         ctx: &mut SrvContext<'_, F, S, W>,
     ) -> Result<usize> {
         let buf = ServerUtil::get_message_body(&mut ctx.r, &ctx.in_header, 0)?;
-        let name = bytes_to_cstr(buf.as_ref()).map_err(|e| {
-            debug!("fuse: bytes to cstr error: {:?}, {:?}", buf, e);
-            e
-        })?;
+        let name = Self::parse_name(&buf)?;
 
         let version = decode_version(self.vers.load(Ordering::Acquire));
         let result = self
@@ -582,22 +584,420 @@ impl<F: AsyncFileSystem + Sync> Server<F> {
         }
     }
 
+    /// The name at the start of `buf`.
+    fn parse_name(buf: &[u8]) -> Result<&CStr> {
+        bytes_to_cstr(buf).inspect_err(|e| debug!("fuse: bytes to cstr error: {:?}, {:?}", buf, e))
+    }
+
+    /// Sets the supplementary group of `ctx` from the create extensions in `tail`.
+    fn set_create_extensions<S: BitmapSlice, W: Writer>(
+        &self,
+        ctx: &mut SrvContext<'_, F, S, W>,
+        tail: &[u8],
+    ) -> Result<()> {
+        let options = FsOptions::from_bits_truncate(self.options.load(Ordering::Acquire));
+        ctx.context.supp_gid = parse_create_extensions(&options, tail)?;
+        Ok(())
+    }
+
+    async fn async_readlink<S: BitmapSlice, W: Writer>(
+        &self,
+        ctx: &mut SrvContext<'_, F, S, W>,
+    ) -> Result<usize> {
+        let result = self.fs.async_readlink(ctx.context(), ctx.nodeid()).await;
+
+        match result {
+            Ok(linkname) => ctx.async_reply_ok(None::<u8>, Some(&linkname)).await,
+            Err(e) => ctx.async_reply_error(e).await,
+        }
+    }
+
+    async fn async_symlink<S: BitmapSlice, W: Writer>(
+        &self,
+        ctx: &mut SrvContext<'_, F, S, W>,
+    ) -> Result<usize> {
+        let buf = ServerUtil::get_message_body(&mut ctx.r, &ctx.in_header, 0)?;
+        // The name and linkname are encoded one after another and separated by a nul character.
+        let (name, linkname) = ServerUtil::extract_two_cstrs(&buf)?;
+        let tail = &buf[name.to_bytes_with_nul().len() + linkname.to_bytes_with_nul().len()..];
+        self.set_create_extensions(ctx, tail)?;
+
+        let result = self
+            .fs
+            .async_symlink(ctx.context(), linkname, ctx.nodeid(), name)
+            .await;
+
+        match result {
+            Ok(entry) => ctx.async_reply_ok(Some(EntryOut::from(entry)), None).await,
+            Err(e) => ctx.async_reply_error(e).await,
+        }
+    }
+
+    async fn async_mknod<S: BitmapSlice, W: Writer>(
+        &self,
+        ctx: &mut SrvContext<'_, F, S, W>,
+    ) -> Result<usize> {
+        let MknodIn {
+            mode, rdev, umask, ..
+        } = ctx.r.read_obj().map_err(Error::DecodeMessage)?;
+        let buf = ServerUtil::get_message_body(&mut ctx.r, &ctx.in_header, size_of::<MknodIn>())?;
+        let name = Self::parse_name(&buf)?;
+        self.set_create_extensions(ctx, &buf[name.to_bytes_with_nul().len()..])?;
+
+        let result = self
+            .fs
+            .async_mknod(ctx.context(), ctx.nodeid(), name, mode, rdev, umask)
+            .await;
+
+        match result {
+            Ok(entry) => ctx.async_reply_ok(Some(EntryOut::from(entry)), None).await,
+            Err(e) => ctx.async_reply_error(e).await,
+        }
+    }
+
+    async fn async_mkdir<S: BitmapSlice, W: Writer>(
+        &self,
+        ctx: &mut SrvContext<'_, F, S, W>,
+    ) -> Result<usize> {
+        let MkdirIn { mode, umask } = ctx.r.read_obj().map_err(Error::DecodeMessage)?;
+        let buf = ServerUtil::get_message_body(&mut ctx.r, &ctx.in_header, size_of::<MkdirIn>())?;
+        let name = Self::parse_name(&buf)?;
+        self.set_create_extensions(ctx, &buf[name.to_bytes_with_nul().len()..])?;
+
+        let result = self
+            .fs
+            .async_mkdir(ctx.context(), ctx.nodeid(), name, mode, umask)
+            .await;
+
+        match result {
+            Ok(entry) => ctx.async_reply_ok(Some(EntryOut::from(entry)), None).await,
+            Err(e) => ctx.async_reply_error(e).await,
+        }
+    }
+
+    async fn async_unlink<S: BitmapSlice, W: Writer>(
+        &self,
+        ctx: &mut SrvContext<'_, F, S, W>,
+    ) -> Result<usize> {
+        let buf = ServerUtil::get_message_body(&mut ctx.r, &ctx.in_header, 0)?;
+        let name = Self::parse_name(&buf)?;
+
+        let result = self
+            .fs
+            .async_unlink(ctx.context(), ctx.nodeid(), name)
+            .await;
+
+        match result {
+            Ok(()) => ctx.async_reply_ok(None::<u8>, None).await,
+            Err(e) => ctx.async_reply_error(e).await,
+        }
+    }
+
+    async fn async_rmdir<S: BitmapSlice, W: Writer>(
+        &self,
+        ctx: &mut SrvContext<'_, F, S, W>,
+    ) -> Result<usize> {
+        let buf = ServerUtil::get_message_body(&mut ctx.r, &ctx.in_header, 0)?;
+        let name = Self::parse_name(&buf)?;
+
+        let result = self.fs.async_rmdir(ctx.context(), ctx.nodeid(), name).await;
+
+        match result {
+            Ok(()) => ctx.async_reply_ok(None::<u8>, None).await,
+            Err(e) => ctx.async_reply_error(e).await,
+        }
+    }
+
+    async fn async_rename<S: BitmapSlice, W: Writer>(
+        &self,
+        ctx: &mut SrvContext<'_, F, S, W>,
+    ) -> Result<usize> {
+        let RenameIn { newdir, .. } = ctx.r.read_obj().map_err(Error::DecodeMessage)?;
+
+        self.async_do_rename(ctx, size_of::<RenameIn>(), newdir, 0)
+            .await
+    }
+
+    async fn async_do_rename<S: BitmapSlice, W: Writer>(
+        &self,
+        ctx: &mut SrvContext<'_, F, S, W>,
+        msg_size: usize,
+        newdir: u64,
+        flags: u32,
+    ) -> Result<usize> {
+        let buf = ServerUtil::get_message_body(&mut ctx.r, &ctx.in_header, msg_size)?;
+        let (oldname, newname) = ServerUtil::extract_two_cstrs(&buf)?;
+
+        let result = self
+            .fs
+            .async_rename(
+                ctx.context(),
+                ctx.nodeid(),
+                oldname,
+                newdir.into(),
+                newname,
+                flags,
+            )
+            .await;
+
+        match result {
+            Ok(()) => ctx.async_reply_ok(None::<u8>, None).await,
+            Err(e) => ctx.async_reply_error(e).await,
+        }
+    }
+
+    async fn async_rename2<S: BitmapSlice, W: Writer>(
+        &self,
+        ctx: &mut SrvContext<'_, F, S, W>,
+    ) -> Result<usize> {
+        let Rename2In { newdir, flags, .. } = ctx.r.read_obj().map_err(Error::DecodeMessage)?;
+
+        let flags = flags & RENAME2_FLAGS;
+
+        self.async_do_rename(ctx, size_of::<Rename2In>(), newdir, flags)
+            .await
+    }
+
+    async fn async_link<S: BitmapSlice, W: Writer>(
+        &self,
+        ctx: &mut SrvContext<'_, F, S, W>,
+    ) -> Result<usize> {
+        let LinkIn { oldnodeid } = ctx.r.read_obj().map_err(Error::DecodeMessage)?;
+        let buf = ServerUtil::get_message_body(&mut ctx.r, &ctx.in_header, size_of::<LinkIn>())?;
+        let name = Self::parse_name(&buf)?;
+
+        let result = self
+            .fs
+            .async_link(ctx.context(), oldnodeid.into(), ctx.nodeid(), name)
+            .await;
+
+        match result {
+            Ok(entry) => ctx.async_reply_ok(Some(EntryOut::from(entry)), None).await,
+            Err(e) => ctx.async_reply_error(e).await,
+        }
+    }
+
+    async fn async_statfs<S: BitmapSlice, W: Writer>(
+        &self,
+        ctx: &mut SrvContext<'_, F, S, W>,
+    ) -> Result<usize> {
+        let result = self.fs.async_statfs(ctx.context(), ctx.nodeid()).await;
+
+        match result {
+            Ok(st) => ctx.async_reply_ok(Some(Kstatfs::from(st)), None).await,
+            Err(e) => ctx.async_reply_error(e).await,
+        }
+    }
+
+    async fn async_release<S: BitmapSlice, W: Writer>(
+        &self,
+        ctx: &mut SrvContext<'_, F, S, W>,
+    ) -> Result<usize> {
+        let ReleaseIn {
+            fh,
+            flags,
+            release_flags,
+            lock_owner,
+        } = ctx.r.read_obj().map_err(Error::DecodeMessage)?;
+
+        let (flush, flock_release, lock_owner) = release_args(release_flags, lock_owner);
+
+        let result = self
+            .fs
+            .async_release(
+                ctx.context(),
+                ctx.nodeid(),
+                flags,
+                fh.into(),
+                flush,
+                flock_release,
+                lock_owner,
+            )
+            .await;
+
+        match result {
+            Ok(()) => ctx.async_reply_ok(None::<u8>, None).await,
+            Err(e) => ctx.async_reply_error(e).await,
+        }
+    }
+
+    async fn async_setxattr<S: BitmapSlice, W: Writer>(
+        &self,
+        ctx: &mut SrvContext<'_, F, S, W>,
+    ) -> Result<usize> {
+        let SetxattrIn { size, flags } = ctx.r.read_obj().map_err(Error::DecodeMessage)?;
+        let buf =
+            ServerUtil::get_message_body(&mut ctx.r, &ctx.in_header, size_of::<SetxattrIn>())?;
+
+        let (name, value) = split_setxattr_body(&buf, size)?;
+        let name = Self::parse_name(name)?;
+
+        let result = self
+            .fs
+            .async_setxattr(ctx.context(), ctx.nodeid(), name, value, flags)
+            .await;
+
+        match result {
+            Ok(()) => ctx.async_reply_ok(None::<u8>, None).await,
+            Err(e) => ctx.async_reply_error(e).await,
+        }
+    }
+
+    async fn async_getxattr<S: BitmapSlice, W: Writer>(
+        &self,
+        ctx: &mut SrvContext<'_, F, S, W>,
+    ) -> Result<usize> {
+        let GetxattrIn { size, .. } = ctx.r.read_obj().map_err(Error::DecodeMessage)?;
+
+        let buf =
+            ServerUtil::get_message_body(&mut ctx.r, &ctx.in_header, size_of::<GetxattrIn>())?;
+        let name = Self::parse_name(&buf)?;
+
+        let result = self
+            .fs
+            .async_getxattr(ctx.context(), ctx.nodeid(), name, size)
+            .await;
+        ctx.async_handle_xattr_result(size, result).await
+    }
+
+    async fn async_listxattr<S: BitmapSlice, W: Writer>(
+        &self,
+        ctx: &mut SrvContext<'_, F, S, W>,
+    ) -> Result<usize> {
+        let GetxattrIn { size, .. } = ctx.r.read_obj().map_err(Error::DecodeMessage)?;
+
+        let result = self
+            .fs
+            .async_listxattr(ctx.context(), ctx.nodeid(), size)
+            .await;
+        ctx.async_handle_xattr_result(size, result).await
+    }
+
+    async fn async_removexattr<S: BitmapSlice, W: Writer>(
+        &self,
+        ctx: &mut SrvContext<'_, F, S, W>,
+    ) -> Result<usize> {
+        let buf = ServerUtil::get_message_body(&mut ctx.r, &ctx.in_header, 0)?;
+        let name = Self::parse_name(&buf)?;
+
+        let result = self
+            .fs
+            .async_removexattr(ctx.context(), ctx.nodeid(), name)
+            .await;
+
+        match result {
+            Ok(()) => ctx.async_reply_ok(None::<u8>, None).await,
+            Err(e) => ctx.async_reply_error(e).await,
+        }
+    }
+
+    async fn async_flush<S: BitmapSlice, W: Writer>(
+        &self,
+        ctx: &mut SrvContext<'_, F, S, W>,
+    ) -> Result<usize> {
+        let FlushIn { fh, lock_owner, .. } = ctx.r.read_obj().map_err(Error::DecodeMessage)?;
+
+        let result = self
+            .fs
+            .async_flush(ctx.context(), ctx.nodeid(), fh.into(), lock_owner)
+            .await;
+
+        match result {
+            Ok(()) => ctx.async_reply_ok(None::<u8>, None).await,
+            Err(e) => ctx.async_reply_error(e).await,
+        }
+    }
+
+    async fn async_access<S: BitmapSlice, W: Writer>(
+        &self,
+        ctx: &mut SrvContext<'_, F, S, W>,
+    ) -> Result<usize> {
+        let AccessIn { mask, .. } = ctx.r.read_obj().map_err(Error::DecodeMessage)?;
+
+        let result = self
+            .fs
+            .async_access(ctx.context(), ctx.nodeid(), mask)
+            .await;
+
+        match result {
+            Ok(()) => ctx.async_reply_ok(None::<u8>, None).await,
+            Err(e) => ctx.async_reply_error(e).await,
+        }
+    }
+
+    async fn async_lseek<S: BitmapSlice, W: Writer>(
+        &self,
+        ctx: &mut SrvContext<'_, F, S, W>,
+    ) -> Result<usize> {
+        let LseekIn {
+            fh, offset, whence, ..
+        } = ctx.r.read_obj().map_err(Error::DecodeMessage)?;
+
+        let result = self
+            .fs
+            .async_lseek(ctx.context(), ctx.nodeid(), fh.into(), offset, whence)
+            .await;
+
+        match result {
+            Ok(offset) => {
+                let out = LseekOut { offset };
+
+                ctx.async_reply_ok(Some(out), None).await
+            }
+            Err(e) => ctx.async_reply_error(e).await,
+        }
+    }
+
+    async fn async_copy_file_range<S: BitmapSlice, W: Writer>(
+        &self,
+        ctx: &mut SrvContext<'_, F, S, W>,
+    ) -> Result<usize> {
+        let CopyFileRangeIn {
+            fh_in,
+            offset_in,
+            nodeid_out,
+            fh_out,
+            offset_out,
+            len,
+            flags,
+        } = ctx.r.read_obj().map_err(Error::DecodeMessage)?;
+
+        let result = self
+            .fs
+            .async_copy_file_range(
+                ctx.context(),
+                ctx.nodeid(),
+                fh_in.into(),
+                offset_in,
+                nodeid_out.into(),
+                fh_out.into(),
+                offset_out,
+                len,
+                flags,
+            )
+            .await;
+
+        match result {
+            Ok(count) => {
+                let out = WriteOut {
+                    size: count,
+                    ..Default::default()
+                };
+
+                ctx.async_reply_ok(Some(out), None).await
+            }
+            Err(e) => ctx.async_reply_error(e).await,
+        }
+    }
+
     async fn async_create<S: BitmapSlice, W: Writer>(
         &self,
         ctx: &mut SrvContext<'_, F, S, W>,
     ) -> Result<usize> {
         let args: CreateIn = ctx.r.read_obj().map_err(Error::DecodeMessage)?;
         let buf = ServerUtil::get_message_body(&mut ctx.r, &ctx.in_header, size_of::<CreateIn>())?;
-        let name = bytes_to_cstr(buf.as_ref()).map_err(|e| {
-            debug!("fuse: bytes to cstr error: {:?}, {:?}", buf, e);
-            e
-        })?;
-
-        let supp_gid = parse_create_extensions(
-            &FsOptions::from_bits_truncate(self.options.load(Ordering::Acquire)),
-            &buf[name.to_bytes_with_nul().len()..],
-        )?;
-        ctx.context.supp_gid = supp_gid;
+        let name = Self::parse_name(&buf)?;
+        self.set_create_extensions(ctx, &buf[name.to_bytes_with_nul().len()..])?;
 
         let result = self
             .fs
@@ -760,6 +1160,25 @@ impl<'a, F: AsyncFileSystem, S: BitmapSlice, W: Writer> SrvContext<'a, F, S, W> 
             Err(e) => self.async_reply_error(e).await,
         }
     }
+
+    /// Replies to a GETXATTR or LISTXATTR whose buffer holds `size` bytes.
+    async fn async_handle_xattr_result(
+        &mut self,
+        size: u32,
+        result: io::Result<impl Into<XattrReply>>,
+    ) -> Result<usize> {
+        match result.map(Into::into).and_then(|reply| reply.fit(size)) {
+            Ok(XattrReply::Data(data)) => self.async_reply_ok(None::<u8>, Some(&data)).await,
+            Ok(XattrReply::Size(size)) => {
+                let out = GetxattrOut {
+                    size,
+                    ..Default::default()
+                };
+                self.async_reply_ok(Some(out), None).await
+            }
+            Err(e) => self.async_reply_error(e).await,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -768,12 +1187,12 @@ mod tests {
     use std::sync::atomic::AtomicUsize;
 
     use super::super::test_util::{
-        check_malformed, check_oversized, oversized_request, request, request_bodies, MockFS,
-        NoDax, TestWriter, OVERSIZED_OPCODES,
+        check_malformed, check_oversized, oversized_request, request, request_bodies, request_for,
+        MockFS, NoDax, TestWriter, OVERSIZED_OPCODES,
     };
     use super::*;
-    use crate::abi::fuse_abi::{Dirent, InHeader};
-    use crate::api::filesystem::{Context, FileSystem, OpenOptions};
+    use crate::abi::fuse_abi::{statvfs64, Dirent, InHeader, RENAME_NOREPLACE, S_IFCHR};
+    use crate::api::filesystem::{Context, FileSystem, GetxattrReply, ListxattrReply, OpenOptions};
     use crate::async_runtime;
 
     const DIR_HANDLE: u64 = 7;
@@ -810,7 +1229,8 @@ mod tests {
         Ok(())
     }
 
-    fn release(handle: u64) -> io::Result<()> {
+    /// Checks the handle that `opendir()` hands out.
+    fn check_handle(handle: u64) -> io::Result<()> {
         if handle == DIR_HANDLE {
             Ok(())
         } else {
@@ -818,8 +1238,251 @@ mod tests {
         }
     }
 
-    /// Serves the same directory with the sync and the async handlers, and counts the calls
-    /// of each.
+    const XATTR_VALUE: &[u8] = b"value";
+
+    fn new_entry(inode: u64) -> Entry {
+        Entry {
+            inode,
+            generation: 1,
+            ..Default::default()
+        }
+    }
+
+    /// Creates the directory "dir", with inode 5.
+    fn mkdir_entry(name: &CStr) -> io::Result<Entry> {
+        match name.to_bytes() {
+            b"dir" => Ok(new_entry(5)),
+            _ => Err(io::Error::from_raw_os_error(libc::EEXIST)),
+        }
+    }
+
+    /// Creates the symlink "link" to "target", with inode 6.
+    fn symlink_entry(linkname: &CStr, name: &CStr) -> io::Result<Entry> {
+        match (linkname.to_bytes(), name.to_bytes()) {
+            (b"target", b"link") => Ok(new_entry(6)),
+            _ => Err(io::Error::from_raw_os_error(libc::EINVAL)),
+        }
+    }
+
+    const MKNOD_MODE: u32 = S_IFCHR | 0o666;
+    /// Device 1:3.
+    const MKNOD_RDEV: u32 = 0x103;
+
+    /// Creates the character device "null" in inode 1, with inode 7.
+    fn mknod_entry(
+        parent: u64,
+        name: &CStr,
+        mode: u32,
+        rdev: u32,
+        umask: u32,
+    ) -> io::Result<Entry> {
+        match (parent, name.to_bytes(), mode, rdev, umask) {
+            (1, b"null", MKNOD_MODE, MKNOD_RDEV, 0o022) => Ok(new_entry(7)),
+            _ => Err(io::Error::from_raw_os_error(libc::EINVAL)),
+        }
+    }
+
+    /// Links inode 2 into inode 1 as "hardlink".
+    fn link_entry(inode: u64, newparent: u64, newname: &CStr) -> io::Result<Entry> {
+        match (inode, newparent, newname.to_bytes()) {
+            (2, 1, b"hardlink") => Ok(new_entry(2)),
+            _ => Err(io::Error::from_raw_os_error(libc::EINVAL)),
+        }
+    }
+
+    /// Removes the file "a" from inode 1.
+    fn check_unlink(parent: u64, name: &CStr) -> io::Result<()> {
+        match (parent, name.to_bytes()) {
+            (1, b"a") => Ok(()),
+            _ => Err(io::Error::from_raw_os_error(libc::ENOENT)),
+        }
+    }
+
+    /// Removes the directory "dir" from inode 1.
+    fn check_rmdir(parent: u64, name: &CStr) -> io::Result<()> {
+        match (parent, name.to_bytes()) {
+            (1, b"dir") => Ok(()),
+            _ => Err(io::Error::from_raw_os_error(libc::ENOENT)),
+        }
+    }
+
+    /// Renames "a" in inode 1 to "b" in inode 5. "b" exists, so RENAME_NOREPLACE fails, and no
+    /// other flag is supported.
+    fn check_rename(
+        olddir: u64,
+        oldname: &CStr,
+        newdir: u64,
+        newname: &CStr,
+        flags: u32,
+    ) -> io::Result<()> {
+        match (olddir, oldname.to_bytes(), newdir, newname.to_bytes()) {
+            (1, b"a", 5, b"b") => match flags {
+                0 => Ok(()),
+                RENAME_NOREPLACE => Err(io::Error::from_raw_os_error(libc::EEXIST)),
+                _ => Err(io::Error::from_raw_os_error(libc::EINVAL)),
+            },
+            _ => Err(io::Error::from_raw_os_error(libc::ENOENT)),
+        }
+    }
+
+    /// A RENAME body for `names`, to inode 5.
+    // On Linux, RenameIn has only `newdir`, so the struct update fills nothing. macOS's RenameIn
+    // also has flags and padding.
+    #[allow(clippy::needless_update)]
+    fn rename_body(names: &[u8]) -> Vec<u8> {
+        let rename_in = RenameIn {
+            newdir: 5,
+            ..Default::default()
+        };
+        [rename_in.as_slice(), names].concat()
+    }
+
+    /// A RENAME2 body for `names`, to inode 5, with `flags`.
+    fn rename2_body(names: &[u8], flags: u32) -> Vec<u8> {
+        let rename2_in = Rename2In {
+            newdir: 5,
+            flags,
+            ..Default::default()
+        };
+        [rename2_in.as_slice(), names].concat()
+    }
+
+    /// Sets "user.a" to `XATTR_VALUE`.
+    fn check_setxattr(name: &CStr, value: &[u8]) -> io::Result<()> {
+        match (name.to_bytes(), value) {
+            (b"user.a", XATTR_VALUE) => Ok(()),
+            _ => Err(io::Error::from_raw_os_error(libc::EINVAL)),
+        }
+    }
+
+    const XATTR_NAMES: &[u8] = b"user.a\0";
+
+    /// The errno for a missing xattr: ENODATA on Linux, ENOATTR on macOS and FreeBSD, which has
+    /// no ENODATA.
+    #[cfg(target_os = "linux")]
+    const XATTR_ABSENT: libc::c_int = libc::ENODATA;
+    #[cfg(not(target_os = "linux"))]
+    const XATTR_ABSENT: libc::c_int = libc::ENOATTR;
+
+    /// Inodes that answer GETXATTR and LISTXATTR with the data, or with its length, whatever the
+    /// size, and leave the size rules to the server.
+    const DATA_INODE: u64 = 3;
+    const COUNT_INODE: u64 = 4;
+
+    /// Answers a GETXATTR or LISTXATTR of `inode` for `size` bytes of `data`, with `value(data)`
+    /// or `count(length)`. Inode 2 sizes the reply like a real file system: the length for size
+    /// 0, the data if it fits, ERANGE otherwise. Other inodes have no xattrs.
+    fn xattr_reply<T>(
+        inode: u64,
+        size: u32,
+        data: &[u8],
+        value: fn(Vec<u8>) -> T,
+        count: fn(u32) -> T,
+    ) -> io::Result<T> {
+        let len = data.len() as u32;
+        match inode {
+            DATA_INODE => Ok(value(data.to_vec())),
+            COUNT_INODE => Ok(count(len)),
+            2 if size == 0 => Ok(count(len)),
+            2 if size >= len => Ok(value(data.to_vec())),
+            2 => Err(io::Error::from_raw_os_error(libc::ERANGE)),
+            _ => Err(io::Error::from_raw_os_error(XATTR_ABSENT)),
+        }
+    }
+
+    /// Gets "user.a", whose value is `XATTR_VALUE`.
+    fn getxattr_reply(inode: u64, name: &CStr, size: u32) -> io::Result<GetxattrReply> {
+        if name.to_bytes() != b"user.a" {
+            return Err(io::Error::from_raw_os_error(XATTR_ABSENT));
+        }
+        xattr_reply(
+            inode,
+            size,
+            XATTR_VALUE,
+            GetxattrReply::Value,
+            GetxattrReply::Count,
+        )
+    }
+
+    /// Lists `XATTR_NAMES`.
+    fn listxattr_reply(inode: u64, size: u32) -> io::Result<ListxattrReply> {
+        xattr_reply(
+            inode,
+            size,
+            XATTR_NAMES,
+            ListxattrReply::Names,
+            ListxattrReply::Count,
+        )
+    }
+
+    /// Removes "user.a" from inode 2.
+    fn check_removexattr(inode: u64, name: &CStr) -> io::Result<()> {
+        match (inode, name.to_bytes()) {
+            (2, b"user.a") => Ok(()),
+            _ => Err(io::Error::from_raw_os_error(XATTR_ABSENT)),
+        }
+    }
+
+    fn statfs_reply() -> statvfs64 {
+        // Safe because statvfs64 is plain data.
+        let mut st: statvfs64 = unsafe { std::mem::zeroed() };
+        st.f_bsize = 4096;
+        st
+    }
+
+    const FILE_HANDLE: u64 = 8;
+    const LOCK_OWNER: u64 = 0x1234;
+    const FILE_SIZE: u64 = 8192;
+
+    /// Flushes `FILE_HANDLE` of inode 2 for `LOCK_OWNER`.
+    fn check_flush(inode: u64, handle: u64, lock_owner: u64) -> io::Result<()> {
+        match (inode, handle, lock_owner) {
+            (2, FILE_HANDLE, LOCK_OWNER) => Ok(()),
+            _ => Err(io::Error::from_raw_os_error(libc::EBADF)),
+        }
+    }
+
+    /// Grants read and write access to inode 2, and nothing else.
+    fn check_access(inode: u64, mask: u32) -> io::Result<()> {
+        let allowed = (libc::R_OK | libc::W_OK) as u32;
+        if inode == 2 && mask & !allowed == 0 {
+            Ok(())
+        } else {
+            Err(io::Error::from_raw_os_error(libc::EACCES))
+        }
+    }
+
+    /// Seeks `FILE_HANDLE` of inode 2, a file of `FILE_SIZE` bytes, relative to its end.
+    fn lseek_offset(inode: u64, handle: u64, offset: u64, whence: u32) -> io::Result<u64> {
+        if (inode, handle, whence) == (2, FILE_HANDLE, libc::SEEK_END as u32) {
+            Ok(FILE_SIZE + offset)
+        } else {
+            Err(io::Error::from_raw_os_error(libc::EINVAL))
+        }
+    }
+
+    /// Copies 2048 bytes at offset 4096 of `FILE_HANDLE` of inode 2 to offset 512 of handle 9 of
+    /// inode 3.
+    #[allow(clippy::too_many_arguments)]
+    fn copy_len(
+        inode_in: u64,
+        fh_in: u64,
+        offset_in: u64,
+        inode_out: u64,
+        fh_out: u64,
+        offset_out: u64,
+        len: u64,
+        flags: u64,
+    ) -> io::Result<u32> {
+        match (
+            inode_in, fh_in, offset_in, inode_out, fh_out, offset_out, len, flags,
+        ) {
+            (2, FILE_HANDLE, 4096, 3, 9, 512, 2048, 0) => Ok(2048),
+            _ => Err(io::Error::from_raw_os_error(libc::EINVAL)),
+        }
+    }
+
+    /// Answers with the sync and the async handlers alike, and counts the calls of each.
     #[derive(Default)]
     struct DirFs {
         sync_calls: AtomicUsize,
@@ -833,6 +1496,16 @@ mod tests {
                 self.async_calls.load(Ordering::Relaxed),
             )
         }
+
+        fn sync_call(&self) {
+            self.sync_calls.fetch_add(1, Ordering::Relaxed);
+        }
+
+        /// Counts the call and yields to the runtime, so the server has to wait for the future.
+        async fn async_call(&self) {
+            self.async_calls.fetch_add(1, Ordering::Relaxed);
+            tokio::task::yield_now().await;
+        }
     }
 
     impl FileSystem for DirFs {
@@ -845,7 +1518,7 @@ mod tests {
             _inode: u64,
             _flags: u32,
         ) -> io::Result<(Option<u64>, OpenOptions)> {
-            self.sync_calls.fetch_add(1, Ordering::Relaxed);
+            self.sync_call();
             Ok((Some(DIR_HANDLE), OpenOptions::CACHE_DIR))
         }
 
@@ -858,7 +1531,7 @@ mod tests {
             offset: u64,
             add_entry: &mut dyn FnMut(DirEntry) -> io::Result<usize>,
         ) -> io::Result<()> {
-            self.sync_calls.fetch_add(1, Ordering::Relaxed);
+            self.sync_call();
             list(inode, offset, |dir_entry, _| add_entry(dir_entry))
         }
 
@@ -871,7 +1544,7 @@ mod tests {
             offset: u64,
             add_entry: &mut dyn FnMut(DirEntry, Entry) -> io::Result<usize>,
         ) -> io::Result<()> {
-            self.sync_calls.fetch_add(1, Ordering::Relaxed);
+            self.sync_call();
             list(inode, offset, add_entry)
         }
 
@@ -882,13 +1555,184 @@ mod tests {
             _flags: u32,
             handle: u64,
         ) -> io::Result<()> {
-            self.sync_calls.fetch_add(1, Ordering::Relaxed);
-            release(handle)
+            self.sync_call();
+            check_handle(handle)
+        }
+
+        fn readlink(&self, _ctx: &Context, _inode: u64) -> io::Result<Vec<u8>> {
+            self.sync_call();
+            Ok(b"target".to_vec())
+        }
+
+        fn mkdir(
+            &self,
+            _ctx: &Context,
+            _parent: u64,
+            name: &CStr,
+            _mode: u32,
+            _umask: u32,
+        ) -> io::Result<Entry> {
+            self.sync_call();
+            mkdir_entry(name)
+        }
+
+        fn symlink(
+            &self,
+            _ctx: &Context,
+            linkname: &CStr,
+            _parent: u64,
+            name: &CStr,
+        ) -> io::Result<Entry> {
+            self.sync_call();
+            symlink_entry(linkname, name)
+        }
+
+        fn mknod(
+            &self,
+            _ctx: &Context,
+            parent: u64,
+            name: &CStr,
+            mode: u32,
+            rdev: u32,
+            umask: u32,
+        ) -> io::Result<Entry> {
+            self.sync_call();
+            mknod_entry(parent, name, mode, rdev, umask)
+        }
+
+        fn link(
+            &self,
+            _ctx: &Context,
+            inode: u64,
+            newparent: u64,
+            newname: &CStr,
+        ) -> io::Result<Entry> {
+            self.sync_call();
+            link_entry(inode, newparent, newname)
+        }
+
+        fn unlink(&self, _ctx: &Context, parent: u64, name: &CStr) -> io::Result<()> {
+            self.sync_call();
+            check_unlink(parent, name)
+        }
+
+        fn rmdir(&self, _ctx: &Context, parent: u64, name: &CStr) -> io::Result<()> {
+            self.sync_call();
+            check_rmdir(parent, name)
+        }
+
+        fn rename(
+            &self,
+            _ctx: &Context,
+            olddir: u64,
+            oldname: &CStr,
+            newdir: u64,
+            newname: &CStr,
+            flags: u32,
+        ) -> io::Result<()> {
+            self.sync_call();
+            check_rename(olddir, oldname, newdir, newname, flags)
+        }
+
+        fn setxattr(
+            &self,
+            _ctx: &Context,
+            _inode: u64,
+            name: &CStr,
+            value: &[u8],
+            _flags: u32,
+        ) -> io::Result<()> {
+            self.sync_call();
+            check_setxattr(name, value)
+        }
+
+        fn getxattr(
+            &self,
+            _ctx: &Context,
+            inode: u64,
+            name: &CStr,
+            size: u32,
+        ) -> io::Result<GetxattrReply> {
+            self.sync_call();
+            getxattr_reply(inode, name, size)
+        }
+
+        fn listxattr(&self, _ctx: &Context, inode: u64, size: u32) -> io::Result<ListxattrReply> {
+            self.sync_call();
+            listxattr_reply(inode, size)
+        }
+
+        fn removexattr(&self, _ctx: &Context, inode: u64, name: &CStr) -> io::Result<()> {
+            self.sync_call();
+            check_removexattr(inode, name)
+        }
+
+        fn release(
+            &self,
+            _ctx: &Context,
+            _inode: u64,
+            _flags: u32,
+            handle: u64,
+            _flush: bool,
+            _flock_release: bool,
+            _lock_owner: Option<u64>,
+        ) -> io::Result<()> {
+            self.sync_call();
+            check_handle(handle)
+        }
+
+        fn statfs(&self, _ctx: &Context, _inode: u64) -> io::Result<statvfs64> {
+            self.sync_call();
+            Ok(statfs_reply())
+        }
+
+        fn flush(
+            &self,
+            _ctx: &Context,
+            inode: u64,
+            handle: u64,
+            lock_owner: u64,
+        ) -> io::Result<()> {
+            self.sync_call();
+            check_flush(inode, handle, lock_owner)
+        }
+
+        fn access(&self, _ctx: &Context, inode: u64, mask: u32) -> io::Result<()> {
+            self.sync_call();
+            check_access(inode, mask)
+        }
+
+        fn lseek(
+            &self,
+            _ctx: &Context,
+            inode: u64,
+            handle: u64,
+            offset: u64,
+            whence: u32,
+        ) -> io::Result<u64> {
+            self.sync_call();
+            lseek_offset(inode, handle, offset, whence)
+        }
+
+        fn copy_file_range(
+            &self,
+            _ctx: &Context,
+            inode_in: u64,
+            fh_in: u64,
+            offset_in: u64,
+            inode_out: u64,
+            fh_out: u64,
+            offset_out: u64,
+            len: u64,
+            flags: u64,
+        ) -> io::Result<u32> {
+            self.sync_call();
+            copy_len(
+                inode_in, fh_in, offset_in, inode_out, fh_out, offset_out, len, flags,
+            )
         }
     }
 
-    // Each handler yields to the runtime before it answers, so the server has to wait for
-    // the future.
     #[async_trait]
     impl AsyncFileSystem for DirFs {
         async fn async_opendir(
@@ -897,8 +1741,7 @@ mod tests {
             _inode: u64,
             _flags: u32,
         ) -> io::Result<(Option<u64>, OpenOptions)> {
-            self.async_calls.fetch_add(1, Ordering::Relaxed);
-            tokio::task::yield_now().await;
+            self.async_call().await;
             Ok((Some(DIR_HANDLE), OpenOptions::CACHE_DIR))
         }
 
@@ -911,8 +1754,7 @@ mod tests {
             offset: u64,
             add_entry: &mut (dyn FnMut(DirEntry) -> io::Result<usize> + Send),
         ) -> io::Result<()> {
-            self.async_calls.fetch_add(1, Ordering::Relaxed);
-            tokio::task::yield_now().await;
+            self.async_call().await;
             list(inode, offset, |dir_entry, _| add_entry(dir_entry))
         }
 
@@ -925,8 +1767,7 @@ mod tests {
             offset: u64,
             add_entry: &mut (dyn FnMut(DirEntry, Entry) -> io::Result<usize> + Send),
         ) -> io::Result<()> {
-            self.async_calls.fetch_add(1, Ordering::Relaxed);
-            tokio::task::yield_now().await;
+            self.async_call().await;
             list(inode, offset, add_entry)
         }
 
@@ -937,9 +1778,191 @@ mod tests {
             _flags: u32,
             handle: u64,
         ) -> io::Result<()> {
-            self.async_calls.fetch_add(1, Ordering::Relaxed);
-            tokio::task::yield_now().await;
-            release(handle)
+            self.async_call().await;
+            check_handle(handle)
+        }
+
+        async fn async_readlink(&self, _ctx: &Context, _inode: u64) -> io::Result<Vec<u8>> {
+            self.async_call().await;
+            Ok(b"target".to_vec())
+        }
+
+        async fn async_mkdir(
+            &self,
+            _ctx: &Context,
+            _parent: u64,
+            name: &CStr,
+            _mode: u32,
+            _umask: u32,
+        ) -> io::Result<Entry> {
+            self.async_call().await;
+            mkdir_entry(name)
+        }
+
+        async fn async_symlink(
+            &self,
+            _ctx: &Context,
+            linkname: &CStr,
+            _parent: u64,
+            name: &CStr,
+        ) -> io::Result<Entry> {
+            self.async_call().await;
+            symlink_entry(linkname, name)
+        }
+
+        async fn async_mknod(
+            &self,
+            _ctx: &Context,
+            parent: u64,
+            name: &CStr,
+            mode: u32,
+            rdev: u32,
+            umask: u32,
+        ) -> io::Result<Entry> {
+            self.async_call().await;
+            mknod_entry(parent, name, mode, rdev, umask)
+        }
+
+        async fn async_link(
+            &self,
+            _ctx: &Context,
+            inode: u64,
+            newparent: u64,
+            newname: &CStr,
+        ) -> io::Result<Entry> {
+            self.async_call().await;
+            link_entry(inode, newparent, newname)
+        }
+
+        async fn async_unlink(&self, _ctx: &Context, parent: u64, name: &CStr) -> io::Result<()> {
+            self.async_call().await;
+            check_unlink(parent, name)
+        }
+
+        async fn async_rmdir(&self, _ctx: &Context, parent: u64, name: &CStr) -> io::Result<()> {
+            self.async_call().await;
+            check_rmdir(parent, name)
+        }
+
+        async fn async_rename(
+            &self,
+            _ctx: &Context,
+            olddir: u64,
+            oldname: &CStr,
+            newdir: u64,
+            newname: &CStr,
+            flags: u32,
+        ) -> io::Result<()> {
+            self.async_call().await;
+            check_rename(olddir, oldname, newdir, newname, flags)
+        }
+
+        async fn async_setxattr(
+            &self,
+            _ctx: &Context,
+            _inode: u64,
+            name: &CStr,
+            value: &[u8],
+            _flags: u32,
+        ) -> io::Result<()> {
+            self.async_call().await;
+            check_setxattr(name, value)
+        }
+
+        async fn async_getxattr(
+            &self,
+            _ctx: &Context,
+            inode: u64,
+            name: &CStr,
+            size: u32,
+        ) -> io::Result<GetxattrReply> {
+            self.async_call().await;
+            getxattr_reply(inode, name, size)
+        }
+
+        async fn async_listxattr(
+            &self,
+            _ctx: &Context,
+            inode: u64,
+            size: u32,
+        ) -> io::Result<ListxattrReply> {
+            self.async_call().await;
+            listxattr_reply(inode, size)
+        }
+
+        async fn async_removexattr(
+            &self,
+            _ctx: &Context,
+            inode: u64,
+            name: &CStr,
+        ) -> io::Result<()> {
+            self.async_call().await;
+            check_removexattr(inode, name)
+        }
+
+        async fn async_release(
+            &self,
+            _ctx: &Context,
+            _inode: u64,
+            _flags: u32,
+            handle: u64,
+            _flush: bool,
+            _flock_release: bool,
+            _lock_owner: Option<u64>,
+        ) -> io::Result<()> {
+            self.async_call().await;
+            check_handle(handle)
+        }
+
+        async fn async_statfs(&self, _ctx: &Context, _inode: u64) -> io::Result<statvfs64> {
+            self.async_call().await;
+            Ok(statfs_reply())
+        }
+
+        async fn async_flush(
+            &self,
+            _ctx: &Context,
+            inode: u64,
+            handle: u64,
+            lock_owner: u64,
+        ) -> io::Result<()> {
+            self.async_call().await;
+            check_flush(inode, handle, lock_owner)
+        }
+
+        async fn async_access(&self, _ctx: &Context, inode: u64, mask: u32) -> io::Result<()> {
+            self.async_call().await;
+            check_access(inode, mask)
+        }
+
+        async fn async_lseek(
+            &self,
+            _ctx: &Context,
+            inode: u64,
+            handle: u64,
+            offset: u64,
+            whence: u32,
+        ) -> io::Result<u64> {
+            self.async_call().await;
+            lseek_offset(inode, handle, offset, whence)
+        }
+
+        async fn async_copy_file_range(
+            &self,
+            _ctx: &Context,
+            inode_in: u64,
+            fh_in: u64,
+            offset_in: u64,
+            inode_out: u64,
+            fh_out: u64,
+            offset_out: u64,
+            len: u64,
+            flags: u64,
+        ) -> io::Result<u32> {
+            self.async_call().await;
+            copy_len(
+                inode_in, fh_in, offset_in, inode_out, fh_out, offset_out, len, flags,
+            )
         }
     }
 
@@ -951,17 +1974,17 @@ mod tests {
         nodeid: u64,
         body: T,
     ) -> Vec<u8> {
-        let in_header = InHeader {
-            len: (size_of::<InHeader>() + size_of::<T>()) as u32,
-            opcode: opcode as u32,
-            unique: 1,
-            nodeid,
-            ..Default::default()
-        };
-        let mut req = in_header.as_slice().to_vec();
-        req.extend_from_slice(body.as_slice());
+        serve_bytes(server, opcode, nodeid, body.as_slice()).await
+    }
 
-        let mut sync_req = req.clone();
+    /// Like `serve()`, with the request body in `body`.
+    async fn serve_bytes(
+        server: &Server<DirFs>,
+        opcode: Opcode,
+        nodeid: u64,
+        body: &[u8],
+    ) -> Vec<u8> {
+        let mut sync_req = request_for(opcode, nodeid, body);
         let mut sync_reply = vec![0u8; 4096];
         let len = server
             .handle_message(
@@ -973,7 +1996,7 @@ mod tests {
             .unwrap();
         sync_reply.truncate(len);
 
-        let mut async_req = req;
+        let mut async_req = request_for(opcode, nodeid, body);
         let mut async_reply = vec![0u8; 4096];
         let len = unsafe {
             server
@@ -984,20 +2007,45 @@ mod tests {
                     None,
                 )
                 .await
-        }
-        .unwrap();
+                .unwrap()
+        };
+        assert_eq!(reply_header(&async_reply).len as usize, len);
         async_reply.truncate(len);
-
         assert_eq!(sync_reply, async_reply);
         async_reply
     }
 
-    fn reply_error(reply: &[u8]) -> i32 {
+    fn reply_header(reply: &[u8]) -> OutHeader {
         let mut header = OutHeader::default();
         header
             .as_mut_slice()
             .copy_from_slice(&reply[..size_of::<OutHeader>()]);
-        header.error
+        header
+    }
+
+    fn reply_error(reply: &[u8]) -> i32 {
+        reply_header(reply).error
+    }
+
+    /// The `T` that fills `reply` after its header.
+    fn reply_out<T: ByteValued + Default>(reply: &[u8]) -> T {
+        let mut out = T::default();
+        out.as_mut_slice()
+            .copy_from_slice(&reply[size_of::<OutHeader>()..]);
+        out
+    }
+
+    /// The inode of the entry in `reply`.
+    fn entry_inode(reply: &[u8]) -> u64 {
+        reply_out::<EntryOut>(reply).nodeid
+    }
+
+    /// The body of a GETXATTR or LISTXATTR for `size` bytes, before any name.
+    fn getxattr_in(size: u32) -> GetxattrIn {
+        GetxattrIn {
+            size,
+            ..Default::default()
+        }
     }
 
     #[tokio::test]
@@ -1006,9 +2054,7 @@ mod tests {
 
         let reply = serve(&server, Opcode::Opendir, 1, OpenIn::default()).await;
         assert_eq!(server.fs.calls(), (1, 1));
-        let mut out = OpenOut::default();
-        out.as_mut_slice()
-            .copy_from_slice(&reply[size_of::<OutHeader>()..]);
+        let out: OpenOut = reply_out(&reply);
         assert_eq!(out.fh, DIR_HANDLE);
         assert_eq!(out.open_flags, OpenOptions::CACHE_DIR.bits());
 
@@ -1078,6 +2124,200 @@ mod tests {
         let reply = serve(&server, opcode, 1, read_in(0, 8192)).await;
         assert_eq!(server.fs.calls(), (4, 4));
         assert_eq!(reply_error(&reply), -libc::ENOMEM);
+    }
+
+    #[tokio::test]
+    async fn test_async_node_requests() {
+        let server = Server::new(DirFs::default());
+        let header_len = size_of::<OutHeader>();
+
+        let reply = serve_bytes(&server, Opcode::Readlink, 2, &[]).await;
+        assert_eq!(&reply[header_len..], b"target");
+        assert_eq!(server.fs.calls(), (1, 1));
+
+        let mkdir_in = MkdirIn {
+            mode: 0o755,
+            umask: 0,
+        };
+        let body = [mkdir_in.as_slice(), b"dir\0"].concat();
+        let reply = serve_bytes(&server, Opcode::Mkdir, 1, &body).await;
+        assert_eq!(entry_inode(&reply), 5);
+        let body = [mkdir_in.as_slice(), b"other\0"].concat();
+        let reply = serve_bytes(&server, Opcode::Mkdir, 1, &body).await;
+        assert_eq!(reply_error(&reply), -libc::EEXIST);
+        assert_eq!(server.fs.calls(), (3, 3));
+
+        // The name comes first, then the target.
+        let reply = serve_bytes(&server, Opcode::Symlink, 1, b"link\0target\0").await;
+        assert_eq!(entry_inode(&reply), 6);
+        assert_eq!(server.fs.calls(), (4, 4));
+
+        let reply = serve_bytes(&server, Opcode::Rename, 1, &rename_body(b"a\0b\0")).await;
+        assert_eq!(reply.len(), header_len);
+        assert_eq!(reply_error(&reply), 0);
+        assert_eq!(server.fs.calls(), (5, 5));
+
+        let setxattr_in = SetxattrIn {
+            size: XATTR_VALUE.len() as u32,
+            flags: 0,
+        };
+        let body = [setxattr_in.as_slice(), b"user.a\0", XATTR_VALUE].concat();
+        let reply = serve_bytes(&server, Opcode::Setxattr, 2, &body).await;
+        assert_eq!(reply_error(&reply), 0);
+        assert_eq!(server.fs.calls(), (6, 6));
+
+        let release_in = ReleaseIn {
+            fh: DIR_HANDLE,
+            ..Default::default()
+        };
+        let reply = serve(&server, Opcode::Release, 2, release_in).await;
+        assert_eq!(reply_error(&reply), 0);
+        assert_eq!(server.fs.calls(), (7, 7));
+
+        let reply = serve_bytes(&server, Opcode::Statfs, 1, &[]).await;
+        let out: Kstatfs = reply_out(&reply);
+        assert_eq!(out.bsize, 4096);
+        assert_eq!(server.fs.calls(), (8, 8));
+    }
+
+    #[tokio::test]
+    async fn test_async_namespace_requests() {
+        let server = Server::new(DirFs::default());
+        let header_len = size_of::<OutHeader>();
+
+        let mknod_in = MknodIn {
+            mode: MKNOD_MODE,
+            rdev: MKNOD_RDEV,
+            umask: 0o022,
+            ..Default::default()
+        };
+        let body = [mknod_in.as_slice(), b"null\0"].concat();
+        let reply = serve_bytes(&server, Opcode::Mknod, 1, &body).await;
+        assert_eq!(entry_inode(&reply), 7);
+        assert_eq!(server.fs.calls(), (1, 1));
+
+        // The request is for the new parent, and the LinkIn names the inode to link.
+        let link_in = LinkIn { oldnodeid: 2 };
+        let body = [link_in.as_slice(), b"hardlink\0"].concat();
+        let reply = serve_bytes(&server, Opcode::Link, 1, &body).await;
+        assert_eq!(entry_inode(&reply), 2);
+        assert_eq!(server.fs.calls(), (2, 2));
+
+        let reply = serve_bytes(&server, Opcode::Unlink, 1, b"a\0").await;
+        assert_eq!(reply.len(), header_len);
+        assert_eq!(reply_error(&reply), 0);
+        let reply = serve_bytes(&server, Opcode::Unlink, 1, b"b\0").await;
+        assert_eq!(reply_error(&reply), -libc::ENOENT);
+        assert_eq!(server.fs.calls(), (4, 4));
+
+        let reply = serve_bytes(&server, Opcode::Rmdir, 1, b"dir\0").await;
+        assert_eq!(reply.len(), header_len);
+        assert_eq!(reply_error(&reply), 0);
+        assert_eq!(server.fs.calls(), (5, 5));
+
+        // The server drops the flags it doesn't know, and passes RENAME_NOREPLACE on.
+        let unknown_flag = 1 << 31;
+        let body = rename2_body(b"a\0b\0", unknown_flag);
+        let reply = serve_bytes(&server, Opcode::Rename2, 1, &body).await;
+        assert_eq!(reply.len(), header_len);
+        assert_eq!(reply_error(&reply), 0);
+        let body = rename2_body(b"a\0b\0", RENAME_NOREPLACE | unknown_flag);
+        let reply = serve_bytes(&server, Opcode::Rename2, 1, &body).await;
+        assert_eq!(reply_error(&reply), -libc::EEXIST);
+        assert_eq!(server.fs.calls(), (7, 7));
+    }
+
+    #[tokio::test]
+    async fn test_async_xattr_requests() {
+        let server = Server::new(DirFs::default());
+        let header_len = size_of::<OutHeader>();
+
+        let reply = serve_bytes(&server, Opcode::Removexattr, 2, b"user.a\0").await;
+        assert_eq!(reply.len(), header_len);
+        assert_eq!(reply_error(&reply), 0);
+        let reply = serve_bytes(&server, Opcode::Removexattr, 2, b"user.b\0").await;
+        assert_eq!(reply_error(&reply), -XATTR_ABSENT);
+        assert_eq!(server.fs.calls(), (2, 2));
+
+        // Whether the file system or the server sizes the reply, a zero-size probe gets the
+        // length, and data longer than the requested size gets ERANGE. A length for a nonzero
+        // size gets EINVAL.
+        for (opcode, name, data) in [
+            (Opcode::Getxattr, &b"user.a\0"[..], XATTR_VALUE),
+            (Opcode::Listxattr, &[][..], XATTR_NAMES),
+        ] {
+            let len = data.len() as u32;
+            let length = GetxattrOut {
+                size: len,
+                ..Default::default()
+            };
+            for (inode, size, error, out) in [
+                (2, 0, 0, length.as_slice()),
+                (2, len, 0, data),
+                (2, len - 1, libc::ERANGE, &[]),
+                (DATA_INODE, 0, 0, length.as_slice()),
+                (DATA_INODE, len - 1, libc::ERANGE, &[]),
+                (COUNT_INODE, len, libc::EINVAL, &[]),
+            ] {
+                let body = [getxattr_in(size).as_slice(), name].concat();
+                let reply = serve_bytes(&server, opcode, inode, &body).await;
+                let case = format!("{opcode:?} of inode {inode} for {size} bytes");
+                assert_eq!(reply_error(&reply), -error, "{case}");
+                assert_eq!(&reply[header_len..], out, "{case}");
+            }
+        }
+        assert_eq!(server.fs.calls(), (14, 14));
+    }
+
+    #[tokio::test]
+    async fn test_async_file_requests() {
+        let server = Server::new(DirFs::default());
+        let header_len = size_of::<OutHeader>();
+
+        let flush_in = FlushIn {
+            fh: FILE_HANDLE,
+            lock_owner: LOCK_OWNER,
+            ..Default::default()
+        };
+        let reply = serve(&server, Opcode::Flush, 2, flush_in).await;
+        assert_eq!(reply.len(), header_len);
+        assert_eq!(reply_error(&reply), 0);
+        assert_eq!(server.fs.calls(), (1, 1));
+
+        let access_in = |mask: i32| AccessIn {
+            mask: mask as u32,
+            ..Default::default()
+        };
+        let read_write = access_in(libc::R_OK | libc::W_OK);
+        let reply = serve(&server, Opcode::Access, 2, read_write).await;
+        assert_eq!(reply.len(), header_len);
+        assert_eq!(reply_error(&reply), 0);
+        let reply = serve(&server, Opcode::Access, 2, access_in(libc::X_OK)).await;
+        assert_eq!(reply_error(&reply), -libc::EACCES);
+        assert_eq!(server.fs.calls(), (3, 3));
+
+        let lseek_in = LseekIn {
+            fh: FILE_HANDLE,
+            offset: 100,
+            whence: libc::SEEK_END as u32,
+            ..Default::default()
+        };
+        let reply = serve(&server, Opcode::Lseek, 2, lseek_in).await;
+        assert_eq!(reply_out::<LseekOut>(&reply).offset, FILE_SIZE + 100);
+        assert_eq!(server.fs.calls(), (4, 4));
+
+        let copy_in = CopyFileRangeIn {
+            fh_in: FILE_HANDLE,
+            offset_in: 4096,
+            nodeid_out: 3,
+            fh_out: 9,
+            offset_out: 512,
+            len: 2048,
+            flags: 0,
+        };
+        let reply = serve(&server, Opcode::CopyFileRange, 2, copy_in).await;
+        assert_eq!(reply_out::<WriteOut>(&reply).size, 2048);
+        assert_eq!(server.fs.calls(), (5, 5));
     }
 
     const BACKING_ID: u32 = 7;

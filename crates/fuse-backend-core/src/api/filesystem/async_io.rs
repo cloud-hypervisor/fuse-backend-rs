@@ -11,8 +11,11 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 
-use super::{Context, DirEntry, Entry, FileSystem, ZeroCopyReader, ZeroCopyWriter};
-use crate::abi::fuse_abi::{stat64, CreateIn, OpenOptions, SetattrValid};
+use super::{
+    Context, DirEntry, Entry, FileSystem, GetxattrReply, ListxattrReply, ZeroCopyReader,
+    ZeroCopyWriter,
+};
+use crate::abi::fuse_abi::{stat64, statvfs64, CreateIn, OpenOptions, SetattrValid};
 use crate::file_traits::AsyncFileReadWriteVolatile;
 
 /// A trait for directly copying data from the fuse transport into a `File` without first storing it
@@ -176,131 +179,6 @@ pub trait AsyncFileSystem: FileSystem {
             self.setattr(ctx, inode, attr, handle, valid),
         ))
     }
-
-    /*
-        /// Read a symbolic link.
-        fn readlink(&self, ctx: Context, inode: Self::Inode) -> io::Result<Vec<u8>> {
-            Err(io::Error::from_raw_os_error(libc::ENOSYS))
-        }
-
-        /// Create a symbolic link.
-        ///
-        /// The file system must create a symbolic link named `name` in the directory represented by
-        /// `parent`, which contains the string `linkname`. Returns an `Entry` for the newly created
-        /// symlink.
-        ///
-        /// If this call is successful then the lookup count of the `Inode` associated with the returned
-        /// `Entry` must be increased by 1.
-        fn symlink(
-            &self,
-            ctx: Context,
-            linkname: &CStr,
-            parent: Self::Inode,
-            name: &CStr,
-        ) -> io::Result<Entry> {
-            Err(io::Error::from_raw_os_error(libc::ENOSYS))
-        }
-
-        /// Create a file node.
-        ///
-        /// Create a regular file, character device, block device, fifo, or socket node named `name` in
-        /// the directory represented by `inode`. Valid values for `mode` and `rdev` are the same as
-        /// those accepted by the `mknod(2)` system call. Returns an `Entry` for the newly created node.
-        ///
-        /// When the `FsOptions::DONT_MASK` feature is set, the file system is responsible for setting
-        /// the permissions of the created node to `mode & !umask`.
-        ///
-        /// If this call is successful then the lookup count of the `Inode` associated with the returned
-        /// `Entry` must be increased by 1.
-        fn mknod(
-            &self,
-            ctx: Context,
-            inode: Self::Inode,
-            name: &CStr,
-            mode: u32,
-            rdev: u32,
-            umask: u32,
-        ) -> io::Result<Entry> {
-            Err(io::Error::from_raw_os_error(libc::ENOSYS))
-        }
-
-        /// Create a directory.
-        ///
-        /// When the `FsOptions::DONT_MASK` feature is set, the file system is responsible for setting
-        /// the permissions of the created directory to `mode & !umask`. Returns an `Entry` for the
-        /// newly created directory.
-        ///
-        /// If this call is successful then the lookup count of the `Inode` associated with the returned
-        /// `Entry` must be increased by 1.
-        fn mkdir(
-            &self,
-            ctx: Context,
-            parent: Self::Inode,
-            name: &CStr,
-            mode: u32,
-            umask: u32,
-        ) -> io::Result<Entry> {
-            Err(io::Error::from_raw_os_error(libc::ENOSYS))
-        }
-
-        /// Remove a file.
-        ///
-        /// If the file's inode lookup count is non-zero, then the file system is expected to delay
-        /// removal of the inode until the lookup count goes to zero. See the documentation of the
-        /// `forget` function for more information.
-        fn unlink(&self, ctx: Context, parent: Self::Inode, name: &CStr) -> io::Result<()> {
-            Err(io::Error::from_raw_os_error(libc::ENOSYS))
-        }
-
-        /// Remove a directory.
-        ///
-        /// If the directory's inode lookup count is non-zero, then the file system is expected to delay
-        /// removal of the inode until the lookup count goes to zero. See the documentation of the
-        /// `forget` function for more information.
-        fn rmdir(&self, ctx: Context, parent: Self::Inode, name: &CStr) -> io::Result<()> {
-            Err(io::Error::from_raw_os_error(libc::ENOSYS))
-        }
-
-        /// Rename a file / directory.
-        ///
-        /// If the destination exists, it should be atomically replaced. If the destination's inode
-        /// lookup count is non-zero, then the file system is expected to delay removal of the inode
-        /// until the lookup count goes to zero. See the documentation of the `forget` function for more
-        /// information.
-        ///
-        /// `flags` may be `libc::RENAME_EXCHANGE` or `libc::RENAME_NOREPLACE`. If
-        /// `libc::RENAME_NOREPLACE` is specified, the implementation must not overwrite `newname` if it
-        /// exists and must return an error instead. If `libc::RENAME_EXCHANGE` is specified, the
-        /// implementation must atomically exchange the two files, i.e., both must exist and neither may
-        /// be deleted.
-        fn rename(
-            &self,
-            ctx: Context,
-            olddir: Self::Inode,
-            oldname: &CStr,
-            newdir: Self::Inode,
-            newname: &CStr,
-            flags: u32,
-        ) -> io::Result<()> {
-            Err(io::Error::from_raw_os_error(libc::ENOSYS))
-        }
-
-        /// Create a hard link.
-        ///
-        /// Create a hard link from `inode` to `newname` in the directory represented by `newparent`.
-        ///
-        /// If this call is successful then the lookup count of the `Inode` associated with the returned
-        /// `Entry` must be increased by 1.
-        fn link(
-            &self,
-            ctx: Context,
-            inode: Self::Inode,
-            newparent: Self::Inode,
-            newname: &CStr,
-        ) -> io::Result<Entry> {
-            Err(io::Error::from_raw_os_error(libc::ENOSYS))
-        }
-    */
 
     /// Open a file.
     ///
@@ -495,40 +373,6 @@ pub trait AsyncFileSystem: FileSystem {
         )))
     }
 
-    /*
-        /// Flush the contents of a file.
-        ///
-        /// This method is called on every `close()` of a file descriptor. Since it is possible to
-        /// duplicate file descriptors there may be many `flush` calls for one call to `open`.
-        ///
-        /// File systems should not make any assumptions about when `flush` will be
-        /// called or even if it will be called at all.
-        ///
-        /// `handle` is the `Handle` returned by the file system from the `open` method, if any. If the
-        /// file system did not return a `Handle` from `open` then the contents of `handle` are
-        /// undefined.
-        ///
-        /// Unlike `fsync`, the file system is not required to flush pending writes. One reason to flush
-        /// data is if the file system wants to return write errors during close. However, this is not
-        /// portable because POSIX does not require `close` to wait for delayed I/O to complete.
-        ///
-        /// If the `FsOptions::POSIX_LOCKS` feature is enabled, then the file system must remove all
-        /// locks belonging to `lock_owner`.
-        ///
-        /// If this method returns an `ENOSYS` error then the kernel will treat it as success and all
-        /// subsequent calls to `flush` will be handled by the kernel without being forwarded to the
-        /// file system.
-        fn flush(
-            &self,
-            ctx: Context,
-            inode: Self::Inode,
-            handle: Self::Handle,
-            lock_owner: u64,
-        ) -> io::Result<()> {
-            Err(io::Error::from_raw_os_error(libc::ENOSYS))
-        }
-    */
-
     /// Synchronize file contents.
     ///
     /// File systems must ensure that the file contents have been flushed to disk before returning
@@ -588,130 +432,6 @@ pub trait AsyncFileSystem: FileSystem {
             self.fallocate(ctx, inode, handle, mode, offset, length),
         ))
     }
-
-    /*
-        /// Release an open file.
-        ///
-        /// This method is called when there are no more references to an open file: all file
-        /// descriptors are closed and all memory mappings are unmapped.
-        ///
-        /// For every `open` call there will be exactly one `release` call (unless the file system is
-        /// force-unmounted).
-        ///
-        /// The file system may reply with an error, but error values are not returned to the `close()`
-        /// or `munmap()` which triggered the release.
-        ///
-        /// `handle` is the `Handle` returned by the file system from the `open` method, if any. If the
-        /// file system did not return a `Handle` from `open` then the contents of
-        /// `handle` are undefined.
-        ///
-        /// If `flush` is `true` then the contents of the file should also be flushed to disk.
-        #[allow(clippy::too_many_arguments)]
-        fn release(
-            &self,
-            ctx: Context,
-            inode: Self::Inode,
-            flags: u32,
-            handle: Self::Handle,
-            flush: bool,
-            flock_release: bool,
-            lock_owner: Option<u64>,
-        ) -> io::Result<()> {
-            Err(io::Error::from_raw_os_error(libc::ENOSYS))
-        }
-
-        /// Get information about the file system.
-        fn statfs(&self, ctx: Context, inode: Self::Inode) -> io::Result<libc::statvfs64> {
-            // Safe because we are zero-initializing a struct with only POD fields.
-            let mut st: libc::statvfs64 = unsafe { mem::zeroed() };
-
-            // This matches the behavior of libfuse as it returns these values if the
-            // filesystem doesn't implement this method.
-            st.f_namemax = 255;
-            st.f_bsize = 512;
-
-            Ok(st)
-        }
-
-        /// Set an extended attribute.
-        ///
-        /// If this method fails with an `ENOSYS` error, then the kernel will treat that as a permanent
-        /// failure. The kernel will return `EOPNOTSUPP` for all future calls to `setxattr` without
-        /// forwarding them to the file system.
-        ///
-        /// Valid values for flags are the same as those accepted by the `setxattr(2)` system call and
-        /// have the same behavior.
-        fn setxattr(
-            &self,
-            ctx: Context,
-            inode: Self::Inode,
-            name: &CStr,
-            value: &[u8],
-            flags: u32,
-        ) -> io::Result<()> {
-            Err(io::Error::from_raw_os_error(libc::ENOSYS))
-        }
-
-        /// Get an extended attribute.
-        ///
-        /// If `size` is 0, then the file system should respond with `GetxattrReply::Count` and the
-        /// number of bytes needed to hold the value. If `size` is large enough to hold the value, then
-        /// the file system should reply with `GetxattrReply::Value` and the value of the extended
-        /// attribute. If `size` is not 0 but is also not large enough to hold the value, then the file
-        /// system should reply with an `ERANGE` error.
-        ///
-        /// The server also enforces this contract on the file system's behalf: a
-        /// `GetxattrReply::Value` larger than `size` is answered with an `ERANGE` error so the
-        /// caller can retry with a bigger buffer, a `Value` returned for a zero-size probe is
-        /// converted to the `Count` reply the kernel expects, and a `Count` returned for a nonzero
-        /// size is answered with an `EINVAL` error, since the kernel would otherwise copy the size
-        /// struct out as the value.
-        ///
-        /// If this method fails with an `ENOSYS` error, then the kernel will treat that as a permanent
-        /// failure. The kernel will return `EOPNOTSUPP` for all future calls to `getxattr` without
-        /// forwarding them to the file system.
-        fn getxattr(
-            &self,
-            ctx: Context,
-            inode: Self::Inode,
-            name: &CStr,
-            size: u32,
-        ) -> io::Result<GetxattrReply> {
-            Err(io::Error::from_raw_os_error(libc::ENOSYS))
-        }
-
-        /// List extended attribute names.
-        ///
-        /// If `size` is 0, then the file system should respond with `ListxattrReply::Count` and the
-        /// number of bytes needed to hold a `\0` byte separated list of the names of all the extended
-        /// attributes. If `size` is large enough to hold the `\0` byte separated list of the attribute
-        /// names, then the file system should reply with `ListxattrReply::Names` and the list. If
-        /// `size` is not 0 but is also not large enough to hold the list, then the file system should
-        /// reply with an `ERANGE` error.
-        ///
-        /// The server also enforces this contract on the file system's behalf: a
-        /// `ListxattrReply::Names` list larger than `size` is answered with an `ERANGE` error so
-        /// the caller can retry with a bigger buffer, a `Names` list returned for a zero-size
-        /// probe is converted to the `Count` reply the kernel expects, and a `Count` returned for
-        /// a nonzero size is answered with an `EINVAL` error, since the kernel would otherwise
-        /// copy the size struct out as the list.
-        ///
-        /// If this method fails with an `ENOSYS` error, then the kernel will treat that as a permanent
-        /// failure. The kernel will return `EOPNOTSUPP` for all future calls to `listxattr` without
-        /// forwarding them to the file system.
-        fn listxattr(&self, ctx: Context, inode: Self::Inode, size: u32) -> io::Result<ListxattrReply> {
-            Err(io::Error::from_raw_os_error(libc::ENOSYS))
-        }
-
-        /// Remove an extended attribute.
-        ///
-        /// If this method fails with an `ENOSYS` error, then the kernel will treat that as a permanent
-        /// failure. The kernel will return `EOPNOTSUPP` for all future calls to `removexattr` without
-        /// forwarding them to the file system.
-        fn removexattr(&self, ctx: Context, inode: Self::Inode, name: &CStr) -> io::Result<()> {
-            Err(io::Error::from_raw_os_error(libc::ENOSYS))
-        }
-    */
 
     /// Open a directory for reading.
     ///
@@ -901,6 +621,345 @@ pub trait AsyncFileSystem: FileSystem {
         ))
     }
 
+    /// Read a symbolic link, like `FileSystem::readlink()`. The default calls `readlink()`.
+    fn async_readlink<'a, 'b, 'async_trait>(
+        &'a self,
+        ctx: &'b Context,
+        inode: Self::Inode,
+    ) -> Pin<Box<dyn Future<Output = io::Result<Vec<u8>>> + Send + 'async_trait>>
+    where
+        'a: 'async_trait,
+        'b: 'async_trait,
+        Self: 'async_trait,
+    {
+        Box::pin(std::future::ready(self.readlink(ctx, inode)))
+    }
+
+    /// Create a symbolic link, like `FileSystem::symlink()`. The default calls `symlink()`.
+    fn async_symlink<'a, 'b, 'c, 'd, 'async_trait>(
+        &'a self,
+        ctx: &'b Context,
+        linkname: &'c CStr,
+        parent: Self::Inode,
+        name: &'d CStr,
+    ) -> Pin<Box<dyn Future<Output = io::Result<Entry>> + Send + 'async_trait>>
+    where
+        'a: 'async_trait,
+        'b: 'async_trait,
+        'c: 'async_trait,
+        'd: 'async_trait,
+        Self: 'async_trait,
+    {
+        Box::pin(std::future::ready(
+            self.symlink(ctx, linkname, parent, name),
+        ))
+    }
+
+    /// Create a file node, like `FileSystem::mknod()`. The default calls `mknod()`.
+    fn async_mknod<'a, 'b, 'c, 'async_trait>(
+        &'a self,
+        ctx: &'b Context,
+        inode: Self::Inode,
+        name: &'c CStr,
+        mode: u32,
+        rdev: u32,
+        umask: u32,
+    ) -> Pin<Box<dyn Future<Output = io::Result<Entry>> + Send + 'async_trait>>
+    where
+        'a: 'async_trait,
+        'b: 'async_trait,
+        'c: 'async_trait,
+        Self: 'async_trait,
+    {
+        Box::pin(std::future::ready(
+            self.mknod(ctx, inode, name, mode, rdev, umask),
+        ))
+    }
+
+    /// Create a directory, like `FileSystem::mkdir()`. The default calls `mkdir()`.
+    fn async_mkdir<'a, 'b, 'c, 'async_trait>(
+        &'a self,
+        ctx: &'b Context,
+        parent: Self::Inode,
+        name: &'c CStr,
+        mode: u32,
+        umask: u32,
+    ) -> Pin<Box<dyn Future<Output = io::Result<Entry>> + Send + 'async_trait>>
+    where
+        'a: 'async_trait,
+        'b: 'async_trait,
+        'c: 'async_trait,
+        Self: 'async_trait,
+    {
+        Box::pin(std::future::ready(
+            self.mkdir(ctx, parent, name, mode, umask),
+        ))
+    }
+
+    /// Remove a file, like `FileSystem::unlink()`. The default calls `unlink()`.
+    fn async_unlink<'a, 'b, 'c, 'async_trait>(
+        &'a self,
+        ctx: &'b Context,
+        parent: Self::Inode,
+        name: &'c CStr,
+    ) -> Pin<Box<dyn Future<Output = io::Result<()>> + Send + 'async_trait>>
+    where
+        'a: 'async_trait,
+        'b: 'async_trait,
+        'c: 'async_trait,
+        Self: 'async_trait,
+    {
+        Box::pin(std::future::ready(self.unlink(ctx, parent, name)))
+    }
+
+    /// Remove a directory, like `FileSystem::rmdir()`. The default calls `rmdir()`.
+    fn async_rmdir<'a, 'b, 'c, 'async_trait>(
+        &'a self,
+        ctx: &'b Context,
+        parent: Self::Inode,
+        name: &'c CStr,
+    ) -> Pin<Box<dyn Future<Output = io::Result<()>> + Send + 'async_trait>>
+    where
+        'a: 'async_trait,
+        'b: 'async_trait,
+        'c: 'async_trait,
+        Self: 'async_trait,
+    {
+        Box::pin(std::future::ready(self.rmdir(ctx, parent, name)))
+    }
+
+    /// Rename a file or directory, like `FileSystem::rename()`. The default calls `rename()`.
+    fn async_rename<'a, 'b, 'c, 'd, 'async_trait>(
+        &'a self,
+        ctx: &'b Context,
+        olddir: Self::Inode,
+        oldname: &'c CStr,
+        newdir: Self::Inode,
+        newname: &'d CStr,
+        flags: u32,
+    ) -> Pin<Box<dyn Future<Output = io::Result<()>> + Send + 'async_trait>>
+    where
+        'a: 'async_trait,
+        'b: 'async_trait,
+        'c: 'async_trait,
+        'd: 'async_trait,
+        Self: 'async_trait,
+    {
+        Box::pin(std::future::ready(
+            self.rename(ctx, olddir, oldname, newdir, newname, flags),
+        ))
+    }
+
+    /// Create a hard link, like `FileSystem::link()`. The default calls `link()`.
+    fn async_link<'a, 'b, 'c, 'async_trait>(
+        &'a self,
+        ctx: &'b Context,
+        inode: Self::Inode,
+        newparent: Self::Inode,
+        newname: &'c CStr,
+    ) -> Pin<Box<dyn Future<Output = io::Result<Entry>> + Send + 'async_trait>>
+    where
+        'a: 'async_trait,
+        'b: 'async_trait,
+        'c: 'async_trait,
+        Self: 'async_trait,
+    {
+        Box::pin(std::future::ready(
+            self.link(ctx, inode, newparent, newname),
+        ))
+    }
+
+    /// Get file system statistics, like `FileSystem::statfs()`. The default calls `statfs()`.
+    fn async_statfs<'a, 'b, 'async_trait>(
+        &'a self,
+        ctx: &'b Context,
+        inode: Self::Inode,
+    ) -> Pin<Box<dyn Future<Output = io::Result<statvfs64>> + Send + 'async_trait>>
+    where
+        'a: 'async_trait,
+        'b: 'async_trait,
+        Self: 'async_trait,
+    {
+        Box::pin(std::future::ready(self.statfs(ctx, inode)))
+    }
+
+    /// Release an open file, like `FileSystem::release()`. The default calls `release()`.
+    #[allow(clippy::too_many_arguments)]
+    fn async_release<'a, 'b, 'async_trait>(
+        &'a self,
+        ctx: &'b Context,
+        inode: Self::Inode,
+        flags: u32,
+        handle: Self::Handle,
+        flush: bool,
+        flock_release: bool,
+        lock_owner: Option<u64>,
+    ) -> Pin<Box<dyn Future<Output = io::Result<()>> + Send + 'async_trait>>
+    where
+        'a: 'async_trait,
+        'b: 'async_trait,
+        Self: 'async_trait,
+    {
+        Box::pin(std::future::ready(self.release(
+            ctx,
+            inode,
+            flags,
+            handle,
+            flush,
+            flock_release,
+            lock_owner,
+        )))
+    }
+
+    /// Set an extended attribute, like `FileSystem::setxattr()`. The default calls `setxattr()`.
+    fn async_setxattr<'a, 'b, 'c, 'd, 'async_trait>(
+        &'a self,
+        ctx: &'b Context,
+        inode: Self::Inode,
+        name: &'c CStr,
+        value: &'d [u8],
+        flags: u32,
+    ) -> Pin<Box<dyn Future<Output = io::Result<()>> + Send + 'async_trait>>
+    where
+        'a: 'async_trait,
+        'b: 'async_trait,
+        'c: 'async_trait,
+        'd: 'async_trait,
+        Self: 'async_trait,
+    {
+        Box::pin(std::future::ready(
+            self.setxattr(ctx, inode, name, value, flags),
+        ))
+    }
+
+    /// Get an extended attribute, like `FileSystem::getxattr()`. The default calls `getxattr()`.
+    fn async_getxattr<'a, 'b, 'c, 'async_trait>(
+        &'a self,
+        ctx: &'b Context,
+        inode: Self::Inode,
+        name: &'c CStr,
+        size: u32,
+    ) -> Pin<Box<dyn Future<Output = io::Result<GetxattrReply>> + Send + 'async_trait>>
+    where
+        'a: 'async_trait,
+        'b: 'async_trait,
+        'c: 'async_trait,
+        Self: 'async_trait,
+    {
+        Box::pin(std::future::ready(self.getxattr(ctx, inode, name, size)))
+    }
+
+    /// List extended attribute names, like `FileSystem::listxattr()`.
+    /// The default calls `listxattr()`.
+    fn async_listxattr<'a, 'b, 'async_trait>(
+        &'a self,
+        ctx: &'b Context,
+        inode: Self::Inode,
+        size: u32,
+    ) -> Pin<Box<dyn Future<Output = io::Result<ListxattrReply>> + Send + 'async_trait>>
+    where
+        'a: 'async_trait,
+        'b: 'async_trait,
+        Self: 'async_trait,
+    {
+        Box::pin(std::future::ready(self.listxattr(ctx, inode, size)))
+    }
+
+    /// Remove an extended attribute, like `FileSystem::removexattr()`.
+    /// The default calls `removexattr()`.
+    fn async_removexattr<'a, 'b, 'c, 'async_trait>(
+        &'a self,
+        ctx: &'b Context,
+        inode: Self::Inode,
+        name: &'c CStr,
+    ) -> Pin<Box<dyn Future<Output = io::Result<()>> + Send + 'async_trait>>
+    where
+        'a: 'async_trait,
+        'b: 'async_trait,
+        'c: 'async_trait,
+        Self: 'async_trait,
+    {
+        Box::pin(std::future::ready(self.removexattr(ctx, inode, name)))
+    }
+
+    /// Flush an open file, like `FileSystem::flush()`. The default calls `flush()`.
+    fn async_flush<'a, 'b, 'async_trait>(
+        &'a self,
+        ctx: &'b Context,
+        inode: Self::Inode,
+        handle: Self::Handle,
+        lock_owner: u64,
+    ) -> Pin<Box<dyn Future<Output = io::Result<()>> + Send + 'async_trait>>
+    where
+        'a: 'async_trait,
+        'b: 'async_trait,
+        Self: 'async_trait,
+    {
+        Box::pin(std::future::ready(
+            self.flush(ctx, inode, handle, lock_owner),
+        ))
+    }
+
+    /// Check file access permissions, like `FileSystem::access()`. The default calls `access()`.
+    fn async_access<'a, 'b, 'async_trait>(
+        &'a self,
+        ctx: &'b Context,
+        inode: Self::Inode,
+        mask: u32,
+    ) -> Pin<Box<dyn Future<Output = io::Result<()>> + Send + 'async_trait>>
+    where
+        'a: 'async_trait,
+        'b: 'async_trait,
+        Self: 'async_trait,
+    {
+        Box::pin(std::future::ready(self.access(ctx, inode, mask)))
+    }
+
+    /// Reposition the offset of an open file, like `FileSystem::lseek()`.
+    /// The default calls `lseek()`.
+    fn async_lseek<'a, 'b, 'async_trait>(
+        &'a self,
+        ctx: &'b Context,
+        inode: Self::Inode,
+        handle: Self::Handle,
+        offset: u64,
+        whence: u32,
+    ) -> Pin<Box<dyn Future<Output = io::Result<u64>> + Send + 'async_trait>>
+    where
+        'a: 'async_trait,
+        'b: 'async_trait,
+        Self: 'async_trait,
+    {
+        Box::pin(std::future::ready(
+            self.lseek(ctx, inode, handle, offset, whence),
+        ))
+    }
+
+    /// Copy a range of data from one file to another, like `FileSystem::copy_file_range()`.
+    /// The default calls `copy_file_range()`.
+    #[allow(clippy::too_many_arguments)]
+    fn async_copy_file_range<'a, 'b, 'async_trait>(
+        &'a self,
+        ctx: &'b Context,
+        inode_in: Self::Inode,
+        fh_in: Self::Handle,
+        offset_in: u64,
+        inode_out: Self::Inode,
+        fh_out: Self::Handle,
+        offset_out: u64,
+        len: u64,
+        flags: u64,
+    ) -> Pin<Box<dyn Future<Output = io::Result<u32>> + Send + 'async_trait>>
+    where
+        'a: 'async_trait,
+        'b: 'async_trait,
+        Self: 'async_trait,
+    {
+        Box::pin(std::future::ready(self.copy_file_range(
+            ctx, inode_in, fh_in, offset_in, inode_out, fh_out, offset_out, len, flags,
+        )))
+    }
+
     /*
     #[cfg(feature = "virtiofs")]
     /// Setup a mapping so that guest can access files in DAX style.
@@ -940,55 +999,6 @@ pub trait AsyncFileSystem: FileSystem {
         requests: Vec<RemovemappingOne>,
         vu_req: &mut dyn FsCacheReqHandler,
     ) -> io::Result<()> {
-        Err(io::Error::from_raw_os_error(libc::ENOSYS))
-    }
-
-    /// Check file access permissions.
-    ///
-    /// This method is called when a userspace process in the client makes an `access()` or
-    /// `chdir()` system call. If the file system was mounted with the `-o default_permissions`
-    /// mount option, then the kernel will perform these checks itself and this method will not be
-    /// called.
-    ///
-    /// If this method returns an `ENOSYS` error, then the kernel will treat it as a permanent
-    /// success: all future calls to `access` will return success without being forwarded to the
-    /// file system.
-    fn access(&self, ctx: Context, inode: Self::Inode, mask: u32) -> io::Result<()> {
-        Err(io::Error::from_raw_os_error(libc::ENOSYS))
-    }
-
-    /// Reposition read/write file offset.
-    fn lseek(
-        &self,
-        ctx: Context,
-        inode: Self::Inode,
-        handle: Self::Handle,
-        offset: u64,
-        whence: u32,
-    ) -> io::Result<u64> {
-        Err(io::Error::from_raw_os_error(libc::ENOSYS))
-    }
-
-    /// Copy data from one file to another.
-    ///
-    /// The `inode_in`/`fh_in` pair identifies the source file and the `inode_out`/`fh_out` pair
-    /// the destination file. `offset_in` and `offset_out` are the starting offsets. `len` is the
-    /// maximum number of bytes to copy and the return value is the number of bytes actually
-    /// copied, which may be smaller than `len`, for example when the end of the source file is
-    /// reached. `flags` is currently unused by the kernel and must be zero.
-    #[allow(clippy::too_many_arguments)]
-    fn copy_file_range(
-        &self,
-        ctx: Context,
-        inode_in: Self::Inode,
-        fh_in: Self::Handle,
-        offset_in: u64,
-        inode_out: Self::Inode,
-        fh_out: Self::Handle,
-        offset_out: u64,
-        len: u64,
-        flags: u64,
-    ) -> io::Result<u32> {
         Err(io::Error::from_raw_os_error(libc::ENOSYS))
     }
 
@@ -1287,6 +1297,302 @@ impl<FS: AsyncFileSystem> AsyncFileSystem for Arc<FS> {
     {
         self.deref().async_releasedir(ctx, inode, flags, handle)
     }
+
+    fn async_readlink<'a, 'b, 'async_trait>(
+        &'a self,
+        ctx: &'b Context,
+        inode: Self::Inode,
+    ) -> Pin<Box<dyn Future<Output = io::Result<Vec<u8>>> + Send + 'async_trait>>
+    where
+        'a: 'async_trait,
+        'b: 'async_trait,
+        Self: 'async_trait,
+    {
+        self.deref().async_readlink(ctx, inode)
+    }
+
+    fn async_symlink<'a, 'b, 'c, 'd, 'async_trait>(
+        &'a self,
+        ctx: &'b Context,
+        linkname: &'c CStr,
+        parent: Self::Inode,
+        name: &'d CStr,
+    ) -> Pin<Box<dyn Future<Output = io::Result<Entry>> + Send + 'async_trait>>
+    where
+        'a: 'async_trait,
+        'b: 'async_trait,
+        'c: 'async_trait,
+        'd: 'async_trait,
+        Self: 'async_trait,
+    {
+        self.deref().async_symlink(ctx, linkname, parent, name)
+    }
+
+    fn async_mknod<'a, 'b, 'c, 'async_trait>(
+        &'a self,
+        ctx: &'b Context,
+        inode: Self::Inode,
+        name: &'c CStr,
+        mode: u32,
+        rdev: u32,
+        umask: u32,
+    ) -> Pin<Box<dyn Future<Output = io::Result<Entry>> + Send + 'async_trait>>
+    where
+        'a: 'async_trait,
+        'b: 'async_trait,
+        'c: 'async_trait,
+        Self: 'async_trait,
+    {
+        self.deref()
+            .async_mknod(ctx, inode, name, mode, rdev, umask)
+    }
+
+    fn async_mkdir<'a, 'b, 'c, 'async_trait>(
+        &'a self,
+        ctx: &'b Context,
+        parent: Self::Inode,
+        name: &'c CStr,
+        mode: u32,
+        umask: u32,
+    ) -> Pin<Box<dyn Future<Output = io::Result<Entry>> + Send + 'async_trait>>
+    where
+        'a: 'async_trait,
+        'b: 'async_trait,
+        'c: 'async_trait,
+        Self: 'async_trait,
+    {
+        self.deref().async_mkdir(ctx, parent, name, mode, umask)
+    }
+
+    fn async_unlink<'a, 'b, 'c, 'async_trait>(
+        &'a self,
+        ctx: &'b Context,
+        parent: Self::Inode,
+        name: &'c CStr,
+    ) -> Pin<Box<dyn Future<Output = io::Result<()>> + Send + 'async_trait>>
+    where
+        'a: 'async_trait,
+        'b: 'async_trait,
+        'c: 'async_trait,
+        Self: 'async_trait,
+    {
+        self.deref().async_unlink(ctx, parent, name)
+    }
+
+    fn async_rmdir<'a, 'b, 'c, 'async_trait>(
+        &'a self,
+        ctx: &'b Context,
+        parent: Self::Inode,
+        name: &'c CStr,
+    ) -> Pin<Box<dyn Future<Output = io::Result<()>> + Send + 'async_trait>>
+    where
+        'a: 'async_trait,
+        'b: 'async_trait,
+        'c: 'async_trait,
+        Self: 'async_trait,
+    {
+        self.deref().async_rmdir(ctx, parent, name)
+    }
+
+    fn async_rename<'a, 'b, 'c, 'd, 'async_trait>(
+        &'a self,
+        ctx: &'b Context,
+        olddir: Self::Inode,
+        oldname: &'c CStr,
+        newdir: Self::Inode,
+        newname: &'d CStr,
+        flags: u32,
+    ) -> Pin<Box<dyn Future<Output = io::Result<()>> + Send + 'async_trait>>
+    where
+        'a: 'async_trait,
+        'b: 'async_trait,
+        'c: 'async_trait,
+        'd: 'async_trait,
+        Self: 'async_trait,
+    {
+        self.deref()
+            .async_rename(ctx, olddir, oldname, newdir, newname, flags)
+    }
+
+    fn async_link<'a, 'b, 'c, 'async_trait>(
+        &'a self,
+        ctx: &'b Context,
+        inode: Self::Inode,
+        newparent: Self::Inode,
+        newname: &'c CStr,
+    ) -> Pin<Box<dyn Future<Output = io::Result<Entry>> + Send + 'async_trait>>
+    where
+        'a: 'async_trait,
+        'b: 'async_trait,
+        'c: 'async_trait,
+        Self: 'async_trait,
+    {
+        self.deref().async_link(ctx, inode, newparent, newname)
+    }
+
+    fn async_statfs<'a, 'b, 'async_trait>(
+        &'a self,
+        ctx: &'b Context,
+        inode: Self::Inode,
+    ) -> Pin<Box<dyn Future<Output = io::Result<statvfs64>> + Send + 'async_trait>>
+    where
+        'a: 'async_trait,
+        'b: 'async_trait,
+        Self: 'async_trait,
+    {
+        self.deref().async_statfs(ctx, inode)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn async_release<'a, 'b, 'async_trait>(
+        &'a self,
+        ctx: &'b Context,
+        inode: Self::Inode,
+        flags: u32,
+        handle: Self::Handle,
+        flush: bool,
+        flock_release: bool,
+        lock_owner: Option<u64>,
+    ) -> Pin<Box<dyn Future<Output = io::Result<()>> + Send + 'async_trait>>
+    where
+        'a: 'async_trait,
+        'b: 'async_trait,
+        Self: 'async_trait,
+    {
+        self.deref()
+            .async_release(ctx, inode, flags, handle, flush, flock_release, lock_owner)
+    }
+
+    fn async_setxattr<'a, 'b, 'c, 'd, 'async_trait>(
+        &'a self,
+        ctx: &'b Context,
+        inode: Self::Inode,
+        name: &'c CStr,
+        value: &'d [u8],
+        flags: u32,
+    ) -> Pin<Box<dyn Future<Output = io::Result<()>> + Send + 'async_trait>>
+    where
+        'a: 'async_trait,
+        'b: 'async_trait,
+        'c: 'async_trait,
+        'd: 'async_trait,
+        Self: 'async_trait,
+    {
+        self.deref().async_setxattr(ctx, inode, name, value, flags)
+    }
+
+    fn async_getxattr<'a, 'b, 'c, 'async_trait>(
+        &'a self,
+        ctx: &'b Context,
+        inode: Self::Inode,
+        name: &'c CStr,
+        size: u32,
+    ) -> Pin<Box<dyn Future<Output = io::Result<GetxattrReply>> + Send + 'async_trait>>
+    where
+        'a: 'async_trait,
+        'b: 'async_trait,
+        'c: 'async_trait,
+        Self: 'async_trait,
+    {
+        self.deref().async_getxattr(ctx, inode, name, size)
+    }
+
+    fn async_listxattr<'a, 'b, 'async_trait>(
+        &'a self,
+        ctx: &'b Context,
+        inode: Self::Inode,
+        size: u32,
+    ) -> Pin<Box<dyn Future<Output = io::Result<ListxattrReply>> + Send + 'async_trait>>
+    where
+        'a: 'async_trait,
+        'b: 'async_trait,
+        Self: 'async_trait,
+    {
+        self.deref().async_listxattr(ctx, inode, size)
+    }
+
+    fn async_removexattr<'a, 'b, 'c, 'async_trait>(
+        &'a self,
+        ctx: &'b Context,
+        inode: Self::Inode,
+        name: &'c CStr,
+    ) -> Pin<Box<dyn Future<Output = io::Result<()>> + Send + 'async_trait>>
+    where
+        'a: 'async_trait,
+        'b: 'async_trait,
+        'c: 'async_trait,
+        Self: 'async_trait,
+    {
+        self.deref().async_removexattr(ctx, inode, name)
+    }
+
+    fn async_flush<'a, 'b, 'async_trait>(
+        &'a self,
+        ctx: &'b Context,
+        inode: Self::Inode,
+        handle: Self::Handle,
+        lock_owner: u64,
+    ) -> Pin<Box<dyn Future<Output = io::Result<()>> + Send + 'async_trait>>
+    where
+        'a: 'async_trait,
+        'b: 'async_trait,
+        Self: 'async_trait,
+    {
+        self.deref().async_flush(ctx, inode, handle, lock_owner)
+    }
+
+    fn async_access<'a, 'b, 'async_trait>(
+        &'a self,
+        ctx: &'b Context,
+        inode: Self::Inode,
+        mask: u32,
+    ) -> Pin<Box<dyn Future<Output = io::Result<()>> + Send + 'async_trait>>
+    where
+        'a: 'async_trait,
+        'b: 'async_trait,
+        Self: 'async_trait,
+    {
+        self.deref().async_access(ctx, inode, mask)
+    }
+
+    fn async_lseek<'a, 'b, 'async_trait>(
+        &'a self,
+        ctx: &'b Context,
+        inode: Self::Inode,
+        handle: Self::Handle,
+        offset: u64,
+        whence: u32,
+    ) -> Pin<Box<dyn Future<Output = io::Result<u64>> + Send + 'async_trait>>
+    where
+        'a: 'async_trait,
+        'b: 'async_trait,
+        Self: 'async_trait,
+    {
+        self.deref().async_lseek(ctx, inode, handle, offset, whence)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn async_copy_file_range<'a, 'b, 'async_trait>(
+        &'a self,
+        ctx: &'b Context,
+        inode_in: Self::Inode,
+        fh_in: Self::Handle,
+        offset_in: u64,
+        inode_out: Self::Inode,
+        fh_out: Self::Handle,
+        offset_out: u64,
+        len: u64,
+        flags: u64,
+    ) -> Pin<Box<dyn Future<Output = io::Result<u32>> + Send + 'async_trait>>
+    where
+        'a: 'async_trait,
+        'b: 'async_trait,
+        Self: 'async_trait,
+    {
+        self.deref().async_copy_file_range(
+            ctx, inode_in, fh_in, offset_in, inode_out, fh_out, offset_out, len, flags,
+        )
+    }
 }
 
 #[cfg(test)]
@@ -1300,6 +1606,10 @@ mod tests {
     impl FileSystem for SyncFs {
         type Inode = u64;
         type Handle = u64;
+
+        fn readlink(&self, _ctx: &Context, _inode: u64) -> io::Result<Vec<u8>> {
+            Ok(b"target".to_vec())
+        }
 
         fn lookup(&self, _ctx: &Context, parent: u64, _name: &CStr) -> io::Result<Entry> {
             Ok(Entry {
@@ -1460,6 +1770,20 @@ mod tests {
 
         // Without a sync handler, the default still returns ENOSYS.
         let err = fs.async_getattr(&ctx, 2, None).await.unwrap_err();
+        assert_eq!(err.raw_os_error(), Some(libc::ENOSYS));
+    }
+
+    #[tokio::test]
+    async fn test_node_defaults_call_sync_handlers() {
+        let fs = SyncFs;
+        let ctx = Context::default();
+
+        assert_eq!(fs.async_readlink(&ctx, 2).await.unwrap(), b"target");
+        // statfs() has a default of its own, which the async default returns.
+        assert_eq!(fs.async_statfs(&ctx, 1).await.unwrap().f_namemax, 255);
+        // Without a sync handler, the default still returns ENOSYS.
+        let name = CStr::from_bytes_with_nul(b"file\0").unwrap();
+        let err = fs.async_unlink(&ctx, 1, name).await.unwrap_err();
         assert_eq!(err.raw_os_error(), Some(libc::ENOSYS));
     }
 
