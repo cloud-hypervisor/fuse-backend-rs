@@ -19,7 +19,7 @@ implementations is future work.
 
 | Feature | Effect |
 | --- | --- |
-| `async-io` | Experimental asynchronous IO path. The async handlers currently relay to their synchronous counterparts, so blocking syscalls run on the async runtime. Linux-only: it builds on `preadv2`/`RWF_NOWAIT` and io_uring. |
+| `async-io` | Experimental asynchronous IO path. READ and WRITE use asynchronous IO. The other async handlers call the synchronous ones, on the async runtime or, with `enable_async_thread_pool()`, on its blocking thread pool. Linux-only, because it builds on `preadv2`/`RWF_NOWAIT` and io_uring. |
 | `virtiofs` | Compile the DAX-window callbacks (`setupmapping`/`removemapping`) that operate on core's virtio-fs ABI types. Forwarded from the umbrella crate. |
 
 ## Usage
