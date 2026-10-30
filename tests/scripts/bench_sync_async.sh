@@ -97,13 +97,30 @@ kernel_at_least() {
 }
 
 # The metadata workloads keep NRFILES files open at once, and the daemon
-# holds an open handle per file as well, but the default soft fd limit of
-# GitHub-hosted runners (1024) is far too low for that, so raise the soft
-# limit to the hard limit; fio otherwise fails with
-# "try reducing/setting openfiles". Note that fio and the daemon each need
-# NRFILES descriptors, so the hard limit must cover both.
-if ! ulimit -S -n "$(ulimit -H -n)"; then
-    echo "warning: could not raise the fd limit" >&2
+# holds an open handle per file as well, so fio and the daemon each need
+# NRFILES descriptors. Raise the soft limit to the hard limit, and then the
+# hard limit itself when the caller may raise it (root can, up to
+# fs.nr_open), because the hard limit of the current GitHub-hosted runners
+# (32768 since the Ubuntu 26.04 image) cannot hold the default NRFILES and
+# fio fails with "try reducing/setting openfiles". Without the privilege
+# to raise the hard limit, shrink NRFILES to what fits instead of failing.
+FD_HARD=$(ulimit -H -n)
+[ "${FD_HARD}" = "unlimited" ] && FD_HARD=1048576
+ulimit -S -n "${FD_HARD}" 2>/dev/null ||
+    echo "warning: could not raise the soft fd limit" >&2
+NRFILES_NEEDED=$((2 * NRFILES + 1024))
+if [ "${FD_HARD}" -lt "${NRFILES_NEEDED}" ]; then
+    if ulimit -H -n "${NRFILES_NEEDED}" 2>/dev/null &&
+        ulimit -S -n "${NRFILES_NEEDED}" 2>/dev/null; then
+        :
+    else
+        NRFILES=$(((FD_HARD - 1024) / 2))
+        if [ "${NRFILES}" -lt 100 ]; then
+            echo "error: fd hard limit ${FD_HARD} is too small for the metadata workloads" >&2
+            exit 1
+        fi
+        echo "warning: fd hard limit too small, reducing NRFILES to ${NRFILES}" >&2
+    fi
 fi
 
 echo "results directory: ${RESULTS_DIR}"
