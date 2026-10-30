@@ -38,8 +38,8 @@ use fuse_backend_core::abi::fuse_abi::{InHeader, Opcode, OutHeader, ReadIn};
 use fuse_backend_core::abi::fuse_uring::{
     FuseUringBufpool, FuseUringCmdReq, FuseUringEntInOut, FuseUringReqHeader,
     FUSE_IO_URING_CMD_ADD_BUFPOOL, FUSE_IO_URING_CMD_ADD_QUEUE, FUSE_IO_URING_CMD_COMMIT_AND_FETCH,
-    FUSE_IO_URING_CMD_REGISTER, FUSE_URING_ENT_ZERO_COPY, FUSE_URING_IN_OUT_HEADER_SZ,
-    FUSE_URING_IOV_SEGS, FUSE_URING_ZERO_COPY,
+    FUSE_IO_URING_CMD_REGISTER, FUSE_URING_ENT_ZERO_COPY, FUSE_URING_IOV_SEGS,
+    FUSE_URING_OP_IN_OUT_SZ, FUSE_URING_ZERO_COPY,
 };
 use fuse_backend_core::api::filesystem::FileSystem;
 use fuse_backend_core::api::server::Server;
@@ -52,7 +52,7 @@ use vm_memory::bitmap::BitmapSlice;
 use vm_memory::mmap::MmapRegion;
 
 use crate::serving::{FuseServing, WorkerSet};
-use crate::{FuseBuf, FuseChannel, FuseDevReaderExt, FuseSession, FUSE_HEADER_SIZE};
+use crate::{FuseChannel, FuseDevReaderExt, FuseSession, FUSE_HEADER_SIZE};
 
 /// Size of `fuse_in_header`/`fuse_out_header` on the wire.
 const IN_HEADER_SIZE: usize = 40;
@@ -1222,12 +1222,29 @@ enum Payload {
     Pool(Arc<BufPools>),
 }
 
-/// One ring entry: the memory areas the kernel reads/writes plus scratch
-/// regions used to reassemble requests and collect replies.
+/// Size of an entry's request scratch: the in header plus the largest fixed
+/// arguments a request can carry in `op_in`.
+const REQ_SCRATCH_SIZE: usize = IN_HEADER_SIZE + FUSE_URING_OP_IN_OUT_SZ;
+
+/// A request the kernel delivered into a ring entry, with the Reader over it
+/// and the UringWriter for its reply. Both borrow the entry.
+struct Request<'a> {
+    unique: u64,
+    /// The largest reply body the request may stage.
+    reply_cap: usize,
+    reader: Reader<'a, ()>,
+    writer: UringWriter<'a, ()>,
+    /// How the client pages of a zero-copy request move its data. The
+    /// caller attaches them to the reader or the writer.
+    zero_copy: Option<ZeroCopyKind>,
+}
+
+/// One ring entry: the memory areas the kernel reads and writes, plus a scratch
+/// region used to reassemble the request header and fixed arguments.
 struct UringEntry {
     qid: u16,
     /// Single allocation, laid out as
-    /// [FuseUringReqHeader][own payload area][request scratch][reply scratch].
+    /// [FuseUringReqHeader][own payload area][request scratch of REQ_SCRATCH_SIZE].
     mem: Box<[u8]>,
     payload: Payload,
     /// The slot of the worker's buffer table where the kernel registers the
@@ -1244,9 +1261,8 @@ impl UringEntry {
             Payload::Own(cap) => cap,
             Payload::Pool(_) => 0,
         };
-        let scratch = FUSE_HEADER_SIZE + own_cap;
         let header_len = std::mem::size_of::<FuseUringReqHeader>();
-        let mem = vec![0u8; header_len + own_cap + 2 * scratch].into_boxed_slice();
+        let mem = vec![0u8; header_len + own_cap + REQ_SCRATCH_SIZE].into_boxed_slice();
         let base = mem.as_ptr();
         // A queue with a buffer pool takes no payload buffer at REGISTER.
         let own_payload = if own_cap == 0 {
@@ -1333,18 +1349,150 @@ impl UringEntry {
     /// `COMMIT_AND_FETCH` hands the client a proper error instead of the
     /// request data still sitting in the entry areas.
     fn stage_error_reply(&mut self, errno: i32) {
-        let header = self.header_mut();
-        let mut in_hdr = InHeader::default();
-        in_hdr
-            .as_mut_slice()
-            .copy_from_slice(&header.in_out[..IN_HEADER_SIZE]);
+        // A partial reply may have overwritten the in header by now, but the
+        // out header keeps `unique` at the same offset.
         let out = OutHeader {
             len: OUT_HEADER_SIZE as u32,
             error: -errno,
-            unique: in_hdr.unique,
+            unique: self.in_header().unique,
         };
+        let header = self.header_mut();
         header.in_out[..OUT_HEADER_SIZE].copy_from_slice(out.as_slice());
         header.ring_ent_in_out.payload_sz = 0;
+    }
+
+    /// The header of the request the kernel delivered into this entry.
+    fn in_header(&self) -> InHeader {
+        let mut hdr = InHeader::default();
+        hdr.as_mut_slice()
+            .copy_from_slice(&self.header().in_out[..IN_HEADER_SIZE]);
+        hdr
+    }
+
+    /// How the client pages of the delivered zero-copy request with
+    /// `opcode` and `payload_sz` move its data.
+    fn zero_copy_kind(&self, opcode: u32, payload_sz: usize) -> Result<ZeroCopyKind> {
+        if opcode == Opcode::Read as u32 {
+            // The kernel lends no payload buffer, and the reply data is
+            // ReadIn.size bytes at most.
+            let read_in = ReadIn::from_slice(&self.header().op_in[..size_of::<ReadIn>()])
+                .ok_or_else(|| SessionFailure("uring: malformed zero-copy READ".into()))?;
+            Ok(ZeroCopyKind::Read {
+                cap: read_in.size as usize,
+            })
+        } else if opcode == Opcode::Write as u32 {
+            // The kernel lends a payload buffer for WriteOut, and payload_sz
+            // counts the data in the client pages.
+            Ok(ZeroCopyKind::Write { len: payload_sz })
+        } else {
+            Err(SessionFailure(format!(
+                "uring: zero-copy request with opcode {opcode}"
+            )))
+        }
+    }
+
+    /// Check the request the kernel delivered into this entry, and build
+    /// the Reader over it and the UringWriter for its reply.
+    ///
+    /// This copies the in header and the fixed arguments behind it into the
+    /// request scratch. The payload stays in the payload buffer, the
+    /// entry's own or the one the kernel lent it, and the Reader reads it
+    /// there. The writer puts the reply header into the `in_out` slot and
+    /// the reply body into the payload buffer, so nothing is copied
+    /// afterwards. Returns `None` if the entry already holds the reply.
+    fn request(&mut self) -> Result<Option<Request<'_>>> {
+        let in_header = self.in_header();
+        // Answer an opcode the table doesn't know with ENOSYS here, rather
+        // than dispatch it without its arguments. The kernel then stops
+        // sending it, as it does with FUSE_STATX.
+        let Some((args_len, has_out_args)) = op_args(in_header.opcode) else {
+            self.stage_error_reply(libc::ENOSYS);
+            return Ok(None);
+        };
+        let ent_in_out = self.header().ring_ent_in_out;
+        let zero_copy = if ent_in_out.flags & FUSE_URING_ENT_ZERO_COPY == 0 {
+            None
+        } else {
+            Some(self.zero_copy_kind(in_header.opcode, ent_in_out.payload_sz as usize)?)
+        };
+        let payload_sz = match zero_copy {
+            // The payload buffer holds no data of a zero-copy WRITE.
+            Some(ZeroCopyKind::Write { .. }) => 0,
+            _ => ent_in_out.payload_sz as usize,
+        };
+        let (payload_buf, payload_cap, zc_cap) = match zero_copy {
+            // A zero-copy READ has no payload buffer, even when it asks for
+            // 0 bytes.
+            Some(ZeroCopyKind::Read { cap }) => (NonNull::dangling(), 0, cap),
+            _ => {
+                let (buf, cap) = self.payload_buffer(has_out_args, payload_sz)?;
+                (buf, cap, 0)
+            }
+        };
+        if args_len > FUSE_URING_OP_IN_OUT_SZ || payload_sz > payload_cap {
+            return Err(SessionFailure(format!(
+                "uring: malformed request, opcode {} args {} payload {}",
+                in_header.opcode, args_len, payload_sz
+            )));
+        }
+        let header_len = std::mem::size_of::<FuseUringReqHeader>();
+        let own_cap = self.own_cap();
+        let base = self.mem.as_mut_ptr();
+        // Safe because the entry allocation holds the request header, then
+        // the own payload area, then the request scratch, which fits the in
+        // header plus the largest fixed arguments checked above. The payload
+        // buffer is the own area or a pool buffer the kernel lent the entry,
+        // which the kernel doesn't touch until the entry commits.
+        //
+        // The Reader's payload and the Writer's body are mutable slices over
+        // the same payload buffer, which Rust's aliasing rules don't allow.
+        // This relies on the server parsing the whole request before it
+        // writes the reply. Removing the overlap needs Reader and Writer
+        // APIs over raw pointers.
+        let (scratch, payload, out_header, body) = unsafe {
+            let header = &*(base as *const FuseUringReqHeader);
+            let scratch = std::slice::from_raw_parts_mut(
+                base.add(header_len + own_cap),
+                IN_HEADER_SIZE + args_len,
+            );
+            scratch[..IN_HEADER_SIZE].copy_from_slice(in_header.as_slice());
+            scratch[IN_HEADER_SIZE..].copy_from_slice(&header.op_in[..args_len]);
+            (
+                scratch,
+                std::slice::from_raw_parts_mut(payload_buf.as_ptr(), payload_sz),
+                std::slice::from_raw_parts_mut(base, OUT_HEADER_SIZE),
+                std::slice::from_raw_parts_mut(payload_buf.as_ptr(), payload_cap),
+            )
+        };
+
+        let reader = Reader::from_uring_buffers(scratch, payload)?;
+        Ok(Some(Request {
+            unique: in_header.unique,
+            reply_cap: payload_cap + zc_cap,
+            reader,
+            writer: UringWriter::new(out_header, body),
+            zero_copy,
+        }))
+    }
+
+    /// Record the size of the staged reply, `total` bytes including the
+    /// reply header, whose body may take `reply_cap` bytes. `unique` names
+    /// the request in errors.
+    fn finish(&mut self, unique: u64, reply_cap: usize, total: usize) -> Result<()> {
+        // Forget-like requests have no reply.
+        let payload_len = match total {
+            0 => 0,
+            n if (OUT_HEADER_SIZE..=OUT_HEADER_SIZE + reply_cap).contains(&n) => {
+                n - OUT_HEADER_SIZE
+            }
+            n => {
+                return Err(SessionFailure(format!(
+                    "uring: malformed reply of {n} bytes for unique 0x{unique:x}"
+                )))
+            }
+        };
+        self.header_mut().ring_ent_in_out.payload_sz = payload_len as u32;
+        Ok(())
     }
 }
 
@@ -1727,217 +1875,57 @@ impl<F: FileSystem + Send + Sync + 'static> UringWorker<F> {
         result
     }
 
-    /// Handle one delivered request: reassemble the header/args in the
-    /// request scratch, dispatch to the server with scatter types that
-    /// reference the entry's payload area directly (zero-copy on the data
-    /// path), and stage the reply straight into the entry areas.
+    /// Serve the request delivered into `entry` and stage its reply there.
     ///
     /// The client pages of a zero-copy request stay with the kernel, and
     /// fixed-buffer operations on `ring` move the data between them and the
-    /// file. Ring completions that arrive meanwhile go to `stash`.
+    /// file. Ring completions that arrive meanwhile go to `completions`.
     fn process(
         &self,
         entry: &mut UringEntry,
         ring: &mut FuseRing,
         completions: &mut Completions,
     ) -> Result<()> {
-        let in_header: InHeader = {
-            let header = entry.header();
-            let mut hdr = InHeader::default();
-            hdr.as_mut_slice()
-                .copy_from_slice(&header.in_out[..IN_HEADER_SIZE]);
-            hdr
-        };
-        // Answer an opcode the table doesn't know with ENOSYS here, rather
-        // than dispatch it without its arguments. The kernel then stops
-        // sending it, as it does with FUSE_STATX.
-        let Some((args_len, has_out_args)) = op_args(in_header.opcode) else {
-            entry.stage_error_reply(libc::ENOSYS);
+        let slot = entry.zero_copy_slot;
+        let Some(Request {
+            unique,
+            reply_cap,
+            reader,
+            writer,
+            zero_copy,
+        }) = entry.request()?
+        else {
             return Ok(());
         };
-        let ent_in_out = entry.header().ring_ent_in_out;
-        let payload_sz = ent_in_out.payload_sz as usize;
-        if ent_in_out.flags & FUSE_URING_ENT_ZERO_COPY == 0 {
-            return self.process_copied(entry, in_header, args_len, has_out_args, payload_sz, None);
-        }
-
-        let kind = if in_header.opcode == Opcode::Read as u32 {
-            // The kernel lends no payload buffer, and the reply data is
-            // ReadIn.size bytes at most.
-            let read_in = ReadIn::from_slice(&entry.header().op_in[..size_of::<ReadIn>()])
-                .ok_or_else(|| SessionFailure("uring: malformed zero-copy READ".into()))?;
-            ZeroCopyKind::Read {
-                cap: read_in.size as usize,
+        let zc_io;
+        let (reader, writer) = match zero_copy {
+            None => (reader, writer),
+            Some(kind) => {
+                let (Some(slot), Some(bounce)) = (slot, self.bounce.as_ref()) else {
+                    return Err(SessionFailure(
+                        "uring: zero-copy request on a worker without zero-copy".into(),
+                    ));
+                };
+                #[cfg(test)]
+                ZERO_COPY_REQUESTS.fetch_add(1, Ordering::Relaxed);
+                zc_io = ZeroCopyIo {
+                    ring: Mutex::new((ring, completions)),
+                    slot,
+                    bounce: Mutex::new(bounce),
+                };
+                match kind {
+                    ZeroCopyKind::Write { len } => (reader.with_zero_copy(&zc_io, len), writer),
+                    ZeroCopyKind::Read { cap } => (reader, writer.with_zero_copy(&zc_io, cap)),
+                }
             }
-        } else if in_header.opcode == Opcode::Write as u32 {
-            // The kernel lends a payload buffer for WriteOut, and payload_sz
-            // counts the data in the client pages.
-            ZeroCopyKind::Write { len: payload_sz }
-        } else {
-            return Err(SessionFailure(format!(
-                "uring: zero-copy request with opcode {}",
-                in_header.opcode
-            )));
         };
-        let (Some(slot), Some(bounce)) = (entry.zero_copy_slot, self.bounce.as_ref()) else {
-            return Err(SessionFailure(
-                "uring: zero-copy request on a worker without zero-copy".into(),
-            ));
-        };
-        #[cfg(test)]
-        ZERO_COPY_REQUESTS.fetch_add(1, Ordering::Relaxed);
-        let zc_io = ZeroCopyIo {
-            ring: Mutex::new((ring, completions)),
-            slot,
-            bounce: Mutex::new(bounce),
-        };
-        // The payload buffer holds no data of a zero-copy WRITE.
-        let payload_sz = match kind {
-            ZeroCopyKind::Write { .. } => 0,
-            ZeroCopyKind::Read { .. } => payload_sz,
-        };
-        self.process_copied(
-            entry,
-            in_header,
-            args_len,
-            has_out_args,
-            payload_sz,
-            Some((&zc_io, kind)),
-        )
-    }
-
-    /// Serve the request in `entry` whose payload buffer holds `payload_sz`
-    /// bytes, and move the data of a zero-copy request through `zero_copy`.
-    fn process_copied(
-        &self,
-        entry: &mut UringEntry,
-        in_header: InHeader,
-        args_len: usize,
-        has_out_args: bool,
-        payload_sz: usize,
-        zero_copy: Option<(&ZeroCopyIo<'_>, ZeroCopyKind)>,
-    ) -> Result<()> {
-        let zc_cap = match zero_copy {
-            Some((_, ZeroCopyKind::Read { cap })) => cap,
-            _ => 0,
-        };
-        let (payload_buf, payload_cap) = match zero_copy {
-            // A zero-copy READ has no payload buffer, even when it asks for
-            // 0 bytes.
-            Some((_, ZeroCopyKind::Read { .. })) => (NonNull::dangling(), 0),
-            _ => entry.payload_buffer(has_out_args, payload_sz)?,
-        };
-        if args_len > FUSE_URING_IN_OUT_HEADER_SZ || payload_sz > payload_cap {
-            return Err(SessionFailure(format!(
-                "uring: malformed request, opcode {} args {} payload {}",
-                in_header.opcode, args_len, payload_sz
-            )));
-        }
-
-        let header_len = std::mem::size_of::<FuseUringReqHeader>();
-        let own_cap = entry.own_cap();
-        let scratch = FUSE_HEADER_SIZE + own_cap;
-        let base = entry.mem.as_mut_ptr();
-
-        // Assemble only the small header/args portion in the request scratch
-        // region (40 + args_len bytes). The payload (up to ~128K for large
-        // writes) stays in the entry's payload area and is read directly by
-        // the scatter Reader, eliminating the per-request payload memcpy.
-        //
-        // Safe because the slices below address disjoint regions of the
-        // entry allocation and live for the duration of this function only.
-        unsafe {
-            let header = &*(base as *const FuseUringReqHeader);
-            let req_scratch =
-                std::slice::from_raw_parts_mut(base.add(header_len + own_cap), scratch);
-            let mut off = 0;
-            req_scratch[off..off + IN_HEADER_SIZE]
-                .copy_from_slice(&header.in_out[..IN_HEADER_SIZE]);
-            off += IN_HEADER_SIZE;
-            req_scratch[off..off + args_len].copy_from_slice(&header.op_in[..args_len]);
-        }
-
-        let total = {
-            // Build a scatter Reader:
-            //   Buffer 1 (header scratch): InHeader + opcode args
-            //   Buffer 2 (payload buffer): request payload — only when
-            //     payload_sz > 0, avoiding a copy of up to ~128K.
-            //
-            // Build a scatter Writer:
-            //   Header slot (entry.in_out): fuse_out_header (16 bytes)
-            //   Body slot (payload buffer): reply body
-            // Both are written in place — no post-copy after handle_message.
-            let header_args_len = IN_HEADER_SIZE + args_len;
-            let header_scratch = unsafe {
-                std::slice::from_raw_parts_mut(base.add(header_len + own_cap), header_args_len)
-            };
-
-            let reader = if payload_sz > 0 {
-                // SAFETY: The Reader's buffer 2 and the Writer's body below
-                // both cover the payload buffer, the entry's own or the one
-                // the kernel lent it, which the kernel doesn't touch until
-                // the entry commits.
-                // This is technically overlapping mutable borrows, but is
-                // sound because:
-                //   (1) The Reader is fully consumed during argument parsing
-                //       (before handle_message returns).
-                //   (2) The Writer only writes to the payload area during
-                //       reply construction (after the Reader is consumed).
-                //   (3) Both slices are constructed via raw pointers inside
-                //       unsafe blocks, so the borrow checker doesn't track
-                //       them across the handle_message call.
-                // A future refactor could eliminate this by using raw
-                // pointers in both Reader and Writer APIs.
-                let entry_payload =
-                    unsafe { std::slice::from_raw_parts_mut(payload_buf.as_ptr(), payload_sz) };
-                Reader::<()>::from_uring_buffers(header_scratch, entry_payload)?
-            } else {
-                Reader::<()>::from_fuse_buffer(FuseBuf::new(header_scratch))?
-            };
-            let reader = match zero_copy {
-                Some((zc_io, ZeroCopyKind::Write { len })) => reader.with_zero_copy(zc_io, len),
-                _ => reader,
-            };
-
-            // The reply header goes into entry.in_out[0..OUT_HEADER_SIZE] and
-            // the reply body goes directly into the payload buffer.
-            // See SAFETY comment above regarding overlap with Reader's buffer 2.
-            let in_out_header = unsafe { std::slice::from_raw_parts_mut(base, OUT_HEADER_SIZE) };
-            let payload_area =
-                unsafe { std::slice::from_raw_parts_mut(payload_buf.as_ptr(), payload_cap) };
-            let writer = UringWriter::<()>::new(in_out_header, payload_area);
-            let writer = match zero_copy {
-                Some((zc_io, ZeroCopyKind::Read { cap })) => writer.with_zero_copy(zc_io, cap),
-                _ => writer,
-            };
-
-            self.server
-                .handle_message(reader, writer, None, None)
-                .map_err(|e| {
-                    SessionFailure(format!(
-                        "uring: handle message unique 0x{:x}: {}",
-                        in_header.unique, e
-                    ))
-                })?
-        };
-
-        if total > 0 {
-            // The scatter writer already placed the reply directly in the
-            // entry areas; just record the payload size and validate.
-            if total < OUT_HEADER_SIZE || total > OUT_HEADER_SIZE + payload_cap + zc_cap {
-                return Err(SessionFailure(format!(
-                    "uring: malformed reply of {} bytes for unique 0x{:x}",
-                    total, in_header.unique
-                )));
-            }
-            let payload_len = total - OUT_HEADER_SIZE;
-            entry.header_mut().ring_ent_in_out.payload_sz = payload_len as u32;
-        } else {
-            // Forget-like requests carry no reply.
-            entry.header_mut().ring_ent_in_out.payload_sz = 0;
-        }
-
-        Ok(())
+        let total = self
+            .server
+            .handle_message(reader, writer, None, None)
+            .map_err(|e| {
+                SessionFailure(format!("uring: handle message unique 0x{unique:x}: {e}"))
+            })?;
+        entry.finish(unique, reply_cap, total)
     }
 }
 
@@ -2537,7 +2525,7 @@ mod tests {
         assert_eq!(entry.qid, 3);
 
         let header_len = std::mem::size_of::<FuseUringReqHeader>();
-        let total = header_len + payload_cap + 2 * (FUSE_HEADER_SIZE + payload_cap);
+        let total = header_len + payload_cap + REQ_SCRATCH_SIZE;
         assert_eq!(entry.mem.len(), total);
 
         // The iovec array must describe the header and payload areas of the
