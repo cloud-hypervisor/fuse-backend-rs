@@ -27,7 +27,7 @@ use std::fmt;
 use std::io;
 use std::io::{Error, Result};
 use std::ops::Deref;
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -280,6 +280,11 @@ pub struct Vfs {
     opts: ArcSwap<VfsOptions>,
     initialized: AtomicBool,
     lock: Mutex<()>,
+    // Each mount's FUSE generation, by fs index. A reused index gets a new one, so the kernel
+    // discards an inode it still holds from the index's previous file system
+    // (`fuse_stale_inode()`) instead of serving its cached pages and attributes for the new one.
+    generations: Vec<AtomicU32>,
+    next_generation: AtomicU32,
     remove_pseudo_root: bool,
     id_mapping: Option<(u32, u32, u32)>,
 }
@@ -301,6 +306,8 @@ impl Vfs {
             root: PseudoFs::new(),
             opts: ArcSwap::new(Arc::new(opts)),
             lock: Mutex::new(()),
+            generations: (0..MAX_VFS_INDEX).map(|_| AtomicU32::new(0)).collect(),
+            next_generation: AtomicU32::new(1),
             initialized: AtomicBool::new(false),
             remove_pseudo_root: false,
             id_mapping: match opts.id_mapping.2 {
@@ -402,6 +409,8 @@ impl Vfs {
             mappings[index as usize] = id_mapping;
             self.mount_id_mappings.store(Arc::new(mappings));
         }
+        // `restore_mount` keeps the generation persisted for its index instead.
+        self.generations[index as usize].store(self.new_generation(), Ordering::Release);
         self.insert_mount_locked(fs, entry, index, path)
             .map_err(VfsError::Mount)?;
 
@@ -547,10 +556,33 @@ impl Vfs {
         self.id_mapping
     }
 
+    /// A generation for a new mount: nonzero, so it differs from the pseudo file system's and
+    /// from snapshots that predate generations, and within the kernel's 32-bit `i_generation`.
+    fn new_generation(&self) -> u32 {
+        match self.next_generation.fetch_add(1, Ordering::Relaxed) {
+            0 => self.next_generation.fetch_add(1, Ordering::Relaxed),
+            generation => generation,
+        }
+    }
+
+    /// The FUSE generation of the entries `fs_idx`'s file system returns: its mount's, or 0 for
+    /// the pseudo file system. Every reply about a node id must carry the same generation, or the
+    /// kernel marks the inode bad (`fuse_stale_inode()`), so all of them go through
+    /// `convert_entry()`.
+    fn generation(&self, fs_idx: VfsIndex) -> u64 {
+        if fs_idx == VFS_PSEUDO_FS_IDX {
+            0
+        } else {
+            u64::from(self.generations[fs_idx as usize].load(Ordering::Acquire))
+        }
+    }
+
     fn convert_entry(&self, fs_idx: VfsIndex, inode: u64, entry: &mut Entry) -> Result<Entry> {
         self.convert_inode(fs_idx, inode).map(|ino| {
             entry.inode = ino;
             entry.attr.st_ino = ino;
+            // A negative entry (inode 0) names no inode, so it carries no generation.
+            entry.generation = if ino == 0 { 0 } else { self.generation(fs_idx) };
             // If id_mapping is enabled, map the internal ID to the external ID.
             if let Some((internal_id, external_id, range)) = self.get_effective_id_mapping(fs_idx) {
                 entry.attr.st_uid = remap_id(entry.attr.st_uid, internal_id, external_id, range);
@@ -825,6 +857,9 @@ pub mod persist {
     ///
     /// Version 2 adds `mount_id_mappings` for per-mount id_mapping persistence.
     /// Version 1 snapshots are still loadable; missing mappings default to `None`.
+    /// Version 3 adds each mount's FUSE generation, so a restored mount replies with the
+    /// generation the kernel already holds for its inodes. Older snapshots restore every
+    /// mount with generation 0, which is what their daemons replied with.
     #[derive(Versionize, Debug)]
     struct VfsState {
         /// Vfs options
@@ -836,11 +871,23 @@ pub mod persist {
         /// per-mount id_mappings (version >= 2)
         #[version(start = 2, default_fn = "default_mount_id_mappings")]
         mount_id_mappings: Vec<Option<IdMappingState>>,
+        /// per-mount FUSE generations, by fs index (version >= 3)
+        #[version(start = 3, default_fn = "default_generations")]
+        generations: Vec<u32>,
+        /// the generation of the next mount (version >= 3)
+        #[version(start = 3, default_fn = "default_next_generation")]
+        next_generation: u32,
     }
 
     impl VfsState {
         fn default_mount_id_mappings(_source_version: u16) -> Vec<Option<IdMappingState>> {
             vec![None; super::MAX_VFS_INDEX]
+        }
+        fn default_generations(_source_version: u16) -> Vec<u32> {
+            vec![0; super::MAX_VFS_INDEX]
+        }
+        fn default_next_generation(_source_version: u16) -> u32 {
+            1
         }
     }
 
@@ -925,6 +972,10 @@ pub mod persist {
             version_map
                 .new_version()
                 .set_type_version(VfsState::type_id(), 2);
+            // Root version 3: VfsState gains per-mount FUSE generations.
+            version_map
+                .new_version()
+                .set_type_version(VfsState::type_id(), 3);
 
             // more versions for the future
 
@@ -1028,6 +1079,12 @@ pub mod persist {
                 root: root_state,
                 next_super: self.next_super.load(Ordering::SeqCst),
                 mount_id_mappings,
+                generations: self
+                    .generations
+                    .iter()
+                    .map(|g| g.load(Ordering::Acquire))
+                    .collect(),
+                next_generation: self.next_generation.load(Ordering::Relaxed),
             };
 
             let vm = Vfs::get_version_map();
@@ -1064,6 +1121,19 @@ pub mod persist {
                 .map(|m| m.map(|s| (s.internal_id, s.external_id, s.range)))
                 .collect();
             self.mount_id_mappings.store(Arc::new(mount_id_mappings));
+
+            if state.generations.len() != self.generations.len() {
+                return Err(VfsError::Persist(format!(
+                    "Vfs snapshot has {} generations, expected {}",
+                    state.generations.len(),
+                    self.generations.len()
+                )));
+            }
+            for (generation, saved) in self.generations.iter().zip(&state.generations) {
+                generation.store(*saved, Ordering::Release);
+            }
+            self.next_generation
+                .store(state.next_generation, Ordering::Relaxed);
 
             self.root
                 .restore_from_bytes(&mut state.root)
@@ -1128,6 +1198,50 @@ pub mod persist {
             assert_eq!(restored_vfs.get_effective_id_mapping(idx2), None);
         }
 
+        // After a live upgrade the kernel still holds the old daemon's inodes. A restored mount
+        // must reply with the generation they carry, or every one of them goes stale.
+        #[test]
+        fn test_vfs_save_restore_keeps_generations() {
+            use crate::tests::{FakeFileSystemOne, FakeFileSystemTwo};
+            use crate::{Vfs, VfsOptions};
+            use fuse_backend_core::abi::fuse_abi::ROOT_ID;
+            use fuse_backend_core::api::filesystem::{Context, FileSystem};
+            use std::ffi::CString;
+
+            let vfs = &Vfs::new(VfsOptions::default());
+            let idx1 = vfs.mount(Box::new(FakeFileSystemOne {}), "/a").unwrap();
+            let idx2 = vfs.mount(Box::new(FakeFileSystemTwo {}), "/b").unwrap();
+            let mut buf = vfs.save_to_bytes().unwrap();
+
+            let restored_vfs = &Vfs::new(VfsOptions::default());
+            restored_vfs.restore_from_bytes(&mut buf).unwrap();
+            restored_vfs
+                .restore_mount(Box::new(FakeFileSystemOne {}), idx1, "/a")
+                .unwrap();
+            restored_vfs
+                .restore_mount(Box::new(FakeFileSystemTwo {}), idx2, "/b")
+                .unwrap();
+            let ctx = Context::new();
+            let root = |vfs: &Vfs, name: &str| {
+                vfs.lookup(&ctx, ROOT_ID.into(), CString::new(name).unwrap().as_c_str())
+                    .unwrap()
+            };
+            for name in ["a", "b"] {
+                let (before, after) = (root(vfs, name), root(restored_vfs, name));
+                assert_eq!(after.inode, before.inode);
+                assert_ne!(before.generation, 0);
+                assert_eq!(after.generation, before.generation, "/{name}");
+            }
+
+            // A mount after the restore still gets a generation no earlier mount had.
+            let idx3 = restored_vfs
+                .mount(Box::new(FakeFileSystemOne {}), "/c")
+                .unwrap();
+            let generation = restored_vfs.generation(idx3);
+            assert_ne!(generation, vfs.generation(idx1));
+            assert_ne!(generation, vfs.generation(idx2));
+        }
+
         // Snapshots written by the old (root version 1) format, which has no
         // mount_id_mappings, must still load: mappings default to `None`.
         #[test]
@@ -1138,6 +1252,9 @@ pub mod persist {
             };
             use crate::tests::FakeFileSystemOne;
             use crate::{Vfs, VfsOptions};
+            use fuse_backend_core::abi::fuse_abi::ROOT_ID;
+            use fuse_backend_core::api::filesystem::{Context, FileSystem};
+            use std::ffi::CString;
 
             let vfs = &Vfs::new(VfsOptions::default());
             let idx = vfs
@@ -1156,6 +1273,8 @@ pub mod persist {
                 root: root_state,
                 next_super: vfs.next_super.load(Ordering::SeqCst),
                 mount_id_mappings: Vec::new(),
+                generations: Vec::new(),
+                next_generation: 0,
             };
             let mut vm = VersionMap::new();
             vm.set_type_version(VfsState::type_id(), 1)
@@ -1172,6 +1291,17 @@ pub mod persist {
             // The per-mount mapping recorded before saving is gone; remapping
             // falls back to the (disabled) global id_mapping.
             assert_eq!(restored_vfs.get_effective_id_mapping(idx), None);
+
+            // The old daemon replied with generation 0, so a restored mount keeps replying with it.
+            restored_vfs
+                .restore_mount(Box::new(FakeFileSystemOne {}), idx, "/a")
+                .unwrap();
+            let ctx = Context::new();
+            let root = restored_vfs
+                .lookup(&ctx, ROOT_ID.into(), CString::new("a").unwrap().as_c_str())
+                .unwrap();
+            assert_ne!(root.inode, 0);
+            assert_eq!(root.generation, 0);
         }
     }
 }
@@ -1554,6 +1684,74 @@ mod tests {
             .getattr(&ctx, VfsInode(0x100_0000_0000_0001), None)
             .unwrap();
         assert_eq!(stat.st_ino, 0x100_0000_0000_0001);
+    }
+
+    #[test]
+    fn test_every_entry_of_a_mount_carries_its_generation() {
+        // The kernel marks an inode bad if two replies about it disagree (fuse_stale_inode()).
+        let vfs = Vfs::new(VfsOptions::default());
+        let ctx = Context::new();
+        let idx = vfs.mount(Box::new(FakeFileSystemTwo {}), "/x/y").unwrap();
+        let generation = vfs.generation(idx);
+        assert_ne!(generation, 0);
+
+        // The pseudo file system's entries keep generation 0.
+        let x = vfs
+            .lookup(&ctx, ROOT_ID.into(), CString::new("x").unwrap().as_c_str())
+            .unwrap();
+        assert_eq!(x.generation, 0);
+
+        // The mount's root, reached across the mountpoint, and an entry inside the mount.
+        let y = vfs
+            .lookup(&ctx, x.inode.into(), CString::new("y").unwrap().as_c_str())
+            .unwrap();
+        assert_eq!(y.generation, generation);
+        let f = vfs
+            .lookup(&ctx, y.inode.into(), CString::new("f").unwrap().as_c_str())
+            .unwrap();
+        assert_ne!(f.inode, 0);
+        assert_eq!(f.generation, generation);
+
+        // A negative entry names no inode, so it carries no generation.
+        let other = vfs.mount(Box::new(FakeFileSystemOne {}), "/n").unwrap();
+        assert_ne!(vfs.generation(other), 0);
+        let n = vfs
+            .lookup(&ctx, ROOT_ID.into(), CString::new("n").unwrap().as_c_str())
+            .unwrap();
+        let missing = vfs
+            .lookup(&ctx, n.inode.into(), CString::new("z").unwrap().as_c_str())
+            .unwrap();
+        assert_eq!((missing.inode, missing.generation), (0, 0));
+    }
+
+    #[test]
+    fn test_a_reused_fs_index_gets_a_new_generation() {
+        // A reused index gives the new file system the old one's node ids. A new generation makes
+        // the kernel discard any inode it still holds from the old one instead of reusing it.
+        let vfs = Vfs::new(VfsOptions::default());
+        let ctx = Context::new();
+        let root = |vfs: &Vfs| {
+            vfs.lookup(&ctx, ROOT_ID.into(), CString::new("a").unwrap().as_c_str())
+                .unwrap()
+        };
+        let first = vfs.mount(Box::new(FakeFileSystemOne {}), "/a").unwrap();
+        let before = root(&vfs);
+        vfs.umount("/a").unwrap();
+        vfs.next_super.store(first, Ordering::SeqCst);
+        let second = vfs.mount(Box::new(FakeFileSystemOne {}), "/a").unwrap();
+        assert_eq!(second, first);
+        let after = root(&vfs);
+        assert_eq!(after.inode, before.inode, "the same node id");
+        assert!(before.generation != 0 && after.generation != 0);
+        assert_ne!(after.generation, before.generation);
+    }
+
+    #[test]
+    fn test_new_generation_skips_zero_when_it_wraps() {
+        let vfs = Vfs::new(VfsOptions::default());
+        vfs.next_generation.store(u32::MAX, Ordering::Relaxed);
+        assert_eq!(vfs.new_generation(), u32::MAX);
+        assert_eq!(vfs.new_generation(), 1);
     }
 
     #[test]
