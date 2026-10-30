@@ -97,9 +97,9 @@ impl FileSystem for Vfs {
             },
             Err(e) => {
                 // When a directory is umount and invalidate entry, a forget request is triggered,
-                // which cannot be forwarded to the backend file system.
-                // this situation is reasonable, so it is changed to warn here
-                warn!(
+                // which cannot be forwarded to the backend file system. This is expected, and
+                // comes once for every inode the kernel had cached, so log it at debug.
+                debug!(
                     "vfs::forget: failed to get_real_rootfs {:?}, inode: {:?}, 
                        maybe it is possible that the vfs submount was dropped by umount, 
                        which is reasonable.",
