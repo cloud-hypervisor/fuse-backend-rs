@@ -220,6 +220,11 @@
   took.
 - [317](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/317): `UringWriter` implements the asynchronous `Writer` methods, so the async server can reply
   through the FUSE-over-io_uring transport.
+- [317](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/317): `UringFuseServing::new_async()` serves FUSE-over-io_uring with the `AsyncFileSystem` handlers.
+  Each worker runs an async runtime and keeps up to one request per ring entry in flight, so
+  handlers that wait don't hold up the worker's other requests.
+  Its queues get `entries_per_queue` pool buffers, because a request keeps its buffer
+  while its handler waits.
 
 ### Changed
 - [325](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/325): The `fuse-backend-fusedev` `uring` transport uses io-uring 0.6 instead of 0.5,

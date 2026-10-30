@@ -47,15 +47,15 @@ tokio = { version = "1.53.3", optional = true }
 vm-memory = { workspace = true }
 
 # Linux-only runtime dependencies: mio's epoll-backed `Poll`/`Waker` drives
-# the exit channel of the Linux session, only the asyncio module of the Linux
-# session consumes futures-util (so the `async-io` feature stays meaningful
-# on FreeBSD/macOS without dragging an unused dependency into their build
-# graphs), and only the Linux session needs vmm-sys-util at runtime
-# (ScmSocket) — the tests of every session backend use its temp files, hence
-# the dev-dependency below.
+# the exit channel of the Linux session, only its asyncio module and the
+# io_uring transport consume futures-util (so the `async-io` feature stays
+# meaningful on FreeBSD/macOS without dragging an unused dependency into
+# their build graphs), and only the Linux session needs vmm-sys-util at
+# runtime (ScmSocket) — the tests of every session backend use its temp
+# files, hence the dev-dependency below.
 [target.'cfg(target_os = "linux")'.dependencies]
 mio = { version = "0.8", features = ["os-poll", "os-ext"] }
-futures-util = { version = "0.3", optional = true, default-features = false, features = ["alloc"] }
+futures-util = { version = "0.3", optional = true, default-features = false, features = ["alloc", "std"] }
 io-uring = { version = "0.6", optional = true }
 vmm-sys-util = { workspace = true }
 
@@ -77,6 +77,7 @@ async-io = [
     "tokio/rt",
     "tokio/macros",
     "tokio/net",
+    "tokio/time",
     "fuse-backend-core/async-io",
     # The session tests mount a real `PassthroughFs`, and core's
     # `BackendFileSystem` requires `AsyncFileSystem` once core's `async-io`
