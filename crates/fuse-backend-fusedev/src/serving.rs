@@ -64,6 +64,8 @@ use std::thread::{self, JoinHandle};
 use fuse_backend_core::api::filesystem::FileSystem;
 use fuse_backend_core::api::server::Server;
 
+#[cfg(all(target_os = "linux", feature = "async-io"))]
+use crate::StopSignal;
 use crate::{Error, FuseChannelExt, FuseSession, Result};
 
 /// A running serving layer that owns a mounted [`FuseSession`].
@@ -331,6 +333,9 @@ fn svc_loop<F: FileSystem + Send + Sync + 'static, C: FuseChannelExt>(
 /// of [`WorkerSet::stop`].
 pub(crate) struct WorkerSet {
     exit: Arc<AtomicBool>,
+    // Wakes the `FuseDevTask` workers when `stop()` sets `exit`.
+    #[cfg(all(target_os = "linux", feature = "async-io"))]
+    signal: Option<StopSignal>,
     tracker: Arc<WorkerExitTracker>,
     handles: Vec<JoinHandle<()>>,
 }
@@ -339,21 +344,31 @@ impl WorkerSet {
     pub(crate) fn new() -> Self {
         WorkerSet {
             exit: Arc::new(AtomicBool::new(false)),
+            #[cfg(all(target_os = "linux", feature = "async-io"))]
+            signal: None,
             tracker: Arc::new(WorkerExitTracker::default()),
             handles: Vec::new(),
         }
     }
 
     /// The exit flag shared with every worker.
-    // Only the async and uring serving layers hand the flag to their
-    // workers, so the accessor only exists in configurations that compile
-    // one of them.
-    #[cfg(any(
-        all(target_os = "linux", feature = "async-io"),
-        all(target_os = "linux", feature = "uring")
-    ))]
+    // Only the uring serving layer hands the flag to its workers, so the
+    // accessor only exists in configurations that compile it.
+    #[cfg(all(target_os = "linux", feature = "uring"))]
     pub(crate) fn exit_flag(&self) -> Arc<AtomicBool> {
         self.exit.clone()
+    }
+
+    /// A stop signal for `FuseDevTask` workers, which sets the exit flag and
+    /// wakes them when the set stops.
+    #[cfg(all(target_os = "linux", feature = "async-io"))]
+    pub(crate) fn stop_signal(&mut self) -> Result<StopSignal> {
+        if let Some(signal) = &self.signal {
+            return Ok(signal.clone());
+        }
+        let signal = StopSignal::new(self.exit.clone())
+            .map_err(|e| Error::SessionFailure(format!("create the stop signal: {e}")))?;
+        Ok(self.signal.insert(signal).clone())
     }
 
     /// The exit tracker, for arming a guard at the top of a worker thread.
@@ -374,6 +389,10 @@ impl WorkerSet {
     /// requests are still served and replied before a worker exits.
     pub(crate) fn stop(&mut self, session: &mut FuseSession, wake: bool) {
         self.exit.store(true, Ordering::Release);
+        #[cfg(all(target_os = "linux", feature = "async-io"))]
+        if let Some(signal) = &self.signal {
+            signal.stop();
+        }
         if wake {
             let _ = session.wake();
         }

@@ -99,7 +99,13 @@ impl<F: AsyncFileSystem + Send + Sync + 'static> AsyncFuseServing<F> {
         }
 
         let mut set = WorkerSet::new();
-        let exit = set.exit_flag();
+        let exit = match set.stop_signal() {
+            Ok(signal) => signal,
+            Err(e) => {
+                set.stop(&mut session, false);
+                return Err(e);
+            }
+        };
         let tracker = set.tracker();
         let (ready_tx, ready_rx) = channel::<bool>();
         for (id, file) in files.into_iter().enumerate() {
@@ -165,11 +171,11 @@ impl<F: AsyncFileSystem + Send + Sync + 'static> AsyncFuseServing<F> {
 
 impl<F: AsyncFileSystem + Send + Sync + 'static> Drop for AsyncFuseServing<F> {
     fn drop(&mut self) {
-        // Pending reads on the workers' cloned file descriptions cannot be
-        // woken with FuseSession::wake(), which only reaches epoll-based
-        // channels: tearing the connection down completes them with ENODEV
-        // instead, which ends poll_handler(). Requests already in flight
-        // are still served and replied before a worker exits.
+        // Idle workers on the tokio runtime return once the stop signal
+        // wakes them. With tokio-uring, a pending read can't be woken, and
+        // tearing the connection down completes it with ENODEV instead,
+        // which ends poll_handler(). Requests already in flight are still
+        // served and replied before a worker exits.
         self.workers.stop(&mut self.session, false);
     }
 }

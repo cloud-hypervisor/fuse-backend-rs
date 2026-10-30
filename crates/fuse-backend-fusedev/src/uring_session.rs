@@ -1798,7 +1798,7 @@ type RunFn<F> = fn(UringWorker<F>, Arc<AtomicBool>, Sender<io::Result<()>>) -> i
 type FallbackFn<F> = fn(
     &mut FuseSession,
     Arc<Server<F>>,
-    Arc<AtomicBool>,
+    &mut WorkerSet,
 ) -> Result<Box<dyn FnOnce(Sender<()>) + Send>>;
 
 /// One io_uring based serving thread, holding ring entries of several
@@ -2800,7 +2800,7 @@ impl<F: FileSystem + Send + Sync + 'static> UringFuseServing<F> {
             }
         }
 
-        let fallback = match fallback(&mut session, server, exit.clone()) {
+        let fallback = match fallback(&mut session, server, &mut set) {
             Ok(body) => body,
             Err(e) => {
                 set.stop(&mut session, true);
@@ -2849,8 +2849,9 @@ impl<F: FileSystem + Send + Sync + 'static> UringFuseServing<F> {
     fn fallback_sync(
         session: &mut FuseSession,
         server: Arc<Server<F>>,
-        exit: Arc<AtomicBool>,
+        set: &mut WorkerSet,
     ) -> Result<Box<dyn FnOnce(Sender<()>) + Send>> {
+        let exit = set.exit_flag();
         let ch = session.new_channel()?;
         Ok(Box::new(move |ready| {
             let _ = ready.send(());
@@ -2936,8 +2937,9 @@ impl<F: AsyncFileSystem + Send + Sync + 'static> UringFuseServing<F> {
     fn fallback_async(
         session: &mut FuseSession,
         server: Arc<Server<F>>,
-        exit: Arc<AtomicBool>,
+        set: &mut WorkerSet,
     ) -> Result<Box<dyn FnOnce(Sender<()>) + Send>> {
+        let exit = set.stop_signal()?;
         let file = session.clone_fuse_file()?;
         let buf_size = session.bufsize();
         Ok(Box::new(move |ready| {
@@ -2952,8 +2954,9 @@ impl<F: AsyncFileSystem + Send + Sync + 'static> UringFuseServing<F> {
 impl<F: FileSystem + Send + Sync + 'static> Drop for UringFuseServing<F> {
     fn drop(&mut self) {
         // Tearing down the connection completes all outstanding ring entries
-        // with an error, which unblocks the worker threads; the fallback
-        // thread is woken through its epoll channel.
+        // with an error, which unblocks the worker threads. The fallback
+        // thread is woken through its epoll channel, or with the async
+        // handlers through its stop signal.
         self.workers.stop(&mut self.session, true);
     }
 }
