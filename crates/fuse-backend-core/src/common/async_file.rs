@@ -30,6 +30,9 @@ pub enum File {
     Borrowed {
         /// The borrowed file descriptor.
         fd: RawFd,
+        /// Whether IO on the descriptor goes through io_uring. Resolved from
+        /// the runtime type when the descriptor is borrowed, see `borrow_fd()`.
+        io_uring: bool,
         /// A reference keeping the file descriptor valid.
         _guard: Arc<dyn Any>,
     },
@@ -79,7 +82,19 @@ impl File {
     /// when dropped: `guard` must keep the descriptor valid for as long as
     /// the returned object, and any IO submitted through it, lives.
     pub fn borrow_fd(fd: RawFd, guard: Arc<dyn Any>) -> Self {
-        File::Borrowed { fd, _guard: guard }
+        // Resolve the IO engine once, here, instead of on every IO: the
+        // runtime type is fixed on first use, and reading it now fixes it,
+        // so per-request lookups would return the same answer.
+        #[cfg(target_os = "linux")]
+        let io_uring = matches!(*RUNTIME_TYPE, RuntimeType::Uring);
+        #[cfg(not(target_os = "linux"))]
+        let io_uring = false;
+
+        File::Borrowed {
+            fd,
+            io_uring,
+            _guard: guard,
+        }
     }
 
     /// Asynchronously read data at `offset` into the buffer.
@@ -100,7 +115,7 @@ impl File {
             File::Uring(f) => f.read_at(buf, offset).await,
             File::Borrowed { fd, .. } => {
                 #[cfg(target_os = "linux")]
-                if matches!(*RUNTIME_TYPE, RuntimeType::Uring) {
+                if self.uses_io_uring() {
                     // Safe because `fd` is valid for the lifetime of this
                     // object, and the wrapper is forgotten on drop (including
                     // cancellation of the IO) so it never closes the
@@ -132,7 +147,7 @@ impl File {
             File::Uring(f) => f.readv_at(bufs, offset).await,
             File::Borrowed { fd, .. } => {
                 #[cfg(target_os = "linux")]
-                if matches!(*RUNTIME_TYPE, RuntimeType::Uring) {
+                if self.uses_io_uring() {
                     // Safe because `fd` is valid for the lifetime of this
                     // object, and the wrapper is forgotten on drop (including
                     // cancellation of the IO) so it never closes the
@@ -164,7 +179,7 @@ impl File {
             File::Uring(f) => f.write_at(buf, offset).await,
             File::Borrowed { fd, .. } => {
                 #[cfg(target_os = "linux")]
-                if matches!(*RUNTIME_TYPE, RuntimeType::Uring) {
+                if self.uses_io_uring() {
                     // Safe because `fd` is valid for the lifetime of this
                     // object, and the wrapper is forgotten on drop (including
                     // cancellation of the IO) so it never closes the
@@ -196,7 +211,7 @@ impl File {
             File::Uring(f) => f.writev_at(bufs, offset).await,
             File::Borrowed { fd, .. } => {
                 #[cfg(target_os = "linux")]
-                if matches!(*RUNTIME_TYPE, RuntimeType::Uring) {
+                if self.uses_io_uring() {
                     // Safe because `fd` is valid for the lifetime of this
                     // object, and the wrapper is forgotten on drop (including
                     // cancellation of the IO) so it never closes the
@@ -211,12 +226,15 @@ impl File {
     }
 
     /// Whether IO on this file goes through io_uring rather than blocking syscalls.
+    ///
+    /// For a borrowed descriptor, this is what `borrow_fd()` resolved from the
+    /// runtime type when the descriptor was borrowed.
     pub(crate) fn uses_io_uring(&self) -> bool {
         match self {
             File::Tokio(_) => false,
             #[cfg(target_os = "linux")]
             File::Uring(_) => true,
-            File::Borrowed { .. } => !RUNTIME_TYPE.file_io_blocks(),
+            File::Borrowed { io_uring, .. } => *io_uring,
         }
     }
 
@@ -246,8 +264,13 @@ impl File {
                     }))
                 }
             }
-            File::Borrowed { fd, _guard } => Ok(File::Borrowed {
+            File::Borrowed {
+                fd,
+                io_uring,
+                _guard,
+            } => Ok(File::Borrowed {
                 fd: *fd,
+                io_uring: *io_uring,
                 _guard: _guard.clone(),
             }),
         }
