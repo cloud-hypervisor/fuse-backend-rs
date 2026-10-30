@@ -53,8 +53,8 @@ use fuse_backend_core::abi::fuse_abi::{
     stat64, CreateIn, Opcode, OpenOptions, SetattrValid, WRITE_KILL_PRIV,
 };
 use fuse_backend_core::api::filesystem::{
-    AsyncFileSystem, AsyncZeroCopyReader, AsyncZeroCopyWriter, Context, FileSystem, ZeroCopyReader,
-    ZeroCopyWriter,
+    AsyncFileSystem, AsyncZeroCopyReader, AsyncZeroCopyWriter, Context, FileSystem, GetxattrReply,
+    ListxattrReply, ZeroCopyReader, ZeroCopyWriter,
 };
 use fuse_backend_core::async_file::File as AsyncFile;
 use fuse_backend_core::async_runtime::{self, Runtime};
@@ -93,7 +93,8 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
     /// execute in parallel on pool threads. Note that the offloading
     /// requires a file system from `new_shared()` or `into_shared()`.
     /// Other instances, even one wrapped in a plain `Arc::new()`, serve
-    /// their requests inline.
+    /// their requests inline. READDIR and READDIRPLUS always run inline,
+    /// because their handlers add each entry to the reply as they go.
     ///
     /// The blocking pool is a tokio runtime property configured when the
     /// runtime is created, this method only selects between the two modes
@@ -112,9 +113,10 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
     /// If a request future is dropped, for example for a takeover, a request
     /// that no pool thread has started yet doesn't run. One that already runs
     /// completes, and the kernel may send it again after the takeover. So a
-    /// WRITE to a file opened with `O_APPEND` can land twice. To avoid that,
-    /// stop the serving task through its state flag, which answers the
-    /// requests in flight before it returns.
+    /// WRITE to a file opened with `O_APPEND` can land twice, and a MKDIR,
+    /// UNLINK or RENAME can run again and fail with EEXIST or ENOENT. To
+    /// avoid that, stop the serving task through its state flag, which
+    /// answers the requests in flight before it returns.
     pub fn enable_async_thread_pool(&self, enable: bool) {
         self.async_thread_pool_enabled
             .store(enable, Ordering::Relaxed);
@@ -736,9 +738,20 @@ fn undo_open<S: BitmapSlice + Send + Sync>(
     }
 }
 
-/// Drop the lookup count that `lookup()` or `create()` took.
-fn undo_lookup<S: BitmapSlice + Send + Sync>(fs: &PassthroughFs<S>, inode: Inode) {
-    fs.forget(&Context::default(), inode, 1);
+/// Drop the lookup count that a handler took for `entry`.
+fn undo_lookup<S: BitmapSlice + Send + Sync>(fs: &PassthroughFs<S>, entry: Entry) {
+    fs.forget(&Context::default(), entry.inode, 1);
+}
+
+/// Release a handle that `opendir()` returned.
+fn undo_opendir<S: BitmapSlice + Send + Sync>(
+    fs: &PassthroughFs<S>,
+    inode: Inode,
+    handle: Option<Handle>,
+) {
+    if let Some(handle) = handle {
+        let _ = fs.releasedir(&Context::default(), inode, 0, handle);
+    }
 }
 
 impl<S: BitmapSlice + Send + Sync + 'static> BackendFileSystem for PassthroughFs<S> {
@@ -766,7 +779,7 @@ impl<S: BitmapSlice + Send + Sync + 'static> AsyncFileSystem for PassthroughFs<S
             [let name = name.to_owned();],
             self.lookup(ctx, parent, name),
             move |fs: &Self, ctx: Context| fs.lookup(&ctx, parent, &name),
-            undo: |fs: &Self, entry: Entry| undo_lookup(fs, entry.inode)
+            undo: undo_lookup
         )
     }
 
@@ -843,7 +856,7 @@ impl<S: BitmapSlice + Send + Sync + 'static> AsyncFileSystem for PassthroughFs<S
             move |fs: &Self, ctx: Context| fs.create(&ctx, parent, &name, args),
             undo: |fs: &Self, (entry, handle, _, _): (Entry, _, _, _)| {
                 undo_open(fs, entry.inode, handle);
-                undo_lookup(fs, entry.inode);
+                undo_lookup(fs, entry);
             }
         )
     }
@@ -1025,6 +1038,38 @@ impl<S: BitmapSlice + Send + Sync + 'static> AsyncFileSystem for PassthroughFs<S
         )
     }
 
+    async fn async_opendir(
+        &self,
+        ctx: &Context,
+        inode: <Self as FileSystem>::Inode,
+        flags: u32,
+    ) -> io::Result<(Option<<Self as FileSystem>::Handle>, OpenOptions)> {
+        async_relay!(
+            self,
+            ctx,
+            [],
+            self.opendir(ctx, inode, flags),
+            move |fs: &Self, ctx: Context| fs.opendir(&ctx, inode, flags),
+            undo: move |fs: &Self, (handle, _)| undo_opendir(fs, inode, handle)
+        )
+    }
+
+    async fn async_releasedir(
+        &self,
+        ctx: &Context,
+        inode: <Self as FileSystem>::Inode,
+        flags: u32,
+        handle: <Self as FileSystem>::Handle,
+    ) -> io::Result<()> {
+        async_relay!(
+            self,
+            ctx,
+            [],
+            self.releasedir(ctx, inode, flags, handle),
+            move |fs: Arc<Self>, ctx: Context| fs.releasedir(&ctx, inode, flags, handle)
+        )
+    }
+
     async fn async_fsyncdir(
         &self,
         ctx: &Context,
@@ -1038,6 +1083,317 @@ impl<S: BitmapSlice + Send + Sync + 'static> AsyncFileSystem for PassthroughFs<S
             [],
             self.fsyncdir(ctx, inode, datasync, handle),
             move |fs: Arc<Self>, ctx: Context| fs.fsyncdir(&ctx, inode, datasync, handle)
+        )
+    }
+
+    async fn async_readlink(
+        &self,
+        ctx: &Context,
+        inode: <Self as FileSystem>::Inode,
+    ) -> io::Result<Vec<u8>> {
+        async_relay!(
+            self,
+            ctx,
+            [],
+            self.readlink(ctx, inode),
+            move |fs: Arc<Self>, ctx: Context| fs.readlink(&ctx, inode)
+        )
+    }
+
+    async fn async_symlink(
+        &self,
+        ctx: &Context,
+        linkname: &CStr,
+        parent: <Self as FileSystem>::Inode,
+        name: &CStr,
+    ) -> io::Result<Entry> {
+        async_relay!(
+            self,
+            ctx,
+            [let linkname = linkname.to_owned(); let name = name.to_owned();],
+            self.symlink(ctx, linkname, parent, name),
+            move |fs: &Self, ctx: Context| fs.symlink(&ctx, &linkname, parent, &name),
+            undo: undo_lookup
+        )
+    }
+
+    async fn async_mknod(
+        &self,
+        ctx: &Context,
+        parent: <Self as FileSystem>::Inode,
+        name: &CStr,
+        mode: u32,
+        rdev: u32,
+        umask: u32,
+    ) -> io::Result<Entry> {
+        async_relay!(
+            self,
+            ctx,
+            [let name = name.to_owned();],
+            self.mknod(ctx, parent, name, mode, rdev, umask),
+            move |fs: &Self, ctx: Context| fs.mknod(&ctx, parent, &name, mode, rdev, umask),
+            undo: undo_lookup
+        )
+    }
+
+    async fn async_mkdir(
+        &self,
+        ctx: &Context,
+        parent: <Self as FileSystem>::Inode,
+        name: &CStr,
+        mode: u32,
+        umask: u32,
+    ) -> io::Result<Entry> {
+        async_relay!(
+            self,
+            ctx,
+            [let name = name.to_owned();],
+            self.mkdir(ctx, parent, name, mode, umask),
+            move |fs: &Self, ctx: Context| fs.mkdir(&ctx, parent, &name, mode, umask),
+            undo: undo_lookup
+        )
+    }
+
+    async fn async_unlink(
+        &self,
+        ctx: &Context,
+        parent: <Self as FileSystem>::Inode,
+        name: &CStr,
+    ) -> io::Result<()> {
+        async_relay!(
+            self,
+            ctx,
+            [let name = name.to_owned();],
+            self.unlink(ctx, parent, name),
+            move |fs: Arc<Self>, ctx: Context| fs.unlink(&ctx, parent, &name)
+        )
+    }
+
+    async fn async_rmdir(
+        &self,
+        ctx: &Context,
+        parent: <Self as FileSystem>::Inode,
+        name: &CStr,
+    ) -> io::Result<()> {
+        async_relay!(
+            self,
+            ctx,
+            [let name = name.to_owned();],
+            self.rmdir(ctx, parent, name),
+            move |fs: Arc<Self>, ctx: Context| fs.rmdir(&ctx, parent, &name)
+        )
+    }
+
+    async fn async_rename(
+        &self,
+        ctx: &Context,
+        olddir: <Self as FileSystem>::Inode,
+        oldname: &CStr,
+        newdir: <Self as FileSystem>::Inode,
+        newname: &CStr,
+        flags: u32,
+    ) -> io::Result<()> {
+        async_relay!(
+            self,
+            ctx,
+            [let oldname = oldname.to_owned(); let newname = newname.to_owned();],
+            self.rename(ctx, olddir, oldname, newdir, newname, flags),
+            move |fs: Arc<Self>, ctx: Context| fs
+                .rename(&ctx, olddir, &oldname, newdir, &newname, flags)
+        )
+    }
+
+    async fn async_link(
+        &self,
+        ctx: &Context,
+        inode: <Self as FileSystem>::Inode,
+        newparent: <Self as FileSystem>::Inode,
+        newname: &CStr,
+    ) -> io::Result<Entry> {
+        async_relay!(
+            self,
+            ctx,
+            [let newname = newname.to_owned();],
+            self.link(ctx, inode, newparent, newname),
+            move |fs: &Self, ctx: Context| fs.link(&ctx, inode, newparent, &newname),
+            undo: undo_lookup
+        )
+    }
+
+    async fn async_statfs(
+        &self,
+        ctx: &Context,
+        inode: <Self as FileSystem>::Inode,
+    ) -> io::Result<libc::statvfs64> {
+        async_relay!(
+            self,
+            ctx,
+            [],
+            self.statfs(ctx, inode),
+            move |fs: Arc<Self>, ctx: Context| fs.statfs(&ctx, inode)
+        )
+    }
+
+    async fn async_release(
+        &self,
+        ctx: &Context,
+        inode: <Self as FileSystem>::Inode,
+        flags: u32,
+        handle: <Self as FileSystem>::Handle,
+        flush: bool,
+        flock_release: bool,
+        lock_owner: Option<u64>,
+    ) -> io::Result<()> {
+        async_relay!(
+            self,
+            ctx,
+            [],
+            self.release(ctx, inode, flags, handle, flush, flock_release, lock_owner),
+            move |fs: Arc<Self>, ctx: Context| fs.release(
+                &ctx,
+                inode,
+                flags,
+                handle,
+                flush,
+                flock_release,
+                lock_owner
+            )
+        )
+    }
+
+    async fn async_setxattr(
+        &self,
+        ctx: &Context,
+        inode: <Self as FileSystem>::Inode,
+        name: &CStr,
+        value: &[u8],
+        flags: u32,
+    ) -> io::Result<()> {
+        async_relay!(
+            self,
+            ctx,
+            [let name = name.to_owned(); let value = value.to_vec();],
+            self.setxattr(ctx, inode, name, value, flags),
+            move |fs: Arc<Self>, ctx: Context| fs.setxattr(&ctx, inode, &name, &value, flags)
+        )
+    }
+
+    async fn async_getxattr(
+        &self,
+        ctx: &Context,
+        inode: <Self as FileSystem>::Inode,
+        name: &CStr,
+        size: u32,
+    ) -> io::Result<GetxattrReply> {
+        async_relay!(
+            self,
+            ctx,
+            [let name = name.to_owned();],
+            self.getxattr(ctx, inode, name, size),
+            move |fs: Arc<Self>, ctx: Context| fs.getxattr(&ctx, inode, &name, size)
+        )
+    }
+
+    async fn async_listxattr(
+        &self,
+        ctx: &Context,
+        inode: <Self as FileSystem>::Inode,
+        size: u32,
+    ) -> io::Result<ListxattrReply> {
+        async_relay!(
+            self,
+            ctx,
+            [],
+            self.listxattr(ctx, inode, size),
+            move |fs: Arc<Self>, ctx: Context| fs.listxattr(&ctx, inode, size)
+        )
+    }
+
+    async fn async_removexattr(
+        &self,
+        ctx: &Context,
+        inode: <Self as FileSystem>::Inode,
+        name: &CStr,
+    ) -> io::Result<()> {
+        async_relay!(
+            self,
+            ctx,
+            [let name = name.to_owned();],
+            self.removexattr(ctx, inode, name),
+            move |fs: Arc<Self>, ctx: Context| fs.removexattr(&ctx, inode, &name)
+        )
+    }
+
+    async fn async_flush(
+        &self,
+        ctx: &Context,
+        inode: <Self as FileSystem>::Inode,
+        handle: <Self as FileSystem>::Handle,
+        lock_owner: u64,
+    ) -> io::Result<()> {
+        async_relay!(
+            self,
+            ctx,
+            [],
+            self.flush(ctx, inode, handle, lock_owner),
+            move |fs: Arc<Self>, ctx: Context| fs.flush(&ctx, inode, handle, lock_owner)
+        )
+    }
+
+    async fn async_access(
+        &self,
+        ctx: &Context,
+        inode: <Self as FileSystem>::Inode,
+        mask: u32,
+    ) -> io::Result<()> {
+        async_relay!(
+            self,
+            ctx,
+            [],
+            self.access(ctx, inode, mask),
+            move |fs: Arc<Self>, ctx: Context| fs.access(&ctx, inode, mask)
+        )
+    }
+
+    async fn async_lseek(
+        &self,
+        ctx: &Context,
+        inode: <Self as FileSystem>::Inode,
+        handle: <Self as FileSystem>::Handle,
+        offset: u64,
+        whence: u32,
+    ) -> io::Result<u64> {
+        async_relay!(
+            self,
+            ctx,
+            [],
+            self.lseek(ctx, inode, handle, offset, whence),
+            move |fs: Arc<Self>, ctx: Context| fs.lseek(&ctx, inode, handle, offset, whence)
+        )
+    }
+
+    async fn async_copy_file_range(
+        &self,
+        ctx: &Context,
+        inode_in: <Self as FileSystem>::Inode,
+        fh_in: <Self as FileSystem>::Handle,
+        offset_in: u64,
+        inode_out: <Self as FileSystem>::Inode,
+        fh_out: <Self as FileSystem>::Handle,
+        offset_out: u64,
+        len: u64,
+        flags: u64,
+    ) -> io::Result<u32> {
+        async_relay!(
+            self,
+            ctx,
+            [],
+            self.copy_file_range(
+                ctx, inode_in, fh_in, offset_in, inode_out, fh_out, offset_out, len, flags
+            ),
+            move |fs: Arc<Self>, ctx: Context| fs.copy_file_range(
+                &ctx, inode_in, fh_in, offset_in, inode_out, fh_out, offset_out, len, flags
+            )
         )
     }
 }
@@ -1199,6 +1555,7 @@ mod tests {
         let cfg = Config {
             root_dir: source.as_path().to_str().unwrap().to_string(),
             do_import: true,
+            xattr: true,
             ..Default::default()
         };
         let fs = PassthroughFs::<()>::new_shared(cfg).unwrap();
@@ -2092,6 +2449,106 @@ mod tests {
                 fs.forget(&ctx, entry.inode, 1);
                 count == 1
             });
+        });
+    }
+
+    // With the thread pool enabled, the pool serves the node, xattr and file
+    // handlers too.
+    #[test]
+    fn test_async_pool_node_ops() {
+        let (fs, source) = prepare_async_fs_shared(true);
+        let ctx = prepare_context();
+        let name = |s: &str| CString::new(s).unwrap();
+        let (dir, link, fifo, pipe) = (name("dir"), name("link"), name("fifo"), name("pipe"));
+        let (file, hardlink, xattr) = (name("file"), name("hardlink"), name("user.test"));
+        std::fs::write(source.as_path().join("file"), b"hello").unwrap();
+
+        async_runtime::block_on(async {
+            let dir_ino = fs
+                .async_mkdir(&ctx, ROOT_ID, &dir, 0o755, 0)
+                .await
+                .unwrap()
+                .inode;
+            let link_ino = fs
+                .async_symlink(&ctx, &dir, ROOT_ID, &link)
+                .await
+                .unwrap()
+                .inode;
+            assert_eq!(fs.async_readlink(&ctx, link_ino).await.unwrap(), b"dir");
+            let mode = libc::S_IFIFO | 0o600;
+            fs.async_mknod(&ctx, dir_ino, &fifo, mode, 0, 0)
+                .await
+                .unwrap();
+            fs.async_rename(&ctx, dir_ino, &fifo, ROOT_ID, &pipe, 0)
+                .await
+                .unwrap();
+            fs.async_unlink(&ctx, ROOT_ID, &pipe).await.unwrap();
+            fs.async_rmdir(&ctx, ROOT_ID, &dir).await.unwrap();
+
+            fs.async_statfs(&ctx, ROOT_ID).await.unwrap();
+            fs.async_access(&ctx, ROOT_ID, libc::R_OK as u32)
+                .await
+                .unwrap();
+            let (dh, _) = fs.async_opendir(&ctx, ROOT_ID, 0).await.unwrap();
+            fs.async_releasedir(&ctx, ROOT_ID, 0, dh.unwrap())
+                .await
+                .unwrap();
+
+            // Copy the 5 bytes of the file to its end.
+            let flags = libc::O_RDWR as u32;
+            let ino = fs.async_lookup(&ctx, ROOT_ID, &file).await.unwrap().inode;
+            let linked = fs.async_link(&ctx, ino, ROOT_ID, &hardlink).await;
+            assert_eq!(linked.unwrap().inode, ino);
+            let (fh, _, _) = fs.async_open(&ctx, ino, flags, 0).await.unwrap();
+            let fh = fh.unwrap();
+            let copied = fs.async_copy_file_range(&ctx, ino, fh, 0, ino, fh, 5, 5, 0);
+            assert_eq!(copied.await.unwrap(), 5);
+            let end = fs
+                .async_lseek(&ctx, ino, fh, 0, libc::SEEK_END as u32)
+                .await;
+            assert_eq!(end.unwrap(), 10);
+            fs.async_flush(&ctx, ino, fh, 0).await.unwrap();
+            fs.async_release(&ctx, ino, flags, fh, false, false, None)
+                .await
+                .unwrap();
+
+            match fs.async_setxattr(&ctx, ino, &xattr, b"value", 0).await {
+                Err(e) if e.raw_os_error() == Some(libc::EOPNOTSUPP) => {
+                    eprintln!(
+                        "skipping the xattr checks: no user xattrs in the temporary directory"
+                    );
+                    return;
+                }
+                r => r.unwrap(),
+            }
+            let size = fs.async_getxattr(&ctx, ino, &xattr, 0).await.unwrap();
+            assert!(matches!(size, GetxattrReply::Count(5)));
+            let list = fs.async_listxattr(&ctx, ino, 64).await.unwrap();
+            // Other xattrs, such as an SELinux label, may be listed too.
+            assert!(matches!(list, ListxattrReply::Names(n)
+                if n.split(|&b| b == 0).any(|x| x == b"user.test")));
+            fs.async_removexattr(&ctx, ino, &xattr).await.unwrap();
+        });
+    }
+
+    // A MKDIR that is dropped while a pool thread serves it drops the lookup
+    // count of the new directory.
+    #[test]
+    fn test_async_pool_dropped_mkdir() {
+        let (fs, source) = prepare_async_fs_shared(true);
+        let ctx = prepare_context();
+        let path = source.as_path().canonicalize().unwrap().join("dir");
+        let name = CString::new("dir").unwrap();
+
+        async_runtime::block_on(async {
+            // The pool thread creates and opens the directory, and then
+            // waits for the inode map to insert the new inode.
+            let mkdir = fs.async_mkdir(&ctx, ROOT_ID, &name, 0o755, 0);
+            drop_while_running(mkdir, &path, fs.inode_map.inodes.read().unwrap()).await;
+            wait_for(|| fds_to(&path) == 0);
+            let entry = fs.lookup(&ctx, ROOT_ID, &name).unwrap();
+            let data = fs.inode_map.get(entry.inode).unwrap();
+            assert_eq!(data.refcount.load(Ordering::Acquire), 1);
         });
     }
 
