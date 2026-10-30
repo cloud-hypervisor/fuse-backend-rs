@@ -48,6 +48,26 @@
   READDIR, READDIRPLUS and RELEASEDIR with them, so a file system that implements them can
   list a directory without blocking the worker. `Vfs` passes them on to the mounted file
   systems.
+- On Linux 7.3 and later, `UringFuseServing` gives each kernel queue a buffer pool of
+  `UringConfig::bufs_per_queue` payload buffers. The kernel lends them to the queue's ring entries
+  while they serve a request, so with fewer buffers than entries a mount needs less memory.
+  `bufs_per_queue` defaults to 4, the default number of entries, and counts as at most
+  `entries_per_queue`. 0 keeps a buffer per entry, as on older kernels. `UringConfig` has a new
+  field, so struct literals need `..Default::default()`.
+- `abi::fuse_uring` has the commands, INIT flag and fields of protocol 7.46 for buffer pools.
+  `Server::uring_bufpool_supported()` tells whether the kernel offered them at INIT, and
+  `Server::uring_payload_size()` returns the size of the kernel's payload buffers.
+- `OpenOptions::IO_URING_ZERO_COPY` and the zero-copy flags of protocol 7.46 in
+  `abi::fuse_uring` let a file system ask for FUSE-over-io_uring zero-copy on an open.
+  `Reader::with_zero_copy()` attaches request data that only the transport can move, through a
+  `ZeroCopySource`, and `Reader::read_to_at()` hands it over. `FileReadWriteVolatile::raw_fd()`
+  gives the transport the file descriptor to move it to. Other reads get a copy through memory.
+- `passthrough::Config::uring_zero_copy` asks for FUSE-over-io_uring zero-copy on the files that
+  `PassthroughFs` opens, except files it opens with O_DIRECT.
+- With `UringConfig::zero_copy` on Linux 7.3 and later, `UringFuseServing` serves the reads and
+  writes of opens that ask for it with zero-copy. It moves the data between the client's pages
+  and the file with io_uring fixed-buffer operations. It needs buffer pools and CAP_SYS_ADMIN,
+  and serves without it otherwise. `UringConfig` has a new field.
 
 ### Changed
 - Bump the declared minimum supported Rust version (MSRV) from 1.80 to 1.86.
@@ -75,6 +95,7 @@
   to enable them. A crate that depends on a transport crate directly must enable
   that crate's `async-io` too, or its writers fail asynchronous replies with
   `EINVAL`.
+- `FuseUringEntInOut::padding` is now `offset`, and `FuseUringCmdReq` has a new `bufpool` field.
 - [254](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/254): `fuse-backend-rs` is now a thin facade re-exporting the sub-crates. Every
   historical `fuse_backend_rs::{abi, api, buffer, common, transport, passthrough,
   overlayfs}` import path and cargo feature name (`fusedev`, `virtiofs`,
