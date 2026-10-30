@@ -9,14 +9,16 @@
 //! A FUSE session can have multiple FUSE channels so that FUSE requests are handled in parallel.
 
 use std::fs::{File, OpenOptions};
+use std::io;
 use std::ops::Deref;
 use std::os::unix::fs::PermissionsExt;
-use std::os::unix::io::AsRawFd;
+use std::os::unix::io::{AsRawFd, RawFd};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, PoisonError};
 
 use crate::{FuseChannelExt, FuseDevReaderExt, FuseSessionExt};
+use fuse_backend_core::abi::fuse_abi::BackingMap;
 use mio::{Events, Poll, Token, Waker};
 use nix::errno::Errno;
 use nix::fcntl::{fcntl, FcntlArg, FdFlag, OFlag};
@@ -882,6 +884,33 @@ fn fuse_fusermount_umount(
             "Unexpected exit code when unmounting via running fusermount: {exit_code:?}"
         ))),
     }
+}
+
+/// Register `fd` as a backing file with ioctl FUSE_DEV_IOC_BACKING_OPEN on the FUSE device
+/// `fuse_file` and return its backing id, for `open` to return with `OpenOptions::PASSTHROUGH`.
+///
+/// Needs `CAP_SYS_ADMIN` and `FsOptions::PASSTHROUGH` enabled at INIT. The id stays valid until
+/// `fuse_backing_close()` or the end of the connection, and files opened with it keep using the
+/// backing file after it is closed.
+pub fn fuse_backing_open(fuse_file: &File, fd: RawFd) -> io::Result<u32> {
+    // #define FUSE_DEV_IOC_BACKING_OPEN _IOW(FUSE_DEV_IOC_MAGIC, 1, struct fuse_backing_map)
+    nix::ioctl_write_ptr!(backing_open, 229, 1, BackingMap);
+
+    let map = BackingMap {
+        fd,
+        ..Default::default()
+    };
+    let id = unsafe { backing_open(fuse_file.as_raw_fd(), &map) }?;
+    Ok(id as u32)
+}
+
+/// Release a backing id returned by `fuse_backing_open()` with ioctl FUSE_DEV_IOC_BACKING_CLOSE.
+pub fn fuse_backing_close(fuse_file: &File, backing_id: u32) -> io::Result<()> {
+    // #define FUSE_DEV_IOC_BACKING_CLOSE _IOW(FUSE_DEV_IOC_MAGIC, 2, uint32_t)
+    nix::ioctl_write_ptr!(backing_close, 229, 2, u32);
+
+    unsafe { backing_close(fuse_file.as_raw_fd(), &backing_id) }?;
+    Ok(())
 }
 
 #[cfg(test)]

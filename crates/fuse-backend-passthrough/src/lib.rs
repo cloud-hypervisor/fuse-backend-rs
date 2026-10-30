@@ -257,18 +257,124 @@ impl InodeMap {
     }
 }
 
+/// Registers the backing files of Linux kernel FUSE passthrough, which passes reads, writes and
+/// mmap of open files to the host files without involving the server. See
+/// `PassthroughFs::set_backing_files()`.
+#[cfg(target_os = "linux")]
+pub trait BackingFiles: Send + Sync {
+    /// Register `fd` as a backing file and return its backing id, such as with
+    /// `fuse_backing_open()` of the fusedev transport.
+    fn open(&self, fd: BorrowedFd<'_>) -> io::Result<u32>;
+
+    /// Release a backing id returned by `open()`, such as with `fuse_backing_close()`.
+    fn close(&self, backing_id: u32) -> io::Result<()>;
+}
+
+/// The backing ids of the inodes open in kernel passthrough mode.
+#[cfg(target_os = "linux")]
+struct KernelPassthrough {
+    files: Arc<dyn BackingFiles>,
+    /// The backing id and the number of open handles of each inode. The kernel fails an open of
+    /// an inode that is already open in passthrough mode unless it passes through to the same
+    /// backing file, so all the handles of an inode share one id.
+    ids: Mutex<HashMap<Inode, (u32, usize)>>,
+}
+
+#[cfg(target_os = "linux")]
+impl KernelPassthrough {
+    /// Get the backing id of `inode` for a new handle if the inode has one.
+    fn share(&self, inode: Inode) -> Option<u32> {
+        // Do not expect poisoned lock here, so safe to unwrap().
+        let mut ids = self.ids.lock().unwrap();
+        let (id, handles) = ids.get_mut(&inode)?;
+        *handles += 1;
+        Some(*id)
+    }
+
+    /// Get the backing id of `inode` for a new handle, registering `file` if the inode has none.
+    fn acquire(&self, inode: Inode, file: &File) -> io::Result<u32> {
+        if let Some(id) = self.share(inode) {
+            return Ok(id);
+        }
+        // Register the file without the lock, so that a slow ioctl doesn't hold up the opens and
+        // releases of other inodes.
+        let new_id = self.files.open(file.as_fd());
+        let mut ids = self.ids.lock().unwrap();
+        if let Some((id, handles)) = ids.get_mut(&inode) {
+            // Another open of the inode registered it meanwhile, and the kernel needs all the
+            // opens of an inode to use the same id. Use that id, even if registering this file
+            // failed.
+            *handles += 1;
+            let id = *id;
+            drop(ids);
+            if let Ok(new_id) = new_id {
+                self.close(inode, new_id);
+            }
+            return Ok(id);
+        }
+        let new_id = new_id?;
+        ids.insert(inode, (new_id, 1));
+        Ok(new_id)
+    }
+
+    fn close(&self, inode: Inode, id: u32) {
+        if let Err(e) = self.files.close(id) {
+            warn!(
+                "fuse: failed to close backing id {} of inode {}: {}",
+                id, inode, e
+            );
+        }
+    }
+
+    /// Drop the reference of a released handle, and close the backing id of `inode` with the last
+    /// one. Files that the kernel opened with the id keep using the backing file.
+    fn release(&self, inode: Inode) {
+        let mut ids = self.ids.lock().unwrap();
+        if let std::collections::hash_map::Entry::Occupied(mut e) = ids.entry(inode) {
+            e.get_mut().1 -= 1;
+            if e.get().1 == 0 {
+                let (id, _) = e.remove();
+                // Nothing needs the map during the ioctl.
+                drop(ids);
+                self.close(inode, id);
+            }
+        }
+    }
+
+    /// Close the backing ids of all inodes. Otherwise the kernel keeps them until the connection
+    /// ends.
+    fn close_all(&self) {
+        let ids: Vec<u32> = self
+            .ids
+            .lock()
+            .unwrap()
+            .drain()
+            .map(|(_, (id, _))| id)
+            .collect();
+        for id in ids {
+            // This fails once the connection has ended, and then there is nothing to close.
+            if let Err(e) = self.files.close(id) {
+                debug!("fuse: failed to close backing id {}: {}", id, e);
+            }
+        }
+    }
+}
+
 struct HandleData {
     inode: Inode,
     file: File,
     open_flags: RwLock<u32>,
+    /// Whether the handle holds a reference to its inode's backing id.
+    has_backing_id: bool,
 }
 
 impl HandleData {
-    fn new(inode: Inode, file: File, flags: u32) -> Self {
+    fn new(inode: Inode, file: File, flags: u32, has_backing_id: bool) -> Self {
         HandleData {
             inode,
             file,
             open_flags: RwLock::new(flags),
+            has_backing_id,
         }
     }
 
@@ -325,7 +431,7 @@ impl HandleMap {
         self.handles.write().unwrap().insert(handle, Arc::new(data));
     }
 
-    fn release(&self, handle: Handle, inode: Inode) -> io::Result<()> {
+    fn release(&self, handle: Handle, inode: Inode) -> io::Result<Arc<HandleData>> {
         // Do not expect poisoned lock here, so safe to unwrap().
         let mut handles = self.handles.write().unwrap();
 
@@ -333,8 +439,7 @@ impl HandleMap {
             if e.get().inode == inode {
                 // We don't need to close the file here because that will happen automatically when
                 // the last `Arc` is dropped.
-                e.remove();
-                return Ok(());
+                return Ok(e.remove());
             }
         }
 
@@ -415,15 +520,26 @@ pub struct PassthroughFs<S: BitmapSlice + Send + Sync = ()> {
     // Init from guest kernel Init cmd of fuse fs.
     perfile_dax: AtomicBool,
 
+    // The backing files of kernel passthrough, see `set_backing_files()`.
+    #[cfg(target_os = "linux")]
+    kernel_passthrough: Option<KernelPassthrough>,
+    // Whether kernel passthrough is enabled. This will only be true when `set_backing_files()`
+    // was called and `init` was called with `FsOptions::PASSTHROUGH`.
+    #[cfg(target_os = "linux")]
+    passthrough: AtomicBool,
+    // Whether a backing file the kernel refused was logged at warn level already.
+    #[cfg(target_os = "linux")]
+    backing_refusal_logged: AtomicBool,
+
     // Whether to offload the synchronous handlers to the blocking thread
     // pool with the async-io feature, see
     // PassthroughFs::enable_async_thread_pool().
     #[cfg(feature = "async-io")]
     async_thread_pool_enabled: AtomicBool,
-    // Weak reference to the `Arc` created by `new_shared()`, used by the
+    // Weak reference to the `Arc` created by `into_shared()`, used by the
     // async handlers to offload the synchronous handlers to the blocking
-    // thread pool. It is dangling for instances created with `new()`, so
-    // `upgrade()` always fails for those.
+    // thread pool. Only `into_shared()` sets it, so `upgrade()` fails for
+    // any other instance, even one wrapped in a plain `Arc::new()`.
     #[cfg(feature = "async-io")]
     shared_ref: std::sync::Weak<PassthroughFs<S>>,
 
@@ -486,6 +602,12 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
             no_readdir: AtomicBool::new(cfg.no_readdir),
             seal_size: AtomicBool::new(cfg.seal_size),
             perfile_dax: AtomicBool::new(false),
+            #[cfg(target_os = "linux")]
+            kernel_passthrough: None,
+            #[cfg(target_os = "linux")]
+            passthrough: AtomicBool::new(false),
+            #[cfg(target_os = "linux")]
+            backing_refusal_logged: AtomicBool::new(false),
             #[cfg(feature = "async-io")]
             async_thread_pool_enabled: AtomicBool::new(false),
             #[cfg(feature = "async-io")]
@@ -529,6 +651,94 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
         )));
 
         Ok(())
+    }
+
+    /// Pass reads, writes and mmap of open regular files through to the host files in the
+    /// kernel, registering them as backing files with `files`. Call it before INIT.
+    ///
+    /// It takes effect when INIT enables `FsOptions::PASSTHROUGH`. The kernel only allows that
+    /// without `FsOptions::WRITEBACK_CACHE`, and the backing ids come from open requests, so it
+    /// doesn't work with `no_open`. Under a `Vfs`, add `FsOptions::PASSTHROUGH` to its `out_opts`,
+    /// set `no_writeback`, and set `no_open` to false, because `VfsOptions` enables it by default.
+    ///
+    /// It stays off with `Config::seal_size`, because passthrough writes don't reach the size
+    /// check, and with `CachePolicy::Never` and `CachePolicy::Metadata`, which open files with
+    /// `OpenOptions::DIRECT_IO` to keep file data out of the page cache. Passthrough opens drop
+    /// `DIRECT_IO`, so the host page cache would serve their reads and writes. It also stays off
+    /// when `Config::allow_direct_io` is false, because the kernel opens the backing file with the
+    /// client's `O_DIRECT`.
+    ///
+    /// Registering a backing file needs `CAP_SYS_ADMIN`, and a host file on a stacked file system
+    /// such as overlayfs needs `Server::set_max_stack_depth(2)`. Otherwise the kernel rejects the
+    /// registration, and the open fails.
+    ///
+    /// After a takeover with `Server::restore_init()`, passthrough keeps working if the new server
+    /// serves the same instance, which keeps its handles and backing ids. That fails if something
+    /// destroys the instance in between, as `Vfs::umount()` does. A new instance doesn't know the
+    /// old backing ids, which stay registered until the connection ends. While files that the old
+    /// instance opened in passthrough mode stay open, the kernel fails other opens of them with
+    /// `EIO`, with or without a new backing file.
+    ///
+    /// To use it with the blocking thread pool of the `async-io` feature, create the file system
+    /// with `new()`, call this, and then share it with `into_shared()`.
+    #[cfg(target_os = "linux")]
+    pub fn set_backing_files(&mut self, files: Arc<dyn BackingFiles>) {
+        self.kernel_passthrough = Some(KernelPassthrough {
+            files,
+            ids: Mutex::new(HashMap::new()),
+        });
+    }
+
+    /// Register the backing file of a new handle of `inode` if kernel passthrough is enabled, and
+    /// return its backing id.
+    ///
+    /// If the kernel refuses the backing file, the handle opens without passthrough, so the
+    /// daemon serves its IO. That is safe because registering only fails when the inode has no
+    /// backing id yet, so none of its handles is open in passthrough mode. `EPERM` means the
+    /// daemon lacks `CAP_SYS_ADMIN` and every registration would fail, so it turns passthrough
+    /// off.
+    ///
+    /// With passthrough off, an inode that still has handles with a backing id keeps sharing it.
+    /// The kernel fails an open of an inode in passthrough mode unless the open uses the same
+    /// backing file.
+    #[cfg(target_os = "linux")]
+    fn acquire_backing_id(&self, inode: Inode, file: &File) -> Option<u32> {
+        let kp = self.kernel_passthrough.as_ref()?;
+        if !self.passthrough.load(Ordering::Relaxed) {
+            return kp.share(inode);
+        }
+        match kp.acquire(inode, file) {
+            Ok(id) => Some(id),
+            Err(e) if e.raw_os_error() == Some(libc::EPERM) => {
+                if self.passthrough.swap(false, Ordering::Relaxed) {
+                    warn!(
+                        "fuse: kernel passthrough needs CAP_SYS_ADMIN, serving IO in the daemon: {}",
+                        e
+                    );
+                }
+                None
+            }
+            Err(e) => {
+                // Log the first refusal as a warning, and the rest at debug level.
+                let level = if self.backing_refusal_logged.swap(true, Ordering::Relaxed) {
+                    log::Level::Debug
+                } else {
+                    log::Level::Warn
+                };
+                log::log!(
+                    level,
+                    "fuse: can't register the backing file of inode {}, opening it without passthrough: {}",
+                    inode,
+                    e
+                );
+                None
+            }
+        }
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn acquire_backing_id(&self, _inode: Inode, _file: &File) -> Option<u32> {
+        None
     }
 
     /// Get the list of file descriptors which should be reserved across live upgrade.
@@ -827,8 +1037,15 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
         // `HandleMap::clear()`.  If `release()` fails the cached cookie (if
         // any) is left behind; that is harmless and it will be dropped by
         // `destroy()`.
-        self.handle_map.release(handle, inode)?;
+        let data = self.handle_map.release(handle, inode)?;
         self.handle_map.remove_cookie(handle);
+        // Directories and handles opened without passthrough have no backing id to release.
+        if data.has_backing_id {
+            #[cfg(target_os = "linux")]
+            if let Some(kp) = &self.kernel_passthrough {
+                kp.release(inode);
+            }
+        }
         Ok(())
     }
 
@@ -1699,6 +1916,454 @@ mod tests {
         let mut newbuf = Vec::new();
         read_buffer_file.read_to_end(&mut newbuf).unwrap();
         assert_eq!(newbuf, data);
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn test_kernel_passthrough_backing_ids() {
+        #[derive(Default)]
+        struct Files {
+            opened: Mutex<Vec<u32>>,
+            closed: Mutex<Vec<u32>>,
+        }
+        impl BackingFiles for Files {
+            fn open(&self, _fd: BorrowedFd<'_>) -> io::Result<u32> {
+                let mut opened = self.opened.lock().unwrap();
+                let id = opened.len() as u32 + 1;
+                opened.push(id);
+                Ok(id)
+            }
+            fn close(&self, backing_id: u32) -> io::Result<()> {
+                self.closed.lock().unwrap().push(backing_id);
+                Ok(())
+            }
+        }
+
+        let tmpdir = TempDir::new().expect("Cannot create temporary directory.");
+        let fs_cfg = Config {
+            do_import: false,
+            root_dir: tmpdir.as_path().to_string_lossy().to_string(),
+            ..Default::default()
+        };
+        let files = Arc::new(Files::default());
+        let mut fs = PassthroughFs::<()>::new(fs_cfg).unwrap();
+        fs.set_backing_files(files.clone());
+        fs.import().unwrap();
+        let opts = fs.init(FsOptions::PASSTHROUGH).unwrap();
+        assert!(opts.contains(FsOptions::PASSTHROUGH));
+
+        let ctx = Context::default();
+        let createin = CreateIn {
+            flags: libc::O_CREAT as u32 | libc::O_RDWR as u32,
+            mode: 0o644,
+            umask: 0,
+            fuse_flags: 0,
+        };
+        let name = CString::new("file").unwrap();
+        let (entry, h1, opts1, id1) = fs.create(&ctx, ROOT_ID, &name, createin).unwrap();
+        assert!(opts1.contains(OpenOptions::PASSTHROUGH));
+        assert_eq!(id1, Some(1));
+
+        // A second open of the inode shares its backing id.
+        let (h2, opts2, id2) = fs
+            .open(&ctx, entry.inode, libc::O_RDONLY as u32, 0)
+            .unwrap();
+        assert!(opts2.contains(OpenOptions::PASSTHROUGH));
+        assert_eq!(id2, Some(1));
+        assert_eq!(*files.opened.lock().unwrap(), vec![1]);
+
+        // Directories don't pass through.
+        let (dh, dopts) = fs.opendir(&ctx, ROOT_ID, libc::O_RDONLY as u32).unwrap();
+        assert!(!dopts.contains(OpenOptions::PASSTHROUGH));
+        assert_eq!(*files.opened.lock().unwrap(), vec![1]);
+        fs.releasedir(&ctx, ROOT_ID, 0, dh.unwrap()).unwrap();
+
+        // The id is closed with the last handle of the inode.
+        fs.release(&ctx, entry.inode, 0, h1.unwrap(), false, false, None)
+            .unwrap();
+        assert!(files.closed.lock().unwrap().is_empty());
+        fs.release(&ctx, entry.inode, 0, h2.unwrap(), false, false, None)
+            .unwrap();
+        assert_eq!(*files.closed.lock().unwrap(), vec![1]);
+
+        // A new open registers the backing file again.
+        let (_, _, id3) = fs
+            .open(&ctx, entry.inode, libc::O_RDONLY as u32, 0)
+            .unwrap();
+        assert_eq!(id3, Some(2));
+
+        // Destroying the file system, as `Vfs::umount()` does, closes the ids still open.
+        fs.destroy();
+        assert_eq!(*files.closed.lock().unwrap(), vec![1, 2]);
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn test_kernel_passthrough_falls_back() {
+        /// Answers registrations with `results` in order, and records the closed ids.
+        struct Files {
+            results: Mutex<Vec<io::Result<u32>>>,
+            calls: AtomicU64,
+            closed: Mutex<Vec<u32>>,
+        }
+        impl Files {
+            fn new(mut results: Vec<io::Result<u32>>) -> Arc<Self> {
+                results.reverse();
+                Arc::new(Files {
+                    results: Mutex::new(results),
+                    calls: AtomicU64::new(0),
+                    closed: Mutex::new(Vec::new()),
+                })
+            }
+        }
+        impl BackingFiles for Files {
+            fn open(&self, _fd: BorrowedFd<'_>) -> io::Result<u32> {
+                self.calls.fetch_add(1, Ordering::Relaxed);
+                self.results.lock().unwrap().pop().unwrap()
+            }
+            fn close(&self, backing_id: u32) -> io::Result<()> {
+                self.closed.lock().unwrap().push(backing_id);
+                Ok(())
+            }
+        }
+        fn passthrough_fs(tmpdir: &TempDir, files: Arc<Files>) -> PassthroughFs<()> {
+            let mut fs = PassthroughFs::<()>::new(Config {
+                do_import: false,
+                root_dir: tmpdir.as_path().to_string_lossy().to_string(),
+                ..Default::default()
+            })
+            .unwrap();
+            fs.set_backing_files(files);
+            fs.import().unwrap();
+            assert!(fs
+                .init(FsOptions::PASSTHROUGH)
+                .unwrap()
+                .contains(FsOptions::PASSTHROUGH));
+            fs
+        }
+        let ctx = Context::default();
+        let createin = CreateIn {
+            flags: libc::O_CREAT as u32 | libc::O_RDWR as u32,
+            mode: 0o644,
+            umask: 0,
+            fuse_flags: 0,
+        };
+        let name = CString::new("file").unwrap();
+
+        // A refused backing file opens without passthrough, and the next open of the inode tries
+        // again.
+        let tmpdir = TempDir::new().unwrap();
+        let files = Files::new(vec![Err(io::Error::from_raw_os_error(libc::ELOOP)), Ok(7)]);
+        let fs = passthrough_fs(&tmpdir, files.clone());
+        let (entry, h1, opts1, id1) = fs.create(&ctx, ROOT_ID, &name, createin).unwrap();
+        assert!(!opts1.contains(OpenOptions::PASSTHROUGH));
+        assert_eq!(id1, None);
+        let (h2, opts2, id2) = fs
+            .open(&ctx, entry.inode, libc::O_RDONLY as u32, 0)
+            .unwrap();
+        assert!(opts2.contains(OpenOptions::PASSTHROUGH));
+        assert_eq!(id2, Some(7));
+        // Releasing the handle without an id leaves the id of the other one alone.
+        fs.release(&ctx, entry.inode, 0, h1.unwrap(), false, false, None)
+            .unwrap();
+        assert!(files.closed.lock().unwrap().is_empty());
+        fs.release(&ctx, entry.inode, 0, h2.unwrap(), false, false, None)
+            .unwrap();
+        assert_eq!(*files.closed.lock().unwrap(), vec![7]);
+
+        // An init() without passthrough turns it off again.
+        let tmpdir = TempDir::new().unwrap();
+        let files = Files::new(vec![Ok(3)]);
+        let fs = passthrough_fs(&tmpdir, files.clone());
+        let (entry, h1, opts1, _) = fs.create(&ctx, ROOT_ID, &name, createin).unwrap();
+        assert!(opts1.contains(OpenOptions::PASSTHROUGH));
+        assert!(!fs
+            .init(FsOptions::empty())
+            .unwrap()
+            .contains(FsOptions::PASSTHROUGH));
+        // A new file doesn't pass through.
+        let other = CString::new("other").unwrap();
+        let (_, _, opts_other, id_other) = fs.create(&ctx, ROOT_ID, &other, createin).unwrap();
+        assert!(!opts_other.contains(OpenOptions::PASSTHROUGH));
+        assert_eq!(id_other, None);
+        assert_eq!(files.calls.load(Ordering::Relaxed), 1);
+        // An inode with a handle from before still shares its id, because the kernel fails
+        // other opens of it.
+        let (h2, opts2, id2) = fs
+            .open(&ctx, entry.inode, libc::O_RDONLY as u32, 0)
+            .unwrap();
+        assert!(opts2.contains(OpenOptions::PASSTHROUGH));
+        assert_eq!(id2, Some(3));
+        fs.release(&ctx, entry.inode, 0, h1.unwrap(), false, false, None)
+            .unwrap();
+        assert!(files.closed.lock().unwrap().is_empty());
+        fs.release(&ctx, entry.inode, 0, h2.unwrap(), false, false, None)
+            .unwrap();
+        assert_eq!(*files.closed.lock().unwrap(), vec![3]);
+
+        // EPERM turns passthrough off, so the next open doesn't try again.
+        let tmpdir = TempDir::new().unwrap();
+        let files = Files::new(vec![Err(io::Error::from_raw_os_error(libc::EPERM))]);
+        let fs = passthrough_fs(&tmpdir, files.clone());
+        let (entry, _, opts1, id1) = fs.create(&ctx, ROOT_ID, &name, createin).unwrap();
+        assert!(!opts1.contains(OpenOptions::PASSTHROUGH));
+        assert_eq!(id1, None);
+        let (_, opts2, id2) = fs
+            .open(&ctx, entry.inode, libc::O_RDONLY as u32, 0)
+            .unwrap();
+        assert!(!opts2.contains(OpenOptions::PASSTHROUGH));
+        assert_eq!(id2, None);
+        assert_eq!(files.calls.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn test_kernel_passthrough_racing_opens() {
+        use std::sync::atomic::AtomicU32;
+        use std::sync::Barrier;
+
+        // `open()` waits until both acquires are in it, and then hands out the ids 1 and 2. This
+        // deadlocks if `acquire()` holds the lock across `open()`.
+        struct Files {
+            barrier: Barrier,
+            next: AtomicU32,
+            closed: Mutex<Vec<u32>>,
+        }
+        impl BackingFiles for Files {
+            fn open(&self, _fd: BorrowedFd<'_>) -> io::Result<u32> {
+                self.barrier.wait();
+                Ok(self.next.fetch_add(1, Ordering::Relaxed) + 1)
+            }
+            fn close(&self, backing_id: u32) -> io::Result<()> {
+                self.closed.lock().unwrap().push(backing_id);
+                Ok(())
+            }
+        }
+
+        let files = Arc::new(Files {
+            barrier: Barrier::new(2),
+            next: AtomicU32::new(0),
+            closed: Mutex::new(Vec::new()),
+        });
+        let kp = KernelPassthrough {
+            files: files.clone(),
+            ids: Mutex::new(HashMap::new()),
+        };
+        let file = TempFile::new().unwrap().into_file();
+        let (a, b) = std::thread::scope(|s| {
+            let a = s.spawn(|| kp.acquire(1, &file).unwrap());
+            let b = s.spawn(|| kp.acquire(1, &file).unwrap());
+            (a.join().unwrap(), b.join().unwrap())
+        });
+
+        // Both opens share the id that was registered first, and the other one is closed.
+        assert_eq!(a, b);
+        let closed = files.closed.lock().unwrap().clone();
+        assert_eq!(closed.len(), 1);
+        assert_ne!(closed[0], a);
+        assert_eq!(kp.ids.lock().unwrap().get(&1), Some(&(a, 2)));
+
+        kp.release(1);
+        kp.release(1);
+        assert_eq!(files.closed.lock().unwrap().len(), 2);
+        assert!(kp.ids.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn test_kernel_passthrough_cache_always() {
+        let tmpdir = TempDir::new().expect("Cannot create temporary directory.");
+        let fs_cfg = Config {
+            do_import: false,
+            cache_policy: CachePolicy::Always,
+            root_dir: tmpdir.as_path().to_string_lossy().to_string(),
+            ..Default::default()
+        };
+        let mut fs = PassthroughFs::<()>::new(fs_cfg).unwrap();
+        fs.set_backing_files(Arc::new(OneIdFiles));
+        fs.import().unwrap();
+        fs.init(FsOptions::PASSTHROUGH).unwrap();
+
+        // The kernel fails a passthrough open that also has KEEP_CACHE.
+        let ctx = Context::default();
+        let createin = CreateIn {
+            flags: libc::O_CREAT as u32 | libc::O_RDWR as u32,
+            mode: 0o644,
+            umask: 0,
+            fuse_flags: 0,
+        };
+        let name = CString::new("file").unwrap();
+        let (entry, _, opts, id) = fs.create(&ctx, ROOT_ID, &name, createin).unwrap();
+        assert_eq!(id, Some(1));
+        assert_eq!(opts, OpenOptions::PASSTHROUGH);
+        let (_, opts, id) = fs
+            .open(&ctx, entry.inode, libc::O_RDONLY as u32, 0)
+            .unwrap();
+        assert_eq!(id, Some(1));
+        assert_eq!(opts, OpenOptions::PASSTHROUGH);
+
+        // Directories don't pass through and keep the cache flags.
+        let (_, opts) = fs.opendir(&ctx, ROOT_ID, libc::O_RDONLY as u32).unwrap();
+        assert_eq!(opts, OpenOptions::KEEP_CACHE | OpenOptions::CACHE_DIR);
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn test_kernel_passthrough_o_direct() {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        let tmpdir = TempDir::new().expect("Cannot create temporary directory.");
+        let probe = tmpdir.as_path().join("probe");
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .custom_flags(libc::O_DIRECT)
+            .open(&probe)
+        {
+            Ok(_) => std::fs::remove_file(&probe).unwrap(),
+            Err(e) if e.raw_os_error() == Some(libc::EINVAL) => {
+                eprintln!(
+                    "skipping test_kernel_passthrough_o_direct: no O_DIRECT in {:?}",
+                    tmpdir.as_path()
+                );
+                return;
+            }
+            Err(e) => panic!("unexpected error opening {:?} with O_DIRECT: {}", probe, e),
+        }
+        let fs_cfg = Config {
+            do_import: false,
+            allow_direct_io: true,
+            root_dir: tmpdir.as_path().to_string_lossy().to_string(),
+            ..Default::default()
+        };
+        let mut fs = PassthroughFs::<()>::new(fs_cfg).unwrap();
+        fs.set_backing_files(Arc::new(OneIdFiles));
+        fs.import().unwrap();
+        fs.init(FsOptions::PASSTHROUGH).unwrap();
+
+        // O_DIRECT creates and opens pass through without DIRECT_IO, which would send their IO
+        // through the daemon. The backing file gets the client's O_DIRECT instead.
+        let ctx = Context::default();
+        let flags = libc::O_RDWR as u32 | libc::O_DIRECT as u32;
+        let createin = CreateIn {
+            flags: flags | libc::O_CREAT as u32,
+            mode: 0o644,
+            umask: 0,
+            fuse_flags: 0,
+        };
+        let name = CString::new("file").unwrap();
+        let (entry, _, opts, id) = fs.create(&ctx, ROOT_ID, &name, createin).unwrap();
+        assert_eq!(id, Some(1));
+        assert_eq!(opts, OpenOptions::PASSTHROUGH);
+        let (_, opts, id) = fs.open(&ctx, entry.inode, flags, 0).unwrap();
+        assert_eq!(id, Some(1));
+        assert_eq!(opts, OpenOptions::PASSTHROUGH);
+
+        // Without passthrough, both get DIRECT_IO.
+        let fs = PassthroughFs::<()>::new(fs.cfg.clone()).unwrap();
+        fs.import().unwrap();
+        fs.init(FsOptions::empty()).unwrap();
+        let name = CString::new("other").unwrap();
+        let (entry, _, opts, id) = fs.create(&ctx, ROOT_ID, &name, createin).unwrap();
+        assert_eq!(id, None);
+        assert_eq!(opts, OpenOptions::DIRECT_IO);
+        let (_, opts, id) = fs.open(&ctx, entry.inode, flags, 0).unwrap();
+        assert_eq!(id, None);
+        assert_eq!(opts, OpenOptions::DIRECT_IO);
+    }
+
+    /// Backing files for tests in which passthrough stays off.
+    #[cfg(target_os = "linux")]
+    struct UnusedFiles;
+
+    #[cfg(target_os = "linux")]
+    impl BackingFiles for UnusedFiles {
+        fn open(&self, _fd: BorrowedFd<'_>) -> io::Result<u32> {
+            unreachable!()
+        }
+        fn close(&self, _backing_id: u32) -> io::Result<()> {
+            unreachable!()
+        }
+    }
+
+    /// Backing files that hand out the id 1 for every file.
+    #[cfg(target_os = "linux")]
+    struct OneIdFiles;
+
+    #[cfg(target_os = "linux")]
+    impl BackingFiles for OneIdFiles {
+        fn open(&self, _fd: BorrowedFd<'_>) -> io::Result<u32> {
+            Ok(1)
+        }
+        fn close(&self, _backing_id: u32) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn test_kernel_passthrough_not_with_seal_size_or_direct_io() {
+        let tmpdir = TempDir::new().expect("Cannot create temporary directory.");
+        let base = Config {
+            do_import: false,
+            root_dir: tmpdir.as_path().to_string_lossy().to_string(),
+            ..Default::default()
+        };
+        for cfg in [
+            Config {
+                seal_size: true,
+                ..base.clone()
+            },
+            Config {
+                cache_policy: CachePolicy::Never,
+                ..base.clone()
+            },
+            Config {
+                cache_policy: CachePolicy::Metadata,
+                ..base.clone()
+            },
+            Config {
+                allow_direct_io: false,
+                ..base.clone()
+            },
+        ] {
+            let mut fs = PassthroughFs::<()>::new(cfg).unwrap();
+            fs.set_backing_files(Arc::new(UnusedFiles));
+            fs.import().unwrap();
+            let opts = fs.init(FsOptions::PASSTHROUGH).unwrap();
+            assert!(!opts.contains(FsOptions::PASSTHROUGH));
+        }
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn test_kernel_passthrough_not_with_writeback() {
+        let tmpdir = TempDir::new().expect("Cannot create temporary directory.");
+        let fs_cfg = Config {
+            do_import: false,
+            root_dir: tmpdir.as_path().to_string_lossy().to_string(),
+            ..Default::default()
+        };
+        let mut fs = PassthroughFs::<()>::new(fs_cfg).unwrap();
+        fs.set_backing_files(Arc::new(UnusedFiles));
+        fs.import().unwrap();
+        let opts = fs
+            .init(FsOptions::PASSTHROUGH | FsOptions::WRITEBACK_CACHE)
+            .unwrap();
+        assert!(!opts.contains(FsOptions::PASSTHROUGH));
+
+        let ctx = Context::default();
+        let createin = CreateIn {
+            flags: libc::O_CREAT as u32 | libc::O_RDWR as u32,
+            mode: 0o644,
+            umask: 0,
+            fuse_flags: 0,
+        };
+        let name = CString::new("file").unwrap();
+        let (_, _, opts, id) = fs.create(&ctx, ROOT_ID, &name, createin).unwrap();
+        assert!(!opts.contains(OpenOptions::PASSTHROUGH));
+        assert_eq!(id, None);
     }
 
     #[test]

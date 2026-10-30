@@ -81,6 +81,35 @@ fn restore_access_mode(flags: libc::c_int, caller_flags: libc::c_int) -> libc::c
 }
 
 impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
+    /// Get the options of a regular file opened or created with `flags`, and with `backing_id` if
+    /// it passes through.
+    #[cfg_attr(not(target_os = "linux"), allow(unused_variables))]
+    fn file_open_options(&self, flags: u32, backing_id: Option<u32>) -> OpenOptions {
+        // The kernel fails a passthrough open with `KEEP_CACHE`, and the backing file has its
+        // own page cache anyway. `DIRECT_IO` would send reads and writes through the daemon. The
+        // kernel opens the backing file with the client's open flags, so an O_DIRECT open still
+        // does direct IO on the host. Changing O_DIRECT later with fcntl() only reaches the
+        // backing file for async IO, which carries the flag per call.
+        #[cfg(target_os = "linux")]
+        if backing_id.is_some() {
+            return OpenOptions::PASSTHROUGH;
+        }
+        let mut opts = OpenOptions::empty();
+        // If the client requested O_DIRECT and we honor it, the host file has O_DIRECT too, so
+        // the kernel must route IO on this handle through the direct IO path. Serving an
+        // O_DIRECT fd through the page-cache path fails with EINVAL because the page-cache
+        // buffers don't satisfy direct IO alignment requirements.
+        if self.cfg.allow_direct_io && flags & (libc::O_DIRECT as u32) != 0 {
+            opts |= OpenOptions::DIRECT_IO;
+        }
+        match self.cfg.cache_policy {
+            CachePolicy::Never | CachePolicy::Metadata => opts |= OpenOptions::DIRECT_IO,
+            CachePolicy::Always => opts |= OpenOptions::KEEP_CACHE,
+            _ => {}
+        };
+        opts
+    }
+
     fn open_inode(&self, inode: Inode, flags: i32) -> io::Result<File> {
         let data = self.inode_map.get(inode)?;
         if !is_safe_inode(data.mode) {
@@ -572,45 +601,30 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
         let file = self.open_inode(inode, flags as i32)?;
         drop(killpriv);
 
-        let data = HandleData::new(inode, file, flags);
+        // Only regular files pass through, `opendir` also gets here.
+        let backing_id = if flags & (libc::O_DIRECTORY as u32) == 0 {
+            self.acquire_backing_id(inode, &file)
+        } else {
+            None
+        };
         let handle = self.next_handle.fetch_add(1, Ordering::Relaxed);
-        self.handle_map.insert(handle, data);
+        self.handle_map.insert(
+            handle,
+            HandleData::new(inode, file, flags, backing_id.is_some()),
+        );
 
-        let mut opts = OpenOptions::empty();
-        // If the client requested O_DIRECT and we honor it, `open_inode()`
-        // opened the backing file with O_DIRECT, so the kernel must route IO
-        // on this handle through the direct IO path: serving an O_DIRECT fd
-        // through the page-cache path fails with EINVAL because the page-cache
-        // buffers don't satisfy direct IO alignment requirements.
-        if self.cfg.allow_direct_io
-            && flags & (libc::O_DIRECT as u32) != 0
-            && flags & (libc::O_DIRECTORY as u32) == 0
-        {
-            opts |= OpenOptions::DIRECT_IO;
-        }
-        match self.cfg.cache_policy {
-            // We only set the direct I/O option on files.
-            CachePolicy::Never => opts.set(
-                OpenOptions::DIRECT_IO,
-                flags & (libc::O_DIRECTORY as u32) == 0,
-            ),
-            CachePolicy::Metadata => {
-                if flags & (libc::O_DIRECTORY as u32) == 0 {
-                    opts |= OpenOptions::DIRECT_IO;
-                } else {
-                    opts |= OpenOptions::CACHE_DIR | OpenOptions::KEEP_CACHE;
+        let opts = if flags & (libc::O_DIRECTORY as u32) == 0 {
+            self.file_open_options(flags, backing_id)
+        } else {
+            match self.cfg.cache_policy {
+                CachePolicy::Metadata | CachePolicy::Always => {
+                    OpenOptions::CACHE_DIR | OpenOptions::KEEP_CACHE
                 }
+                _ => OpenOptions::empty(),
             }
-            CachePolicy::Always => {
-                opts |= OpenOptions::KEEP_CACHE;
-                if flags & (libc::O_DIRECTORY as u32) != 0 {
-                    opts |= OpenOptions::CACHE_DIR;
-                }
-            }
-            _ => {}
         };
 
-        Ok((Some(handle), opts, None))
+        Ok((Some(handle), opts, backing_id))
     }
 
     fn do_getattr(
@@ -664,7 +678,7 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
             self.handle_map.get(handle, inode)
         } else {
             let file = self.open_inode(inode, flags | libc::O_DIRECTORY)?;
-            Ok(Arc::new(HandleData::new(inode, file, flags as u32)))
+            Ok(Arc::new(HandleData::new(inode, file, flags as u32, false)))
         }
     }
 
@@ -679,7 +693,7 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
             self.handle_map.get(handle, inode)
         } else {
             let file = self.open_inode(inode, flags)?;
-            Ok(Arc::new(HandleData::new(inode, file, flags as u32)))
+            Ok(Arc::new(HandleData::new(inode, file, flags as u32, false)))
         }
     }
 }
@@ -735,12 +749,51 @@ impl<S: BitmapSlice + Send + Sync> FileSystem for PassthroughFs<S> {
             self.perfile_dax.store(true, Ordering::Relaxed);
         }
 
+        // A takeover can call init() again with other options, so passthrough stays on only if
+        // this negotiation enables it again.
+        #[cfg(target_os = "linux")]
+        self.passthrough.store(false, Ordering::Relaxed);
+        #[cfg(target_os = "linux")]
+        if self.kernel_passthrough.is_some() && capable.contains(FsOptions::PASSTHROUGH) {
+            // The kernel ignores FUSE_PASSTHROUGH along with FUSE_WRITEBACK_CACHE, and needs open
+            // requests to get the backing ids. Passthrough writes skip the seal_size check. The
+            // Never and Metadata cache policies want FOPEN_DIRECT_IO, which passthrough opens drop.
+            // The kernel opens the backing file with the client's O_DIRECT, which
+            // allow_direct_io = false would filter out.
+            if self.writeback.load(Ordering::Relaxed)
+                || self.no_open.load(Ordering::Relaxed)
+                || self.seal_size.load(Ordering::Relaxed)
+                || !self.cfg.allow_direct_io
+                || matches!(
+                    self.cfg.cache_policy,
+                    CachePolicy::Never | CachePolicy::Metadata
+                )
+            {
+                warn!(
+                    "fuse: kernel passthrough conflicts with writeback, no_open, seal_size, \
+                     allow_direct_io = false or cache policy {:?}, disabled",
+                    self.cfg.cache_policy
+                );
+            } else {
+                info!("fuse: kernel passthrough enabled");
+                opts |= FsOptions::PASSTHROUGH;
+                self.passthrough.store(true, Ordering::Relaxed);
+            }
+        }
+
         Ok(opts)
     }
 
     fn destroy(&self) {
         self.handle_map.clear();
         self.inode_map.clear();
+        // `Vfs::umount()` destroys a file system while the connection goes on, so release the
+        // backing ids.
+        #[cfg(target_os = "linux")]
+        if let Some(kp) = &self.kernel_passthrough {
+            kp.close_all();
+            self.passthrough.store(false, Ordering::Relaxed);
+        }
 
         if let Err(e) = self.import() {
             error!("fuse: failed to destroy instance, {:?}", e);
@@ -961,7 +1014,13 @@ impl<S: BitmapSlice + Send + Sync> FileSystem for PassthroughFs<S> {
             let _groups = ScopedSuppGroups::new(ctx.supp_gid)?;
             let (_uid, _gid) = set_creds(ctx.uid, ctx.gid)?;
 
-            let flags = self.get_writeback_open_flags(args.flags as i32);
+            let mut flags = self.get_writeback_open_flags(args.flags as i32);
+            // Like `open_inode()`, don't give the host file O_DIRECT unless we honor it. Without
+            // `DIRECT_IO`, reads and writes on the handle take the page-cache path, which fails
+            // with EINVAL on an O_DIRECT fd.
+            if !self.cfg.allow_direct_io {
+                flags &= !libc::O_DIRECT;
+            }
             let mode = args.mode & !(args.umask & 0o777);
             // Same writeback O_WRONLY -> O_RDWR promotion rationale as the fallback in
             // `open_inode()`: a file created with a mode that denies read access to its owner
@@ -1002,25 +1061,21 @@ impl<S: BitmapSlice + Send + Sync> FileSystem for PassthroughFs<S> {
             }
         };
 
+        let mut backing_id = None;
         let ret_handle = if !self.no_open.load(Ordering::Relaxed) {
+            backing_id = self.acquire_backing_id(entry.inode, &file);
             let handle = self.next_handle.fetch_add(1, Ordering::Relaxed);
-            let data = HandleData::new(entry.inode, file, args.flags);
-
-            self.handle_map.insert(handle, data);
+            self.handle_map.insert(
+                handle,
+                HandleData::new(entry.inode, file, args.flags, backing_id.is_some()),
+            );
             Some(handle)
         } else {
             None
         };
 
-        let mut opts = OpenOptions::empty();
-        match self.cfg.cache_policy {
-            CachePolicy::Never => opts |= OpenOptions::DIRECT_IO,
-            CachePolicy::Metadata => opts |= OpenOptions::DIRECT_IO,
-            CachePolicy::Always => opts |= OpenOptions::KEEP_CACHE,
-            _ => {}
-        };
-
-        Ok((entry, ret_handle, opts, None))
+        let opts = self.file_open_options(args.flags, backing_id);
+        Ok((entry, ret_handle, opts, backing_id))
     }
 
     fn unlink(&self, _ctx: &Context, parent: Inode, name: &CStr) -> io::Result<()> {
