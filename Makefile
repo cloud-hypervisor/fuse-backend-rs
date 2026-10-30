@@ -110,11 +110,12 @@ smoke-all: smoke
 # live panic mid-benchmark -- exactly what happened when native async WRITE
 # started calling the reader's async_read_to(): the bench panicked and every
 # group after it never ran again, undetected for weeks because the fio
-# pipeline exercises the daemon binary, not this crate.  The microbench
-# drives PassthroughFs directly against a temporary directory -- no mount, no
+# pipeline exercises the daemon binary, not this crate.  Both microbenches
+# drive PassthroughFs directly against a temporary directory -- no mount, no
 # /dev/fuse, no privileges -- so this is safe wherever cargo runs.
 bench-smoke:
 	${CARGO} bench -p fuse-backend-rs-benchmark --bench sync_vs_async_microbench -- --test
+	${CARGO} bench -p fuse-backend-rs-benchmark --bench async_io_microbench -- --test
 
 build-macos:
 	${CARGO} build --features="fusedev"
