@@ -5,6 +5,7 @@ use std::io;
 
 use async_trait::async_trait;
 
+use super::sync_io::copy_file_range_error;
 use super::*;
 
 #[async_trait]
@@ -100,10 +101,7 @@ impl AsyncFileSystem for Vfs {
     )> {
         validate_path_component(name)?;
 
-        // The supp gid is parsed after the request-wide id remap, so
-        // translate it here, where the target mount is known.
-        let mut ctx = ctx.clone();
-        self.remap_ctx_supp_gid(&mut ctx, parent.fs_idx());
+        let ctx = self.ctx_for_mount(ctx, parent.fs_idx());
 
         match self.get_real_rootfs(parent)? {
             (Left(fs), idata) => fs.create(&ctx, idata.ino(), name, args),
@@ -304,6 +302,292 @@ impl AsyncFileSystem for Vfs {
             (Right(fs), idata) => fs.async_releasedir(ctx, idata.ino(), flags, handle).await,
         }
     }
+
+    async fn async_readlink(&self, ctx: &Context, inode: VfsInode) -> Result<Vec<u8>> {
+        match self.get_real_rootfs(inode)? {
+            (Left(fs), idata) => fs.readlink(ctx, idata.ino()),
+            (Right(fs), idata) => fs.async_readlink(ctx, idata.ino()).await,
+        }
+    }
+
+    async fn async_symlink(
+        &self,
+        ctx: &Context,
+        linkname: &CStr,
+        parent: VfsInode,
+        name: &CStr,
+    ) -> Result<Entry> {
+        validate_path_component(name)?;
+
+        let ctx = self.ctx_for_mount(ctx, parent.fs_idx());
+
+        match self.get_real_rootfs(parent)? {
+            (Left(fs), idata) => fs.symlink(&ctx, linkname, idata.ino(), name),
+            (Right(fs), idata) => fs
+                .async_symlink(&ctx, linkname, idata.ino(), name)
+                .await
+                .and_then(|e| self.convert_backend_entry(idata, e)),
+        }
+    }
+
+    async fn async_mknod(
+        &self,
+        ctx: &Context,
+        inode: VfsInode,
+        name: &CStr,
+        mode: u32,
+        rdev: u32,
+        umask: u32,
+    ) -> Result<Entry> {
+        validate_path_component(name)?;
+
+        let ctx = self.ctx_for_mount(ctx, inode.fs_idx());
+
+        match self.get_real_rootfs(inode)? {
+            (Left(fs), idata) => fs.mknod(&ctx, idata.ino(), name, mode, rdev, umask),
+            (Right(fs), idata) => fs
+                .async_mknod(&ctx, idata.ino(), name, mode, rdev, umask)
+                .await
+                .and_then(|e| self.convert_backend_entry(idata, e)),
+        }
+    }
+
+    async fn async_mkdir(
+        &self,
+        ctx: &Context,
+        parent: VfsInode,
+        name: &CStr,
+        mode: u32,
+        umask: u32,
+    ) -> Result<Entry> {
+        validate_path_component(name)?;
+
+        let ctx = self.ctx_for_mount(ctx, parent.fs_idx());
+
+        match self.get_real_rootfs(parent)? {
+            (Left(fs), idata) => fs.mkdir(&ctx, idata.ino(), name, mode, umask),
+            (Right(fs), idata) => fs
+                .async_mkdir(&ctx, idata.ino(), name, mode, umask)
+                .await
+                .and_then(|e| self.convert_backend_entry(idata, e)),
+        }
+    }
+
+    async fn async_unlink(&self, ctx: &Context, parent: VfsInode, name: &CStr) -> Result<()> {
+        validate_path_component(name)?;
+
+        match self.get_real_rootfs(parent)? {
+            (Left(fs), idata) => fs.unlink(ctx, idata.ino(), name),
+            (Right(fs), idata) => fs.async_unlink(ctx, idata.ino(), name).await,
+        }
+    }
+
+    async fn async_rmdir(&self, ctx: &Context, parent: VfsInode, name: &CStr) -> Result<()> {
+        validate_path_component(name)?;
+
+        match self.get_real_rootfs(parent)? {
+            (Left(fs), idata) => fs.rmdir(ctx, idata.ino(), name),
+            (Right(fs), idata) => fs.async_rmdir(ctx, idata.ino(), name).await,
+        }
+    }
+
+    async fn async_rename(
+        &self,
+        ctx: &Context,
+        olddir: VfsInode,
+        oldname: &CStr,
+        newdir: VfsInode,
+        newname: &CStr,
+        flags: u32,
+    ) -> Result<()> {
+        validate_path_component(oldname)?;
+        validate_path_component(newname)?;
+
+        let (root, idata_old, idata_new) = self.get_real_rootfs_pair(olddir, newdir)?;
+
+        match root {
+            Left(fs) => fs.rename(
+                ctx,
+                idata_old.ino(),
+                oldname,
+                idata_new.ino(),
+                newname,
+                flags,
+            ),
+            Right(fs) => {
+                fs.async_rename(
+                    ctx,
+                    idata_old.ino(),
+                    oldname,
+                    idata_new.ino(),
+                    newname,
+                    flags,
+                )
+                .await
+            }
+        }
+    }
+
+    async fn async_link(
+        &self,
+        ctx: &Context,
+        inode: VfsInode,
+        newparent: VfsInode,
+        newname: &CStr,
+    ) -> Result<Entry> {
+        validate_path_component(newname)?;
+
+        let (root, idata_old, idata_new) = self.get_real_rootfs_pair(inode, newparent)?;
+
+        match root {
+            Left(fs) => fs.link(ctx, idata_old.ino(), idata_new.ino(), newname),
+            Right(fs) => fs
+                .async_link(ctx, idata_old.ino(), idata_new.ino(), newname)
+                .await
+                .and_then(|e| self.convert_backend_entry(idata_new, e)),
+        }
+    }
+
+    async fn async_statfs(&self, ctx: &Context, inode: VfsInode) -> Result<statvfs64> {
+        match self.get_real_rootfs(inode)? {
+            (Left(fs), idata) => fs.statfs(ctx, idata.ino()),
+            (Right(fs), idata) => fs.async_statfs(ctx, idata.ino()).await,
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn async_release(
+        &self,
+        ctx: &Context,
+        inode: VfsInode,
+        flags: u32,
+        handle: u64,
+        flush: bool,
+        flock_release: bool,
+        lock_owner: Option<u64>,
+    ) -> Result<()> {
+        match self.get_real_rootfs(inode)? {
+            (Left(fs), idata) => fs.release(
+                ctx,
+                idata.ino(),
+                flags,
+                handle,
+                flush,
+                flock_release,
+                lock_owner,
+            ),
+            (Right(fs), idata) => {
+                fs.async_release(
+                    ctx,
+                    idata.ino(),
+                    flags,
+                    handle,
+                    flush,
+                    flock_release,
+                    lock_owner,
+                )
+                .await
+            }
+        }
+    }
+
+    async fn async_setxattr(
+        &self,
+        ctx: &Context,
+        inode: VfsInode,
+        name: &CStr,
+        value: &[u8],
+        flags: u32,
+    ) -> Result<()> {
+        match self.get_real_rootfs(inode)? {
+            (Left(fs), idata) => fs.setxattr(ctx, idata.ino(), name, value, flags),
+            (Right(fs), idata) => {
+                fs.async_setxattr(ctx, idata.ino(), name, value, flags)
+                    .await
+            }
+        }
+    }
+
+    async fn async_getxattr(
+        &self,
+        ctx: &Context,
+        inode: VfsInode,
+        name: &CStr,
+        size: u32,
+    ) -> Result<GetxattrReply> {
+        match self.get_real_rootfs(inode)? {
+            (Left(fs), idata) => fs.getxattr(ctx, idata.ino(), name, size),
+            (Right(fs), idata) => fs.async_getxattr(ctx, idata.ino(), name, size).await,
+        }
+    }
+
+    async fn async_listxattr(
+        &self,
+        ctx: &Context,
+        inode: VfsInode,
+        size: u32,
+    ) -> Result<ListxattrReply> {
+        match self.get_real_rootfs(inode)? {
+            (Left(fs), idata) => fs.listxattr(ctx, idata.ino(), size),
+            (Right(fs), idata) => fs.async_listxattr(ctx, idata.ino(), size).await,
+        }
+    }
+
+    async fn async_removexattr(&self, ctx: &Context, inode: VfsInode, name: &CStr) -> Result<()> {
+        match self.get_real_rootfs(inode)? {
+            (Left(fs), idata) => fs.removexattr(ctx, idata.ino(), name),
+            (Right(fs), idata) => fs.async_removexattr(ctx, idata.ino(), name).await,
+        }
+    }
+
+    async fn async_flush(
+        &self,
+        ctx: &Context,
+        inode: VfsInode,
+        handle: u64,
+        lock_owner: u64,
+    ) -> Result<()> {
+        match self.get_real_rootfs(inode)? {
+            (Left(fs), idata) => fs.flush(ctx, idata.ino(), handle, lock_owner),
+            (Right(fs), idata) => fs.async_flush(ctx, idata.ino(), handle, lock_owner).await,
+        }
+    }
+
+    async fn async_access(&self, ctx: &Context, inode: VfsInode, mask: u32) -> Result<()> {
+        match self.get_real_rootfs(inode)? {
+            (Left(fs), idata) => fs.access(ctx, idata.ino(), mask),
+            (Right(fs), idata) => fs.async_access(ctx, idata.ino(), mask).await,
+        }
+    }
+
+    // Like `copy_file_range()`.
+    async fn async_copy_file_range(
+        &self,
+        ctx: &Context,
+        inode_in: VfsInode,
+        fh_in: u64,
+        offset_in: u64,
+        inode_out: VfsInode,
+        fh_out: u64,
+        offset_out: u64,
+        len: u64,
+        flags: u64,
+    ) -> Result<u32> {
+        let (fs, idata_in, idata_out) = self.copy_file_range_fs(inode_in, inode_out)?;
+        fs.async_copy_file_range(
+            ctx,
+            idata_in.ino(),
+            fh_in,
+            offset_in,
+            idata_out.ino(),
+            fh_out,
+            offset_out,
+            len,
+            flags,
+        )
+        .await
+        .map_err(copy_file_range_error)
+    }
 }
 
 #[cfg(test)]
@@ -377,7 +661,7 @@ mod tests {
     }
 
     /// A backend whose root directory, inode 1, holds a file with inode 5. Only the async
-    /// handlers serve the directory, after they yield to the runtime once.
+    /// handlers answer, after they yield to the runtime once.
     struct AsyncDirFs;
 
     impl FileSystem for AsyncDirFs {
@@ -449,6 +733,58 @@ mod tests {
             tokio::task::yield_now().await;
             check_dir_handle(handle)
         }
+
+        async fn async_readlink(&self, _ctx: &Context, _inode: u64) -> Result<Vec<u8>> {
+            tokio::task::yield_now().await;
+            Ok(b"target".to_vec())
+        }
+
+        async fn async_mkdir(
+            &self,
+            _ctx: &Context,
+            _parent: u64,
+            name: &CStr,
+            _mode: u32,
+            _umask: u32,
+        ) -> Result<Entry> {
+            tokio::task::yield_now().await;
+            match name.to_bytes() {
+                b"dir" => Ok(Entry {
+                    inode: 6,
+                    ..Default::default()
+                }),
+                _ => Err(io::Error::from_raw_os_error(libc::EEXIST)),
+            }
+        }
+
+        async fn async_rename(
+            &self,
+            _ctx: &Context,
+            _olddir: u64,
+            _oldname: &CStr,
+            _newdir: u64,
+            _newname: &CStr,
+            _flags: u32,
+        ) -> Result<()> {
+            tokio::task::yield_now().await;
+            Ok(())
+        }
+
+        async fn async_copy_file_range(
+            &self,
+            _ctx: &Context,
+            _inode_in: u64,
+            _fh_in: u64,
+            _offset_in: u64,
+            _inode_out: u64,
+            _fh_out: u64,
+            _offset_out: u64,
+            len: u64,
+            _flags: u64,
+        ) -> Result<u32> {
+            tokio::task::yield_now().await;
+            Ok(len as u32)
+        }
     }
 
     impl BackendFileSystem for AsyncDirFs {
@@ -469,6 +805,8 @@ mod tests {
 
     /// The VFS inode of the root of the first mount.
     const MOUNT_ROOT: u64 = 0x100_0000_0000_0001;
+    /// The VFS inode of the file in an `AsyncDirFs` that is the first mount.
+    const MOUNT_FILE: u64 = 0x100_0000_0000_0005;
 
     /// Lists the directory `inode` with READDIR, as the name and inode of each entry. It uses
     /// the handle that `AsyncDirFs` opens, which the pseudo fs ignores.
@@ -534,7 +872,7 @@ mod tests {
         vfs.mount_with_id_mapping(Box::new(AsyncDirFs), "/x", Some((0, 1000, 1)))
             .unwrap();
         let ctx = Context::default();
-        let file = 0x100_0000_0000_0005;
+        let file = MOUNT_FILE;
 
         let handle = tokio::spawn(async move {
             assert_eq!(list(&vfs, MOUNT_ROOT).await, [(b"file".to_vec(), file)]);
@@ -571,6 +909,94 @@ mod tests {
         assert_eq!(handle, None);
         let (handle, _) = vfs.async_opendir(&ctx, MOUNT_ROOT.into(), 0).await.unwrap();
         assert_eq!(handle, Some(DIR_HANDLE));
+    }
+
+    #[tokio::test]
+    async fn test_vfs_async_node_requests() {
+        let vfs = Vfs::new(VfsOptions::default());
+        vfs.mount(Box::new(AsyncDirFs), "/x").unwrap();
+        let ctx = Context::default();
+        let name = |s: &str| CString::new(s).unwrap();
+
+        let handle = tokio::spawn(async move {
+            let entry = vfs
+                .async_mkdir(&ctx, MOUNT_ROOT.into(), &name("dir"), 0o755, 0)
+                .await
+                .unwrap();
+            assert_eq!(entry.inode, 0x100_0000_0000_0006);
+            let err = vfs
+                .async_mkdir(&ctx, MOUNT_ROOT.into(), &name("a/b"), 0o755, 0)
+                .await
+                .unwrap_err();
+            assert_eq!(err.raw_os_error(), Some(libc::EINVAL));
+
+            let target = vfs.async_readlink(&ctx, MOUNT_FILE.into()).await;
+            assert_eq!(target.unwrap(), b"target");
+
+            let (a, b) = (name("a"), name("b"));
+            vfs.async_rename(&ctx, MOUNT_ROOT.into(), &a, MOUNT_ROOT.into(), &b, 0)
+                .await
+                .unwrap();
+            // A rename can't leave its file system.
+            let err = vfs
+                .async_rename(&ctx, MOUNT_ROOT.into(), &a, ROOT_ID.into(), &b, 0)
+                .await
+                .unwrap_err();
+            assert_eq!(err.raw_os_error(), Some(libc::EINVAL));
+        });
+        handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_vfs_async_xattr_name_with_slash() {
+        fn errno<T>(res: Result<T>) -> Option<i32> {
+            res.err().and_then(|e| e.raw_os_error())
+        }
+
+        let vfs = Vfs::new(VfsOptions::default());
+        vfs.mount(Box::new(FakeFileSystemOne {}), "/x").unwrap();
+        let ctx = Context::new();
+        let x = CString::new("x").unwrap();
+        let x = vfs.async_lookup(&ctx, ROOT_ID.into(), &x).await;
+        let inode = x.unwrap().inode.into();
+
+        // Linux allows '/' in xattr names, so the requests reach the file system, whose
+        // default handlers answer ENOSYS.
+        let name = CString::new("user.a/b").unwrap();
+        let set = vfs.async_setxattr(&ctx, inode, &name, b"v", 0).await;
+        let get = vfs.async_getxattr(&ctx, inode, &name, 0).await;
+        let remove = vfs.async_removexattr(&ctx, inode, &name).await;
+        let enosys = Some(libc::ENOSYS);
+        assert_eq!(errno(set), enosys);
+        assert_eq!(errno(get), enosys);
+        assert_eq!(errno(remove), enosys);
+    }
+
+    #[tokio::test]
+    async fn test_vfs_async_copy_file_range() {
+        use super::super::sync_io::{COPY_CROSS_MOUNT, COPY_UNSUPPORTED};
+
+        let vfs = Vfs::new(VfsOptions::default());
+        vfs.mount(Box::new(AsyncDirFs), "/x").unwrap();
+        // FakeFileSystemOne answers ENOSYS.
+        vfs.mount(Box::new(FakeFileSystemOne {}), "/y").unwrap();
+        let other = |ino: u64| 0x200_0000_0000_0000 | ino;
+        let ctx = Context::default();
+        let copy = |inode_in: u64, inode_out: u64| {
+            vfs.async_copy_file_range(&ctx, inode_in.into(), 1, 0, inode_out.into(), 2, 0, 4096, 0)
+        };
+
+        // AsyncDirFs answers only with its async handler.
+        assert_eq!(copy(MOUNT_FILE, MOUNT_FILE).await.unwrap(), 4096);
+        for (inode_in, inode_out, errno) in [
+            (other(5), other(6), COPY_UNSUPPORTED),
+            (MOUNT_FILE, other(5), COPY_CROSS_MOUNT),
+            (ROOT_ID, MOUNT_FILE, libc::EISDIR),
+            (MOUNT_FILE, ROOT_ID, libc::EISDIR),
+        ] {
+            let err = copy(inode_in, inode_out).await.unwrap_err();
+            assert_eq!(err.raw_os_error(), Some(errno));
+        }
     }
 
     // Note: the passthrough integration test driving async requests through
