@@ -12,6 +12,12 @@
 //! the application's own tokio runtime drives futures from this crate, such as
 //! `FuseDevTask::poll_handler()`, because a plain tokio runtime can't poll `tokio-uring` objects.
 //!
+//! Code outside this module and `async_file` doesn't match on [`RuntimeType`]. It dispatches on
+//! what the runtime means for the operation instead: [`RuntimeType::file_io_blocks()`] tells
+//! whether file IO blocks the calling thread, and `async_file::File::uses_io_uring()` tells
+//! whether file IO goes through io_uring. A new behavioral difference between the runtimes
+//! should become such a capability query, not a new `match` site in a filesystem crate.
+//!
 //! Note: creating io-uring rings locks kernel memory accounted against `RLIMIT_MEMLOCK`
 //! (see `account_memlock()` in the kernel). If the limit is too low (e.g. the default
 //! 64KB), ring creation may fail with `ENOMEM`, in which case [`Runtime::new()`] panics
