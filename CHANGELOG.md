@@ -196,6 +196,8 @@
   writes of opens that ask for it with zero-copy. It moves the data between the client's pages
   and the file with io_uring fixed-buffer operations. It needs buffer pools and CAP_SYS_ADMIN,
   and serves without it otherwise. `UringConfig` has a new field.
+- [317](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/317): `UringWriter` implements the asynchronous `Writer` methods, so the async server can reply
+  through the FUSE-over-io_uring transport.
 
 ### Changed
 - [325](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/325): The `fuse-backend-fusedev` `uring` transport uses io-uring 0.6 instead of 0.5,

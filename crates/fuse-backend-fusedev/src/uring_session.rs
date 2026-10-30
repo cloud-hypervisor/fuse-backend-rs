@@ -46,6 +46,8 @@ use fuse_backend_core::api::server::Server;
 use fuse_backend_core::buffer::{Error::*, Reader, Result, Writer, ZeroCopySource};
 use fuse_backend_core::file_buf::FileVolatileSlice;
 use fuse_backend_core::file_traits::FileReadWriteVolatile;
+#[cfg(feature = "async-io")]
+use fuse_backend_core::{file_buf::FileVolatileBuf, file_traits::AsyncFileReadWriteVolatile};
 use vm_memory::bitmap::BitmapSlice;
 use vm_memory::mmap::MmapRegion;
 
@@ -568,6 +570,25 @@ impl<'a, S: BitmapSlice> UringWriter<'a, S> {
         Ok(data.len())
     }
 
+    /// The unwritten end of the body region, after checking that `count`
+    /// more bytes fit into it. Free space in the header slot doesn't count,
+    /// because file data only goes into the body.
+    fn body_tail(&mut self, count: usize) -> io::Result<*mut u8> {
+        let spare = self.body.spare_capacity_mut();
+        check_space(spare.len(), count)?;
+        Ok(spare.as_mut_ptr().cast())
+    }
+
+    /// Account `cnt` bytes that a file read placed at `body_tail()`.
+    ///
+    /// # Safety
+    /// The bytes must have been written at the pointer `body_tail(count)`
+    /// returned, with `cnt <= count`.
+    unsafe fn advance_body(&mut self, cnt: usize) {
+        let new_len = self.body.len() + cnt;
+        self.body.set_len(new_len);
+    }
+
     /// Stage data read from a file descriptor at offset `off` into the body
     /// region. Must be called after the header has been fully written.
     pub fn write_from_at<F: FileReadWriteVolatile>(
@@ -593,24 +614,47 @@ impl<'a, S: BitmapSlice> UringWriter<'a, S> {
             zc.len += cnt;
             return Ok(cnt);
         }
-        // File data only goes into the body, so free space in the header
-        // slot doesn't count.
-        check_space(self.body.capacity() - self.body.len(), count)?;
+        let tail = self.body_tail(count)?;
+        // Safe because body_tail() checked that count bytes fit.
         let cnt = src
             .read_vectored_at_volatile(
-                // Safe because the body has room for count more bytes.
-                unsafe {
-                    &[FileVolatileSlice::from_raw_ptr(
-                        self.body.as_mut_ptr().add(self.body.len()),
-                        count,
-                    )]
-                },
+                unsafe { &[FileVolatileSlice::from_raw_ptr(tail, count)] },
                 off,
             )?
             .min(count);
-        let new_len = self.body.len() + cnt;
-        // Safe because the read placed cnt <= count bytes behind the body.
-        unsafe { self.body.set_len(new_len) };
+        // Safe because the read placed cnt <= count bytes at the tail.
+        unsafe { self.advance_body(cnt) };
+        Ok(cnt)
+    }
+
+    /// Stage data read asynchronously from a file at offset `off` into the
+    /// body region, like `write_from_at()`.
+    ///
+    /// The read points into memory the writer borrows, so the caller must
+    /// not drop the future before it completes.
+    #[cfg(feature = "async-io")]
+    pub async fn async_write_from_at<F: AsyncFileReadWriteVolatile + ?Sized>(
+        &mut self,
+        src: &F,
+        count: usize,
+        off: u64,
+    ) -> io::Result<usize> {
+        if self.zero_copy.is_some() {
+            // Moving zero-copy data waits on the worker's ring, which only
+            // the synchronous handlers may do.
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "zero-copy data can't be written asynchronously",
+            ));
+        }
+        let tail = self.body_tail(count)?;
+        // Safe because body_tail() checked that count bytes fit, and the
+        // writer borrows the body region for 'a, which outlives the read.
+        let buf = unsafe { FileVolatileBuf::from_raw_ptr(tail, 0, count) };
+        let (res, _) = src.async_read_at_volatile(buf, off).await;
+        let cnt = res?.min(count);
+        // Safe because the read placed cnt <= count bytes at the tail.
+        unsafe { self.advance_body(cnt) };
         Ok(cnt)
     }
 }
@@ -650,12 +694,10 @@ impl<S: BitmapSlice> Write for UringWriter<'_, S> {
 }
 
 impl<'a, S: BitmapSlice> Writer for UringWriter<'a, S> {
-    // All methods forward to the inherent methods of the same name; the
-    // explicit `UringWriter::` prefix keeps the forwarding unambiguous and
-    // makes removing an inherent method a compile error instead of silent
-    // infinite recursion. The uring transport has no async-io support and
-    // relies on the trait's default `EINVAL` implementations for the
-    // `async_*` methods.
+    // The synchronous methods and `async_write_from_at` forward to the
+    // inherent methods of the same name. The writer only stages the reply in
+    // memory, so the other `async_*` methods run the `io::Write` methods and
+    // `commit()`.
     fn write_from_at<F: FileReadWriteVolatile>(
         &mut self,
         src: F,
@@ -678,6 +720,41 @@ impl<'a, S: BitmapSlice> Writer for UringWriter<'a, S> {
     }
 
     fn commit(&mut self, other: Option<&Self>) -> io::Result<usize> {
+        UringWriter::commit(self, other)
+    }
+
+    #[cfg(feature = "async-io")]
+    async fn async_write(&mut self, data: &[u8]) -> io::Result<usize> {
+        self.write(data)
+    }
+
+    #[cfg(feature = "async-io")]
+    async fn async_write2(&mut self, data: &[u8], data2: &[u8]) -> io::Result<usize> {
+        self.write_vectored(&[IoSlice::new(data), IoSlice::new(data2)])
+    }
+
+    #[cfg(feature = "async-io")]
+    async fn async_write3(&mut self, data: &[u8], data2: &[u8], data3: &[u8]) -> io::Result<usize> {
+        self.write_vectored(&[IoSlice::new(data), IoSlice::new(data2), IoSlice::new(data3)])
+    }
+
+    #[cfg(feature = "async-io")]
+    async fn async_write_all(&mut self, buf: &[u8]) -> io::Result<()> {
+        self.write_all(buf)
+    }
+
+    #[cfg(feature = "async-io")]
+    async fn async_write_from_at<F: AsyncFileReadWriteVolatile + ?Sized>(
+        &mut self,
+        src: &F,
+        count: usize,
+        off: u64,
+    ) -> io::Result<usize> {
+        UringWriter::async_write_from_at(self, src, count, off).await
+    }
+
+    #[cfg(feature = "async-io")]
+    async fn async_commit(&mut self, other: Option<&Self>) -> io::Result<usize> {
         UringWriter::commit(self, other)
     }
 }
@@ -2628,6 +2705,49 @@ mod tests {
 
         // Body should contain file data starting at offset 8.
         assert_eq!(&body[..16], &(8..24).collect::<Vec<u8>>()[..]);
+    }
+
+    #[cfg(feature = "async-io")]
+    #[test]
+    fn test_uring_writer_async() {
+        use fuse_backend_core::async_file::File as AsyncFile;
+        use fuse_backend_core::async_runtime;
+
+        let dir = TempDir::new().unwrap();
+        let path = dir.as_path().join("data");
+        std::fs::write(&path, (0..64).collect::<Vec<u8>>()).unwrap();
+
+        let mut hdr = vec![0u8; OUT_HEADER_SIZE];
+        let mut body = vec![0u8; 32];
+        {
+            let mut w = UringWriter::<'_, ()>::new(&mut hdr, &mut body);
+            async_runtime::block_on(async {
+                // Writes fill the header slot first and spill into the body,
+                // like the synchronous writes do.
+                w.async_write_all(&[0xFF; OUT_HEADER_SIZE + 1])
+                    .await
+                    .unwrap();
+                assert_eq!(w.async_write2(&[1], &[2]).await.unwrap(), 2);
+
+                let file = AsyncFile::async_open(&path, false, false).await.unwrap();
+                // Read through the trait with an unsized file, as the async
+                // server does.
+                let src: &dyn AsyncFileReadWriteVolatile = &file;
+                assert_eq!(
+                    Writer::async_write_from_at(&mut w, src, 16, 8)
+                        .await
+                        .unwrap(),
+                    16
+                );
+                assert_eq!(w.async_commit(None).await.unwrap(), OUT_HEADER_SIZE + 19);
+                // The writer rejects more data than the body has left.
+                assert!(w.async_write_from_at(&file, 16, 0).await.is_err());
+            });
+        }
+
+        assert_eq!(&hdr[..], &[0xFF; OUT_HEADER_SIZE]);
+        assert_eq!(&body[..3], &[0xFF, 1, 2]);
+        assert_eq!(&body[3..19], &(8..24).collect::<Vec<u8>>()[..]);
     }
 
     /// A worker over PassthroughFs, for exercising process() without a
