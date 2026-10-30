@@ -218,6 +218,8 @@
   only READDIR and READDIRPLUS still run on the runtime thread. A MKDIR, MKNOD, SYMLINK, LINK or
   OPENDIR that is dropped while a pool thread serves it gives back the lookup count or handle it
   took.
+- [317](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/317): `UringWriter` implements the asynchronous `Writer` methods, so the async server can reply
+  through the FUSE-over-io_uring transport.
 
 ### Changed
 - [325](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/325): The `fuse-backend-fusedev` `uring` transport uses io-uring 0.6 instead of 0.5,
