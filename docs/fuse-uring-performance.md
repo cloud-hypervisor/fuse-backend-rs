@@ -255,9 +255,13 @@ with a slot per entry. A zero-copy READ gets a reply body that only the
 transport can fill, and `write_from()` runs `READ_FIXED` from the file
 into the slot. A zero-copy WRITE gets a `Reader` whose data only the
 transport can move, and `read_to()` runs `WRITE_FIXED` from the slot
-into the file. Both run on the worker's ring and wait for the result
-there, because the kernel registered the pages in that ring's table. If the
-kernel refuses zero-copy, `UringFuseServing` adds the queues without it.
+into the file. Both run on the worker's ring, because the kernel
+registered the pages in that ring's table. A synchronous handler waits
+for the result on the ring. With `UringFuseServing::new_async()`, the
+asynchronous handlers call `async_write_from()` and `async_read_to()`,
+whose operations carry the index of the request's entry, and the worker
+loop wakes the request when the result comes off the ring. If the kernel
+refuses zero-copy, `UringFuseServing` adds the queues without it.
 
 A file system that reads or writes zero-copy data through memory, or
 with a file that has no descriptor, still works, but slower. The worker
@@ -294,13 +298,6 @@ and uses the buffer pools of protocol 7.46 (kernel 7.3) when the kernel has them
 - Buffer pools with configurable bufs_per_queue, see "Buffer pools" above
 - Zero-copy for opens that ask for it, see "Zero-copy" above
 - Fallback to classic `/dev/fuse` for notifications/interrupts
-
-### Future Work
-
-1. **Async zero-copy**: `ZeroCopySource` and the zero-copy reply wait
-   synchronously on the worker's ring, which suits the synchronous
-   handlers. Serving `AsyncFileSystem` handlers over io_uring needs
-   asynchronous versions.
 
 ### Tuning Recommendations
 
