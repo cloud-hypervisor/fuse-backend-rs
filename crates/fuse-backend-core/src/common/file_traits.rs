@@ -955,8 +955,8 @@ mod async_io {
         }
 
         /// Vectored IO moves the right data through many buffers. The runtime's own file uses
-        /// io_uring when the runtime does, a borrowed descriptor follows the runtime, and a tokio
-        /// file always makes blocking syscalls.
+        /// io_uring when the runtime does, a borrowed descriptor follows the runtime unless it was
+        /// borrowed to block, and a tokio file always makes blocking syscalls.
         #[test]
         fn async_vectored_io_data() {
             let dir = tempfile::tempdir().unwrap();
@@ -980,10 +980,12 @@ mod async_io {
             let many_read_sizes = vec![4; 1200];
 
             let owner = open("borrowed");
+            let blocking = open("blocking");
             block_on(async {
                 let files = [
                     File::from_std_file(open("runtime")),
                     File::borrow_fd(owner.as_raw_fd(), Arc::new(())),
+                    File::borrow_fd_blocking(blocking.as_raw_fd(), Arc::new(())),
                     File::Tokio(tokio::fs::File::from_std(open("tokio"))),
                 ];
                 for file in files.iter() {

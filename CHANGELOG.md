@@ -221,6 +221,13 @@
   `&dyn AsyncFileReadWriteVolatile` instead of going through the `Arc` forwarding impl, which
   boxed one more future per READ and WRITE. Overrides of `async_write_from_at()` add `+ ?Sized`
   to `F`. A 4 KiB READ through `Server::async_handle_message()` takes 25-35 ns (3-5%) less.
+- Without the thread pool, `PassthroughFs::async_write()` writes with `pwritev()` on tokio-uring
+  too, as it does on tokio. ext4 and tmpfs don't take buffered writes that can't block, so
+  io_uring handed every write to an io-wq thread. 4 KiB random writes through `/dev/fuse` with
+  4 async workers went from 861k-906k to 1073k-1078k IOPS. A write that waits on dirty page
+  throttling now stalls the worker, as in the sync server. Zero-copy writes over io_uring don't
+  change, and still pay for the io-wq thread on ext4 and tmpfs. For this,
+  `async_file::File::borrow_fd_blocking()` borrows a descriptor whose IO never uses io_uring.
 - Bump the declared minimum supported Rust version (MSRV) from 1.80 to 1.86.
   Trait-object upcasting (stabilized in Rust 1.86) is required by the default
   `AsyncFileSystem` read/write handlers and by the passthrough O_DIRECT relay,

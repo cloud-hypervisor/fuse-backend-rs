@@ -31,7 +31,8 @@ pub enum File {
         /// The borrowed file descriptor.
         fd: RawFd,
         /// Whether IO on the descriptor goes through io_uring. Resolved from
-        /// the runtime type when the descriptor is borrowed, see `borrow_fd()`.
+        /// the runtime type when the descriptor is borrowed, see `borrow_fd()`,
+        /// and always false from `borrow_fd_blocking()`.
         io_uring: bool,
         /// A reference keeping the file descriptor valid.
         _guard: Arc<dyn Any>,
@@ -93,6 +94,17 @@ impl File {
         File::Borrowed {
             fd,
             io_uring,
+            _guard: guard,
+        }
+    }
+
+    /// Like `borrow_fd()`, for a file object that does its IO with blocking
+    /// syscalls on the calling thread, even on a runtime whose
+    /// `RuntimeType::file_io_blocks()` is false.
+    pub fn borrow_fd_blocking(fd: RawFd, guard: Arc<dyn Any>) -> Self {
+        File::Borrowed {
+            fd,
+            io_uring: false,
             _guard: guard,
         }
     }
@@ -228,7 +240,8 @@ impl File {
     /// Whether IO on this file goes through io_uring rather than blocking syscalls.
     ///
     /// For a borrowed descriptor, this is what `borrow_fd()` resolved from the
-    /// runtime type when the descriptor was borrowed.
+    /// runtime type when the descriptor was borrowed, and false for one from
+    /// `borrow_fd_blocking()`.
     pub(crate) fn uses_io_uring(&self) -> bool {
         match self {
             File::Tokio(_) => false,
@@ -649,6 +662,9 @@ mod tests {
         let mut buffer = [0u8; 4];
         assert_eq!(std::io::Read::read(&mut owner, &mut buffer).unwrap(), 4);
         assert_eq!(&buffer, b"test");
+
+        // A blocking borrowed file never uses io_uring.
+        assert!(!File::borrow_fd_blocking(owner.as_raw_fd(), Arc::new(())).uses_io_uring());
     }
 
     #[test]

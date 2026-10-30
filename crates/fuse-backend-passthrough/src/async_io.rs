@@ -27,7 +27,9 @@
 //! runtime thread. These are the relayed READ and WRITE requests, and on the
 //! tokio runtime also READ cache misses and every WRITE. A pool thread runs
 //! the synchronous handler on its own copy of the data, see `read_on_pool()`
-//! and `write_on_pool()`.
+//! and `write_on_pool()`. Without the thread pool, a WRITE is a `pwritev()`
+//! on the runtime thread with either runtime, except for zero-copy data, which
+//! the transport writes to the file, see `async_write()`.
 //!
 //! # Runtime requirement
 //!
@@ -35,9 +37,9 @@
 //! `Runtime` (`fuse_backend_core::async_runtime`). On Linux with io_uring,
 //! the default, that is a tokio-uring runtime, whose operations panic when
 //! polled outside its context. So on another executor, such as a plain tokio
-//! runtime, the first native WRITE or READ cache miss panics. Serve the
-//! filesystem with a transport that drives this crate's `Runtime`, as
-//! `AsyncFuseServing` does, or choose the tokio runtime with
+//! runtime, the first READ cache miss, or WRITE with the thread pool,
+//! panics. Serve the filesystem with a transport that drives this crate's
+//! `Runtime`, as `AsyncFuseServing` does, or choose the tokio runtime with
 //! `async_runtime::set_runtime_type()` or `FUSE_BACKEND_RS_ASYNC_RUNTIME=tokio`.
 //! Its `preadv`/`pwritev` calls work in any runtime context, but block the
 //! runtime thread on cache misses unless the thread pool is enabled.
@@ -121,13 +123,16 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
     }
 
     /// Create an asynchronous file object for the file referenced by a
-    /// handle, to serve READ/WRITE requests with native asynchronous IO.
+    /// handle, to serve READ/WRITE requests.
     ///
     /// The fd of the handle is borrowed for the duration of the IO: the
     /// asynchronous file object holds a reference to the handle data, which
     /// keeps the descriptor valid until the request completes, even if the
     /// handle is released in the meantime. This avoids the `dup()`/`close()`
     /// syscall pair of owning an independent descriptor per request.
+    ///
+    /// With `blocking`, the file object does its IO with blocking syscalls
+    /// on the calling thread, even on tokio-uring.
     // The asynchronous IO engine (io_uring) is bound to the thread polling
     // it, so asynchronous file objects are neither `Send` nor `Sync`; they
     // are only used within the single-threaded async runtime context.
@@ -136,6 +141,7 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
         &self,
         data: &Arc<HandleData>,
         flags: u32,
+        blocking: bool,
     ) -> io::Result<Arc<dyn AsyncFileReadWriteVolatile>> {
         let fd = data.borrow_fd().as_raw_fd();
         // Reconcile the O_DIRECT flag of the shared file description before
@@ -146,7 +152,11 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
         // submission time.
         drop(self.ensure_file_flags(data, &data.borrow_fd(), flags)?);
 
-        Ok(Arc::new(AsyncFile::borrow_fd(fd, data.clone())))
+        Ok(Arc::new(if blocking {
+            AsyncFile::borrow_fd_blocking(fd, data.clone())
+        } else {
+            AsyncFile::borrow_fd(fd, data.clone())
+        }))
     }
 
     /// The shared file system to offload blocking handlers to, if the thread
@@ -909,7 +919,7 @@ impl<S: BitmapSlice + Send + Sync + 'static> AsyncFileSystem for PassthroughFs<S
         // Cache miss: serve the remainder with native asynchronous IO,
         // continuing at the writer's position and the file offset where
         // the inline attempt stopped.
-        let file = self.async_file_from_data(&data, flags)?;
+        let file = self.async_file_from_data(&data, flags, false)?;
         let n = SendZeroCopyFuture(w.async_write_from(
             file,
             size as usize - served,
@@ -949,8 +959,9 @@ impl<S: BitmapSlice + Send + Sync + 'static> AsyncFileSystem for PassthroughFs<S
         // the pool thread, with no `.await` in between.
         let relay = flags & (os_compat::O_DIRECT as u32) != 0
             || (self.killpriv_v2.load(Ordering::Relaxed) && fuse_flags & WRITE_KILL_PRIV != 0);
+        let mut pool = self.pool_fs();
         if relay || async_runtime::runtime_type().file_io_blocks() {
-            if let Some(fs) = self.pool_fs() {
+            if let Some(fs) = pool.take() {
                 return Self::write_on_pool(
                     fs, ctx, inode, handle, r, size, offset, flags, fuse_flags,
                 )
@@ -983,10 +994,18 @@ impl<S: BitmapSlice + Send + Sync + 'static> AsyncFileSystem for PassthroughFs<S
         // asynchronous file object holds a reference to the handle data,
         // which keeps the descriptor valid until the request completes,
         // avoiding the `dup()`/`close()` syscall pair per request.
-        let file = self.async_file_from_data(&data, flags)?;
+        //
+        // Without the pool, write with `pwritev()` on the runtime thread, as
+        // the tokio runtime does. ext4 and tmpfs don't take buffered writes
+        // that can't block, so io_uring would hand each one to an io-wq
+        // thread, which costs more than a write that the page cache absorbs.
+        // XFS and btrfs take them, so there io_uring hands off only the writes
+        // that would block, and those now stall the worker instead. Zero-copy
+        // data still goes through the transport's ring.
+        let file = self.async_file_from_data(&data, flags, pool.is_none())?;
 
-        // Serve the request with native asynchronous IO: the transport
-        // transfers the data directly between its buffer and the file.
+        // The transport transfers the data directly between its buffer and
+        // the file.
         SendZeroCopyFuture(r.async_read_to(file, size as usize, offset)).await
     }
 
