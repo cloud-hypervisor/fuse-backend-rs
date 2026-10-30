@@ -23,6 +23,9 @@ build = "build.rs"
 # constructs `buffer::Error::SessionFailure` and serves through the core
 # server methods that are gated on the `fusedev` cfg in core.
 fuse-backend-core = { path = "../fuse-backend-core", version = "0.14.0", features = ["fusedev"] }
+# The io_uring transport calls its zero-copy traits through `dyn`, so
+# their async methods need async-trait.
+async-trait = { version = "0.1.42", optional = true }
 libc = "0.2.68"
 log = "0.4.6"
 # nix dropped its default features in 0.27, so the modules the sessions use
@@ -60,7 +63,6 @@ io-uring = { version = "0.6", optional = true }
 vmm-sys-util = { workspace = true }
 
 [dev-dependencies]
-async-trait = "0.1.42"
 # tests/async_serving_load.rs waits for a tokio timer in a handler.
 tokio = { version = "1.53.3", features = ["time"] }
 vmm-sys-util = { workspace = true }
@@ -73,6 +75,7 @@ fuse-backend-passthrough = { path = "../fuse-backend-passthrough", version = "0.
 [features]
 default = []
 async-io = [
+    "async-trait",
     "futures-util",
     "tokio/rt",
     "tokio/macros",
