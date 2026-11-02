@@ -240,6 +240,7 @@ impl Default for VfsOptions {
             | FsOptions::ZERO_MESSAGE_OPENDIR
             | FsOptions::HANDLE_KILLPRIV_V2
             | FsOptions::CREATE_SUPP_GROUP
+            | FsOptions::DIRECT_IO_ALLOW_MMAP
             | FsOptions::PERFILE_DAX;
         VfsOptions {
             no_open: true,
