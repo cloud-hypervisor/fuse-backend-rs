@@ -1837,6 +1837,21 @@ mod tests {
     }
 
     #[test]
+    fn test_init_mirrors_kernel_flags() {
+        let tmpdir = TempDir::new().expect("Cannot create temporary directory.");
+        let fs_cfg = Config {
+            do_import: false,
+            root_dir: tmpdir.as_path().to_string_lossy().to_string(),
+            ..Default::default()
+        };
+        let fs = PassthroughFs::<()>::new(fs_cfg).unwrap();
+        fs.import().unwrap();
+        let mirrored = FsOptions::CREATE_SUPP_GROUP | FsOptions::DIRECT_IO_ALLOW_MMAP;
+        assert!(fs.init(mirrored).unwrap().contains(mirrored));
+        assert!(!fs.init(FsOptions::empty()).unwrap().intersects(mirrored));
+    }
+
+    #[test]
     fn test_generic_read_write_noopen() {
         let tmpdir = TempDir::new().expect("Cannot create temporary directory.");
         // Prepare passthrough fs.

@@ -203,6 +203,9 @@ const INIT_EXT: u64 = 0x4000_0000;
 // This flag indicates whether the guest kernel enable per-file dax
 const PERFILE_DAX: u64 = 0x2_0000_0000;
 
+// Allow shared mmap of files opened with FOPEN_DIRECT_IO (protocol 7.39)
+const DIRECT_IO_ALLOW_MMAP: u64 = 1_u64 << 36;
+
 // Passthrough of reads, writes and mmap to backing files
 const PASSTHROUGH: u64 = 1_u64 << 37;
 
@@ -482,6 +485,13 @@ bitflags! {
 
         /// indicates whether the kernel support resend inflight request
         const HAS_RESEND = HAS_RESEND;
+
+        /// Indicates that the kernel allows a `MAP_SHARED` mmap of a file opened with
+        /// `OpenOptions::DIRECT_IO` (protocol 7.39). Without it, such an mmap fails with ENODEV.
+        ///
+        /// The mapping goes through the page cache, and the kernel writes back the dirty pages in
+        /// the range of each direct read or write of the file first.
+        const DIRECT_IO_ALLOW_MMAP = DIRECT_IO_ALLOW_MMAP;
 
         /// Indicates support for passthrough of reads, writes and mmap to backing files, as
         /// added in Linux 6.9 (not the Anolis `FD_PASSTHROUGH`).

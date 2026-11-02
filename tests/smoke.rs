@@ -13,14 +13,17 @@ mod example;
 mod fusedev_tests {
     use std::ffi::CString;
     use std::io::Result;
+    use std::os::fd::AsRawFd;
     use std::os::unix::ffi::OsStrExt;
     use std::os::unix::fs::MetadataExt;
+    use std::os::unix::fs::OpenOptionsExt;
     use std::os::unix::fs::PermissionsExt;
     use std::os::unix::process::CommandExt;
     use std::path::Path;
     use std::process::Command;
 
     use nix::mount::MsFlags;
+    use nix::sys::mman::{mmap, munmap, MapFlags, ProtFlags};
     use vmm_sys_util::tempdir::TempDir;
 
     use crate::example::passthroughfs;
@@ -303,6 +306,57 @@ mod fusedev_tests {
         // of the setgid directory.
         let md = std::fs::metadata(src_dir.as_path().join("setgid-dir/file")).unwrap();
         assert_eq!(md.gid(), gid);
+
+        daemon.umount().unwrap();
+        Ok(())
+    }
+
+    #[test]
+    #[ignore] // it depends on privileged mode to pass through /dev/fuse
+    fn integration_test_direct_io_shared_mmap() -> Result<()> {
+        // An O_DIRECT open of a file on the mount gets DIRECT_IO, and the kernel fails a shared
+        // mmap of such a file with ENODEV unless the server negotiated FUSE_DIRECT_IO_ALLOW_MMAP.
+        // xfstests generic/091 maps files that it opens with O_DIRECT.
+        if !kernel_at_least(6, 6) {
+            eprintln!(
+                "skipping integration_test_direct_io_shared_mmap: kernel {} does not support FUSE_DIRECT_IO_ALLOW_MMAP (needs >= 6.6)",
+                kernel_release()
+            );
+            return Ok(());
+        }
+
+        let src_dir = TempDir::new().unwrap();
+        let mnt_dir = TempDir::new().unwrap();
+        let src = src_dir.as_path().to_str().unwrap().to_string();
+        let mnt = mnt_dir.as_path().to_str().unwrap().to_string();
+        let data: Vec<u8> = (0..8192u32).map(|i| i as u8).collect();
+        std::fs::write(src_dir.as_path().join("file"), &data).unwrap();
+
+        let mut daemon = passthroughfs::Daemon::new(&src, &mnt, 1).unwrap();
+        daemon.mount().unwrap();
+
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECT)
+            .open(mnt_dir.as_path().join("file"))
+            .expect("open with O_DIRECT through the mount");
+        // SAFETY: a new read-only mapping of `file`, unmapped below.
+        let addr = unsafe {
+            mmap(
+                std::ptr::null_mut(),
+                data.len(),
+                ProtFlags::PROT_READ,
+                MapFlags::MAP_SHARED,
+                file.as_raw_fd(),
+                0,
+            )
+        }
+        .expect("shared mmap of an O_DIRECT file");
+        // SAFETY: the mapping covers `data.len()` readable bytes.
+        let mapped = unsafe { std::slice::from_raw_parts(addr as *const u8, data.len()) };
+        assert_eq!(mapped, &data[..]);
+        // SAFETY: `addr` and the length are those of the mapping above.
+        unsafe { munmap(addr, data.len()) }.unwrap();
 
         daemon.umount().unwrap();
         Ok(())
