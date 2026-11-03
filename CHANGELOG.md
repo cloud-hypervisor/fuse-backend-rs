@@ -140,6 +140,11 @@
   and no code in the workspace relied on it.
 
 ### Fixed
+- Reading a request from the fuse device now returns `Ok(None)` on `ECONNABORTED` too, like
+  `ENODEV`. The kernel returns `ECONNABORTED` instead of `ENODEV` when the connection is aborted
+  while a request is being handed over to the reader, so `FuseChannel` and
+  `BlockingFuseChannel` reported a session failure for a teardown their callers should see as a
+  normal end — for example a blocking channel whose `FUSE_INIT` read races the session's umount.
 - READDIR and READDIRPLUS answer ENOMEM when the reply can't hold the reply header plus the
   requested size. The check left out the header, so a writer short by up to 16 bytes started the
   listing and failed partway.
