@@ -81,14 +81,23 @@ jobs:
     - name: Build the baseline daemon
       if: github.event_name == 'pull_request'
       run: |
-        # cargo resolves the workspace root from the manifest being
-        # built, so without CARGO_TARGET_DIR the binary would land in
-        # base-src/target/. Build into the target directory of the main
-        # checkout instead: the binary ends up where cp expects it, and
-        # dependencies shared by both variants are compiled only once.
-        (cd base-src/tests/benchmark && CARGO_TARGET_DIR="${GITHUB_WORKSPACE}/target" cargo build --release)
+        # Build the baseline into a target directory of its own. The two
+        # checkouts hold same-named path packages (fuse-backend-core,
+        # fusedev, ...), and cargo keys their unit slots on the package
+        # identity rather than the checkout, so a shared target/ makes
+        # the current build reuse artifacts fingerprinted by the
+        # baseline build: the baseline is checked out later, so its
+        # fingerprints are newer than the main checkout's sources and
+        # cargo's mtime freshness check wrongly calls them fresh. The
+        # current daemon is then built against baseline rlibs, which
+        # either fails to compile (a PR that adds an ABI item, e.g.
+        # E0432 no `BackingMap`) or, worse, silently measures the
+        # baseline against itself. Registry dependencies are rebuilt
+        # for the baseline instead of shared, which costs a few
+        # minutes of CI time but keeps the two variants honest.
+        (cd base-src/tests/benchmark && CARGO_TARGET_DIR="${GITHUB_WORKSPACE}/target-base" cargo build --release)
         mkdir -p variants
-        cp target/release/fuse-backend-rs-benchmark variants/daemon-base
+        cp target-base/release/fuse-backend-rs-benchmark variants/daemon-base
 
     - name: Build the current daemon
       run: |
