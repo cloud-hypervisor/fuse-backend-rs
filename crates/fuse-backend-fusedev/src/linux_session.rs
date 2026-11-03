@@ -496,6 +496,15 @@ impl FuseChannel {
                             debug!("got ENODEV when reading fuse fd, assuming fuse filesystem was umounted.");
                             return Ok(None);
                         }
+                        Errno::ECONNABORTED => {
+                            // The kernel returns ECONNABORTED instead of ENODEV when
+                            // the connection is aborted while a request is being
+                            // handed over to this reader (fuse_abort_conn() sets
+                            // fpq->connected = 0 between the two). Either way the
+                            // session is being torn down, so treat it like ENODEV.
+                            debug!("got ECONNABORTED when reading fuse fd, assuming fuse session was aborted.");
+                            return Ok(None);
+                        }
                         e => {
                             warn! {"read fuse dev failed on fd {}: {}", fd, e};
                             return Err(SessionFailure(format!("read new request: {e:?}")));
@@ -572,6 +581,12 @@ impl BlockingFuseChannel {
                     }
                     Errno::ENODEV => {
                         debug!("got ENODEV when reading fuse fd, assuming fuse filesystem was umounted.");
+                        return Ok(None);
+                    }
+                    Errno::ECONNABORTED => {
+                        // See the comment on the ECONNABORTED arm above: the read
+                        // raced an aborting connection, so the session is gone.
+                        debug!("got ECONNABORTED when reading fuse fd, assuming fuse session was aborted.");
                         return Ok(None);
                     }
                     // No EAGAIN arm on purpose: unlike `FuseChannel`, this fd is
