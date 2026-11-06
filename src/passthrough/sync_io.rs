@@ -1455,8 +1455,7 @@ impl<S: BitmapSlice + Send + Sync> FileSystem for PassthroughFs<S> {
         let data_in = self.handle_map.get(handle_in, inode_in)?;
         let data_out = self.handle_map.get(handle_out, inode_out)?;
 
-        let (_guard_in, file_in) = data_in.get_file_mut();
-        let (_guard_out, file_out) = data_out.get_file_mut();
+        let (_guards, file_in, file_out) = HandleData::get_files_mut(&data_in, &data_out);
 
         let mut off_in = offset_in as libc::off64_t;
         let mut off_out = offset_out as libc::off64_t;
@@ -1513,8 +1512,7 @@ impl<S: BitmapSlice + Send + Sync> FileSystem for PassthroughFs<S> {
             }
         };
 
-        let (_guard_in, file_in) = data_in.get_file_mut();
-        let (_guard_out, file_out) = data_out.get_file_mut();
+        let (_guards, file_in, file_out) = HandleData::get_files_mut(&data_in, &data_out);
 
         let fd_in = file_in.as_raw_fd();
         let fd_out = file_out.as_raw_fd();
@@ -1890,6 +1888,134 @@ mod tests {
         assert!(fs.fsyncdir(&ctx, ROOT_ID, false, 0).is_ok());
     }
 
+    /// Run `f` on a thread of its own and fail when it has not returned within `limit`: a
+    /// request that deadlocks on a handle lock never returns.
+    fn returns_within<T: Send + 'static>(
+        limit: Duration,
+        what: &str,
+        f: impl FnOnce() -> T + Send + 'static,
+    ) -> T {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(f());
+        });
+        rx.recv_timeout(limit)
+            .unwrap_or_else(|_| panic!("{} did not return within {:?}", what, limit))
+    }
+
+    /// Open `name` (with `data`) for reading and writing and return its inode and a handle.
+    fn open_rw(
+        fs: &PassthroughFs<()>,
+        source: &TempDir,
+        name: &str,
+        data: &[u8],
+    ) -> (Inode, Handle) {
+        let ctx = prepare_context();
+        std::fs::write(source.as_path().join(name), data).unwrap();
+        let entry = fs
+            .lookup(&ctx, ROOT_ID, &CString::new(name).unwrap())
+            .unwrap();
+        let (handle, _, _) = fs.open(&ctx, entry.inode, libc::O_RDWR as u32, 0).unwrap();
+        (entry.inode, handle.expect("a handle"))
+    }
+
+    /// copy_file_range and remap_file_range with one handle for both ends (a copy within
+    /// one open file) lock that handle once. They took its lock twice and waited forever.
+    #[test]
+    fn test_copy_and_remap_within_one_handle_return() {
+        let (fs, source) = prepare_fs_tmpdir();
+        let (inode, handle) = open_rw(&fs, &source, "one.txt", b"0123456789abcdef");
+        let fs = Arc::new(fs);
+
+        let copy_fs = fs.clone();
+        let copied = returns_within(
+            Duration::from_secs(10),
+            "copy_file_range within one handle",
+            move || {
+                copy_fs.copy_file_range(
+                    &prepare_context(),
+                    inode,
+                    handle,
+                    0,
+                    inode,
+                    handle,
+                    16,
+                    4,
+                    0,
+                )
+            },
+        );
+        assert_eq!(copied.unwrap(), 4);
+        assert_eq!(
+            std::fs::read(source.as_path().join("one.txt")).unwrap(),
+            b"0123456789abcdef0123"
+        );
+
+        // The clone itself may be refused by the filesystem under the temporary directory;
+        // the request must return either way.
+        let remap_fs = fs.clone();
+        let _ = returns_within(
+            Duration::from_secs(10),
+            "remap_file_range within one handle",
+            move || {
+                remap_fs.remap_file_range(
+                    &prepare_context(),
+                    inode,
+                    handle,
+                    0,
+                    inode,
+                    handle,
+                    4096,
+                    4096,
+                    0,
+                )
+            },
+        );
+    }
+
+    /// Two copies over the same two handles in opposite directions, run together many times,
+    /// all return. Locking the handle read first and then the one written let each hold one
+    /// lock and wait for the other.
+    #[test]
+    fn test_copies_in_opposite_directions_return() {
+        let (fs, source) = prepare_fs_tmpdir();
+        let (a, ha) = open_rw(&fs, &source, "a.txt", b"aaaaaaaa");
+        let (b, hb) = open_rw(&fs, &source, "b.txt", b"bbbbbbbb");
+        let fs = Arc::new(fs);
+        returns_within(
+            Duration::from_secs(60),
+            "copies in opposite directions",
+            move || {
+                let threads: Vec<_> = vec![(a, ha, b, hb), (b, hb, a, ha)]
+                    .into_iter()
+                    .map(|(from, from_handle, to, to_handle)| {
+                        let fs = fs.clone();
+                        std::thread::spawn(move || {
+                            let ctx = prepare_context();
+                            for _ in 0..20_000 {
+                                fs.copy_file_range(
+                                    &ctx,
+                                    from,
+                                    from_handle,
+                                    0,
+                                    to,
+                                    to_handle,
+                                    0,
+                                    8,
+                                    0,
+                                )
+                                .unwrap();
+                            }
+                        })
+                    })
+                    .collect();
+                for thread in threads {
+                    thread.join().unwrap();
+                }
+            },
+        );
+    }
+
     #[test]
     fn test_copy_file_range() {
         let (fs, source) = prepare_fs_tmpdir();
@@ -2050,7 +2176,11 @@ mod tests {
         }
 
         // Cleanup
-        arc_fs.release(&ctx, src_entry.inode, 0, src_handle, true, true, None).unwrap();
-        arc_fs.release(&ctx, dst_entry.inode, 0, dst_handle, true, true, None).unwrap();
+        arc_fs
+            .release(&ctx, src_entry.inode, 0, src_handle, true, true, None)
+            .unwrap();
+        arc_fs
+            .release(&ctx, dst_entry.inode, 0, dst_handle, true, true, None)
+            .unwrap();
     }
 }
