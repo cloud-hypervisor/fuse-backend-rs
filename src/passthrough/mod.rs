@@ -256,6 +256,9 @@ impl InodeMap {
     }
 }
 
+/// The locks `HandleData::get_files_mut` holds: one handle's, or two.
+type HandleGuards<'a> = (MutexGuard<'a, ()>, Option<MutexGuard<'a, ()>>);
+
 struct HandleData {
     inode: Inode,
     file: File,
@@ -279,6 +282,27 @@ impl HandleData {
 
     fn get_file_mut(&self) -> (MutexGuard<'_, ()>, &File) {
         (self.lock.lock().unwrap(), &self.file)
+    }
+
+    /// Lock the handle a request reads (`a`) and the one it writes (`b`), and return their
+    /// files. One handle is locked once: its lock is not reentrant, so taking it twice would
+    /// wait forever. Two handles are locked in the order of their addresses, so two requests
+    /// over the same two handles in opposite directions cannot each hold one lock and wait
+    /// for the other.
+    fn get_files_mut<'a>(
+        a: &'a HandleData,
+        b: &'a HandleData,
+    ) -> (HandleGuards<'a>, &'a File, &'a File) {
+        let guards = if std::ptr::eq(a, b) {
+            (a.lock.lock().unwrap(), None)
+        } else if (a as *const HandleData) < (b as *const HandleData) {
+            let first = a.lock.lock().unwrap();
+            (first, Some(b.lock.lock().unwrap()))
+        } else {
+            let first = b.lock.lock().unwrap();
+            (first, Some(a.lock.lock().unwrap()))
+        };
+        (guards, &a.file, &b.file)
     }
 
     fn borrow_fd(&self) -> BorrowedFd<'_> {
