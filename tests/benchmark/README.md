@@ -1,8 +1,8 @@
 # fuse-backend-rs benchmark tooling
 
-Tooling to compare the performance of the synchronous, asynchronous and
-io_uring IO paths, complementing the functional tests. Two levels are
-provided:
+Tooling to compare the performance of the synchronous, asynchronous,
+io_uring and kernel-passthrough IO paths, complementing the functional
+tests. Two levels are provided:
 
 ## 1. Micro-benchmark (framework overhead)
 
@@ -58,9 +58,12 @@ blocking channels cloned with `FUSE_DEV_IOC_CLONE`), async mode (N
 asynchronous workers through `AsyncFuseServing`, each with
 its own `/dev/fuse` file description and async runtime, tokio-uring when
 io_uring is available), pool mode (the async mode with
-`PassthroughFs::enable_async_thread_pool()`) and uring mode (the experimental
+`PassthroughFs::enable_async_thread_pool()`), uring mode (the experimental
 FUSE-over-io_uring transport, requires kernel 6.14+ and is skipped
-otherwise) — and runs identical fio workloads:
+otherwise), nowriteback mode (the sync daemon with the FUSE writeback
+cache turned off) and passthrough mode (the sync daemon with kernel
+passthrough, requires kernel 6.9+ with `CONFIG_FUSE_PASSTHROUGH` and is
+skipped on kernels known to lack it) — and runs identical fio workloads:
 
 - sequential read/write with 1MB requests
 - random read/write with 4KB requests
@@ -88,7 +91,8 @@ The fio results are written in JSON format to a temporary results directory
 summary is printed at the end. The default execution order is sync then
 async; the second mode benefits from a warmer page cache, so cross-check
 with `BENCH_MODES="async sync"`. The uring mode is included with
-`BENCH_MODES="sync async uring"`.
+`BENCH_MODES="sync async uring"`, and the kernel passthrough arms with
+`BENCH_MODES="sync nowriteback passthrough"`.
 
 To quantify the difference between the transports, collect each mode's
 results and compare the collected files — `bench_compare.py` is
@@ -106,31 +110,38 @@ python3 tests/scripts/bench_compare.py compare sync.json uring.json
 Both transports run on the same machine back-to-back, so environment
 effects mostly cancel out; for confidence run once per `BENCH_MODES` order.
 
-`BENCH_DAEMON_ARGS` passes extra arguments to the daemon in every mode. With
-`BENCH_DAEMON_ARGS=--kernel-passthrough` the kernel passes reads, writes and mmap
-of open files through to the source files (Linux 6.9+ with
-`CONFIG_FUSE_PASSTHROUGH`), so the data workloads measure the backing
-filesystem rather than the daemon. The kernel doesn't allow passthrough with
-the writeback cache, so the flag turns the cache off too.
-`BENCH_DAEMON_ARGS=--no-writeback` turns the cache off without passthrough, to
-tell the two effects apart.
+The `nowriteback` and `passthrough` modes separate two effects that would
+otherwise mix: the kernel doesn't allow passthrough with the writeback
+cache, so `--kernel-passthrough` turns the cache off as well. Comparing
+passthrough against nowriteback (the same daemon with just the cache off)
+shows the kernel passthrough effect alone, and nowriteback against sync
+shows what the writeback cache itself contributes. With kernel
+passthrough (Linux 6.9+ with `CONFIG_FUSE_PASSTHROUGH`), the kernel
+passes reads, writes and mmap of open files through to the source files,
+so the data workloads measure the backing filesystem rather than the
+daemon; the metadata workloads (filecreate, readdir, filedelete) still go
+through the daemon and act as a control. `BENCH_DAEMON_ARGS` passes
+extra arguments to the daemon in every mode, if a combination beyond the
+modes is needed.
 
 ## 3. Continuous benchmarking in CI
 
 The `Benchmark` workflow (`.github/workflows/benchmark.yml`) runs the fio
-comparison on GitHub-hosted runners for a matrix of sync/async/uring modes
-and 1/8 threads; the uring mode is skipped on runners whose kernel is
-older than 6.14:
+comparison on GitHub-hosted runners for a matrix of
+sync/async/uring/nowriteback/passthrough modes and 1/8 threads; the uring
+mode is skipped on runners whose kernel is older than 6.14, and the
+passthrough mode on kernels known to lack `CONFIG_FUSE_PASSTHROUGH`:
 
 - Pull requests: add the `run-benchmark` label to trigger a benchmark run.
   The merge base and the PR are built and benchmarked back to back *in the
   same job*, and the two result sets are compared in the job summary of the
   workflow run (Actions tab). The execution order of the two variants is
   alternated between the thread counts to spread runner drift across them.
-  The merge base predates the uring transport, so the baseline comparison
-  covers only sync and async; the PR's uring numbers are instead compared
-  cross-mode against the sync/async numbers of the same run, which needs
-  no baseline.
+  The merge base predates the uring transport and the passthrough flags,
+  so the baseline comparison covers only sync and async; the PR's uring
+  numbers are instead compared cross-mode against the sync/async numbers
+  of the same run, and its passthrough numbers against the nowriteback
+  control mode, which needs no baseline.
 - Pushes to master and manual dispatches run a single benchmark for
   reference; no baseline is stored.
 

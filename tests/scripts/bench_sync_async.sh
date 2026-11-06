@@ -3,14 +3,16 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 #
-# Compare the synchronous, asynchronous and io_uring fusedev IO paths of
-# fuse-backend-rs using fio.
+# Compare the synchronous, asynchronous, io_uring and kernel-passthrough
+# fusedev IO paths of fuse-backend-rs using fio.
 #
 # For each mode (sync: N worker threads, async: one FuseDevTask on the
-# async runtime, uring: the experimental FUSE-over-io_uring transport),
-# the script mounts the benchmark daemon and runs the same fio workloads
-# against the mountpoint. The fio results are stored in JSON format
-# (<mode>-<workload>.json) under $BENCH_RESULTS_DIR for further
+# async runtime, uring: the experimental FUSE-over-io_uring transport,
+# nowriteback: sync with the FUSE writeback cache turned off, passthrough:
+# sync with the kernel serving reads, writes and mmap on the backing
+# files itself), the script mounts the benchmark daemon and runs the same
+# fio workloads against the mountpoint. The fio results are stored in JSON
+# format (<mode>-<workload>.json) under $BENCH_RESULTS_DIR for further
 # analysis, see tests/scripts/bench_compare.py.
 #
 # Requirements: Linux, fio, jq, python3, permission to mount fuse (root or
@@ -18,7 +20,10 @@
 # FUSE-over-io_uring enabled (the fuse module parameter enable_uring,
 # which the script tries to turn on when it is writable); kernels that
 # reject the transport during the INIT handshake make the mode be
-# skipped with a warning.
+# skipped with a warning. The passthrough mode additionally requires
+# kernel 6.9+ with CONFIG_FUSE_PASSTHROUGH, and CAP_SYS_ADMIN in the
+# initial user namespace for the backing file ioctls; it is skipped on
+# kernels known to lack the configuration.
 #
 # Tunables (environment variables):
 #   BENCH_THREADS  number of sync worker threads / fio jobs (default 4)
@@ -32,7 +37,12 @@
 #                  second mode benefits from a warmer page cache, so run
 #                  both orders to cross-check the results. The pool mode is
 #                  the async mode with PassthroughFs offloading blocking
-#                  work to the runtime's blocking thread pool.
+#                  work to the runtime's blocking thread pool. The
+#                  nowriteback mode is the sync daemon with the FUSE
+#                  writeback cache turned off, and the passthrough mode is
+#                  the sync daemon with kernel passthrough, which turns
+#                  the cache off as well: comparing the three separates
+#                  the writeback cache effect from the passthrough effect.
 #                  bench_compare.py collects a mode by its file name prefix,
 #                  so no mode name may start with another mode name and a
 #                  dash.
@@ -90,7 +100,8 @@ command -v python3 >/dev/null 2>&1 || { echo "error: python3 is required" >&2; e
 
 # kernel_at_least MAJOR MINOR: true if the running kernel is at least
 # MAJOR.MINOR. Used to gate the uring mode, which requires the kernel
-# FUSE_URING interface (6.14+).
+# FUSE_URING interface (6.14+), and the passthrough mode, which requires
+# the kernel FUSE passthrough interface (6.9+).
 kernel_at_least() {
     local want_major=$1 want_minor=$2 kv major minor
     kv=$(uname -r)
@@ -102,6 +113,41 @@ kernel_at_least() {
     esac
     [ "${major}" -gt "${want_major}" ] && return 0
     [ "${major}" -eq "${want_major}" ] && [ "${minor}" -ge "${want_minor}" ]
+}
+
+# kernel_config_enables NAME: exit 0 when the running kernel's
+# configuration is known to enable NAME, exit 1 when it is known to
+# disable it, exit 2 when the configuration is not readable at all
+# (many distro kernels ship it only in a separate debug package).
+# Kernel configuration is not exposed through sysfs, and the backing
+# file ioctls of an unsupported kernel still let the daemon mount (it
+# falls back to serving the IO itself), so the passthrough mode cannot
+# probe the support at runtime: it relies on this check. A kernel whose
+# configuration is unknown runs the mode anyway, and a silent fallback
+# then shows up as near-zero deltas against the nowriteback control
+# mode.
+kernel_config_enables() {
+    local name=$1 kv cfg
+    kv=$(uname -r)
+    if [ -r "/boot/config-${kv}" ]; then
+        # A disabled option leaves no "NAME=value" line at all, only a
+        # "# NAME is not set" comment, so no match means disabled.
+        grep -q "^${name}=" "/boot/config-${kv}" && return 0
+        return 1
+    fi
+    if [ -r /proc/config.gz ]; then
+        # Decompress into a variable first: piping into grep -q would let
+        # pipefail turn grep's early SIGPIPE on zcat into a false "disabled",
+        # and a missing zcat would land in the same arm instead of "unknown".
+        # grep -q reads the here-string to the end, so no pipe is involved.
+        cfg=$(zcat /proc/config.gz 2>/dev/null) || return 2
+        # A disabled option leaves no "NAME=value" line at all, only a
+        # "# NAME is not set" comment, so no match means disabled.
+        [ -n "${cfg}" ] || return 2
+        grep -q "^${name}=" <<<"${cfg}" && return 0
+        return 1
+    fi
+    return 2
 }
 
 # The metadata workloads keep NRFILES files open at once, and the daemon
@@ -259,6 +305,7 @@ for mode in ${MODES}; do
     mode_args=""
     [ "${mode}" = "async" ] && mode_args="--async"
     [ "${mode}" = "pool" ] && mode_args="--async --thread-pool"
+    [ "${mode}" = "nowriteback" ] && mode_args="--no-writeback"
     if [ "${mode}" = "uring" ]; then
         if ! kernel_at_least 6 14; then
             echo "warning: mode uring requires kernel 6.14+ ($(uname -r)), skipping" >&2
@@ -273,6 +320,30 @@ for mode in ${MODES}; do
             ( echo 1 > /sys/module/fuse/parameters/enable_uring ) 2>/dev/null || true
         fi
         mode_args="--uring"
+    fi
+    if [ "${mode}" = "passthrough" ]; then
+        if ! kernel_at_least 6 9; then
+            echo "warning: mode passthrough requires kernel 6.9+ ($(uname -r)), skipping" >&2
+            continue
+        fi
+        # The backing file ioctls exist but return an error without
+        # CONFIG_FUSE_PASSTHROUGH, and the daemon then mounts fine while
+        # silently serving the IO itself, which would poison the
+        # measurement; only the kernel configuration tells them apart.
+        # (The "|| kcfg=$?" keeps set -e from ending the script on the
+        # known-disabled and unknown exits.)
+        kcfg=0
+        kernel_config_enables CONFIG_FUSE_PASSTHROUGH || kcfg=$?
+        case ${kcfg} in
+            1)
+                echo "warning: CONFIG_FUSE_PASSTHROUGH is not set, skipping mode passthrough" >&2
+                continue
+                ;;
+            2)
+                echo "warning: kernel configuration not readable, running mode passthrough unverified" >&2
+                ;;
+        esac
+        mode_args="--kernel-passthrough"
     fi
 
     echo ""
