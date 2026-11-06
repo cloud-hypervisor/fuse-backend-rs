@@ -562,6 +562,12 @@ pub trait FileSystem {
     /// attribute. If `size` is not 0 but is also not large enough to hold the value, then the file
     /// system should reply with an `ERANGE` error.
     ///
+    /// The server also enforces this contract on the file system's behalf: a `GetxattrReply::Value`
+    /// larger than `size` is answered with an `ERANGE` error so the caller can retry with a bigger
+    /// buffer, a `Value` returned for a zero-size probe is converted to the `Count` reply the
+    /// kernel expects, and a `Count` returned for a nonzero size is answered with an `EINVAL`
+    /// error, since the kernel would otherwise copy the size struct out as the value.
+    ///
     /// If this method fails with an `ENOSYS` error, then the kernel will treat that as a permanent
     /// failure. The kernel will return `EOPNOTSUPP` for all future calls to `getxattr` without
     /// forwarding them to the file system.
@@ -583,6 +589,12 @@ pub trait FileSystem {
     /// names, then the file system should reply with `ListxattrReply::Names` and the list. If
     /// `size` is not 0 but is also not large enough to hold the list, then the file system should
     /// reply with an `ERANGE` error.
+    ///
+    /// The server also enforces this contract on the file system's behalf: a `ListxattrReply::Names`
+    /// list larger than `size` is answered with an `ERANGE` error so the caller can retry with a
+    /// bigger buffer, a `Names` list returned for a zero-size probe is converted to the `Count`
+    /// reply the kernel expects, and a `Count` returned for a nonzero size is answered with an
+    /// `EINVAL` error, since the kernel would otherwise copy the size struct out as the list.
     ///
     /// If this method fails with an `ENOSYS` error, then the kernel will treat that as a permanent
     /// failure. The kernel will return `EOPNOTSUPP` for all future calls to `listxattr` without

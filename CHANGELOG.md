@@ -145,6 +145,13 @@
   while a request is being handed over to the reader, so `FuseChannel` and
   `BlockingFuseChannel` reported a session failure for a teardown their callers should see as a
   normal end — for example a blocking channel whose `FUSE_INIT` read races the session's umount.
+- GETXATTR and LISTXATTR answer ERANGE when the file system returns a value or name list
+  bigger than the requested size, instead of a reply the kernel would reject with EINVAL
+  (surfacing as EIO to the caller). The server now enforces the documented size contract
+  on the file system's behalf: a value or name list for a zero-size probe is converted to
+  the needed size the kernel expects, and a count for a nonzero size is answered with
+  EINVAL instead of being copied out as the value or the list. The `getxattr`/`listxattr`
+  trait docs say so.
 - READDIR and READDIRPLUS answer ENOMEM when the reply can't hold the reply header plus the
   requested size. The check left out the header, so a writer short by up to 16 bytes started the
   listing and failed partway.
