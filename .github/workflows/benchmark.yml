@@ -1,4 +1,5 @@
-# Benchmark the synchronous, asynchronous and io_uring fusedev IO paths.
+# Benchmark the synchronous, asynchronous, io_uring and kernel-passthrough
+# fusedev IO paths.
 #
 # Triggers:
 #   - pull requests: add the "run-benchmark" label to benchmark the PR.
@@ -18,6 +19,14 @@
 # The merge base predates the uring transport, so only the PR variant
 # runs that mode; its numbers are compared cross-mode against the
 # sync/async results of the same run, which needs no baseline.
+#
+# The passthrough mode requires kernel 6.9+ with CONFIG_FUSE_PASSTHROUGH;
+# the benchmark script skips it on kernels known to lack the
+# configuration. It is compared against the nowriteback control mode
+# (the same daemon with just the FUSE writeback cache off) of the same
+# run, so the deltas isolate the kernel passthrough effect from the
+# writeback cache effect; the baseline daemon predates the flags, so
+# again only the PR variant runs either mode.
 #
 # The comparison is advisory and never fails the workflow; significant
 # regressions must be re-checked on bare metal.
@@ -112,13 +121,15 @@ jobs:
         CARGO_BIN=$(which cargo)
         # Both variants are measured with this very script of the PR,
         # so the workload definition is identical. The baseline daemon
-        # predates the uring transport and would reject --uring, so only
-        # the current variant runs that mode (the script itself skips it
-        # when the kernel does not accept FUSE-over-io_uring).
+        # predates the uring transport and would reject --uring, and it
+        # predates --kernel-passthrough and --no-writeback as well, so
+        # only the current variant runs those modes (the script itself
+        # skips uring when the kernel does not accept FUSE-over-io_uring,
+        # and passthrough on kernels known to lack CONFIG_FUSE_PASSTHROUGH).
         SCRIPT=tests/scripts/bench_sync_async.sh
         run_variant() {
             local modes="sync async"
-            [ "$1" = current ] && modes="sync async uring"
+            [ "$1" = current ] && modes="sync async uring nowriteback passthrough"
             # sudo -E is not supported by sudo-rs (the default sudo on
             # Ubuntu 26.04 runners); route the environment through env(1)
             # so it is applied after the privilege boundary and the env
@@ -150,9 +161,11 @@ jobs:
       run: |
         for variant in current base; do
             [ -d "bench-${variant}" ] || continue
-            for mode in sync async uring; do
-                # The uring mode is skipped on kernels without FUSE_URING
-                # and never runs for the baseline variant.
+            for mode in sync async uring nowriteback passthrough; do
+                # The uring and passthrough modes are skipped on kernels
+                # without FUSE_URING / CONFIG_FUSE_PASSTHROUGH, and all
+                # three of uring, nowriteback and passthrough never run
+                # for the baseline variant.
                 compgen -G "bench-${variant}/${mode}-*.json" > /dev/null || continue
                 python3 tests/scripts/bench_compare.py collect \
                     "${GITHUB_WORKSPACE}/bench-${variant}" "${mode}" \
@@ -212,6 +225,44 @@ jobs:
             done
         fi
 
+        # Cross-mode comparisons isolating the kernel passthrough effect
+        # of this very PR run: nowriteback vs sync shows what the FUSE
+        # writeback cache itself contributes, and passthrough vs
+        # nowriteback compares two runs of the same sync daemon that
+        # differ only in the kernel serving the IO on the backing files,
+        # so those deltas are the kernel passthrough effect alone. The
+        # passthrough table is absent on runners whose kernels predate
+        # or disable FUSE passthrough.
+        NWB_JSON="current-nowriteback-${{ matrix.threads }}threads.json"
+        if [ -f "${NWB_JSON}" ]; then
+            {
+                echo ""
+                echo "### Cross-mode comparison: nowriteback vs sync of this PR"
+                echo ""
+                echo "Positive deltas mean the sync daemon without the writeback"
+                echo "cache outperformed the one with the cache on that workload."
+                echo ""
+            } >> "${GITHUB_STEP_SUMMARY}"
+            python3 tests/scripts/bench_compare.py compare \
+                "current-sync-${{ matrix.threads }}threads.json" \
+                "${NWB_JSON}" >> "${GITHUB_STEP_SUMMARY}"
+        fi
+        PT_JSON="current-passthrough-${{ matrix.threads }}threads.json"
+        if [ -f "${NWB_JSON}" ] && [ -f "${PT_JSON}" ]; then
+            {
+                echo ""
+                echo "### Cross-mode comparison: passthrough vs nowriteback of this PR"
+                echo ""
+                echo "Positive deltas mean kernel passthrough outperformed the same"
+                echo "daemon with just the writeback cache off, so the deltas are"
+                echo "the kernel passthrough effect alone."
+                echo ""
+            } >> "${GITHUB_STEP_SUMMARY}"
+            python3 tests/scripts/bench_compare.py compare \
+                "${NWB_JSON}" \
+                "${PT_JSON}" >> "${GITHUB_STEP_SUMMARY}"
+        fi
+
     - name: Show results
       if: github.event_name != 'pull_request'
       run: |
@@ -224,6 +275,12 @@ jobs:
                 echo ""
                 echo "This runner's kernel supports FUSE_URING, so the run"
                 echo "covered the uring transport as well."
+            fi
+            if [ -f "current-passthrough-${{ matrix.threads }}threads.json" ]; then
+                echo ""
+                echo "This runner's kernel reports FUSE passthrough support, so the run"
+                echo "covered the kernel passthrough mode as well (unverified when the"
+                echo "kernel configuration was not readable)."
             fi
         } >> "${GITHUB_STEP_SUMMARY}"
 
