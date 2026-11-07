@@ -190,6 +190,8 @@
   `Reader::with_zero_copy()` attaches request data that only the transport can move, through a
   `ZeroCopySource`, and `Reader::read_to_at()` hands it over. `FileReadWriteVolatile::raw_fd()`
   gives the transport the file descriptor to move it to. Other reads get a copy through memory.
+- [282](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/282): `passthrough::Config::uring_zero_copy` asks for FUSE-over-io_uring zero-copy on the files that
+  `PassthroughFs` opens, except files it opens with O_DIRECT.
 
 ### Changed
 - [325](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/325): The `fuse-backend-fusedev` `uring` transport uses io-uring 0.6 instead of 0.5,
