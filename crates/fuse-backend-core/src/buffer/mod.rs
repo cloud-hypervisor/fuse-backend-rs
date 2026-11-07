@@ -18,6 +18,7 @@ use std::any::Any;
 use std::collections::VecDeque;
 use std::io::{self, Read};
 use std::mem::{size_of, MaybeUninit};
+use std::os::unix::io::RawFd;
 use std::ptr::copy_nonoverlapping;
 use std::sync::LazyLock;
 use std::{cmp, fmt};
@@ -407,15 +408,114 @@ impl<'a, S: BitmapSlice> IoBuffers<'a, S> {
 /// descriptors after any device-readable descriptors (2.6.4.2 in Virtio Spec v1.1).
 /// Reader will skip iterating over descriptor chain when first writable
 /// descriptor is encountered.
-#[derive(Clone)]
 pub struct Reader<'a, S = ()> {
     pub(crate) buffers: IoBuffers<'a, S>,
+    /// Request data behind the buffers that only the transport can move.
+    zero_copy: Option<ZeroCopyData<'a>>,
+}
+
+// Not derived: a clone that kept the zero-copy data could move the same
+// client pages into a file twice.
+impl<S: Clone> Clone for Reader<'_, S> {
+    fn clone(&self) -> Self {
+        Reader {
+            buffers: self.buffers.clone(),
+            zero_copy: None,
+        }
+    }
+}
+
+/// Request data that a transport keeps out of the server's memory, such as
+/// the client pages that FUSE-over-io_uring zero-copy lends a server. Only
+/// the transport can move it, straight into a file. See
+/// `Reader::with_zero_copy()`.
+pub trait ZeroCopySource: Sync {
+    /// Write `count` bytes of the data, starting `pos` bytes into it, to
+    /// the file `fd`, at offset `off`, or at the file's position if `off`
+    /// is `None`. Returns how many bytes it wrote.
+    fn write_to_file(
+        &self,
+        pos: usize,
+        fd: RawFd,
+        count: usize,
+        off: Option<u64>,
+    ) -> io::Result<usize>;
+
+    /// Copy up to `count` bytes of the data, starting `pos` bytes into it,
+    /// into memory, and hand them to `take`, which returns how many it
+    /// took. Returns that number. This is the slow way, for readers without
+    /// a file descriptor.
+    fn read_to_memory(
+        &self,
+        pos: usize,
+        count: usize,
+        take: &mut dyn FnMut(&[u8]) -> io::Result<usize>,
+    ) -> io::Result<usize>;
+}
+
+/// The zero-copy data of a request, and how much of it was read.
+#[derive(Clone, Copy)]
+struct ZeroCopyData<'a> {
+    src: &'a dyn ZeroCopySource,
+    len: usize,
+    pos: usize,
+}
+
+impl ZeroCopyData<'_> {
+    fn remaining(&self) -> usize {
+        self.len - self.pos
+    }
+
+    /// Copy the next bytes into `buf`, and count them as read.
+    fn copy_to(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let len = buf.len().min(self.remaining());
+        let n = self.src.read_to_memory(self.pos, len, &mut |data| {
+            let n = data.len().min(len);
+            buf[..n].copy_from_slice(&data[..n]);
+            Ok(n)
+        })?;
+        self.pos += n;
+        Ok(n)
+    }
+
+    /// Have the source write up to `count` bytes to the file `fd`, at `off`
+    /// or at its position, and count them as read.
+    fn write_to_file(&mut self, fd: RawFd, count: usize, off: Option<u64>) -> io::Result<usize> {
+        let count = count.min(self.remaining());
+        let n = self.src.write_to_file(self.pos, fd, count, off)?.min(count);
+        self.pos += n;
+        Ok(n)
+    }
+
+    /// Copy up to `count` bytes into memory and hand them to `write`. Only
+    /// the bytes `write` takes count as read.
+    fn bounce(
+        &mut self,
+        count: usize,
+        write: impl FnOnce(FileVolatileSlice) -> io::Result<usize>,
+    ) -> io::Result<usize> {
+        let mut write = Some(write);
+        let count = count.min(self.remaining());
+        let n = self.src.read_to_memory(self.pos, count, &mut |data| {
+            let Some(write) = write.take() else {
+                return Ok(0);
+            };
+            // Safe because `write` only reads the slice, which `data`
+            // backs for the duration of the call.
+            let slice =
+                unsafe { FileVolatileSlice::from_raw_ptr(data.as_ptr() as *mut u8, data.len()) };
+            Ok(write(slice)?.min(data.len()))
+        })?;
+        self.pos += n;
+        Ok(n)
+    }
 }
 
 impl<S: BitmapSlice> Default for Reader<'_, S> {
     fn default() -> Self {
         Reader {
             buffers: IoBuffers::default(),
+            zero_copy: None,
         }
     }
 }
@@ -444,7 +544,18 @@ impl<'a, S: BitmapSlice> Reader<'a, S> {
     pub fn from_volatile_slices(slices: Vec<VolatileSlice<'a, S>>) -> Self {
         Reader {
             buffers: IoBuffers::new(slices),
+            zero_copy: None,
         }
+    }
+
+    /// Append `len` bytes of request data that only `src` can move. Once
+    /// the buffers are read, `read_to_at()` hands this data to `src`, which
+    /// writes it into the destination file if it has a file descriptor (see
+    /// `FileReadWriteVolatile::raw_fd()`). Other reads, and destinations
+    /// without one, get a copy through memory, which is slower.
+    pub fn with_zero_copy(mut self, src: &'a dyn ZeroCopySource, len: usize) -> Self {
+        self.zero_copy = Some(ZeroCopyData { src, len, pos: 0 });
+        self
     }
 
     /// Reads an object from the descriptor chain buffer.
@@ -473,8 +584,22 @@ impl<'a, S: BitmapSlice> Reader<'a, S> {
         mut dst: F,
         count: usize,
     ) -> io::Result<usize> {
+        if let Some(zc) = self.zero_copy_left() {
+            let Some(fd) = dst.raw_fd() else {
+                return zc.bounce(count, |slice| dst.write_volatile(slice));
+            };
+            return zc.write_to_file(fd, count, None);
+        }
         self.buffers
             .consume_for_read(count, |bufs| dst.write_vectored_volatile(bufs))
+    }
+
+    /// The zero-copy data left, once the buffers are read.
+    fn zero_copy_left(&mut self) -> Option<&mut ZeroCopyData<'a>> {
+        match self.zero_copy.as_mut() {
+            Some(zc) if zc.remaining() > 0 && self.buffers.available_bytes() == 0 => Some(zc),
+            _ => None,
+        }
     }
 
     /// Reads data from the descriptor chain buffer into a File at offset `off`.
@@ -487,6 +612,12 @@ impl<'a, S: BitmapSlice> Reader<'a, S> {
         count: usize,
         off: u64,
     ) -> io::Result<usize> {
+        if let Some(zc) = self.zero_copy_left() {
+            let Some(fd) = dst.raw_fd() else {
+                return zc.bounce(count, |slice| dst.write_at_volatile(slice, off));
+            };
+            return zc.write_to_file(fd, count, Some(off));
+        }
         self.buffers
             .consume_for_read(count, |bufs| dst.write_vectored_at_volatile(bufs, off))
     }
@@ -519,27 +650,34 @@ impl<'a, S: BitmapSlice> Reader<'a, S> {
     /// May return an error if the combined lengths of all the buffers in the DescriptorChain
     /// would cause an integer overflow.
     pub fn available_bytes(&self) -> usize {
-        self.buffers.available_bytes()
+        let zero_copy = self.zero_copy.map_or(0, |zc| zc.remaining());
+        self.buffers.available_bytes() + zero_copy
     }
 
     /// Returns number of bytes already read from the descriptor chain buffer.
     pub fn bytes_read(&self) -> usize {
-        self.buffers.bytes_consumed()
+        self.buffers.bytes_consumed() + self.zero_copy.map_or(0, |zc| zc.pos)
     }
 
     /// Splits this `Reader` into two at the given offset in the `DescriptorChain` buffer.
     /// After the split, `self` will be able to read up to `offset` bytes while the returned
     /// `Reader` can read up to `available_bytes() - offset` bytes.  Returns an error if
-    /// `offset > self.available_bytes()`.
+    /// `offset > self.available_bytes()`. The zero-copy data, which comes
+    /// after the buffers, goes to the returned `Reader`, so `offset` must
+    /// lie within the buffers.
     pub fn split_at(&mut self, offset: usize) -> Result<Self> {
-        self.buffers
-            .split_at(offset)
-            .map(|buffers| Reader { buffers })
+        self.buffers.split_at(offset).map(|buffers| Reader {
+            buffers,
+            zero_copy: self.zero_copy.take(),
+        })
     }
 }
 
 impl<S: BitmapSlice> io::Read for Reader<'_, S> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if let Some(zc) = self.zero_copy_left() {
+            return zc.copy_to(buf);
+        }
         self.buffers.consume_for_read(buf.len(), |bufs| {
             let mut rem = buf;
             let mut total = 0;
@@ -679,6 +817,14 @@ mod async_io {
             count: usize,
             off: u64,
         ) -> io::Result<usize> {
+            if self.zero_copy_left().is_some() {
+                // The FUSE-over-io_uring transport that moves zero-copy data
+                // serves synchronous handlers only.
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "zero-copy data can't be read asynchronously",
+                ));
+            }
             // Safe because `bufs` doesn't out-live `self`.
             let bufs = unsafe { self.buffers.prepare_io_buf(count) };
             if bufs.is_empty() {
@@ -713,6 +859,158 @@ mod tests {
         bitmap::{AtomicBitmap, Bitmap},
         VolatileSlice,
     };
+
+    /// A zero-copy source that records what it was asked to write.
+    #[derive(Default)]
+    struct RecordingSource(
+        std::sync::Mutex<Vec<(usize, std::os::unix::io::RawFd, usize, Option<u64>)>>,
+    );
+
+    impl super::ZeroCopySource for RecordingSource {
+        fn write_to_file(
+            &self,
+            pos: usize,
+            fd: std::os::unix::io::RawFd,
+            count: usize,
+            off: Option<u64>,
+        ) -> std::io::Result<usize> {
+            self.0.lock().unwrap().push((pos, fd, count, off));
+            // Write at most 5 bytes per call, like a short write.
+            Ok(count.min(5))
+        }
+
+        fn read_to_memory(
+            &self,
+            pos: usize,
+            count: usize,
+            take: &mut dyn FnMut(&[u8]) -> std::io::Result<usize>,
+        ) -> std::io::Result<usize> {
+            // The data is the byte sequence 100, 101, ...
+            let data: Vec<u8> = (0..count).map(|i| (100 + pos + i) as u8).collect();
+            take(&data)
+        }
+    }
+
+    #[test]
+    fn test_reader_zero_copy_read() {
+        use super::Reader;
+        use std::io::Read;
+
+        // Plain reads copy the zero-copy data after the buffers.
+        let src = RecordingSource::default();
+        let mut header = vec![7u8; 2];
+        let mut r = Reader::<()>::from_slice(&mut header).with_zero_copy(&src, 8);
+        let mut buf = [0u8; 4];
+        r.read_exact(&mut buf).unwrap();
+        assert_eq!(buf, [7, 7, 100, 101]);
+        assert_eq!(r.available_bytes(), 6);
+    }
+
+    #[test]
+    fn test_reader_zero_copy_read_to_position() {
+        use super::Reader;
+        use std::os::unix::io::AsRawFd;
+
+        // read_to() with a file descriptor writes at the file's position.
+        let src = RecordingSource::default();
+        let mut header = vec![0u8; 0];
+        let mut r = Reader::<()>::from_slice(&mut header).with_zero_copy(&src, 8);
+        let mut file = std::fs::File::open("/dev/null").unwrap();
+        assert_eq!(r.read_to(&mut file, 4).unwrap(), 4);
+        assert_eq!(*src.0.lock().unwrap(), vec![(0, file.as_raw_fd(), 4, None)]);
+    }
+
+    #[test]
+    fn test_reader_zero_copy() {
+        use super::Reader;
+        use std::io::Read;
+        use std::os::unix::io::AsRawFd;
+
+        let src = RecordingSource::default();
+        let mut header = vec![7u8; 4];
+        let mut r = Reader::<()>::from_slice(&mut header).with_zero_copy(&src, 8);
+        assert_eq!(r.available_bytes(), 12);
+
+        // The buffers come first.
+        let mut hdr = [0u8; 4];
+        r.read_exact(&mut hdr).unwrap();
+        assert_eq!(hdr, [7; 4]);
+
+        // read_to_at() hands the rest to the source, with the destination's
+        // fd, and advances by what it wrote.
+        let mut file = std::fs::File::open("/dev/null").unwrap();
+        let fd = file.as_raw_fd();
+        assert_eq!(r.read_to_at(&mut file, 8, 100).unwrap(), 5);
+        assert_eq!(r.available_bytes(), 3);
+        assert_eq!(r.read_to_at(&mut file, 8, 105).unwrap(), 3);
+        assert_eq!(r.available_bytes(), 0);
+        assert_eq!(r.bytes_read(), 12);
+        assert_eq!(
+            *src.0.lock().unwrap(),
+            vec![(0, fd, 8, Some(100)), (5, fd, 3, Some(105))]
+        );
+
+        // A destination without a file descriptor gets a copy, and only the
+        // bytes it takes count as read.
+        let mut header = vec![0u8; 0];
+        let mut r = Reader::<()>::from_slice(&mut header).with_zero_copy(&src, 8);
+        let mut no_fd = NoFd(Vec::new());
+        assert_eq!(r.read_to_at(&mut no_fd, 8, 0).unwrap(), 3);
+        assert_eq!(r.read_to(&mut no_fd, 8).unwrap(), 3);
+        assert_eq!(no_fd.0, [100, 101, 102, 103, 104, 105]);
+        assert_eq!(r.available_bytes(), 2);
+
+        // Splitting within the buffers gives the zero-copy data to the
+        // second half.
+        let mut header = vec![0u8; 4];
+        let mut r = Reader::<()>::from_slice(&mut header).with_zero_copy(&src, 8);
+        let rest = r.split_at(2).unwrap();
+        assert_eq!(r.available_bytes(), 2);
+        assert_eq!(rest.available_bytes(), 10);
+    }
+
+    /// A file without a descriptor that keeps what is written to it, at
+    /// most 3 bytes per write.
+    struct NoFd(Vec<u8>);
+
+    impl NoFd {
+        fn take(&mut self, s: crate::file_buf::FileVolatileSlice) -> std::io::Result<usize> {
+            let n = s.len().min(3);
+            // Safe because the slice points at n readable bytes.
+            let bytes = unsafe { std::slice::from_raw_parts(s.as_ptr(), n) };
+            self.0.extend_from_slice(bytes);
+            Ok(n)
+        }
+    }
+
+    impl crate::file_traits::FileReadWriteVolatile for NoFd {
+        fn read_volatile(
+            &mut self,
+            _: crate::file_buf::FileVolatileSlice,
+        ) -> std::io::Result<usize> {
+            Ok(0)
+        }
+        fn write_volatile(
+            &mut self,
+            s: crate::file_buf::FileVolatileSlice,
+        ) -> std::io::Result<usize> {
+            self.take(s)
+        }
+        fn read_at_volatile(
+            &mut self,
+            _: crate::file_buf::FileVolatileSlice,
+            _: u64,
+        ) -> std::io::Result<usize> {
+            Ok(0)
+        }
+        fn write_at_volatile(
+            &mut self,
+            s: crate::file_buf::FileVolatileSlice,
+            _: u64,
+        ) -> std::io::Result<usize> {
+            self.take(s)
+        }
+    }
 
     #[test]
     fn test_io_buffers() {

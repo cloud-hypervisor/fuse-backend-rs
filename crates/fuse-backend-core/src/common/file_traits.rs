@@ -16,7 +16,7 @@
 
 use std::fs::File;
 use std::io::{Error, ErrorKind, Result};
-use std::os::unix::io::AsRawFd;
+use std::os::unix::io::{AsRawFd, RawFd};
 
 use libc::{c_int, c_void, read, readv, size_t, write, writev};
 
@@ -42,6 +42,13 @@ impl FileSetLen for File {
 
 /// A trait similar to `Read` and `Write`, but uses [FileVolatileSlice] objects as data buffers.
 pub trait FileReadWriteVolatile {
+    /// The file descriptor behind this file, if it has one. A transport
+    /// uses it to move data between the file and memory the server can't
+    /// map, such as the client pages of FUSE-over-io_uring zero-copy.
+    fn raw_fd(&self) -> Option<RawFd> {
+        None
+    }
+
     /// Read bytes from this file into the given slice, returning the number of bytes read on
     /// success.
     fn read_volatile(&mut self, slice: FileVolatileSlice) -> Result<usize>;
@@ -194,6 +201,10 @@ pub trait FileReadWriteVolatile {
 }
 
 impl<T: FileReadWriteVolatile + ?Sized> FileReadWriteVolatile for &mut T {
+    fn raw_fd(&self) -> Option<RawFd> {
+        (**self).raw_fd()
+    }
+
     fn read_volatile(&mut self, slice: FileVolatileSlice) -> Result<usize> {
         (**self).read_volatile(slice)
     }
@@ -254,6 +265,10 @@ impl<T: FileReadWriteVolatile + ?Sized> FileReadWriteVolatile for &mut T {
 macro_rules! volatile_impl {
     ($ty:ty) => {
         impl FileReadWriteVolatile for $ty {
+            fn raw_fd(&self) -> Option<RawFd> {
+                Some(self.as_raw_fd())
+            }
+
             fn read_volatile(&mut self, slice: FileVolatileSlice) -> Result<usize> {
                 // Safe because only bytes inside the slice are accessed and the kernel is expected
                 // to handle arbitrary memory for I/O.
