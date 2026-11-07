@@ -839,13 +839,11 @@ impl<S: BitmapSlice + Send + Sync> FileSystem for PassthroughFs<S> {
             opts |= FsOptions::HANDLE_KILLPRIV_V2;
             self.killpriv_v2.store(true, Ordering::Relaxed);
         }
-        // No config option is needed: the handlers unconditionally honor
-        // Context.supp_gid, so just mirror what the kernel offers.  This
-        // also covers standalone mounts not sitting behind a Vfs, which
-        // negotiates the flag on its own.
-        if capable.contains(FsOptions::CREATE_SUPP_GROUP) {
-            opts |= FsOptions::CREATE_SUPP_GROUP;
-        }
+        // No config option is needed for these, so mirror what the kernel offers. The
+        // handlers unconditionally honor Context.supp_gid, and without DIRECT_IO_ALLOW_MMAP the
+        // kernel fails a shared mmap of every file opened with DIRECT_IO. This also covers
+        // standalone mounts not sitting behind a Vfs, which negotiates the flags on its own.
+        opts |= capable & (FsOptions::CREATE_SUPP_GROUP | FsOptions::DIRECT_IO_ALLOW_MMAP);
 
         if capable.contains(FsOptions::PERFILE_DAX) {
             opts |= FsOptions::PERFILE_DAX;
