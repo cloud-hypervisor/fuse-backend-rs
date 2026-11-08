@@ -172,6 +172,16 @@ impl InodeData {
     }
 }
 
+/// An inode [`PassthroughFs::pin_held_inodes`] found held, kept open while this value lives.
+pub struct PinnedInode(Arc<InodeData>);
+
+impl PinnedInode {
+    /// The inode number the file system gave out.
+    pub fn inode(&self) -> Inode {
+        self.0.inode
+    }
+}
+
 /// Data structures to manage accessed inodes.
 struct InodeMap {
     inodes: RwLock<InodeStore>,
@@ -553,17 +563,34 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
         Ok(PathBuf::from(OsString::from_vec(buf)))
     }
 
-    /// Every inode this file system holds: the root, and each inode a lookup gave out whose
-    /// references FORGET has not dropped.
-    pub fn held_inodes(&self) -> Vec<Inode> {
+    /// Every inode this file system holds, the root and each inode a lookup gave out whose
+    /// references FORGET has not dropped, pinned: each stays open, and its path readable with
+    /// [`PassthroughFs::pinned_path`], after a FORGET drops it from the file system.
+    ///
+    /// Taking the pins costs one reference count per inode and no system call, so a caller can
+    /// take them while its guest is paused and read the paths after it runs again.
+    pub fn pin_held_inodes(&self) -> Vec<PinnedInode> {
         // Do not expect poisoned lock here, so safe to unwrap().
         self.inode_map
             .inodes
             .read()
             .unwrap()
-            .inodes()
-            .copied()
+            .inode_data()
+            .map(|data| PinnedInode(Arc::clone(data)))
             .collect()
+    }
+
+    /// The path a pinned inode has now.
+    pub fn pinned_path(&self, pinned: &PinnedInode) -> io::Result<PathBuf> {
+        let file = pinned.0.get_file()?;
+        let pathname = CString::new(format!("{}", file.as_raw_fd()))
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        Self::readlinkat(self.proc_self_fd.as_raw_fd(), &pathname)
+    }
+
+    /// The attributes a pinned inode has now.
+    pub fn pinned_stat(&self, pinned: &PinnedInode) -> io::Result<libc::stat64> {
+        stat_fd(&pinned.0.get_file()?, None)
     }
 
     /// The highest handle this file system has given out, or 0 when it has given none.
@@ -1253,7 +1280,7 @@ mod tests {
     }
 
     #[test]
-    fn test_held_inodes_and_max_handle() {
+    fn test_pinned_inodes_and_max_handle() {
         let source = TempDir::new().expect("Cannot create temporary directory.");
         std::fs::create_dir(source.as_path().join("d")).unwrap();
         let fs_cfg = Config {
@@ -1265,21 +1292,34 @@ mod tests {
         let fs = PassthroughFs::<()>::new(fs_cfg).unwrap();
         fs.import().unwrap();
         let ctx = Context::default();
-        assert_eq!(fs.held_inodes(), vec![fuse::ROOT_ID]);
+        let inodes = |pins: &[PinnedInode]| {
+            let mut inodes: Vec<_> = pins.iter().map(PinnedInode::inode).collect();
+            inodes.sort();
+            inodes
+        };
+        assert_eq!(inodes(&fs.pin_held_inodes()), vec![fuse::ROOT_ID]);
         assert_eq!(fs.max_handle(), 0);
 
         let entry = fs
             .lookup(&ctx, fuse::ROOT_ID, &CString::new("d").unwrap())
             .unwrap();
-        let mut held = fs.held_inodes();
-        held.sort();
-        assert_eq!(held, vec![fuse::ROOT_ID, entry.inode]);
+        let pins = fs.pin_held_inodes();
+        assert_eq!(inodes(&pins), vec![fuse::ROOT_ID, entry.inode]);
 
         let (handle, _) = fs.opendir(&ctx, entry.inode, 0).unwrap();
         assert_eq!(Some(fs.max_handle()), handle);
 
+        // A pinned inode's path and attributes stay readable after FORGET drops it, and the
+        // file system no longer holds it.
         fs.forget(&ctx, entry.inode, 1);
-        assert_eq!(fs.held_inodes(), vec![fuse::ROOT_ID]);
+        assert_eq!(inodes(&fs.pin_held_inodes()), vec![fuse::ROOT_ID]);
+        let pinned = pins.iter().find(|p| p.inode() == entry.inode).unwrap();
+        std::fs::rename(source.as_path().join("d"), source.as_path().join("e")).unwrap();
+        assert_eq!(fs.pinned_path(pinned).unwrap(), source.as_path().join("e"));
+        assert_eq!(
+            fs.pinned_stat(pinned).unwrap().st_mode & libc::S_IFMT,
+            libc::S_IFDIR
+        );
     }
 
     #[test]
