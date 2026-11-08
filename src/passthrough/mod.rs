@@ -553,6 +553,24 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
         Ok(PathBuf::from(OsString::from_vec(buf)))
     }
 
+    /// Every inode this file system holds: the root, and each inode a lookup gave out whose
+    /// references FORGET has not dropped.
+    pub fn held_inodes(&self) -> Vec<Inode> {
+        // Do not expect poisoned lock here, so safe to unwrap().
+        self.inode_map
+            .inodes
+            .read()
+            .unwrap()
+            .inodes()
+            .copied()
+            .collect()
+    }
+
+    /// The highest handle this file system has given out, or 0 when it has given none.
+    pub fn max_handle(&self) -> Handle {
+        self.next_handle.load(Ordering::Relaxed).saturating_sub(1)
+    }
+
     /// Get the file pathname corresponding to the Inode
     /// This function is used by Nydus blobfs
     pub fn readlinkat_proc_file(&self, inode: Inode) -> io::Result<PathBuf> {
@@ -1232,6 +1250,36 @@ mod tests {
                 assert_eq!(fs.no_open.load(Ordering::Relaxed), cfg);
             })
             .unwrap();
+    }
+
+    #[test]
+    fn test_held_inodes_and_max_handle() {
+        let source = TempDir::new().expect("Cannot create temporary directory.");
+        std::fs::create_dir(source.as_path().join("d")).unwrap();
+        let fs_cfg = Config {
+            do_import: true,
+            inode_file_handles: false,
+            root_dir: source.as_path().to_str().unwrap().to_string(),
+            ..Default::default()
+        };
+        let fs = PassthroughFs::<()>::new(fs_cfg).unwrap();
+        fs.import().unwrap();
+        let ctx = Context::default();
+        assert_eq!(fs.held_inodes(), vec![fuse::ROOT_ID]);
+        assert_eq!(fs.max_handle(), 0);
+
+        let entry = fs
+            .lookup(&ctx, fuse::ROOT_ID, &CString::new("d").unwrap())
+            .unwrap();
+        let mut held = fs.held_inodes();
+        held.sort();
+        assert_eq!(held, vec![fuse::ROOT_ID, entry.inode]);
+
+        let (handle, _) = fs.opendir(&ctx, entry.inode, 0).unwrap();
+        assert_eq!(Some(fs.max_handle()), handle);
+
+        fs.forget(&ctx, entry.inode, 1);
+        assert_eq!(fs.held_inodes(), vec![fuse::ROOT_ID]);
     }
 
     #[test]
