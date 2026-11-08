@@ -73,6 +73,11 @@ impl InodeStore {
         self.by_id.clear();
     }
 
+    /// Every inode in the store.
+    pub fn inodes(&self) -> impl Iterator<Item = &Inode> {
+        self.data.keys()
+    }
+
     pub fn get(&self, inode: &Inode) -> Option<&Arc<InodeData>> {
         self.data.get(inode)
     }
