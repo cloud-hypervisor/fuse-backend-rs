@@ -839,11 +839,24 @@ impl<S: BitmapSlice + Send + Sync> FileSystem for PassthroughFs<S> {
             opts |= FsOptions::HANDLE_KILLPRIV_V2;
             self.killpriv_v2.store(true, Ordering::Relaxed);
         }
-        // No config option is needed for these, so mirror what the kernel offers. The
-        // handlers unconditionally honor Context.supp_gid, and without DIRECT_IO_ALLOW_MMAP the
-        // kernel fails a shared mmap of every file opened with DIRECT_IO. This also covers
-        // standalone mounts not sitting behind a Vfs, which negotiates the flags on its own.
-        opts |= capable & (FsOptions::CREATE_SUPP_GROUP | FsOptions::DIRECT_IO_ALLOW_MMAP);
+        // No config option is needed for CREATE_SUPP_GROUP, so mirror what the kernel offers.
+        // The handlers unconditionally honor Context.supp_gid. This also covers standalone
+        // mounts not sitting behind a Vfs, which negotiates the flag on its own.
+        opts |= capable & FsOptions::CREATE_SUPP_GROUP;
+        // The kernel fails a shared mmap of a file opened with DIRECT_IO with ENODEV unless
+        // DIRECT_IO_ALLOW_MMAP was negotiated. Under Auto and Always only an explicit O_DIRECT
+        // open gets that reply, so mirror the flag for them unconditionally. Under Never and
+        // Metadata every regular file does, and a negotiated flag would serve shared mmaps
+        // from the client page cache, which the kernel only invalidates on each new mmap and
+        // on its own direct writes — weaker than the coherency those policies promise — so
+        // they get the flag only when the deployment opts in through Config::allow_mmap.
+        if !matches!(
+            self.cfg.cache_policy,
+            CachePolicy::Never | CachePolicy::Metadata
+        ) || self.cfg.allow_mmap
+        {
+            opts |= capable & FsOptions::DIRECT_IO_ALLOW_MMAP;
+        }
 
         if capable.contains(FsOptions::PERFILE_DAX) {
             opts |= FsOptions::PERFILE_DAX;

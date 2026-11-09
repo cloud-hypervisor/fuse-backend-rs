@@ -63,6 +63,15 @@
   systems.
 
 ### Changed
+- [294](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/294): `PassthroughFs` negotiates
+  `FsOptions::DIRECT_IO_ALLOW_MMAP` under the `Never` and `Metadata` cache policies only when the
+  new `Config::allow_mmap` opts in (default off), so shared mmaps keep failing with `ENODEV` there
+  by default: a negotiated flag would serve them from the client page cache, which the kernel only
+  invalidates on each new mmap and on its own direct writes — weaker than the no-caching promise
+  those policies make. The `Auto` and `Always` policies still negotiate the flag for the explicit
+  `O_DIRECT` opens. A standalone `OverlayFs` mount under `CachePolicy::Never` gains the same
+  `Config::allow_mmap` knob. Behind a `Vfs` the flag is connection-wide in `VfsOptions::out_opts`,
+  where a strict deployment removes it like any other capability bit.
 - Bump the declared minimum supported Rust version (MSRV) from 1.80 to 1.86.
   Trait-object upcasting (stabilized in Rust 1.86) is required by the default
   `AsyncFileSystem` read/write handlers and by the passthrough O_DIRECT relay,

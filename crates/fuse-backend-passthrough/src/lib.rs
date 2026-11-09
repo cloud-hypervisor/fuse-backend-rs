@@ -1852,6 +1852,40 @@ mod tests {
     }
 
     #[test]
+    fn test_init_gates_direct_io_allow_mmap() {
+        // The default policy (Auto) mirrors the flag unconditionally; test_init_mirrors_kernel_flags
+        // covers that. Under the strict policies the flag is an opt-in: without it, shared mmaps of
+        // the policy's always-DIRECT_IO files keep failing with ENODEV.
+        let tmpdir = TempDir::new().expect("Cannot create temporary directory.");
+        let fs_cfg = Config {
+            do_import: false,
+            root_dir: tmpdir.as_path().to_string_lossy().to_string(),
+            cache_policy: CachePolicy::Never,
+            ..Default::default()
+        };
+        let fs = PassthroughFs::<()>::new(fs_cfg).unwrap();
+        fs.import().unwrap();
+        let mirrored = FsOptions::CREATE_SUPP_GROUP | FsOptions::DIRECT_IO_ALLOW_MMAP;
+        let opts = fs.init(mirrored).unwrap();
+        assert!(!opts.contains(FsOptions::DIRECT_IO_ALLOW_MMAP));
+        assert!(opts.contains(FsOptions::CREATE_SUPP_GROUP));
+
+        let fs_cfg = Config {
+            do_import: false,
+            root_dir: tmpdir.as_path().to_string_lossy().to_string(),
+            cache_policy: CachePolicy::Metadata,
+            allow_mmap: true,
+            ..Default::default()
+        };
+        let fs = PassthroughFs::<()>::new(fs_cfg).unwrap();
+        fs.import().unwrap();
+        assert!(fs
+            .init(mirrored)
+            .unwrap()
+            .contains(FsOptions::DIRECT_IO_ALLOW_MMAP));
+    }
+
+    #[test]
     fn test_generic_read_write_noopen() {
         let tmpdir = TempDir::new().expect("Cannot create temporary directory.");
         // Prepare passthrough fs.

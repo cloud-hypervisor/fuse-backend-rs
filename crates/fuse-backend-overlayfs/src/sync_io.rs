@@ -65,6 +65,16 @@ impl FileSystem for OverlayFs {
             self.perfile_dax.store(true, Ordering::Relaxed);
         }
 
+        // OverlayFs replies DIRECT_IO for regular files only under CachePolicy::Never, and the
+        // kernel fails a shared mmap of such a file with ENODEV unless DIRECT_IO_ALLOW_MMAP was
+        // negotiated. A negotiated flag serves those mmaps from the client page cache, weaker
+        // than the coherency Never promises, so request it only on the explicit Config::allow_mmap
+        // opt-in (and only what the kernel offers). This matters for standalone mounts; behind a
+        // Vfs the connection-wide flag comes from VfsOptions::out_opts.
+        if self.config.allow_mmap && capable.contains(FsOptions::DIRECT_IO_ALLOW_MMAP) {
+            opts |= FsOptions::DIRECT_IO_ALLOW_MMAP;
+        }
+
         Ok(opts)
     }
 
