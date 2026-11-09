@@ -602,7 +602,9 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
                 inode: data.inode,
                 file: match &data.handle {
                     InodeHandle::File(_) => PinnedFile::Held(Arc::clone(data)),
-                    InodeHandle::Handle(handle) => PinnedFile::Opened(handle.open(libc::O_PATH)),
+                    InodeHandle::Handle(handle) => {
+                        PinnedFile::Opened(handle.open(libc::O_PATH | libc::O_CLOEXEC))
+                    }
                 },
             })
             .collect()
@@ -1399,10 +1401,25 @@ mod tests {
         let file = fs
             .lookup(&ctx, fuse::ROOT_ID, &CString::new("f").unwrap())
             .unwrap();
+        assert!(
+            matches!(
+                fs.inode_map.get(file.inode).unwrap().handle,
+                InodeHandle::Handle(_)
+            ),
+            "the inode is named by a file handle, not a descriptor"
+        );
         let pins = fs.pin_held_inodes();
         fs.forget(&ctx, file.inode, 1);
         std::fs::remove_file(source.as_path().join("f")).unwrap();
         let pin = pins.iter().find(|p| p.inode() == file.inode).unwrap();
+        let PinnedFile::Opened(Ok(opened)) = &pin.file else {
+            panic!("a handle-named inode is pinned by a file opened for it");
+        };
+        let fd_flags = unsafe { libc::fcntl(opened.as_raw_fd(), libc::F_GETFD) };
+        assert!(
+            fd_flags & libc::FD_CLOEXEC != 0,
+            "a pin's descriptor would outlive it in an exec'd child"
+        );
         assert_eq!(fs.pinned_stat(pin).unwrap().st_nlink, 0);
         assert!(fs
             .pinned_path(pin)
