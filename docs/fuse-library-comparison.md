@@ -382,8 +382,13 @@ request, not from credential handling.
 
 Scripts live under `tests/scripts/`:
 
-- `bench_library_compare.sh` — full matrix (5 workloads × 4 thread counts ×
-  2 daemons), fio-based
+- `bench_library_compare.sh` — full matrix (5 workloads × the thread counts
+  in `THREADS_LIST` × 2 daemons), fio-based. The backend side is the
+  `tests/benchmark` daemon run with `--no-writeback`, and the fuser side is
+  `tests/passthrough-fuser`; the same script runs from a GitHub CI runner
+  (label `run-fuser-compare` on the PR), where cross-daemon deltas from the
+  same job are the signal and absolute numbers are not comparable across
+  runners
 - `bench_multi_round.sh` — wrapper running N rounds into separate result
   directories
 - `parse_multi_round.py` — per-round IOPS + mean + spread aggregation

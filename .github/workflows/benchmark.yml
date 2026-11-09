@@ -1,5 +1,6 @@
 # Benchmark the synchronous, asynchronous, io_uring and kernel-passthrough
-# fusedev IO paths.
+# fusedev IO paths, and (on the run-fuser-compare label) the library
+# comparison against the fuser crate.
 #
 # Triggers:
 #   - pull requests: add the "run-benchmark" label to benchmark the PR.
@@ -9,6 +10,13 @@
 #     runner turned out to be useless: GitHub-hosted runners are shared
 #     VMs whose performance fluctuates by tens of percent, which even
 #     produced "regressions" on code paths the PR did not touch.
+#   - pull requests: add the "run-fuser-compare" label to run the
+#     fuse-backend-rs vs fuser library comparison of the PR head. Both
+#     daemons are measured back to back in the same job, so the
+#     cross-daemon deltas are the signal; absolute numbers from a shared
+#     runner are not comparable across runs. Both daemons run with the
+#     FUSE writeback cache off (the backend one via --no-writeback; fuser
+#     cannot negotiate it), so the write path compares like for like.
 #   - pushes to master / workflow_dispatch: a single run, the collected
 #     results are written to the job summary for reference.
 #
@@ -291,3 +299,88 @@ jobs:
         path: |
           current-*.json
           base-*.json
+
+  # Library comparison: the PR head's fuse-backend-rs against the fuser
+  # crate, both serving the same passthrough workloads from daemons built
+  # from this very checkout. Both daemons run in the same job on the same
+  # runner, so the per-workload deltas cancel environment effects; the
+  # absolute numbers are only meaningful relative to each other. The
+  # results table is advisory and never fails the workflow.
+  fuser-compare:
+    if: github.event_name == 'pull_request' && github.event.label.name == 'run-fuser-compare'
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+    - uses: actions/checkout@v3
+
+    - name: Cache cargo
+      uses: Swatinem/rust-cache@v2.2.0
+      with:
+        cache-on-failure: true
+
+    - name: Install Rust
+      uses: actions-rs/toolchain@v1
+      with:
+        profile: minimal
+        toolchain: stable
+        override: true
+
+    - name: Install tools
+      run: |
+        if ! command -v fio >/dev/null; then
+            sudo apt-get update
+            sudo apt-get install -y fio
+        fi
+        # The fuser daemon mounts through the fusermount3 helper and uses
+        # AutoUnmount with SessionACL::All, which need fuse3 and
+        # user_allow_other respectively.
+        sudo apt-get install -y fuse3
+        echo user_allow_other | sudo tee --append /etc/fuse.conf
+
+    - name: Build both daemons
+      run: |
+        cargo build --release -p fuse-backend-rs-benchmark -p passthrough-fuser
+
+    - name: Run the library comparison
+      run: |
+        CARGO_BIN=$(which cargo)
+        # sudo -E is not supported by sudo-rs (the default sudo on
+        # Ubuntu 26.04 runners); route the environment through env(1).
+        # Progress goes to the log; the results table goes to stdout,
+        # which is appended to the job summary below.
+        sudo env PATH="$(dirname "${CARGO_BIN}"):${PATH}" CARGO_HOME="${HOME}/.cargo" \
+            RUST_BACKTRACE=1 \
+            BACKEND_BIN="${GITHUB_WORKSPACE}/target/release/fuse-backend-rs-benchmark" \
+            FUSER_BIN="${GITHUB_WORKSPACE}/target/release/passthrough-fuser" \
+            RESULTS_DIR="${GITHUB_WORKSPACE}/fuser-compare-results" \
+            THREADS_LIST="1 8" \
+            bash tests/scripts/bench_library_compare.sh \
+            > "${GITHUB_WORKSPACE}/fuser-compare-table.txt"
+        sudo chown -R $(id -u):$(id -g) "${HOME}/.cargo"
+
+    - name: Show results
+      if: always()
+      run: |
+        {
+            echo "## Library comparison: fuse-backend-rs vs fuser (PR head)"
+            echo ""
+            echo "Both daemons were built from this PR's checkout and measured"
+            echo "back to back on the same runner, with the FUSE writeback cache"
+            echo "off on both sides (fuser cannot negotiate it), so the deltas"
+            echo "are the signal; absolute numbers from a shared runner are not"
+            echo "comparable across runs. The deltas are advisory; conclusions"
+            echo "about either library should be re-checked on bare metal."
+            echo ""
+            echo '```'
+            cat "${GITHUB_WORKSPACE}/fuser-compare-table.txt" || echo "no results: the comparison did not run"
+            echo '```'
+        } >> "${GITHUB_STEP_SUMMARY}"
+
+    - name: Upload results
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: fuser-compare-results
+        path: |
+          fuser-compare-table.txt
+          fuser-compare-results/

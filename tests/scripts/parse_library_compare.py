@@ -3,8 +3,10 @@
 import json
 import sys
 
-results_dir = sys.argv[1] if len(sys.argv) > 1 else "/tmp/fuser-compare-results"
-threads_list = [1, 2, 4, 8]
+results_dir = sys.argv[1] if len(sys.argv) > 1 else "fuser-compare-results"
+# Optional: the thread counts that were run (must match THREADS_LIST given
+# to bench_library_compare.sh). Default to the historical local matrix.
+threads_list = [int(t) for t in sys.argv[2].split()] if len(sys.argv) > 2 else [1, 2, 4, 8]
 workloads = ["filecreate", "randread-4k", "randwrite-4k", "seqread-128k", "seqwrite-128k"]
 WRITE_WORKLOADS = {"randwrite-4k", "seqwrite-128k", "filecreate"}
 

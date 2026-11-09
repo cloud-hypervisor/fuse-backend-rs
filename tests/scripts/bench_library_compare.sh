@@ -1,28 +1,63 @@
 #!/bin/bash
-# Benchmark: fuse-backend-rs vs fuser passthrough filesystems
-# Run on oxs-dev only (requires sudo for mount)
+# Benchmark: fuse-backend-rs vs fuser passthrough filesystems.
+#
+# Runs the same fio workloads against two passthrough daemons — one built
+# on this crate, one on the fuser library — and prints a per-workload
+# delta table (parse_library_compare.py). Both daemons run with the FUSE
+# writeback cache off (the backend one via --no-writeback; fuser cannot
+# negotiate it at all), so the write path compares like for like. Reading
+# the deltas rather than the absolute numbers keeps a shared CI runner
+# usable: both sides are measured in the same job, so runner drift cancels.
+#
+# Requirements: Linux, fio, python3, permission to mount fuse (root or
+# fusermount). The fuser daemon mounts through the fusermount3 helper and
+# uses AutoUnmount with SessionACL::All, which also needs user_allow_other
+# in /etc/fuse.conf.
+#
+# Environment knobs (all optional):
+#   BACKEND_BIN    fuse-backend-rs daemon; must accept
+#                  "<src> <mnt> --threads N" (default: the tests/benchmark
+#                  binary under target/release)
+#   FUSER_BIN      fuser daemon; must accept "<src> <mnt> -t N"
+#                  (default: the passthrough-fuser binary under
+#                  target/release)
+#   BACKEND_EXTRA  extra args for the backend daemon (e.g. "--sync-blocking")
+#   FUSER_EXTRA    extra args for the fuser daemon (e.g. "--no-clone-fd")
+#   THREADS_LIST   space-separated thread counts (default "1 8"; the local
+#                  runs that produced docs/fuse-library-comparison.md used
+#                  "1 2 4 8")
+#   RUNTIME        seconds per workload (default 10)
+#   RESULTS_DIR    where the fio JSON results go
+#   SRC_DIR        backing directory served through the mounts
+#   MNT_DIR        mountpoint directory
+#
+# Usage: run the script as root (or with fusermount permissions) from the
+# workspace root after building both daemons in release mode. Progress goes
+# to stderr; the results table goes to stdout, so CI can append stdout to
+# GITHUB_STEP_SUMMARY while the log keeps the progress lines.
 set -euo pipefail
 
-BIN_DIR="/tmp/fuser-compare/target/release"
-BACKEND_BIN="$BIN_DIR/passthrough"
-FUSER_BIN="$BIN_DIR/passthrough-fuser"
-RESULTS_DIR="/tmp/fuser-compare-results"
-SRC_DIR="/tmp/fuser-compare-src"
-MNT_DIR="/tmp/fuser-compare-mnt"
+BACKEND_BIN="${BACKEND_BIN:-target/release/fuse-backend-rs-benchmark}"
+FUSER_BIN="${FUSER_BIN:-target/release/passthrough-fuser}"
+RESULTS_DIR="${RESULTS_DIR:-fuser-compare-results}"
+SRC_DIR="${SRC_DIR:-/tmp/fuser-compare-src}"
+MNT_DIR="${MNT_DIR:-/tmp/fuser-compare-mnt}"
+THREADS_LIST="${THREADS_LIST:-1 8}"
+RUNTIME="${RUNTIME:-10}"
+BACKEND_EXTRA="${BACKEND_EXTRA:-}"
+FUSER_EXTRA="${FUSER_EXTRA:-}"
 
-# Threads to test
-THREADS_LIST=(1 2 4 8)
+DAEMON_PID=""
 
-# Workloads
+log() {
+    echo "$@" >&2
+}
+
+# Workloads: fixed-amount work (nrfiles) rather than time_based, so the
+# same amount of work is measured on both daemons regardless of speed.
 run_workload() {
-    local name=$1
-    local rw=$2
-    local bs=$3
-    local size=$4
-    local nrfiles=$5
-    local outfile=$6
-    local extra=${7:-}
-    
+    local name=$1 rw=$2 bs=$3 size=$4 nrfiles=$5 outfile=$6 extra=${7:-}
+
     fio --name="$name" \
         --directory="$MNT_DIR" \
         --rw="$rw" \
@@ -31,7 +66,7 @@ run_workload() {
         --nrfiles="$nrfiles" \
         --numjobs=1 \
         --time_based \
-        --runtime=10 \
+        --runtime="${RUNTIME}" \
         --group_reporting \
         --output-format=json \
         --output="$outfile" \
@@ -40,15 +75,8 @@ run_workload() {
 }
 
 run_multithread_workload() {
-    local name=$1
-    local rw=$2
-    local bs=$3
-    local size=$4
-    local nrfiles=$5
-    local numjobs=$6
-    local outfile=$7
-    local extra=${8:-}
-    
+    local name=$1 rw=$2 bs=$3 size=$4 nrfiles=$5 numjobs=$6 outfile=$7 extra=${8:-}
+
     fio --name="$name" \
         --directory="$MNT_DIR" \
         --rw="$rw" \
@@ -57,7 +85,7 @@ run_multithread_workload() {
         --nrfiles="$nrfiles" \
         --numjobs="$numjobs" \
         --time_based \
-        --runtime=10 \
+        --runtime="${RUNTIME}" \
         --group_reporting \
         --output-format=json \
         --output="$outfile" \
@@ -65,231 +93,166 @@ run_multithread_workload() {
         2>/dev/null
 }
 
-# Start/stop daemons
+# start_backend <threads>: the tests/benchmark daemon with the writeback
+# cache off, so the write path matches fuser's (which cannot negotiate
+# FUSE_WRITEBACK_CACHE). The daemon's stdout/stderr go to a log file
+# under RESULTS_DIR, not to this script's streams: the results table is
+# printed on stdout, and a child inheriting it would interleave its log
+# lines into the table.
 start_backend() {
     local threads=$1
     rm -rf "$SRC_DIR" "$MNT_DIR"
     mkdir -p "$SRC_DIR" "$MNT_DIR"
-    $BACKEND_BIN "$SRC_DIR" "$MNT_DIR" "$threads" &
+    # shellcheck disable=SC2086
+    "$BACKEND_BIN" "$SRC_DIR" "$MNT_DIR" --no-writeback --threads "$threads" $BACKEND_EXTRA \
+        > "$RESULTS_DIR/backend.log" 2>&1 &
     DAEMON_PID=$!
-    # Wait for mount
-    for i in $(seq 1 30); do
-        if mountpoint -q "$MNT_DIR" 2>/dev/null; then
-            echo "  fuse-backend-rs mounted (pid=$DAEMON_PID, threads=$threads)"
-            return 0
-        fi
-        sleep 0.1
-    done
-    echo "  ERROR: fuse-backend-rs failed to mount"
-    kill $DAEMON_PID 2>/dev/null || true
-    return 1
+    wait_for_mount "fuse-backend-rs" "$DAEMON_PID"
 }
 
 start_fuser() {
     local threads=$1
     rm -rf "$SRC_DIR" "$MNT_DIR"
     mkdir -p "$SRC_DIR" "$MNT_DIR"
-    $FUSER_BIN "$SRC_DIR" "$MNT_DIR" -t "$threads" &
+    # shellcheck disable=SC2086
+    "$FUSER_BIN" "$SRC_DIR" "$MNT_DIR" -t "$threads" $FUSER_EXTRA \
+        > "$RESULTS_DIR/fuser.log" 2>&1 &
     DAEMON_PID=$!
-    # Wait for mount
-    for i in $(seq 1 30); do
-        if mountpoint -q "$MNT_DIR" 2>/dev/null; then
-            echo "  fuser mounted (pid=$DAEMON_PID, threads=$threads)"
+    wait_for_mount "fuser" "$DAEMON_PID"
+}
+
+# Wait up to 5s for the mountpoint to appear, checking daemon liveness first
+# so a daemon that mounted and immediately died (leaving a stale mount) is
+# never taken for success.
+wait_for_mount() {
+    local daemon=$1 pid=$2
+    for _ in $(seq 50); do
+        if ! kill -0 "$pid" 2>/dev/null; then
+            log "  ERROR: $daemon daemon died without mounting"
+            wait "$pid" 2>/dev/null || true
+            return 1
+        fi
+        if mountpoint -q "$MNT_DIR"; then
+            log "  $daemon mounted (pid=$pid)"
             return 0
         fi
         sleep 0.1
     done
-    echo "  ERROR: fuser failed to mount"
-    kill $DAEMON_PID 2>/dev/null || true
+    log "  ERROR: $daemon failed to mount"
+    kill "$pid" 2>/dev/null || true
+    wait "$pid" 2>/dev/null || true
     return 1
 }
 
 stop_daemon() {
     if [ -n "${DAEMON_PID:-}" ]; then
-        kill $DAEMON_PID 2>/dev/null || true
-        wait $DAEMON_PID 2>/dev/null || true
-        # Force unmount if still mounted
+        kill "$DAEMON_PID" 2>/dev/null || true
+        wait "$DAEMON_PID" 2>/dev/null || true
+        # Force unmount if still mounted (the fuser daemon unmounts on
+        # drop, the backend one on umount(); a SIGTERM race can leave
+        # either behind).
         if mountpoint -q "$MNT_DIR" 2>/dev/null; then
-            fusermount3 -u "$MNT_DIR" 2>/dev/null || sudo umount -f "$MNT_DIR" 2>/dev/null || true
+            fusermount3 -u "$MNT_DIR" 2>/dev/null || umount "$MNT_DIR" 2>/dev/null || true
         fi
         DAEMON_PID=""
     fi
 }
 
-# Parse JSON result
-get_iops() {
-    python3 -c "import json,sys; d=json.load(sys.stdin); print(d['jobs'][0]['$1']['iops'])" 2>/dev/null || echo "N/A"
-}
+run_daemon_suite() {
+    local daemon=$1 threads=$2
 
-get_bw() {
-    python3 -c "import json,sys; d=json.load(sys.stdin); print(f\"{d['jobs'][0]['$1']['bw']/1024:.1f}\")" 2>/dev/null || echo "N/A"
-}
+    if [ "$daemon" = "backend" ]; then
+        start_backend "$threads" || return 1
+    else
+        start_fuser "$threads" || return 1
+    fi
 
-get_lat() {
-    python3 -c "import json,sys; d=json.load(sys.stdin); print(f\"{d['jobs'][0]['$1']['lat_ns']['mean']/1000:.1f}\")" 2>/dev/null || echo "N/A"
+    # Warm up.
+    sleep 1
+
+    # filecreate: metadata-heavy — 5000 small files.
+    log -n "  filecreate... "
+    run_workload "filecreate" "write" "4k" "4k" "5000" \
+        "$RESULTS_DIR/${daemon}_t${threads}_filecreate.json" \
+        2>/dev/null || true
+    log "done"
+
+    # The data workloads need a test file; create it through the mount so
+    # the daemon sees it.
+    dd if=/dev/urandom of="$MNT_DIR/testfile" bs=1M count=256 2>/dev/null || true
+
+    # randread-4k
+    log -n "  randread-4k... "
+    run_multithread_workload "randread-4k" "randread" "4k" "256M" "1" "$threads" \
+        "$RESULTS_DIR/${daemon}_t${threads}_randread-4k.json" \
+        2>/dev/null || true
+    log "done"
+
+    # randwrite-4k
+    log -n "  randwrite-4k... "
+    run_multithread_workload "randwrite-4k" "randwrite" "4k" "256M" "1" "$threads" \
+        "$RESULTS_DIR/${daemon}_t${threads}_randwrite-4k.json" \
+        2>/dev/null || true
+    log "done"
+
+    # seqread-128k
+    log -n "  seqread-128k... "
+    run_multithread_workload "seqread-128k" "read" "128k" "256M" "1" "$threads" \
+        "$RESULTS_DIR/${daemon}_t${threads}_seqread-128k.json" \
+        2>/dev/null || true
+    log "done"
+
+    # seqwrite-128k
+    log -n "  seqwrite-128k... "
+    run_multithread_workload "seqwrite-128k" "write" "128k" "256M" "1" "$threads" \
+        "$RESULTS_DIR/${daemon}_t${threads}_seqwrite-128k.json" \
+        2>/dev/null || true
+    log "done"
+
+    stop_daemon
 }
 
 # Main
-echo "============================================================"
-echo "  fuse-backend-rs vs fuser Performance Comparison"
-echo "  $(date)"
-echo "  Kernel: $(uname -r)"
-echo "  CPU: $(nproc) cores"
-echo "============================================================"
-echo ""
+log "============================================================"
+log "  fuse-backend-rs vs fuser Performance Comparison"
+log "  $(date)"
+log "  Kernel: $(uname -r)"
+log "  CPU: $(nproc) cores"
+log "  backend: ${BACKEND_BIN} ${BACKEND_EXTRA}"
+log "  fuser:   ${FUSER_BIN} ${FUSER_EXTRA}"
+log "============================================================"
+log ""
 
 rm -rf "$RESULTS_DIR"
 mkdir -p "$RESULTS_DIR"
 
-for threads in "${THREADS_LIST[@]}"; do
-    echo "=== Thread count: $threads ==="
-    echo ""
-    
-    for daemon in "backend" "fuser"; do
-        echo "--- $daemon ---"
-        
-        if [ "$daemon" = "backend" ]; then
-            start_backend "$threads" || continue
-        else
-            start_fuser "$threads" || continue
-        fi
-        
-        # Warm up
-        sleep 1
-        
-        # filecreate: metadata-heavy — create 5000 small files
-        echo -n "  filecreate... "
-        run_workload "filecreate" "write" "4k" "4k" "5000" \
-            "$RESULTS_DIR/${daemon}_t${threads}_filecreate.json" \
-            2>/dev/null || true
-        echo "done"
-        
-        # randread-4k
-        echo -n "  randread-4k... "
-        # Create a test file THROUGH THE MOUNT so it's visible to the daemon
-        dd if=/dev/urandom of="$MNT_DIR/testfile" bs=1M count=256 2>/dev/null || true
-        run_multithread_workload "randread-4k" "randread" "4k" "256M" "1" "$threads" \
-            "$RESULTS_DIR/${daemon}_t${threads}_randread-4k.json" \
-            2>/dev/null || true
-        echo "done"
-        
-        # randwrite-4k
-        echo -n "  randwrite-4k... "
-        run_multithread_workload "randwrite-4k" "randwrite" "4k" "256M" "1" "$threads" \
-            "$RESULTS_DIR/${daemon}_t${threads}_randwrite-4k.json" \
-            2>/dev/null || true
-        echo "done"
-        
-        # seqread-128k
-        echo -n "  seqread-128k... "
-        run_multithread_workload "seqread-128k" "read" "128k" "256M" "1" "$threads" \
-            "$RESULTS_DIR/${daemon}_t${threads}_seqread-128k.json" \
-            2>/dev/null || true
-        echo "done"
-        
-        # seqwrite-128k
-        echo -n "  seqwrite-128k... "
-        run_multithread_workload "seqwrite-128k" "write" "128k" "256M" "1" "$threads" \
-            "$RESULTS_DIR/${daemon}_t${threads}_seqwrite-128k.json" \
-            2>/dev/null || true
-        echo "done"
-        
-        stop_daemon
-        echo ""
+daemon_idx=0
+for threads in ${THREADS_LIST}; do
+    log "=== Thread count: $threads ==="
+    log ""
+
+    # Alternate the daemon order between thread counts to spread runner
+    # drift (warmup, thermals) across the two daemons.
+    if [ $((daemon_idx % 2)) -eq 0 ]; then
+        order=("backend" "fuser")
+    else
+        order=("fuser" "backend")
+    fi
+    daemon_idx=$((daemon_idx + 1))
+
+    for daemon in "${order[@]}"; do
+        log "--- $daemon ---"
+        run_daemon_suite "$daemon" "$threads" || {
+            log "  ERROR: $daemon suite failed at $threads threads, skipping"
+            stop_daemon
+        }
+        log ""
     done
 done
 
 # Cleanup
 rm -rf "$SRC_DIR" "$MNT_DIR"
 
-echo ""
-echo "============================================================"
-echo "  Results Summary"
-echo "============================================================"
-echo ""
-
-# Generate summary table
-python3 << 'PYEOF'
-import json
-import os
-import glob
-
-results_dir = "/tmp/fuser-compare-results"
-threads_list = [1, 2, 4, 8]
-workloads = ["filecreate", "randread-4k", "randwrite-4k", "seqread-128k", "seqwrite-128k"]
-
-def load_result(daemon, threads, workload):
-    path = f"{results_dir}/{daemon}_t{threads}_{workload}.json"
-    try:
-        with open(path) as f:
-            content = f.read()
-        # fio may write warnings before the JSON; locate the JSON object start
-        idx = content.find('{')
-        if idx < 0:
-            return None, None, None
-        data = json.loads(content[idx:])
-        job = data['jobs'][0]
-        if job.get('error', 0) != 0:
-            return None, None, None
-        # For write-only workloads, use 'write'; for read, use 'read'
-        if workload in ["randwrite-4k", "seqwrite-128k", "filecreate"]:
-            section = 'write'
-        else:
-            section = 'read'
-        iops = job[section]['iops']
-        bw_mbps = job[section]['bw'] / 1024
-        lat_us = job[section]['lat_ns']['mean'] / 1000
-        if iops == 0:
-            return None, None, None
-        return iops, bw_mbps, lat_us
-    except:
-        return None, None, None
-
-print(f"{'Workload':<16} {'Threads':>7} | {'backend IOPS':>12} {'fuser IOPS':>12} | {'Diff%':>8}")
-print("-" * 72)
-
-for wl in workloads:
-    for t in threads_list:
-        b_iops, b_bw, b_lat = load_result("backend", t, wl)
-        f_iops, f_bw, f_lat = load_result("fuser", t, wl)
-        
-        if b_iops and f_iops and f_iops > 0:
-            diff = ((b_iops - f_iops) / f_iops) * 100
-            print(f"{wl:<16} {t:>7} | {b_iops:>12.1f} {f_iops:>12.1f} | {diff:>+7.1f}%")
-        else:
-            print(f"{wl:<16} {t:>7} | {'N/A':>12} {'N/A':>12} | {'N/A':>8}")
-
-print()
-print(f"{'Workload':<16} {'Threads':>7} | {'backend BW(MB/s)':>16} {'fuser BW(MB/s)':>16} | {'Diff%':>8}")
-print("-" * 76)
-
-for wl in workloads:
-    for t in threads_list:
-        b_iops, b_bw, b_lat = load_result("backend", t, wl)
-        f_iops, f_bw, f_lat = load_result("fuser", t, wl)
-        
-        if b_bw and f_bw and f_bw > 0:
-            diff = ((b_bw - f_bw) / f_bw) * 100
-            print(f"{wl:<16} {t:>7} | {b_bw:>16.1f} {f_bw:>16.1f} | {diff:>+7.1f}%")
-        else:
-            print(f"{wl:<16} {t:>7} | {'N/A':>16} {'N/A':>16} | {'N/A':>8}")
-
-print()
-print(f"{'Workload':<16} {'Threads':>7} | {'backend Lat(us)':>16} {'fuser Lat(us)':>16} | {'Diff%':>8}")
-print("-" * 76)
-
-for wl in workloads:
-    for t in threads_list:
-        b_iops, b_bw, b_lat = load_result("backend", t, wl)
-        f_iops, f_bw, f_lat = load_result("fuser", t, wl)
-        
-        if b_lat and f_lat and f_lat > 0:
-            diff = ((b_lat - f_lat) / f_lat) * 100
-            print(f"{wl:<16} {t:>7} | {b_lat:>16.1f} {f_lat:>16.1f} | {diff:>+7.1f}%")
-        else:
-            print(f"{wl:<16} {t:>7} | {'N/A':>16} {'N/A':>16} | {'N/A':>8}")
-
-PYEOF
-
-echo ""
-echo "Detailed JSON results saved in: $RESULTS_DIR/"
+# Results table on stdout, so CI can append it to the job summary while
+# progress lines stay in the log.
+python3 "$(dirname "$0")/parse_library_compare.py" "$RESULTS_DIR" ${THREADS_LIST}
