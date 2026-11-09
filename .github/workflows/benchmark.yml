@@ -17,6 +17,11 @@
 #     runner are not comparable across runs. Both daemons run with the
 #     FUSE writeback cache off (the backend one via --no-writeback; fuser
 #     cannot negotiate it), so the write path compares like for like.
+#     Two scenarios are reported: "common" (the request/response mode
+#     both libraries share) for per-request service-path drift, and
+#     "best" (each library's strongest transport: FUSE-over-io_uring on
+#     the backend side when the kernel accepts it, else the async
+#     transport) for the structural gap between the architectures.
 #   - pushes to master / workflow_dispatch: a single run, the collected
 #     results are written to the job summary for reference.
 #
@@ -309,7 +314,7 @@ jobs:
   fuser-compare:
     if: github.event_name == 'pull_request' && github.event.label.name == 'run-fuser-compare'
     runs-on: ubuntu-latest
-    timeout-minutes: 40
+    timeout-minutes: 75
     steps:
     - uses: actions/checkout@v3
 
@@ -354,6 +359,7 @@ jobs:
             FUSER_BIN="${GITHUB_WORKSPACE}/target/release/passthrough-fuser" \
             RESULTS_DIR="${GITHUB_WORKSPACE}/fuser-compare-results" \
             THREADS_LIST="1 8" \
+            MODES="common best" \
             bash tests/scripts/bench_library_compare.sh \
             > "${GITHUB_WORKSPACE}/fuser-compare-table.txt"
         sudo chown -R $(id -u):$(id -g) "${HOME}/.cargo"
@@ -370,6 +376,14 @@ jobs:
             echo "are the signal; absolute numbers from a shared runner are not"
             echo "comparable across runs. The deltas are advisory; conclusions"
             echo "about either library should be re-checked on bare metal."
+            echo ""
+            echo "Two scenarios are reported:"
+            echo "- **common**: the request/response mode both libraries share"
+            echo "  (sync workers vs fuser event loops with clone_fd) — watch this"
+            echo "  one for per-request service-path drift between the libs."
+            echo "- **best**: each library's strongest transport (FUSE-over-io_uring"
+            echo "  when the kernel accepts it, else the async transport, vs fuser"
+            echo "  clone_fd multi-threading) — the structural gap, not lib drift."
             echo ""
             echo '```'
             cat "${GITHUB_WORKSPACE}/fuser-compare-table.txt" || echo "no results: the comparison did not run"

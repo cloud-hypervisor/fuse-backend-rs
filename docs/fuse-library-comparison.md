@@ -383,12 +383,17 @@ request, not from credential handling.
 Scripts live under `tests/scripts/`:
 
 - `bench_library_compare.sh` — full matrix (5 workloads × the thread counts
-  in `THREADS_LIST` × 2 daemons), fio-based. The backend side is the
-  `tests/benchmark` daemon run with `--no-writeback`, and the fuser side is
-  `tests/passthrough-fuser`; the same script runs from a GitHub CI runner
-  (label `run-fuser-compare` on the PR), where cross-daemon deltas from the
-  same job are the signal and absolute numbers are not comparable across
-  runners
+  in `THREADS_LIST` × 2 daemons × the scenarios in `MODES`), fio-based. The
+  backend side is the `tests/benchmark` daemon run with `--no-writeback`,
+  and the fuser side is `tests/passthrough-fuser`; the same script runs
+  from a GitHub CI runner (label `run-fuser-compare` on the PR), where
+  cross-daemon deltas from the same job are the signal and absolute numbers
+  are not comparable across runners. Two scenarios: `common` (the
+  request/response mode both libraries share: sync workers vs fuser event
+  loops with clone_fd — watch it for per-request service-path drift) and
+  `best` (each library's strongest transport: the backend side runs
+  FUSE-over-io_uring when the kernel accepts it, else the async transport,
+  against fuser's clone_fd multi-threading — the structural gap)
 - `bench_multi_round.sh` — wrapper running N rounds into separate result
   directories
 - `parse_multi_round.py` — per-round IOPS + mean + spread aggregation
