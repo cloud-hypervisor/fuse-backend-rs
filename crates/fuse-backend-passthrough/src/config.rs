@@ -14,9 +14,10 @@ pub enum CachePolicy {
     /// the FUSE client (i.e., the file system does not have exclusive access to the directory).
     ///
     /// A shared mmap of a file is the exception. When the kernel offers
-    /// `FsOptions::DIRECT_IO_ALLOW_MMAP`, it maps the file through the page cache, which it
-    /// invalidates on each new mmap of the file and on each direct write through the mount. Older
-    /// kernels fail the mmap.
+    /// `FsOptions::DIRECT_IO_ALLOW_MMAP` and the deployment opts in through `Config::allow_mmap`,
+    /// it maps the file through the page cache, which it invalidates on each new mmap of the
+    /// file and on each direct write through the mount. Otherwise, and on older kernels, the
+    /// mmap fails with `ENODEV`.
     Never,
 
     /// This is almost same as Never, but it allows page cache of directories, dentries and attr
@@ -188,6 +189,26 @@ pub struct Config {
     ///
     /// The default is `true`.
     pub allow_direct_io: bool,
+
+    /// Whether shared mmaps of regular files are allowed under the `Never` and `Metadata`
+    /// cache policies.
+    ///
+    /// Those two policies open every regular file with `DIRECT_IO`, and the kernel fails a
+    /// `MAP_SHARED` mmap of such a file with `ENODEV` unless the server negotiated
+    /// `FsOptions::DIRECT_IO_ALLOW_MMAP`. Negotiating the flag lets the kernel serve the
+    /// mapping from the client page cache, which it only invalidates on each new mmap of the
+    /// file and on its own direct writes — weaker than the no-caching promise those policies
+    /// make — so by default the flag is not negotiated for them and the mmap keeps failing.
+    /// Set this option to opt in. The `Auto` and `Always` policies always negotiate the flag
+    /// when the kernel offers it, because there only an explicit `O_DIRECT` open makes the
+    /// file be opened with `DIRECT_IO`.
+    ///
+    /// Behind a `Vfs` the flag is connection-wide and comes from `VfsOptions::out_opts`; a
+    /// deployment serving a `Never` or `Metadata` backend through a `Vfs` removes it from
+    /// there instead, like any other capability bit.
+    ///
+    /// The default value for this option is `false`.
+    pub allow_mmap: bool,
 }
 
 impl Default for Config {
@@ -212,6 +233,7 @@ impl Default for Config {
             dir_attr_timeout: None,
             use_host_ino: false,
             allow_direct_io: true,
+            allow_mmap: false,
         }
     }
 }

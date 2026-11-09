@@ -18,6 +18,14 @@ pub struct Config {
     pub no_readdir: bool,
     pub perfile_dax: bool,
     pub cache_policy: CachePolicy,
+    /// Whether shared mmaps of regular files are allowed under the `Never` cache policy, which
+    /// opens them with `DIRECT_IO`. Without this option (the default) a standalone mount does
+    /// not negotiate `FsOptions::DIRECT_IO_ALLOW_MMAP`, so the kernel fails such a mmap with
+    /// `ENODEV`; opting in lets the kernel serve it from the client page cache, which it only
+    /// invalidates on each new mmap and on its own direct writes. Behind a `Vfs` the flag is
+    /// connection-wide and comes from `VfsOptions::out_opts` instead. The `Auto` and `Always`
+    /// policies never open files with `DIRECT_IO`, so the option does nothing for them.
+    pub allow_mmap: bool,
     pub attr_timeout: Duration,
     pub entry_timeout: Duration,
 }
