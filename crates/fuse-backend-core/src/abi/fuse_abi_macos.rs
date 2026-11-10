@@ -184,6 +184,10 @@ const WRITEBACK_CACHE: u64 = 0x1_0000;
 /// Filesystem backs opendir() with a zero-message passthrough.
 const NO_OPENDIR_SUPPORT: u64 = 0x100_0000;
 
+/// The kernel accepts more than 32 pages (128 KiB) per request (added in
+/// Linux 4.20; macFUSE never offers it).
+const MAX_PAGES: u64 = 0x40_0000;
+
 /// Filesystem is responsible for clearing suid/sgid/capability bits.
 const HANDLE_KILLPRIV_V2: u64 = 0x1000_0000;
 
@@ -280,6 +284,7 @@ bitflags! {
         const ZERO_MESSAGE_OPEN = NO_OPEN_SUPPORT;
         const WRITEBACK_CACHE = WRITEBACK_CACHE;
         const ZERO_MESSAGE_OPENDIR = NO_OPENDIR_SUPPORT;
+        const MAX_PAGES = MAX_PAGES;
         const HANDLE_KILLPRIV_V2 = HANDLE_KILLPRIV_V2;
         const PERFILE_DAX = PERFILE_DAX;
         const CREATE_SUPP_GROUP = CREATE_SUPP_GROUP;
@@ -553,6 +558,11 @@ pub enum Opcode {
     NotifyReply = 41,
     BatchForget = 42,
     Fallocate = 43,
+    // Upstream (Linux) FUSE protocol opcodes macFUSE never sends.
+    Readdirplus = 44,
+    Rename2 = 45,
+    Lseek = 46,
+    CopyFileRange = 47,
     Setvolname = 61,
     Getxtimes = 62,
     Exchange = 63,
@@ -566,7 +576,7 @@ pub enum Opcode {
 impl From<u32> for Opcode {
     fn from(op: u32) -> Opcode {
         // Don't use `mem::transmute` here: the value range contains holes
-        // (e.g. 0, 7, 19, 44..61), and transmuting an invalid value into the
+        // (e.g. 0, 7, 19, 48..61), and transmuting an invalid value into the
         // enum is undefined behavior. Unknown values are mapped to
         // `MaxOpcode`, which callers treat as an unsupported opcode.
         match op {
@@ -611,6 +621,10 @@ impl From<u32> for Opcode {
             41 => Opcode::NotifyReply,
             42 => Opcode::BatchForget,
             43 => Opcode::Fallocate,
+            44 => Opcode::Readdirplus,
+            45 => Opcode::Rename2,
+            46 => Opcode::Lseek,
+            47 => Opcode::CopyFileRange,
             61 => Opcode::Setvolname,
             62 => Opcode::Getxtimes,
             63 => Opcode::Exchange,
@@ -724,6 +738,21 @@ pub struct RenameIn {
 }
 unsafe impl ByteValued for RenameIn {}
 
+// Wire values carried in `Rename2In::flags`, matching the Linux uapi
+// `RENAME_*` constants; macFUSE never sends Rename2.
+pub const RENAME_NOREPLACE: u32 = 1;
+pub const RENAME_EXCHANGE: u32 = 2;
+pub const RENAME_WHITEOUT: u32 = 4;
+
+#[repr(C)]
+#[derive(Debug, Default, Copy, Clone)]
+pub struct Rename2In {
+    pub newdir: u64,
+    pub flags: u32,
+    pub padding: u32,
+}
+unsafe impl ByteValued for Rename2In {}
+
 #[repr(C)]
 #[derive(Debug, Default, Copy, Clone)]
 pub struct ExchangeIn {
@@ -808,6 +837,39 @@ pub struct CreateIn {
     pub fuse_flags: u32,
 }
 unsafe impl ByteValued for CreateIn {}
+
+// The request-extension types of the upstream (Linux) FUSE protocol. The
+// macOS kernel never appends extensions to create requests, but they are
+// wire-protocol values, so the shared server parses them uniformly; the
+// values match `<fuse_kernel.h>` (and the Linux ABI twin) exactly.
+
+/// Extension type: supplementary group extension (`SuppGroups`).
+///
+/// Values 0..=31 of `ExtHeader::ext_type` are reserved for the security
+/// context extension.
+pub const FUSE_EXT_GROUPS: u32 = 32;
+
+/// Header of a request extension appended to create/mkdir/symlink/mknod
+/// requests by the kernel.
+#[repr(C)]
+#[derive(Debug, Default, Copy, Clone)]
+pub struct ExtHeader {
+    /// Total size of this extension including this header.
+    pub size: u32,
+    /// Type of extension.
+    pub ext_type: u32,
+}
+unsafe impl ByteValued for ExtHeader {}
+
+/// Payload of the supplementary group extension: `nr_groups` is followed by
+/// a flexible array of group IDs.
+#[repr(C)]
+#[derive(Debug, Default, Copy, Clone)]
+pub struct SuppGroups {
+    /// Number of supplementary groups.
+    pub nr_groups: u32,
+}
+unsafe impl ByteValued for SuppGroups {}
 
 #[repr(C)]
 #[derive(Debug, Default, Copy, Clone)]
@@ -973,7 +1035,10 @@ pub struct InitOut {
     pub max_pages: u16,
     pub map_alignment: u16,
     pub flags2: u32,
-    pub unused: [u32; 7],
+    /// Only sent with `FsOptions::PASSTHROUGH`, which macFUSE never offers.
+    /// Carved out of the unused tail, so the layout matches the Linux twin.
+    pub max_stack_depth: u32,
+    pub unused: [u32; 6],
 }
 unsafe impl ByteValued for InitOut {}
 
@@ -1065,6 +1130,23 @@ pub struct FallocateIn {
     pub padding: u32,
 }
 unsafe impl ByteValued for FallocateIn {}
+
+#[repr(C)]
+#[derive(Debug, Default, Copy, Clone)]
+pub struct LseekIn {
+    pub fh: u64,
+    pub offset: u64,
+    pub whence: u32,
+    pub padding: u32,
+}
+unsafe impl ByteValued for LseekIn {}
+
+#[repr(C)]
+#[derive(Debug, Default, Copy, Clone)]
+pub struct LseekOut {
+    pub offset: u64,
+}
+unsafe impl ByteValued for LseekOut {}
 
 #[repr(C)]
 #[derive(Default, Copy, Clone)]
@@ -1211,8 +1293,18 @@ mod tests {
         assert_eq!(std::mem::size_of::<AttrOut>(), 120);
         assert_eq!(std::mem::size_of::<MknodIn>(), 16);
         assert_eq!(std::mem::size_of::<MkdirIn>(), 8);
+        assert_eq!(std::mem::size_of::<Rename2In>(), 16);
+        assert_eq!(std::mem::size_of::<ExtHeader>(), 8);
+        assert_eq!(std::mem::size_of::<SuppGroups>(), 4);
+        assert_eq!(std::mem::size_of::<LseekIn>(), 24);
+        assert_eq!(std::mem::size_of::<LseekOut>(), 8);
         assert_eq!(std::mem::size_of::<InHeader>(), 40);
         assert_eq!(std::mem::size_of::<OutHeader>(), 16);
+        // The carve-out of `max_stack_depth` from the unused tail must keep
+        // the layout identical to the Linux twin.
+        assert_eq!(std::mem::size_of::<InitOut>(), 64);
+        assert_eq!(std::mem::offset_of!(InitOut, flags2), 32);
+        assert_eq!(std::mem::offset_of!(InitOut, max_stack_depth), 36);
     }
 
     #[test]
@@ -1285,6 +1377,10 @@ mod tests {
             Opcode::NotifyReply,
             Opcode::BatchForget,
             Opcode::Fallocate,
+            Opcode::Readdirplus,
+            Opcode::Rename2,
+            Opcode::Lseek,
+            Opcode::CopyFileRange,
             Opcode::Setvolname,
             Opcode::Getxtimes,
             Opcode::Exchange,
@@ -1301,7 +1397,7 @@ mod tests {
         assert_eq!(Opcode::from(0) as u32, Opcode::MaxOpcode as u32);
         assert_eq!(Opcode::from(7) as u32, Opcode::MaxOpcode as u32);
         assert_eq!(Opcode::from(19) as u32, Opcode::MaxOpcode as u32);
-        assert_eq!(Opcode::from(44) as u32, Opcode::MaxOpcode as u32);
+        assert_eq!(Opcode::from(48) as u32, Opcode::MaxOpcode as u32);
         assert_eq!(Opcode::from(60) as u32, Opcode::MaxOpcode as u32);
         assert_eq!(
             Opcode::from(Opcode::MaxOpcode as u32) as u32,

@@ -955,6 +955,13 @@ pub struct Rename2In {
 }
 unsafe impl ByteValued for Rename2In {}
 
+// Wire values carried in `Rename2In::flags`, mirroring the uapi RENAME_*
+// constants (the same values as `libc::RENAME_*`, so the server can mask the
+// flags without a libc dependency that macOS doesn't share).
+pub const RENAME_NOREPLACE: u32 = 1;
+pub const RENAME_EXCHANGE: u32 = 2;
+pub const RENAME_WHITEOUT: u32 = 4;
+
 #[repr(C)]
 #[derive(Debug, Default, Copy, Clone)]
 pub struct LinkIn {
