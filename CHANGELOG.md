@@ -5,7 +5,7 @@
   whether the kernel lets the process serve FUSE over io_uring: the fuse module's `enable_uring`
   parameter is on and the process may create an io_uring. Checking it before mounting saves a
   mount that would fall back to `/dev/fuse`.
-- [NNN](link): Give `fuse-backend-passthrough` a cross-platform framework: the
+- [301](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/301): Give `fuse-backend-passthrough` a cross-platform framework: the
   Linux syscall seams (statx, file handles, mount fds, credentials, directory
   walks, file operations, kernel passthrough) move behind per-OS subtrees
   (`os/linux/` with `os/macos/` twins), so the crate now also compiles on
@@ -18,6 +18,20 @@
   `BackingFiles` trait compiling. Linux behavior is unchanged
   (the seams are 1:1 delegations), and `make build-macos`/`check-macos` grow
   matching rows for the crate.
+- [NNN](link): Symmetrize `fuse-backend-core`'s per-OS ABIs and un-gate the
+  server code that only carried `target_os` predicates because the macOS ABI
+  lacked symbols: the macOS ABI now defines the Linux protocol values
+  macFUSE never sends (opcodes 44..47, `Rename2In`/`LseekIn`/`LseekOut`,
+  `FUSE_EXT_GROUPS` extension types, `MAX_PAGES`, and `InitOut`'s
+  `max_stack_depth`), `libc::RENAME_*` moves into the ABIs as wire
+  constants, and the shared dispatch handlers, `parse_create_extensions()`
+  and the INIT negotiation run without OS gates — with two deliberate
+  exceptions: `INIT_EXT` stays Linux-only (macFUSE assigns its bit 30 to
+  `VOL_RENAME`), and the io_uring runtime keeps its Linux-only carrier
+  gates. The `overlay::Layer` contract compiles on both platforms once the
+  `mode_t`/`ENOTSUP`/`ENOATTR` libc vocabulary differences are bridged, and the
+  server test module now runs on macOS too, exercising the un-gated
+  handlers there.
 - [254](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/254): Split the library into a layered Cargo workspace and break the layers out into
   their own crates — `fuse-backend-core` (ABI, API/server, buffers),
   `fuse-backend-fusedev` and `fuse-backend-virtiofs` (transports), and

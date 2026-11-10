@@ -68,9 +68,6 @@ mod inode_store;
 // the bare names the call sites already use, so the rest of the crate
 // needs no cfg.
 mod os;
-// The `Layer` trait this impl targets is only compiled on Linux (the
-// overlayfs driver is a Linux-only crate).
-#[cfg(target_os = "linux")]
 mod overlay;
 mod sync_io;
 mod util;

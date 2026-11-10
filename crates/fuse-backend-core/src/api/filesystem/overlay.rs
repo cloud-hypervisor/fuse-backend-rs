@@ -8,7 +8,7 @@ use std::ffi::{CStr, CString};
 use std::io::{Error, ErrorKind, Result};
 
 use super::{Context, Entry, FileSystem, GetxattrReply};
-use crate::abi::fuse_abi::stat64;
+use crate::abi::fuse_abi::{stat64, S_IFCHR};
 
 pub const OPAQUE_XATTR_LEN: u32 = 16;
 pub const OPAQUE_XATTR: &str = "user.fuseoverlayfs.opaque";
@@ -53,9 +53,12 @@ pub trait Layer: FileSystem {
         }
 
         // Try to create whiteout char device with 0/0 device number.
-        let dev = libc::makedev(0, 0);
-        let mode = libc::S_IFCHR | 0o777;
-        self.mknod(ctx, ino.into(), name, mode, dev as u32, 0)
+        // `FileSystem::mknod` takes the FUSE ABI's u32 mode/rdev; the mode
+        // bits come from the ABI's u32 vocabulary, and `makedev()`'s result
+        // is a real narrowing/widening on both platforms.
+        let mode = S_IFCHR | 0o777;
+        let dev = libc::makedev(0, 0) as u32;
+        self.mknod(ctx, ino.into(), name, mode, dev, 0)
     }
 
     /// Delete whiteout file with name <name>.
@@ -149,16 +152,16 @@ pub trait Layer: FileSystem {
                 }
                 Err(e) => {
                     if let Some(raw_error) = e.raw_os_error() {
-                        // ENODATA means the xattr is absent. EOPNOTSUPP and
-                        // ENOSYS mean the filesystem has no xattr support at
-                        // all: tmpfs answers EOPNOTSUPP to user.* xattrs
-                        // before Linux 6.12 and a layer with xattr support
-                        // disabled answers ENOSYS. Such a filesystem can
-                        // never hold an opaque xattr, so treat all of them
-                        // as not opaque instead of failing. (ENOTSUP is not
-                        // listed: it is the same errno as EOPNOTSUPP on
-                        // Linux.)
-                        if matches!(raw_error, libc::ENODATA | libc::EOPNOTSUPP | libc::ENOSYS) {
+                        // ENODATA means the xattr is absent, and the
+                        // "unsupported" errnos mean the filesystem has no
+                        // xattr support at all: tmpfs answers EOPNOTSUPP
+                        // to user.* xattrs before Linux 6.12, a layer with
+                        // xattr support disabled answers ENOSYS, and macOS
+                        // spells the "unsupported" errno ENOTSUP. Such a
+                        // filesystem can never hold an opaque xattr, so
+                        // treat all of them as not opaque instead of
+                        // failing.
+                        if is_xattr_unsupported(raw_error) {
                             return Ok(false);
                         }
                     }
@@ -209,6 +212,26 @@ pub(crate) fn is_whiteout(st: stat64) -> bool {
     is_chardev(st) && major == 0 && minor == 0
 }
 
+// Errnos on which `is_opaque()` reports "not opaque" instead of failing.
+// ENOTSUP and EOPNOTSUPP are the same value on Linux, so listing both
+// spellings in one pattern trips the compiler's unreachable-pattern lint
+// there; macOS keeps them distinct, its xattr stack answers ENOTSUP, and
+// its getxattr reports a missing attribute as ENOATTR (where Linux says
+// ENODATA).
+fn is_xattr_unsupported(raw_error: libc::c_int) -> bool {
+    #[cfg(target_os = "linux")]
+    let unsupported = [libc::ENODATA, libc::EOPNOTSUPP, libc::ENOSYS];
+    #[cfg(target_os = "macos")]
+    let unsupported = [
+        libc::ENODATA,
+        libc::ENOATTR,
+        libc::EOPNOTSUPP,
+        libc::ENOTSUP,
+        libc::ENOSYS,
+    ];
+    unsupported.contains(&raw_error)
+}
+
 pub(crate) fn to_cstring(name: &str) -> Result<CString> {
     CString::new(name).map_err(|e| Error::new(ErrorKind::InvalidData, e))
 }
@@ -220,9 +243,10 @@ mod tests {
 
     // Test double for a Layer: getattr reports a file of <mode> and getxattr
     // answers from a closure, so is_opaque()'s handling of the getxattr
-    // errnos can be checked without any backing filesystem.
+    // errnos can be checked without any backing filesystem. The mode keeps
+    // libc's `mode_t` width so it feeds straight into the ABI stat64.
     struct MockLayer<F: Fn(&CStr) -> Result<GetxattrReply>> {
-        mode: u32,
+        mode: libc::mode_t,
         getxattr: F,
     }
 
@@ -260,7 +284,7 @@ mod tests {
     }
 
     fn is_opaque_with(
-        mode: u32,
+        mode: libc::mode_t,
         getxattr: impl Fn(&CStr) -> Result<GetxattrReply>,
     ) -> Result<bool> {
         MockLayer { mode, getxattr }.is_opaque(&Context::default(), 1)

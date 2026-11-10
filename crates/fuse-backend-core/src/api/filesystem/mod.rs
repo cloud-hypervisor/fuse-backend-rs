@@ -38,13 +38,10 @@ pub use fs_cache_req_handler::FsCacheReqHandler;
 mod sync_io;
 pub use sync_io::FileSystem;
 
-// The `Layer` contract is driver-neutral: any Linux filesystem driver that
-// can serve as an overlay layer implements it, independent of the transport
-// crates (`fuse-backend-fusedev`/`fuse-backend-virtiofs`) that used to gate
-// it before the crate split.
-#[cfg(target_os = "linux")]
+// The `Layer` contract is driver-neutral: any filesystem driver that can
+// serve as an overlay layer implements it, independent of the transport
+// crates (`fuse-backend-fusedev`/`fuse-backend-virtiofs`).
 mod overlay;
-#[cfg(target_os = "linux")]
 pub use overlay::Layer;
 
 // The path/inode helpers and the `BackendFileSystem` mount contract below are
