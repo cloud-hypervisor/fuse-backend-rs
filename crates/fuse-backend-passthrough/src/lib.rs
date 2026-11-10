@@ -43,12 +43,22 @@ use self::util::{
 use fuse_backend_core::abi::fuse_abi as fuse;
 use fuse_backend_core::abi::fuse_abi::Opcode;
 use fuse_backend_core::api::filesystem::Entry;
+#[cfg(target_os = "linux")]
+use fuse_backend_core::api::PROC_SELF_FD_CSTR;
 use fuse_backend_core::api::{
     validate_path_component, BackendFileSystem, CURRENT_DIR_CSTR, EMPTY_CSTR, PARENT_DIR_CSTR,
-    PROC_SELF_FD_CSTR, SLASH_ASCII, VFS_MAX_INO,
+    SLASH_ASCII, VFS_MAX_INO,
 };
 
-#[cfg(feature = "async-io")]
+// The async-io support builds on Linux-only syscalls (`preadv2`/`RWF_NOWAIT`,
+// io_uring in the core runtime), so the whole feature stays Linux-only for
+// now; a macOS port of the async path is future work.
+#[cfg(all(feature = "async-io", not(target_os = "linux")))]
+compile_error!(
+    "the `async-io` feature of fuse-backend-passthrough is Linux-only \
+     (preadv2/RWF_NOWAIT, io_uring); do not enable it on this platform"
+);
+#[cfg(all(feature = "async-io", target_os = "linux"))]
 mod async_io;
 mod config;
 mod inode_store;
@@ -58,6 +68,9 @@ mod inode_store;
 // the bare names the call sites already use, so the rest of the crate
 // needs no cfg.
 mod os;
+// The `Layer` trait this impl targets is only compiled on Linux (the
+// overlayfs driver is a Linux-only crate).
+#[cfg(target_os = "linux")]
 mod overlay;
 mod sync_io;
 mod util;
@@ -471,13 +484,13 @@ pub struct PassthroughFs<S: BitmapSlice + Send + Sync = ()> {
     // Whether to offload the synchronous handlers to the blocking thread
     // pool with the async-io feature, see
     // PassthroughFs::enable_async_thread_pool().
-    #[cfg(feature = "async-io")]
+    #[cfg(all(feature = "async-io", target_os = "linux"))]
     async_thread_pool_enabled: AtomicBool,
     // Weak reference to the `Arc` created by `into_shared()`, used by the
     // async handlers to offload the synchronous handlers to the blocking
     // thread pool. Only `into_shared()` sets it, so `upgrade()` fails for
     // any other instance, even one wrapped in a plain `Arc::new()`.
-    #[cfg(feature = "async-io")]
+    #[cfg(all(feature = "async-io", target_os = "linux"))]
     shared_ref: std::sync::Weak<PassthroughFs<S>>,
 
     dir_entry_timeout: Duration,
@@ -502,12 +515,27 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
             cfg.writeback = false;
         }
 
-        // Safe because this is a constant value and a valid C string.
-        let proc_self_fd_cstr = unsafe { CStr::from_bytes_with_nul_unchecked(PROC_SELF_FD_CSTR) };
+        // macOS has no procfs, so there is no `/proc/self/fd` to reopen
+        // descriptors through.  Keep a placeholder fd so the field (and
+        // `keep_fds()`) stay meaningful; every path that would actually use
+        // it is a Linux-only syscall seam and returns `ENOSYS` on macOS.
+        #[cfg(target_os = "linux")]
+        let proc_self_fd = {
+            // Safe because this is a constant value and a valid C string.
+            let proc_self_fd_cstr =
+                unsafe { CStr::from_bytes_with_nul_unchecked(PROC_SELF_FD_CSTR) };
+            Self::open_file(
+                &libc::AT_FDCWD,
+                proc_self_fd_cstr,
+                os_compat::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                0,
+            )?
+        };
+        #[cfg(target_os = "macos")]
         let proc_self_fd = Self::open_file(
             &libc::AT_FDCWD,
-            proc_self_fd_cstr,
-            os_compat::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            unsafe { CStr::from_bytes_with_nul_unchecked(b"/dev/null\0") },
+            libc::O_RDONLY | libc::O_CLOEXEC,
             0,
         )?;
 
@@ -545,9 +573,9 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
             passthrough: AtomicBool::new(false),
             #[cfg(target_os = "linux")]
             backing_refusal_logged: AtomicBool::new(false),
-            #[cfg(feature = "async-io")]
+            #[cfg(all(feature = "async-io", target_os = "linux"))]
             async_thread_pool_enabled: AtomicBool::new(false),
-            #[cfg(feature = "async-io")]
+            #[cfg(all(feature = "async-io", target_os = "linux"))]
             shared_ref: std::sync::Weak::new(),
             dir_entry_timeout,
             dir_attr_timeout,
@@ -584,7 +612,7 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
             handle,
             2,
             id,
-            st.st.st_mode,
+            os_compat::st_mode_u32(st.st.st_mode),
         )));
 
         Ok(())
@@ -889,14 +917,20 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
 
                     InodeMap::insert_locked(
                         inodes.deref_mut(),
-                        Arc::new(InodeData::new(inode, handle, 1, id, st.st.st_mode)),
+                        Arc::new(InodeData::new(
+                            inode,
+                            handle,
+                            1,
+                            id,
+                            os_compat::st_mode_u32(st.st.st_mode),
+                        )),
                     );
                     inode
                 }
             }
         };
 
-        let (entry_timeout, attr_timeout) = if is_dir(st.st.st_mode) {
+        let (entry_timeout, attr_timeout) = if is_dir(os_compat::st_mode_u32(st.st.st_mode)) {
             (self.dir_entry_timeout, self.dir_attr_timeout)
         } else {
             (self.cfg.entry_timeout, self.cfg.attr_timeout)
@@ -1016,16 +1050,17 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
             }
 
             Opcode::Fallocate => {
-                let op = mode & !(libc::FALLOC_FL_KEEP_SIZE | libc::FALLOC_FL_UNSHARE_RANGE);
+                let op =
+                    mode & !(os_compat::FALLOC_FL_KEEP_SIZE | os_compat::FALLOC_FL_UNSHARE_RANGE);
                 match op {
                     // Allocate, punch and zero, must not change file size.
-                    0 | libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_ZERO_RANGE => {
+                    0 | os_compat::FALLOC_FL_PUNCH_HOLE | os_compat::FALLOC_FL_ZERO_RANGE => {
                         if size + offset > file_size {
                             return Err(eperm());
                         }
                     }
                     // collapse and insert will change file size, forbid.
-                    libc::FALLOC_FL_COLLAPSE_RANGE | libc::FALLOC_FL_INSERT_RANGE => {
+                    os_compat::FALLOC_FL_COLLAPSE_RANGE | os_compat::FALLOC_FL_INSERT_RANGE => {
                         return Err(eperm());
                     }
                     // Invalid operation
@@ -1078,27 +1113,28 @@ impl<S: BitmapSlice + Send + Sync + 'static> BackendFileSystem for PassthroughFs
     }
 }
 
-// The macOS kernel never sends the FUSE_EXT_GROUPS extension.
-#[cfg(not(target_os = "linux"))]
-#[derive(Debug)]
-pub(crate) struct ScopedSuppGroups;
-
-#[cfg(not(target_os = "linux"))]
-impl ScopedSuppGroups {
-    pub(crate) fn new(_supp_gid: Option<libc::gid_t>) -> io::Result<Option<Self>> {
-        Ok(None)
-    }
-}
+// The macOS kernel never sends the FUSE_EXT_GROUPS extension, so the
+// `ScopedSuppGroups` guard lives in `credentials_macos.rs` as a stub that
+// never adopts a group.
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(target_os = "linux")]
     use caps::{CapSet, Capability};
+    // `CreateIn` and the `Read`/`Write` traits are consumed by the
+    // Linux-gated fixtures below.
+    #[cfg(target_os = "linux")]
     use fuse_backend_core::abi::fuse_abi::CreateIn;
     use fuse_backend_core::api::filesystem::*;
+    #[cfg(target_os = "linux")]
     use fuse_backend_vfs::{Vfs, VfsOptions};
+    // Only the Linux-gated fixtures use the `log` facade directly.
+    #[cfg(target_os = "linux")]
     use log;
+    #[cfg(target_os = "linux")]
     use std::io::{Read, Seek, SeekFrom, Write};
+    #[cfg(target_os = "linux")]
     use std::ops::Deref;
     use std::os::unix::prelude::MetadataExt;
     use vmm_sys_util::{tempdir::TempDir, tempfile::TempFile};
@@ -1125,9 +1161,19 @@ mod tests {
         let fs = PassthroughFs::<()>::new(fs_cfg).unwrap();
         fs.import().unwrap();
 
+        // The fs keeps an open descriptor of `source`, but macOS fails with
+        // ENOENT once the directory has been deleted, while Linux keeps
+        // serving the unlinked directory.  Keep the source alive for the
+        // test duration on macOS so the fixtures work identically.
+        #[cfg(target_os = "macos")]
+        std::mem::forget(source);
+
         fs
     }
 
+    // The VFS `no_open` passthrough is a Linux-only feature (the vfs crate
+    // gates the option on Linux).
+    #[cfg(target_os = "linux")]
     fn passthroughfs_no_open(cfg: bool) {
         let opts = VfsOptions {
             no_open: cfg,
@@ -1158,12 +1204,14 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "linux")]
     fn test_passthroughfs_no_open() {
         passthroughfs_no_open(true);
         passthroughfs_no_open(false);
     }
 
     #[test]
+    #[cfg(target_os = "linux")]
     fn test_passthroughfs_inode_file_handles() {
         log::set_max_level(log::LevelFilter::Trace);
 
@@ -1309,6 +1357,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "linux")]
     fn test_writeback_open_and_create() {
         // prepare a fs with writeback cache and open being true, so a write-only opened file
         // should have read permission as well.
@@ -1490,7 +1539,7 @@ mod tests {
             let inode_store = fs.inode_map.get_map_mut();
             let inode_data = inode_store.get(&entry.inode).unwrap();
             assert!(inode_store.inode_by_id(&inode_data.id).is_some());
-            let id = inode_data.id.clone();
+            let id = inode_data.id;
             drop(inode_store);
 
             fs.forget(&ctx, entry.inode, 1);
@@ -1606,6 +1655,9 @@ mod tests {
         assert!(!fs.cfg.writeback);
     }
 
+    // These assert the init() flag-mirroring for wire-protocol bits that both
+    // per-OS ABI files define (fuse_abi_linux.rs, fuse_abi_macos.rs), so
+    // they run wherever the crate builds, not on a specific OS.
     #[test]
     fn test_init_mirrors_kernel_flags() {
         let tmpdir = TempDir::new().expect("Cannot create temporary directory.");
@@ -1656,6 +1708,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "linux")]
     fn test_generic_read_write_noopen() {
         let tmpdir = TempDir::new().expect("Cannot create temporary directory.");
         // Prepare passthrough fs.

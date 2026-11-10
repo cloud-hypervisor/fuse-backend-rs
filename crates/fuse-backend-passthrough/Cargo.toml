@@ -2,8 +2,8 @@
 name = "fuse-backend-passthrough"
 version = "0.14.0"
 keywords = ["fuse", "passthrough", "filesystem"]
-categories = ["filesystem", "os::linux-apis"]
-description = "A passthrough FUSE filesystem driver forwarding requests to the host filesystem (Linux-only)"
+categories = ["filesystem", "os::linux-apis", "os::macos-apis"]
+description = "A passthrough FUSE filesystem driver forwarding requests to the host filesystem"
 authors = [
     "Liu Bo <bo.liu@linux.alibaba.com>",
     "Liu Jiang <gerry@linux.alibaba.com>",
@@ -39,6 +39,9 @@ fuse-backend-vfs = { path = "../fuse-backend-vfs", version = "0.14.0" }
 
 [features]
 default = []
+# The native asynchronous IO path builds on Linux-only syscalls
+# (`preadv2`/`RWF_NOWAIT`, io_uring), so the feature is Linux-only; enabling
+# it on other platforms fails the build.
 async-io = ["async-trait", "tokio/rt", "fuse-backend-core/async-io"]
 # The DAX window callbacks (`setupmapping`/`removemapping`) operate on
 # `fuse_backend_core::abi::virtio_fs` types, which are gated on core's
@@ -47,6 +50,9 @@ async-io = ["async-trait", "tokio/rt", "fuse-backend-core/async-io"]
 # same conditions as before the crate split.
 virtiofs = ["fuse-backend-core/virtiofs"]
 
+# `all-features = true` above means docs.rs must not cross-build the darwin
+# targets: `async-io` is Linux-only (enforced by a `compile_error!` in lib.rs)
+# and would fail every non-Linux doc build. Add them back when that port lands.
 [package.metadata.docs.rs]
 all-features = true
 targets = [

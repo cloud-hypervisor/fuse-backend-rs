@@ -16,7 +16,10 @@ use std::sync::Arc;
 use vmm_sys_util::fam::{FamStruct, FamStructWrapper};
 
 use super::mount_fd::{MPRResult, MountFd, MountFds, MountId};
-use crate::util::{openat, reopen_fd_through_proc, stat_fd};
+use super::os_compat;
+use crate::fsops::stat_fd;
+use crate::util::{openat, reopen_fd_through_proc};
+use fuse_backend_core::abi::fuse_abi as fuse;
 use fuse_backend_core::api::EMPTY_CSTR;
 
 /// An arbitrary maximum size for CFileHandle::f_handle.
@@ -370,7 +373,7 @@ impl InodeHandle {
         match self {
             InodeHandle::File(f) => Ok(InodeFile::Ref(f)),
             InodeHandle::Handle(h) => {
-                let f = h.open(libc::O_PATH)?;
+                let f = h.open(os_compat::O_PATH)?;
                 Ok(InodeFile::Owned(f))
             }
         }
@@ -383,7 +386,7 @@ impl InodeHandle {
         }
     }
 
-    pub(crate) fn stat(&self) -> io::Result<libc::stat64> {
+    pub(crate) fn stat(&self) -> io::Result<fuse::stat64> {
         match self {
             InodeHandle::File(f) => stat_fd(f, None),
             InodeHandle::Handle(_h) => {

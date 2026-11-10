@@ -52,6 +52,13 @@ pub const FATTR_CHGTIME: u32 = 1 << 29;
 pub const FATTR_BKUPTIME: u32 = 1 << 30;
 pub const FATTR_FLAGS: u32 = 1 << 31;
 
+/// Kill suid and sgid bits.
+///
+/// An upstream FUSE protocol value (from `fuse_kernel.h`) that macFUSE's
+/// kernel never sets; defined so shared filesystem drivers can parse the
+/// setattr valid mask uniformly.
+pub const FATTR_KILL_SUIDGID: u32 = 0x800;
+
 bitflags! {
     pub struct SetattrValid: u32 {
         const MODE = FATTR_MODE;
@@ -66,6 +73,7 @@ bitflags! {
         const CHGTIME = FATTR_CHGTIME;
         const BKUPTIME = FATTR_BKUPTIME;
         const FLAGS = FATTR_FLAGS;
+        const KILL_SUIDGID = FATTR_KILL_SUIDGID;
     }
 }
 
@@ -83,6 +91,12 @@ const FOPEN_KEEP_CACHE: u32 = 2;
 /// The file is not seekable.
 const FOPEN_NONSEEKABLE: u32 = 4;
 
+/// Indicate that the lookup reply is for a directory cache.
+///
+/// An upstream FUSE protocol value (from `fuse_kernel.h`); defined so shared
+/// filesystem drivers can build open replies uniformly.
+const FOPEN_CACHE_DIR: u32 = 8;
+
 const FOPEN_PURGE_ATTR: u32 = 1 << 30;
 
 const FOPEN_PURGE_UBC: u32 = 1 << 31;
@@ -97,6 +111,9 @@ bitflags! {
         const KEEP_CACHE = FOPEN_KEEP_CACHE;
         /// The file is not seekable.
         const NONSEEKABLE = FOPEN_NONSEEKABLE;
+
+        /// Indicate that the lookup reply is for a directory cache.
+        const CACHE_DIR = FOPEN_CACHE_DIR;
 
         const PURGE_ATTR = FOPEN_PURGE_ATTR;
 
@@ -137,6 +154,40 @@ const EXCHANGE_DATA: u64 = 1 << 28;
 const CASE_INSENSITIVE: u64 = 1 << 29;
 const VOL_RENAME: u64 = 1 << 30;
 const XTIMES: u64 = 1 << 31;
+
+// Feature flags of the upstream (Linux) FUSE protocol. macFUSE's kernel
+// never offers them in the INIT handshake, but they are wire-protocol
+// values, so shared filesystem drivers parse and negotiate them uniformly;
+// the values match `<fuse_kernel.h>` (and the Linux ABI twin) exactly.
+
+/// Kernel sends READDIRPLUS requests.
+const DO_READDIRPLUS: u64 = 0x2000;
+
+/// If `DO_READDIRPLUS` is set, the kernel uses READDIRPLUS only when needed.
+const READDIRPLUS_AUTO: u64 = 0x4000;
+
+/// Filesystem backs open() with a zero-message passthrough.
+const NO_OPEN_SUPPORT: u64 = 0x2_0000;
+
+/// Writeback caching: the kernel buffers writes and flushes later.
+const WRITEBACK_CACHE: u64 = 0x1_0000;
+
+/// Filesystem backs opendir() with a zero-message passthrough.
+const NO_OPENDIR_SUPPORT: u64 = 0x100_0000;
+
+/// Filesystem is responsible for clearing suid/sgid/capability bits.
+const HANDLE_KILLPRIV_V2: u64 = 0x1000_0000;
+
+/// The kernel honors per-file DAX indications in lookup replies.
+const PERFILE_DAX: u64 = 0x2_0000_0000;
+
+/// The kernel sends the parent directory's group in create requests
+/// (FUSE_EXT_GROUPS extension).
+const CREATE_SUPP_GROUP: u64 = 1_u64 << 34;
+
+/// The kernel can serve shared mmaps of files opened with DIRECT_IO
+/// (added in Linux 6.14; macFUSE never offers it).
+const DIRECT_IO_ALLOW_MMAP: u64 = 1_u64 << 36;
 
 /**
  *
@@ -208,6 +259,18 @@ bitflags! {
         const CASE_INSENSITIVE = CASE_INSENSITIVE;
         const VOL_RENAME = VOL_RENAME;
         const XTIMES = XTIMES;
+
+        // Upstream (Linux) FUSE protocol features that macFUSE's kernel
+        // never offers; see the constant definitions above.
+        const DO_READDIRPLUS = DO_READDIRPLUS;
+        const READDIRPLUS_AUTO = READDIRPLUS_AUTO;
+        const ZERO_MESSAGE_OPEN = NO_OPEN_SUPPORT;
+        const WRITEBACK_CACHE = WRITEBACK_CACHE;
+        const ZERO_MESSAGE_OPENDIR = NO_OPENDIR_SUPPORT;
+        const HANDLE_KILLPRIV_V2 = HANDLE_KILLPRIV_V2;
+        const PERFILE_DAX = PERFILE_DAX;
+        const CREATE_SUPP_GROUP = CREATE_SUPP_GROUP;
+        const DIRECT_IO_ALLOW_MMAP = DIRECT_IO_ALLOW_MMAP;
     }
 }
 
@@ -228,6 +291,9 @@ pub const WRITE_CACHE: u32 = 1;
 
 /// `lock_owner` field is valid.
 pub const WRITE_LOCKOWNER: u32 = 2;
+
+/// kill suid and sgid bits
+pub const WRITE_KILL_PRIV: u32 = 4;
 
 // Read flags.
 pub const READ_LOCKOWNER: u32 = 2;

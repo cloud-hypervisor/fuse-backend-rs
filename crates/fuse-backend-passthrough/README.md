@@ -1,6 +1,6 @@
 # fuse-backend-passthrough
 
-A **passthrough** FUSE filesystem driver (Linux-only): it forwards FUSE requests
+A **passthrough** FUSE filesystem driver: it forwards FUSE requests
 to the host filesystem, passing files through from the daemon to the client. It
 is the sample/reference driver shipped with the library.
 
@@ -8,11 +8,18 @@ Built on [`fuse-backend-core`]. It is a driver only — pair it with a transport
 ([`fuse-backend-fusedev`] or [`fuse-backend-virtiofs`]), or use the umbrella
 [`fuse-backend-rs`] crate, which bundles it with each transport.
 
+## Platform support
+
+Linux is fully supported. The crate also compiles on macOS, but the macOS
+support is a stub for now: the unported operations answer `ENOSYS`, so a
+macOS mount fails cleanly instead of half-working. Filling in the macOS
+implementations is future work.
+
 ## Cargo features
 
 | Feature | Effect |
 | --- | --- |
-| `async-io` | Experimental asynchronous IO path. The async handlers currently relay to their synchronous counterparts, so blocking syscalls run on the async runtime. |
+| `async-io` | Experimental asynchronous IO path. The async handlers currently relay to their synchronous counterparts, so blocking syscalls run on the async runtime. Linux-only: it builds on `preadv2`/`RWF_NOWAIT` and io_uring. |
 | `virtiofs` | Compile the DAX-window callbacks (`setupmapping`/`removemapping`) that operate on core's virtio-fs ABI types. Forwarded from the umbrella crate. |
 
 ## Usage

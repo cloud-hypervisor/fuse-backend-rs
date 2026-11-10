@@ -5,6 +5,15 @@
   whether the kernel lets the process serve FUSE over io_uring: the fuse module's `enable_uring`
   parameter is on and the process may create an io_uring. Checking it before mounting saves a
   mount that would fall back to `/dev/fuse`.
+- [NNN](link): Give `fuse-backend-passthrough` a cross-platform framework: the
+  Linux syscall seams (statx, file handles, mount fds, credentials, directory
+  walks, file operations) move behind per-OS subtrees (`os/linux/` with
+  `os/macos/` twins), so the crate now also compiles on macOS. The macOS
+  modules are honest stubs — types are real, unported operations answer
+  `ENOSYS` — so a macOS mount fails cleanly instead of half-working; filling
+  in the macOS implementations is future work. Linux behavior is unchanged
+  (the seams are 1:1 delegations), and `make build-macos`/`check-macos` grow
+  matching rows for the crate.
 - [254](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/254): Split the library into a layered Cargo workspace and break the layers out into
   their own crates — `fuse-backend-core` (ABI, API/server, buffers),
   `fuse-backend-fusedev` and `fuse-backend-virtiofs` (transports), and

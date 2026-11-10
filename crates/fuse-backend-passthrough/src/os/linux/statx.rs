@@ -9,12 +9,13 @@ use std::os::unix::io::AsRawFd;
 
 use super::os_compat::{statx_st, STATX_BASIC_STATS, STATX_MNT_ID};
 use crate::FileHandle;
+use fuse_backend_core::abi::fuse_abi as fuse;
 use fuse_backend_core::api::EMPTY_CSTR;
 
 pub type MountId = u64;
 
 pub struct StatExt {
-    pub st: libc::stat64,
+    pub st: fuse::stat64,
     pub mnt_id: MountId,
 }
 
@@ -28,12 +29,12 @@ pub struct StatExt {
  * to return it.)
  */
 trait SafeStatXAccess {
-    fn stat64(&self) -> Option<libc::stat64>;
+    fn stat64(&self) -> Option<fuse::stat64>;
     fn mount_id(&self) -> Option<MountId>;
 }
 
 impl SafeStatXAccess for statx_st {
-    fn stat64(&self) -> Option<libc::stat64> {
+    fn stat64(&self) -> Option<fuse::stat64> {
         fn makedev(maj: libc::c_uint, min: libc::c_uint) -> libc::dev_t {
             libc::makedev(maj, min)
         }
@@ -47,7 +48,7 @@ impl SafeStatXAccess for statx_st {
              * So we take a zeroed struct and set what we can.
              * (Zero in all fields is wrong, but safe.)
              */
-            let mut st = unsafe { MaybeUninit::<libc::stat64>::zeroed().assume_init() };
+            let mut st = unsafe { MaybeUninit::<fuse::stat64>::zeroed().assume_init() };
 
             st.st_dev = makedev(self.stx_dev_major, self.stx_dev_minor);
             st.st_ino = self.stx_ino;
