@@ -38,11 +38,11 @@ mod sync_io;
 mod test_util;
 
 /// Maximum buffer size of FUSE requests.
-#[cfg(target_os = "linux")]
-pub const MAX_BUFFER_SIZE: u32 = 1 << 20;
-/// Maximum buffer size of FUSE requests.
-#[cfg(target_os = "macos")]
-pub const MAX_BUFFER_SIZE: u32 = 1 << 25;
+///
+/// A per-OS protocol value (macFUSE negotiates a wider `max_write` than the
+/// Linux kernel does); it lives in the ABI files and is re-exported here so
+/// the historical path keeps working.
+pub use crate::abi::fuse_abi::MAX_BUFFER_SIZE;
 const MIN_READ_BUFFER: u32 = 8192;
 const BUFFER_HEADER_SIZE: u32 = 0x1000;
 const DIRENT_PADDING: [u8; 8] = [0; 8];

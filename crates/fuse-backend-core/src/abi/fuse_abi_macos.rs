@@ -36,6 +36,21 @@ pub const KERNEL_MINOR_VERSION_LOOKUP_NEGATIVE_ENTRY_ZERO: u32 = 4;
 /// The ID of the inode corresponding to the root directory of the file system.
 pub const ROOT_ID: u64 = 1;
 
+// POSIX file-type and permission bits in the u32 width the ABI's
+// `Attr::mode` uses. The values are the same as libc's `S_IF*`/`S_IRWX*`;
+// they are re-declared because libc's `mode_t` is u16 on macOS, so the
+// libc constants cannot feed the u32 wire representation without a cast.
+pub const S_IFDIR: u32 = 0o040_000;
+pub const S_IFCHR: u32 = 0o020_000;
+pub const S_IRWXU: u32 = 0o700;
+pub const S_IRWXG: u32 = 0o070;
+pub const S_IRWXO: u32 = 0o007;
+
+/// Maximum buffer size of FUSE requests the kernel protocol defines here:
+/// a historical bound of the macFUSE port (wider than Linux's 1 MB, since
+/// macFUSE allows a bigger `max_write`).
+pub const MAX_BUFFER_SIZE: u32 = 1 << 25;
+
 // Bitmasks for `fuse_setattr_in.valid`.
 const FATTR_MODE: u32 = 0x1;
 const FATTR_UID: u32 = 0x2;
