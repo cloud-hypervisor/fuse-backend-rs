@@ -48,7 +48,6 @@ use std::pin::Pin;
 
 use async_trait::async_trait;
 
-use super::util::stat_fd;
 use super::*;
 use fuse_backend_core::abi::fuse_abi::{
     stat64, CreateIn, Opcode, OpenOptions, SetattrValid, WRITE_KILL_PRIV,
@@ -873,7 +872,7 @@ impl<S: BitmapSlice + Send + Sync + 'static> AsyncFileSystem for PassthroughFs<S
         // into its page-aligned buffer without a bounce buffer, see
         // `read_on_pool()`, and otherwise the runtime thread.
         let data = self.get_data(handle, inode, libc::O_RDONLY)?;
-        if flags & (libc::O_DIRECT as u32) != 0 {
+        if flags & (os_compat::O_DIRECT as u32) != 0 {
             return match self.pool_fs() {
                 Some(fs) => Self::read_on_pool(fs, ctx, data, w, size, offset, flags).await,
                 None => self.do_read(&data, w, size, offset, flags, false),
@@ -948,7 +947,7 @@ impl<S: BitmapSlice + Send + Sync + 'static> AsyncFileSystem for PassthroughFs<S
         // from its page-aligned buffer, which needs no bounce buffer, see
         // `write_on_pool()`. `do_write()` drops and restores CAP_FSETID on
         // the pool thread, with no `.await` in between.
-        let relay = flags & (libc::O_DIRECT as u32) != 0
+        let relay = flags & (os_compat::O_DIRECT as u32) != 0
             || (self.killpriv_v2.load(Ordering::Relaxed) && fuse_flags & WRITE_KILL_PRIV != 0);
         if relay || async_runtime::runtime_type().file_io_blocks() {
             if let Some(fs) = self.pool_fs() {
@@ -976,7 +975,7 @@ impl<S: BitmapSlice + Send + Sync + 'static> AsyncFileSystem for PassthroughFs<S
         let data = self.get_data(handle, inode, libc::O_RDWR)?;
 
         if self.seal_size.load(Ordering::Relaxed) {
-            let st = stat_fd(data.get_file(), None)?;
+            let st = fsops::stat_fd(data.get_file(), None)?;
             self.seal_size_check(Opcode::Write, st.st_size as u64, offset, size as u64, 0)?;
         }
 
@@ -1043,7 +1042,10 @@ impl<S: BitmapSlice + Send + Sync + 'static> AsyncFileSystem for PassthroughFs<S
     }
 }
 
-#[cfg(test)]
+// The fixtures exercise the native asynchronous data path (`RWF_NOWAIT`,
+// `O_DIRECT` relays) and need the Linux-only `preadv2()` behind it; async-io
+// on macOS is not part of this framework.
+#[cfg(all(test, target_os = "linux"))]
 mod tests {
     use std::sync::atomic::Ordering;
     use std::sync::Arc;

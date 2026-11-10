@@ -129,6 +129,7 @@ build-macos:
 	${CARGO} build -p fuse-backend-core --no-default-features
 	${CARGO} build -p fuse-backend-vfs --no-default-features
 	${CARGO} build -p fuse-backend-vfs --no-default-features --features="fuse-backend-vfs/persist"
+	${CARGO} build -p fuse-backend-passthrough
 
 check-macos: build-macos
 	${CARGO} fmt --all -- --check
@@ -145,11 +146,15 @@ check-macos: build-macos
 	${CARGO} clippy -p fuse-backend-vfs --no-default-features -- -Dwarnings
 	${CARGO} test -p fuse-backend-vfs --no-default-features -- --nocapture --skip integration
 	${CARGO} test -p fuse-backend-vfs --no-default-features --features="fuse-backend-vfs/persist" -- --nocapture --skip integration
+	${CARGO} clippy -p fuse-backend-passthrough -- -Dwarnings
+	${CARGO} test -p fuse-backend-passthrough -- --nocapture --skip integration
 	# The fusedev crate owns the macOS session tests; the umbrella rows above
-	# only build it as a dependency and never run its test target. virtiofs,
-	# passthrough and overlayfs are deliberately absent: virtiofs cannot build
-	# on macOS (core's Opcode::SetupMapping/RemoveMapping are Linux-only) and
-	# the two filesystem drivers are Linux-only crates.
+	# only build it as a dependency and never run its test target. virtiofs
+	# and overlayfs are deliberately absent: virtiofs cannot build on macOS
+	# (core's Opcode::SetupMapping/RemoveMapping are Linux-only) and overlayfs
+	# is a Linux-only crate. The passthrough crate now builds on macOS (the
+	# unported operations answer ENOSYS in the os seams), so it gets its own
+	# clippy and test rows above.
 	${CARGO} test -p fuse-backend-fusedev --no-default-features -- --nocapture --skip integration
 	${CARGO} test -p fuse-backend-fusedev --features="fuse-backend-fusedev/fuse-t" -- --nocapture --skip integration
 

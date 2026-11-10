@@ -12,7 +12,7 @@ use std::io;
 use std::mem::size_of;
 use std::os::unix::io::RawFd;
 
-use super::os_compat::LinuxDirent64;
+use crate::os::LinuxDirent64;
 use vm_memory::ByteValued;
 
 /// Skip entries in a getdents64 buffer up to and including the entry whose

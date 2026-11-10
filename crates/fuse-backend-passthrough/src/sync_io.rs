@@ -8,17 +8,17 @@
 use std::ffi::{CStr, CString};
 use std::fs::File;
 use std::io;
-use std::mem::{self, size_of, ManuallyDrop, MaybeUninit};
+use std::mem::{self, size_of, ManuallyDrop};
 use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
 
-use super::os_compat::LinuxDirent64;
-use super::util::{stat_fd, sync_fd};
+use super::os_compat;
 use super::*;
+use crate::os::LinuxDirent64;
 use fuse_backend_core::abi::fuse_abi::{
-    stat64, CreateIn, Opcode, FOPEN_IN_KILL_SUIDGID, WRITE_KILL_PRIV,
+    stat64, statvfs64, CreateIn, Opcode, FOPEN_IN_KILL_SUIDGID, WRITE_KILL_PRIV,
 };
 #[cfg(feature = "virtiofs")]
 use fuse_backend_core::abi::virtio_fs;
@@ -88,9 +88,14 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
         if !is_safe_inode(data.mode) {
             Err(ebadf())
         } else {
+            // `os_compat::O_DIRECT` is 0 on macOS (no `open()` flag
+            // equivalent), so the flag-stripping branch is compiled out and
+            // the guest's direct-IO request is silently ignored there.
+            #[cfg_attr(target_os = "macos", allow(unused_mut))]
             let mut new_flags = flags;
-            if !self.cfg.allow_direct_io && flags & libc::O_DIRECT != 0 {
-                new_flags &= !libc::O_DIRECT;
+            #[cfg(target_os = "linux")]
+            if !self.cfg.allow_direct_io && flags & os_compat::O_DIRECT != 0 {
+                new_flags &= !os_compat::O_DIRECT;
             }
             let writeback_flags = self.get_writeback_open_flags(new_flags);
             match data.open_file(writeback_flags | libc::O_CLOEXEC, &self.proc_self_fd) {
@@ -124,18 +129,18 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
         mut flags: u32,
     ) -> io::Result<FileFlagGuard<'a, u32>> {
         let guard = data.open_flags.read().unwrap();
-        if *guard & libc::O_DIRECT as u32 == flags & libc::O_DIRECT as u32 {
+        if *guard & os_compat::O_DIRECT as u32 == flags & os_compat::O_DIRECT as u32 {
             return Ok(FileFlagGuard::Reader(guard));
         }
         drop(guard);
 
         let mut guard = data.open_flags.write().unwrap();
         // Update the O_DIRECT flag if needed
-        if *guard & libc::O_DIRECT as u32 != flags & libc::O_DIRECT as u32 {
-            if flags & libc::O_DIRECT as u32 != 0 {
-                flags = *guard | libc::O_DIRECT as u32;
+        if *guard & os_compat::O_DIRECT as u32 != flags & os_compat::O_DIRECT as u32 {
+            if flags & os_compat::O_DIRECT as u32 != 0 {
+                flags = *guard | os_compat::O_DIRECT as u32;
             } else {
-                flags = *guard & !libc::O_DIRECT as u32;
+                flags = *guard & !os_compat::O_DIRECT as u32;
             }
             let ret = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETFL, flags) };
             if ret != 0 {
@@ -460,7 +465,7 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
         // through the page-cache path fails with EINVAL because the page-cache
         // buffers don't satisfy direct IO alignment requirements.
         if self.cfg.allow_direct_io
-            && flags & (libc::O_DIRECT as u32) != 0
+            && flags & (os_compat::O_DIRECT as u32) != 0
             && flags & (libc::O_DIRECTORY as u32) == 0
         {
             opts |= OpenOptions::DIRECT_IO;
@@ -510,7 +515,7 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
         let st = match (!self.no_open.load(Ordering::Relaxed), handle) {
             (true, Some(h)) => {
                 let hd = self.handle_map.get(h, inode)?;
-                stat_fd(hd.get_file(), None)
+                fsops::stat_fd(hd.get_file(), None)
             }
             _ => data.handle.stat(),
         };
@@ -576,7 +581,7 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
         // alignment constraints the transport buffers don't satisfy, so stage
         // the data through an aligned bounce buffer. An aligned `w` takes the
         // data directly, and reads until EOF like `read_direct()`.
-        if self.cfg.allow_direct_io && flags & (libc::O_DIRECT as u32) != 0 {
+        if self.cfg.allow_direct_io && flags & (os_compat::O_DIRECT as u32) != 0 {
             if !aligned {
                 return self.read_direct(&f, w, size as usize, offset);
             }
@@ -613,7 +618,7 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
         // can change the O_DIRECT flag of the fd while we are using it.
         let _flags_guard = self.ensure_file_flags(data, &fd, flags)?;
         if self.seal_size.load(Ordering::Relaxed) {
-            let st = stat_fd(&fd, None)?;
+            let st = fsops::stat_fd(&fd, None)?;
             self.seal_size_check(Opcode::Write, st.st_size as u64, offset, size as u64, 0)?;
         }
 
@@ -633,7 +638,7 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
         // alignment constraints the transport buffers don't satisfy, so stage
         // the payload through an aligned bounce buffer. An aligned `r` gives
         // the payload directly, and writes all of it like `write_direct()`.
-        if self.cfg.allow_direct_io && flags & (libc::O_DIRECT as u32) != 0 {
+        if self.cfg.allow_direct_io && flags & (os_compat::O_DIRECT as u32) != 0 {
             if !aligned {
                 return self.write_direct(&f, r, size as usize, offset);
             }
@@ -779,17 +784,11 @@ impl<S: BitmapSlice + Send + Sync> FileSystem for PassthroughFs<S> {
         };
     }
 
-    fn statfs(&self, _ctx: &Context, inode: Inode) -> io::Result<libc::statvfs64> {
-        let mut out = MaybeUninit::<libc::statvfs64>::zeroed();
+    fn statfs(&self, _ctx: &Context, inode: Inode) -> io::Result<statvfs64> {
         let data = self.inode_map.get(inode)?;
         let file = data.get_file()?;
 
-        // Safe because this will only modify `out` and we check the return value.
-        match unsafe { libc::fstatvfs64(file.as_raw_fd(), out.as_mut_ptr()) } {
-            // Safe because the kernel guarantees that `out` has been initialized.
-            0 => Ok(unsafe { out.assume_init() }),
-            _ => Err(io::Error::last_os_error()),
-        }
+        fsops::fstatvfs(file.as_raw_fd())
     }
 
     fn lookup(&self, _ctx: &Context, parent: Inode, name: &CStr) -> io::Result<Entry> {
@@ -862,7 +861,13 @@ impl<S: BitmapSlice + Send + Sync> FileSystem for PassthroughFs<S> {
 
             let file = data.get_file()?;
             // Safe because this doesn't modify any memory and we check the return value.
-            unsafe { libc::mkdirat(file.as_raw_fd(), name.as_ptr(), mode & !umask) }
+            unsafe {
+                libc::mkdirat(
+                    file.as_raw_fd(),
+                    name.as_ptr(),
+                    (mode & !umask) as libc::mode_t,
+                )
+            }
         };
         if res < 0 {
             return Err(io::Error::last_os_error());
@@ -1212,22 +1217,7 @@ impl<S: BitmapSlice + Send + Sync> FileSystem for PassthroughFs<S> {
                 u32::MAX
             };
 
-            // Safe because this is a constant value and a valid C string.
-            let empty = unsafe { CStr::from_bytes_with_nul_unchecked(EMPTY_CSTR) };
-
-            // Safe because this doesn't modify any memory and we check the return value.
-            let res = unsafe {
-                libc::fchownat(
-                    file.as_raw_fd(),
-                    empty.as_ptr(),
-                    uid,
-                    gid,
-                    libc::AT_EMPTY_PATH | libc::AT_SYMLINK_NOFOLLOW,
-                )
-            };
-            if res < 0 {
-                return Err(io::Error::last_os_error());
-            }
+            fsops::fchown_by_fd(file.as_raw_fd(), uid, gid)?;
         }
 
         if valid.contains(SetattrValid::SIZE) {
@@ -1316,24 +1306,13 @@ impl<S: BitmapSlice + Send + Sync> FileSystem for PassthroughFs<S> {
         let old_file = old_inode.get_file()?;
         let new_file = new_inode.get_file()?;
 
-        // Safe because this doesn't modify any memory and we check the return value.
-        // TODO: Switch to libc::renameat2 once https://github.com/rust-lang/libc/pull/1508 lands
-        // and we have glibc 2.28.
-        let res = unsafe {
-            libc::syscall(
-                libc::SYS_renameat2,
-                old_file.as_raw_fd(),
-                oldname.as_ptr(),
-                new_file.as_raw_fd(),
-                newname.as_ptr(),
-                flags,
-            )
-        };
-        if res == 0 {
-            Ok(())
-        } else {
-            Err(io::Error::last_os_error())
-        }
+        fsops::renameat2(
+            old_file.as_raw_fd(),
+            oldname,
+            new_file.as_raw_fd(),
+            newname,
+            flags,
+        )
     }
 
     fn mknod(
@@ -1360,7 +1339,7 @@ impl<S: BitmapSlice + Send + Sync> FileSystem for PassthroughFs<S> {
                     file.as_raw_fd(),
                     name.as_ptr(),
                     (mode & !umask) as libc::mode_t,
-                    u64::from(rdev),
+                    u64::from(rdev) as libc::dev_t,
                 )
             }
         };
@@ -1385,56 +1364,15 @@ impl<S: BitmapSlice + Send + Sync> FileSystem for PassthroughFs<S> {
         let file = data.get_file()?;
         let new_file = new_inode.get_file()?;
 
-        // Safe because this is a constant value and a valid C string.
-        let empty = unsafe { CStr::from_bytes_with_nul_unchecked(EMPTY_CSTR) };
+        fsops::linkat_by_fd(
+            file.as_raw_fd(),
+            self.proc_self_fd.as_raw_fd(),
+            data.mode,
+            new_file.as_raw_fd(),
+            newname,
+        )?;
 
-        // Safe because this doesn't modify any memory and we check the return value.
-        let res = unsafe {
-            libc::linkat(
-                file.as_raw_fd(),
-                empty.as_ptr(),
-                new_file.as_raw_fd(),
-                newname.as_ptr(),
-                libc::AT_EMPTY_PATH,
-            )
-        };
-        if res == 0 {
-            self.do_lookup(newparent, newname)
-        } else {
-            let err = io::Error::last_os_error();
-            // linkat() with AT_EMPTY_PATH requires CAP_DAC_READ_SEARCH,
-            // which unprivileged daemons don't have, and the kernel reports
-            // the missing capability as ENOENT. Retry through /proc/self/fd,
-            // following the magic symlink to the file the fd refers to.
-            if err.raw_os_error() == Some(libc::ENOENT) {
-                // The retry cannot link a symlink itself: following the
-                // magic symlink resolves to the link target, so the new
-                // name would point at the target instead of the symlink.
-                // Report the missing capability instead of linking the
-                // wrong file. The file type cannot change for a live
-                // inode, so the cached mode is reliable here.
-                if (data.mode & libc::S_IFMT) == libc::S_IFLNK {
-                    return Err(io::Error::from_raw_os_error(libc::EPERM));
-                }
-                let oldpath = CString::new(format!("{}", file.as_raw_fd()))
-                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-                // Safe because this doesn't modify any memory and we check the return value.
-                let res = unsafe {
-                    libc::linkat(
-                        self.proc_self_fd.as_raw_fd(),
-                        oldpath.as_ptr(),
-                        new_file.as_raw_fd(),
-                        newname.as_ptr(),
-                        libc::AT_SYMLINK_FOLLOW,
-                    )
-                };
-                if res == 0 {
-                    return self.do_lookup(newparent, newname);
-                }
-                return Err(io::Error::last_os_error());
-            }
-            Err(err)
-        }
+        self.do_lookup(newparent, newname)
     }
 
     fn symlink(
@@ -1528,7 +1466,7 @@ impl<S: BitmapSlice + Send + Sync> FileSystem for PassthroughFs<S> {
     ) -> io::Result<()> {
         let data = self.get_data(handle, inode, libc::O_RDONLY)?;
         let fd = data.borrow_fd();
-        sync_fd(&fd, datasync)
+        fsops::sync_fd(&fd, datasync)
     }
 
     fn fsyncdir(
@@ -1540,12 +1478,12 @@ impl<S: BitmapSlice + Send + Sync> FileSystem for PassthroughFs<S> {
     ) -> io::Result<()> {
         let data = self.get_dirdata(handle, inode, libc::O_RDONLY)?;
         let fd = data.borrow_fd();
-        sync_fd(&fd, datasync)
+        fsops::sync_fd(&fd, datasync)
     }
 
     fn access(&self, ctx: &Context, inode: Inode, mask: u32) -> io::Result<()> {
         let data = self.inode_map.get(inode)?;
-        let st = stat_fd(&data.get_file()?, None)?;
+        let st = fsops::stat_fd(&data.get_file()?, None)?;
         let mode = mask as i32 & (libc::R_OK | libc::W_OK | libc::X_OK);
 
         if mode == libc::F_OK {
@@ -1656,7 +1594,7 @@ impl<S: BitmapSlice + Send + Sync> FileSystem for PassthroughFs<S> {
         let fd = data.borrow_fd();
 
         if self.seal_size.load(Ordering::Relaxed) {
-            let st = stat_fd(&fd, None)?;
+            let st = fsops::stat_fd(&fd, None)?;
             self.seal_size_check(
                 Opcode::Fallocate,
                 st.st_size as u64,
@@ -1695,7 +1633,6 @@ impl<S: BitmapSlice + Send + Sync> FileSystem for PassthroughFs<S> {
         fsops::lseek(file.as_raw_fd(), offset, whence)
     }
 
-    #[cfg(target_os = "linux")]
     #[allow(clippy::too_many_arguments)]
     fn copy_file_range(
         &self,
@@ -1734,7 +1671,9 @@ impl<S: BitmapSlice + Send + Sync> FileSystem for PassthroughFs<S> {
     }
 }
 
-#[cfg(test)]
+// The fixtures exercise Linux-only paths: real `getdents64` walks, `O_DIRECT`
+// opens, `SEEK_DATA`, and handle-based I/O through `/proc/self/fd`.
+#[cfg(all(test, target_os = "linux"))]
 mod tests {
     use std::convert::TryInto;
 
@@ -2894,7 +2833,7 @@ mod readdir_cookie_tests {
         buf
     }
 
-    fn names(buf: &Vec<u8>) -> Vec<String> {
+    fn names(buf: &[u8]) -> Vec<String> {
         let mut out = Vec::new();
         let mut pos = 0;
         while pos + size_of::<LinuxDirent64>() <= buf.len() {
@@ -2998,7 +2937,8 @@ mod readdir_cookie_tests {
 // enumeration semantics (batching, cookies, EOF), the readdirplus
 // attribute contract, the lookup-refcount ownership of the two handlers,
 // the partial-delivery error contract, and the cookie cache lifecycle.
-#[cfg(test)]
+// Real directory enumeration needs `getdents64`, which is Linux-only.
+#[cfg(all(test, target_os = "linux"))]
 mod readdir_tests {
     use super::*;
     use fuse_backend_core::abi::fuse_abi::ROOT_ID;

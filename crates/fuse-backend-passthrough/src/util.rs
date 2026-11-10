@@ -6,16 +6,15 @@ use std::collections::{btree_map, BTreeMap};
 use std::ffi::{CStr, CString};
 use std::fs::File;
 use std::io;
-use std::mem::MaybeUninit;
 use std::ops::Deref;
 use std::os::unix::io::{AsRawFd, FromRawFd};
 use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use std::sync::{Mutex, RwLockReadGuard, RwLockWriteGuard};
 
 use super::inode_store::InodeId;
+use super::os_compat;
 use super::MAX_HOST_INO;
 use fuse_backend_core::abi::fuse_abi as fuse;
-use fuse_backend_core::api::EMPTY_CSTR;
 
 /// the 56th bit used to set the inode to 1 indicates virtual inode
 const VIRTUAL_INODE_FLAG: u64 = 1 << 55;
@@ -178,39 +177,19 @@ pub fn reopen_fd_through_proc(
     )
 }
 
-pub fn stat_fd(dir: &impl AsRawFd, path: Option<&CStr>) -> io::Result<fuse::stat64> {
-    // Safe because this is a constant value and a valid C string.
-    let pathname =
-        path.unwrap_or_else(|| unsafe { CStr::from_bytes_with_nul_unchecked(EMPTY_CSTR) });
-    let mut st = MaybeUninit::<fuse::stat64>::zeroed();
-
-    // Safe because the kernel will only write data in `st` and we check the return value.
-    let res = unsafe {
-        libc::fstatat64(
-            dir.as_raw_fd(),
-            pathname.as_ptr(),
-            st.as_mut_ptr(),
-            libc::AT_EMPTY_PATH | libc::AT_SYMLINK_NOFOLLOW,
-        )
-    };
-    if res >= 0 {
-        // Safe because the kernel guarantees that the struct is now fully initialized.
-        Ok(unsafe { st.assume_init() })
-    } else {
-        Err(io::Error::last_os_error())
-    }
-}
-
 /// Returns true if it's safe to open this inode without O_PATH.
 pub fn is_safe_inode(mode: u32) -> bool {
     // Only regular files and directories are considered safe to be opened from the file
     // server without O_PATH.
-    matches!(mode & libc::S_IFMT, libc::S_IFREG | libc::S_IFDIR)
+    matches!(
+        mode & os_compat::S_IFMT,
+        os_compat::S_IFREG | os_compat::S_IFDIR
+    )
 }
 
 /// Returns true if the mode is for a directory.
 pub fn is_dir(mode: u32) -> bool {
-    (mode & libc::S_IFMT) == libc::S_IFDIR
+    (mode & os_compat::S_IFMT) == os_compat::S_IFDIR
 }
 
 pub fn ebadf() -> io::Error {
@@ -227,22 +206,6 @@ pub fn enosys() -> io::Error {
 
 pub fn eperm() -> io::Error {
     io::Error::from_raw_os_error(libc::EPERM)
-}
-
-pub fn sync_fd(fd: &impl AsRawFd, datasync: bool) -> io::Result<()> {
-    // Safe because this doesn't modify any memory and we check the return value.
-    let res = unsafe {
-        if datasync {
-            libc::fdatasync(fd.as_raw_fd())
-        } else {
-            libc::fsync(fd.as_raw_fd())
-        }
-    };
-    if res == 0 {
-        Ok(())
-    } else {
-        Err(io::Error::last_os_error())
-    }
 }
 
 /// A helper structure to hold RwLock guard.
@@ -265,37 +228,38 @@ impl<'a, T> Deref for FileFlagGuard<'a, T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::fsops::stat_fd;
 
     #[test]
     fn test_is_safe_inode() {
-        let mode = libc::S_IFREG;
+        let mode = os_compat::S_IFREG;
         assert!(is_safe_inode(mode));
 
-        let mode = libc::S_IFDIR;
+        let mode = os_compat::S_IFDIR;
         assert!(is_safe_inode(mode));
 
-        let mode = libc::S_IFBLK;
+        let mode = os_compat::S_IFBLK;
         assert!(!is_safe_inode(mode));
 
-        let mode = libc::S_IFCHR;
+        let mode = os_compat::S_IFCHR;
         assert!(!is_safe_inode(mode));
 
-        let mode = libc::S_IFIFO;
+        let mode = os_compat::S_IFIFO;
         assert!(!is_safe_inode(mode));
 
-        let mode = libc::S_IFLNK;
+        let mode = os_compat::S_IFLNK;
         assert!(!is_safe_inode(mode));
 
-        let mode = libc::S_IFSOCK;
+        let mode = os_compat::S_IFSOCK;
         assert!(!is_safe_inode(mode));
     }
 
     #[test]
     fn test_is_dir() {
-        let mode = libc::S_IFREG;
+        let mode = os_compat::S_IFREG;
         assert!(!is_dir(mode));
 
-        let mode = libc::S_IFDIR;
+        let mode = os_compat::S_IFDIR;
         assert!(is_dir(mode));
     }
 
@@ -363,7 +327,7 @@ mod tests {
             let generator = UniqueInodeGenerator::new();
             let inode_alt_key = InodeId {
                 ino: MAX_HOST_INO + 1,
-                dev: u64::MAX,
+                dev: libc::dev_t::MAX,
                 mnt: u64::MAX,
             };
             let unique_inode = generator.get_unique_inode(&inode_alt_key).unwrap();
@@ -374,7 +338,7 @@ mod tests {
 
             let inode_alt_key = InodeId {
                 ino: MAX_HOST_INO + 2,
-                dev: u64::MAX,
+                dev: libc::dev_t::MAX,
                 mnt: u64::MAX,
             };
             let unique_inode = generator.get_unique_inode(&inode_alt_key).unwrap();
@@ -385,7 +349,7 @@ mod tests {
 
             let inode_alt_key = InodeId {
                 ino: MAX_HOST_INO + 3,
-                dev: u64::MAX,
+                dev: libc::dev_t::MAX,
                 mnt: 0,
             };
             let unique_inode = generator.get_unique_inode(&inode_alt_key).unwrap();
@@ -396,7 +360,7 @@ mod tests {
 
             let inode_alt_key = InodeId {
                 ino: u64::MAX,
-                dev: u64::MAX,
+                dev: libc::dev_t::MAX,
                 mnt: u64::MAX,
             };
             let unique_inode = generator.get_unique_inode(&inode_alt_key).unwrap();

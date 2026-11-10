@@ -102,8 +102,6 @@ mod test {
     use super::super::*;
     use super::*;
 
-    use std::ffi::CStr;
-    use std::mem::MaybeUninit;
     use std::os::unix::io::AsRawFd;
     use std::sync::atomic::Ordering;
     use vmm_sys_util::tempfile::TempFile;
@@ -128,27 +126,6 @@ mod test {
         }
     }
 
-    fn stat_fd(fd: &impl AsRawFd) -> io::Result<libc::stat64> {
-        let mut st = MaybeUninit::<libc::stat64>::zeroed();
-        let null_path = unsafe { CStr::from_bytes_with_nul_unchecked(b"\0") };
-
-        // Safe because the kernel will only write data in `st` and we check the return value.
-        let res = unsafe {
-            libc::fstatat64(
-                fd.as_raw_fd(),
-                null_path.as_ptr(),
-                st.as_mut_ptr(),
-                libc::AT_EMPTY_PATH | libc::AT_SYMLINK_NOFOLLOW,
-            )
-        };
-        if res >= 0 {
-            // Safe because the kernel guarantees that the struct is now fully initialized.
-            Ok(unsafe { st.assume_init() })
-        } else {
-            Err(io::Error::last_os_error())
-        }
-    }
-
     #[test]
     fn test_inode_store() {
         let mut m = InodeStore::default();
@@ -158,19 +135,31 @@ mod test {
         let inode1: Inode = 3;
         let inode2: Inode = 4;
         let inode_stat1 = StatExt {
-            st: stat_fd(tmpfile1.as_file()).unwrap(),
+            st: fsops::stat_fd(tmpfile1.as_file(), None).unwrap(),
             mnt_id: 0,
         };
         let inode_stat2 = StatExt {
-            st: stat_fd(tmpfile2.as_file()).unwrap(),
+            st: fsops::stat_fd(tmpfile2.as_file(), None).unwrap(),
             mnt_id: 0,
         };
         let id1 = InodeId::from_stat(&inode_stat1);
         let id2 = InodeId::from_stat(&inode_stat2);
         let file_or_handle1 = InodeHandle::File(tmpfile1.into_file());
         let file_or_handle2 = InodeHandle::File(tmpfile2.into_file());
-        let data1 = InodeData::new(inode1, file_or_handle1, 2, id1, inode_stat1.st.st_mode);
-        let data2 = InodeData::new(inode2, file_or_handle2, 2, id2, inode_stat2.st.st_mode);
+        let data1 = InodeData::new(
+            inode1,
+            file_or_handle1,
+            2,
+            id1,
+            os_compat::st_mode_u32(inode_stat1.st.st_mode),
+        );
+        let data2 = InodeData::new(
+            inode2,
+            file_or_handle2,
+            2,
+            id2,
+            os_compat::st_mode_u32(inode_stat2.st.st_mode),
+        );
         let data1 = Arc::new(data1);
         let data2 = Arc::new(data2);
 
