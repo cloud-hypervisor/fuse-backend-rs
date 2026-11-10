@@ -10,7 +10,7 @@ use std::os::unix::io::{AsRawFd, RawFd};
 use std::sync::{Arc, Mutex, RwLock, Weak};
 
 use super::statx::statx;
-use super::util::{einval, is_safe_inode};
+use crate::util::{einval, is_safe_inode};
 
 const MOUNT_INFO_FILE: &str = "/proc/self/mountinfo";
 
