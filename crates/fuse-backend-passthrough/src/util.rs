@@ -46,7 +46,7 @@ impl UniqueInodeGenerator {
         }
     }
 
-    pub fn get_unique_inode(&self, id: &InodeId) -> io::Result<libc::ino64_t> {
+    pub fn get_unique_inode(&self, id: &InodeId) -> io::Result<fuse::ino64_t> {
         let unique_id = {
             let id: DevMntIDPair = DevMntIDPair(id.dev, id.mnt);
             let mut id_map_guard = self.dev_mntid_map.lock().unwrap();
@@ -81,7 +81,7 @@ impl UniqueInodeGenerator {
     }
 
     #[cfg(test)]
-    fn decode_unique_inode(&self, inode: libc::ino64_t) -> io::Result<InodeId> {
+    fn decode_unique_inode(&self, inode: fuse::ino64_t) -> io::Result<InodeId> {
         if inode > fuse_backend_core::api::VFS_MAX_INO {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -178,11 +178,11 @@ pub fn reopen_fd_through_proc(
     )
 }
 
-pub fn stat_fd(dir: &impl AsRawFd, path: Option<&CStr>) -> io::Result<libc::stat64> {
+pub fn stat_fd(dir: &impl AsRawFd, path: Option<&CStr>) -> io::Result<fuse::stat64> {
     // Safe because this is a constant value and a valid C string.
     let pathname =
         path.unwrap_or_else(|| unsafe { CStr::from_bytes_with_nul_unchecked(EMPTY_CSTR) });
-    let mut st = MaybeUninit::<libc::stat64>::zeroed();
+    let mut st = MaybeUninit::<fuse::stat64>::zeroed();
 
     // Safe because the kernel will only write data in `st` and we check the return value.
     let res = unsafe {

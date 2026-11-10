@@ -17,4 +17,7 @@ pub(crate) use self::compat as os_compat;
 #[cfg(target_os = "linux")]
 pub(crate) mod linux;
 #[cfg(target_os = "linux")]
-pub(crate) use self::linux::{file_handle, mount_fd, statx};
+pub(crate) use self::linux::{
+    credentials::{drop_cap_fsetid, set_creds, ScopedSuppGroups},
+    dir, file_handle, fsops, mount_fd, statx,
+};

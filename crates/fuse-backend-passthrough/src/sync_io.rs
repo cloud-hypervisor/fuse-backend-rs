@@ -17,7 +17,9 @@ use std::time::Duration;
 use super::os_compat::LinuxDirent64;
 use super::util::{stat_fd, sync_fd};
 use super::*;
-use fuse_backend_core::abi::fuse_abi::{CreateIn, Opcode, FOPEN_IN_KILL_SUIDGID, WRITE_KILL_PRIV};
+use fuse_backend_core::abi::fuse_abi::{
+    stat64, CreateIn, Opcode, FOPEN_IN_KILL_SUIDGID, WRITE_KILL_PRIV,
+};
 #[cfg(feature = "virtiofs")]
 use fuse_backend_core::abi::virtio_fs;
 #[cfg(feature = "virtiofs")]
@@ -252,42 +254,6 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
         Ok(written)
     }
 
-    /// Skip entries in a getdents64 buffer up to and including the entry whose
-    /// `d_off` equals `offset`.  After this returns, `buf` starts with the entry
-    /// immediately after the matched one.  Returns `true` if the target cookie
-    /// was found, `false` otherwise.
-    fn skip_to_cookie(buf: &mut Vec<u8>, offset: u64) -> bool {
-        let mut cur: usize = 0;
-        let mut found = false;
-        let mut target_reclen: usize = 0;
-        while cur + size_of::<LinuxDirent64>() <= buf.len() {
-            let front = &buf[cur..cur + size_of::<LinuxDirent64>()];
-            let dirent64 = match LinuxDirent64::from_slice(front) {
-                Some(d) => d,
-                // Defend against a malformed getdents64 buffer.
-                None => break,
-            };
-            let reclen = dirent64.d_reclen as usize;
-            // Defend against a malformed getdents64 buffer: a record shorter
-            // than the header would loop forever.
-            if reclen < size_of::<LinuxDirent64>() {
-                break;
-            }
-            if dirent64.d_off as u64 == offset {
-                found = true;
-                target_reclen = reclen;
-                break;
-            }
-            cur += reclen;
-        }
-
-        if found {
-            cur += target_reclen;
-            buf.drain(..cur);
-        }
-        found
-    }
-
     /// Return the `d_off` of the last dirent in a `getdents64` buffer, or
     /// `None` if the buffer is empty.
     fn last_cookie_in_buf(mut buf: &[u8]) -> Option<u64> {
@@ -354,10 +320,9 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
             return Ok(());
         }
 
-        let mut buf = Vec::<u8>::with_capacity(size as usize);
         let data = self.get_dirdata(handle, inode, libc::O_RDONLY)?;
 
-        {
+        let buf = {
             // Since we are going to work with the kernel offset, we have to acquire the file lock
             // for both the `lseek64` and `getdents64` syscalls to ensure that no other thread
             // changes the kernel offset while we are using it.
@@ -368,104 +333,7 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
             // can be skipped entirely — O(1) instead of O(n) for sequential readdir.
             let cookie_hit = self.consume_cached_cookie(handle, offset);
 
-            // NFSv4 directory cookies (`nfs_cookie4`, RFC 7530) are unsigned 64-bit and roughly
-            // half exceed `INT64_MAX`. When the guest resumes a readdir from such a cookie, the
-            // `u64` -> `off64_t` cast produces a negative value and the host kernel's
-            // `nfs_llseek_dir()` rejects it with `EINVAL`. In that case fall back to a linear scan
-            // from the beginning, skipping past the target cookie so the caller receives exactly the
-            // entries it has not seen yet.
-            let seek_ok = if cookie_hit {
-                true
-            } else if offset > i64::MAX as u64 {
-                false
-            } else {
-                // Safe because this doesn't modify any memory and we check the return value.
-                let res = unsafe {
-                    libc::lseek64(dir.as_raw_fd(), offset as libc::off64_t, libc::SEEK_SET)
-                };
-                if res >= 0 {
-                    true
-                } else {
-                    let err = io::Error::last_os_error();
-                    // Only the "offset too large" case is recoverable here.
-                    if err.raw_os_error() != Some(libc::EINVAL) {
-                        return Err(err);
-                    }
-                    false
-                }
-            };
-
-            if seek_ok {
-                // Safe because the kernel guarantees that it will only write to `buf` and we check
-                // the return value.
-                let res = unsafe {
-                    libc::syscall(
-                        libc::SYS_getdents64,
-                        dir.as_raw_fd(),
-                        buf.as_mut_ptr() as *mut LinuxDirent64,
-                        size as libc::c_int,
-                    )
-                };
-                if res < 0 {
-                    return Err(io::Error::last_os_error());
-                }
-                // Safe because we trust the value returned by kernel.
-                unsafe { buf.set_len(res as usize) };
-            } else {
-                // Fallback for cookies the kernel cannot `lseek()` to: rewind and walk batches with
-                // `getdents64` until the entry whose `d_off == offset` is consumed, then return the
-                // entries after it. We never re-seek nor discard an already-read batch, so no
-                // entries are lost.
-                //
-                // Safe because this doesn't modify any memory and we check the return value.
-                let res = unsafe { libc::lseek64(dir.as_raw_fd(), 0, libc::SEEK_SET) };
-                if res < 0 {
-                    return Err(io::Error::last_os_error());
-                }
-
-                let mut found = false;
-                loop {
-                    // Safe because the kernel guarantees that it will only write to `buf` and we
-                    // check the return value.
-                    let res = unsafe {
-                        libc::syscall(
-                            libc::SYS_getdents64,
-                            dir.as_raw_fd(),
-                            buf.as_mut_ptr() as *mut LinuxDirent64,
-                            size as libc::c_int,
-                        )
-                    };
-                    if res < 0 {
-                        return Err(io::Error::last_os_error());
-                    }
-                    // Safe because we trust the value returned by kernel.
-                    unsafe { buf.set_len(res as usize) };
-
-                    if res == 0 {
-                        // EOF: either the target cookie was never found (the entry is gone or the
-                        // cookie was stale) or it was the very last entry of the directory. Return
-                        // an empty buffer so the guest stops iterating instead of looping forever.
-                        break;
-                    }
-
-                    if found {
-                        // Already past the target entry, this batch is the reply.
-                        break;
-                    }
-
-                    if Self::skip_to_cookie(&mut buf, offset) {
-                        // Consumed everything up to and including the target entry. If it was the
-                        // last record of this batch, fetch the next one: returning an empty reply
-                        // here would falsely signal end-of-directory.
-                        found = true;
-                        if !buf.is_empty() {
-                            break;
-                        }
-                    } else {
-                        buf.clear();
-                    }
-                }
-            }
+            let buf = dir::getdents64(dir.as_raw_fd(), cookie_hit, offset, size)?;
 
             // Both paths leave the fd right after the last entry in `buf`; remember that
             // position so a resume from its cookie can skip the `lseek64`/scan entirely.
@@ -477,7 +345,8 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
 
             // Explicitly drop the lock so that it's not held while we fill in the fuse buffer.
             mem::drop(guard);
-        }
+            buf
+        };
 
         let mut rem = &buf[..];
         // Whether the callback stored an entry yet.
@@ -630,11 +499,7 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
         Ok((Some(handle), opts, backing_id))
     }
 
-    fn do_getattr(
-        &self,
-        inode: Inode,
-        handle: Option<Handle>,
-    ) -> io::Result<(libc::stat64, Duration)> {
+    fn do_getattr(&self, inode: Inode, handle: Option<Handle>) -> io::Result<(stat64, Duration)> {
         let data = self.inode_map.get(inode).map_err(|e| {
             error!("fuse: do_getattr ino {} Not find err {:?}", inode, e);
             e
@@ -1278,7 +1143,7 @@ impl<S: BitmapSlice + Send + Sync> FileSystem for PassthroughFs<S> {
         _ctx: &Context,
         inode: Inode,
         handle: Option<Handle>,
-    ) -> io::Result<(libc::stat64, Duration)> {
+    ) -> io::Result<(stat64, Duration)> {
         self.do_getattr(inode, handle)
     }
 
@@ -1286,10 +1151,10 @@ impl<S: BitmapSlice + Send + Sync> FileSystem for PassthroughFs<S> {
         &self,
         _ctx: &Context,
         inode: Inode,
-        attr: libc::stat64,
+        attr: stat64,
         handle: Option<Handle>,
         valid: SetattrValid,
-    ) -> io::Result<(libc::stat64, Duration)> {
+    ) -> io::Result<(stat64, Duration)> {
         let inode_data = self.inode_map.get(inode)?;
 
         enum Data {
@@ -1734,26 +1599,8 @@ impl<S: BitmapSlice + Send + Sync> FileSystem for PassthroughFs<S> {
 
         let data = self.inode_map.get(inode)?;
         let file = data.get_file()?;
-        let pathname = CString::new(format!("/proc/self/fd/{}", file.as_raw_fd()))
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
 
-        // The f{set,get,remove,list}xattr functions don't work on an fd opened with `O_PATH` so we
-        // need to use the {set,get,remove,list}xattr variants.
-        // Safe because this doesn't modify any memory and we check the return value.
-        let res = unsafe {
-            libc::setxattr(
-                pathname.as_ptr(),
-                name.as_ptr(),
-                value.as_ptr() as *const libc::c_void,
-                value.len(),
-                flags as libc::c_int,
-            )
-        };
-        if res == 0 {
-            Ok(())
-        } else {
-            Err(io::Error::last_os_error())
-        }
+        fsops::setxattr(file.as_raw_fd(), name, value, flags)
     }
 
     fn getxattr(
@@ -1769,32 +1616,8 @@ impl<S: BitmapSlice + Send + Sync> FileSystem for PassthroughFs<S> {
 
         let data = self.inode_map.get(inode)?;
         let file = data.get_file()?;
-        let mut buf = Vec::<u8>::with_capacity(size as usize);
-        let pathname = CString::new(format!("/proc/self/fd/{}", file.as_raw_fd(),))
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
 
-        // The f{set,get,remove,list}xattr functions don't work on an fd opened with `O_PATH` so we
-        // need to use the {set,get,remove,list}xattr variants.
-        // Safe because this will only modify the contents of `buf`.
-        let res = unsafe {
-            libc::getxattr(
-                pathname.as_ptr(),
-                name.as_ptr(),
-                buf.as_mut_ptr() as *mut libc::c_void,
-                size as libc::size_t,
-            )
-        };
-        if res < 0 {
-            return Err(io::Error::last_os_error());
-        }
-
-        if size == 0 {
-            Ok(GetxattrReply::Count(res as u32))
-        } else {
-            // Safe because we trust the value returned by kernel.
-            unsafe { buf.set_len(res as usize) };
-            Ok(GetxattrReply::Value(buf))
-        }
+        fsops::getxattr(file.as_raw_fd(), name, size)
     }
 
     fn listxattr(&self, _ctx: &Context, inode: Inode, size: u32) -> io::Result<ListxattrReply> {
@@ -1804,31 +1627,8 @@ impl<S: BitmapSlice + Send + Sync> FileSystem for PassthroughFs<S> {
 
         let data = self.inode_map.get(inode)?;
         let file = data.get_file()?;
-        let mut buf = Vec::<u8>::with_capacity(size as usize);
-        let pathname = CString::new(format!("/proc/self/fd/{}", file.as_raw_fd()))
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
 
-        // The f{set,get,remove,list}xattr functions don't work on an fd opened with `O_PATH` so we
-        // need to use the {set,get,remove,list}xattr variants.
-        // Safe because this will only modify the contents of `buf`.
-        let res = unsafe {
-            libc::listxattr(
-                pathname.as_ptr(),
-                buf.as_mut_ptr() as *mut libc::c_char,
-                size as libc::size_t,
-            )
-        };
-        if res < 0 {
-            return Err(io::Error::last_os_error());
-        }
-
-        if size == 0 {
-            Ok(ListxattrReply::Count(res as u32))
-        } else {
-            // Safe because we trust the value returned by kernel.
-            unsafe { buf.set_len(res as usize) };
-            Ok(ListxattrReply::Names(buf))
-        }
+        fsops::listxattr(file.as_raw_fd(), size)
     }
 
     fn removexattr(&self, _ctx: &Context, inode: Inode, name: &CStr) -> io::Result<()> {
@@ -1838,18 +1638,8 @@ impl<S: BitmapSlice + Send + Sync> FileSystem for PassthroughFs<S> {
 
         let data = self.inode_map.get(inode)?;
         let file = data.get_file()?;
-        let pathname = CString::new(format!("/proc/self/fd/{}", file.as_raw_fd()))
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
 
-        // The f{set,get,remove,list}xattr functions don't work on an fd opened with `O_PATH` so we
-        // need to use the {set,get,remove,list}xattr variants.
-        // Safe because this doesn't modify any memory and we check the return value.
-        let res = unsafe { libc::removexattr(pathname.as_ptr(), name.as_ptr()) };
-        if res == 0 {
-            Ok(())
-        } else {
-            Err(io::Error::last_os_error())
-        }
+        fsops::removexattr(file.as_raw_fd(), name)
     }
 
     fn fallocate(
@@ -1876,20 +1666,7 @@ impl<S: BitmapSlice + Send + Sync> FileSystem for PassthroughFs<S> {
             )?;
         }
 
-        // Safe because this doesn't modify any memory and we check the return value.
-        let res = unsafe {
-            libc::fallocate64(
-                fd.as_raw_fd(),
-                mode as libc::c_int,
-                offset as libc::off64_t,
-                length as libc::off64_t,
-            )
-        };
-        if res == 0 {
-            Ok(())
-        } else {
-            Err(io::Error::last_os_error())
-        }
+        fsops::fallocate64(fd.as_raw_fd(), mode, offset, length)
     }
 
     fn lseek(
@@ -1915,19 +1692,7 @@ impl<S: BitmapSlice + Send + Sync> FileSystem for PassthroughFs<S> {
         // TODO: `offset as off64_t` truncates high-bit NFS directory cookies
         // the same way as the old do_readdir code.  SEEK_SET with offset >
         // i64::MAX will receive EINVAL from nfs_llseek_dir().
-        // Safe because this doesn't modify any memory and we check the return value.
-        let res = unsafe {
-            libc::lseek(
-                file.as_raw_fd(),
-                offset as libc::off64_t,
-                whence as libc::c_int,
-            )
-        };
-        if res < 0 {
-            Err(io::Error::last_os_error())
-        } else {
-            Ok(res as u64)
-        }
+        fsops::lseek(file.as_raw_fd(), offset, whence)
     }
 
     #[cfg(target_os = "linux")]
@@ -1952,31 +1717,20 @@ impl<S: BitmapSlice + Send + Sync> FileSystem for PassthroughFs<S> {
         // the copied length, so the backing files' own positions are neither
         // read nor advanced: no need to serialize against lseek() by taking
         // get_file_mut().
-        let mut off_in: libc::loff_t = offset_in as libc::loff_t;
-        let mut off_out: libc::loff_t = offset_out as libc::loff_t;
 
         // The WriteOut reply reports the copied length as a u32, so never ask
         // for more than can be answered; the kernel re-requests the remainder.
         let len = len.min(u32::MAX as u64) as usize;
 
-        // Safe because the only memory this modifies is the two offset locals
-        // which we own, and we check the return value.
-        let res = unsafe {
-            libc::syscall(
-                libc::SYS_copy_file_range,
-                data_in.get_file().as_raw_fd(),
-                &mut off_in as *mut libc::loff_t,
-                data_out.get_file().as_raw_fd(),
-                &mut off_out as *mut libc::loff_t,
-                len,
-                flags as libc::c_uint,
-            )
-        };
-        if res < 0 {
-            Err(io::Error::last_os_error())
-        } else {
-            Ok(res as u32)
-        }
+        let copied = fsops::copy_file_range(
+            data_in.get_file().as_raw_fd(),
+            offset_in,
+            data_out.get_file().as_raw_fd(),
+            offset_out,
+            len,
+            flags,
+        )?;
+        Ok(copied as u32)
     }
 }
 
@@ -3127,7 +2881,7 @@ mod readdir_cookie_tests {
             let reclen = (header + name_len + 7) & !7;
             let dirent = LinuxDirent64 {
                 d_ino: 1,
-                d_off: *off as libc::off64_t,
+                d_off: *off as i64,
                 d_reclen: reclen as libc::c_ushort,
                 d_ty: libc::DT_REG as libc::c_uchar,
             };
@@ -3159,28 +2913,28 @@ mod readdir_cookie_tests {
     #[test]
     fn skip_to_cookie_finds_middle_entry() {
         let mut buf = build_dirent_buf(&[(1, b"a"), (2, b"b"), (3, b"c")]);
-        assert!(PassthroughFs::<()>::skip_to_cookie(&mut buf, 2));
+        assert!(dir::skip_to_cookie(&mut buf, 2));
         assert_eq!(names(&buf), vec!["c".to_string()]);
     }
 
     #[test]
     fn skip_to_cookie_finds_first_entry() {
         let mut buf = build_dirent_buf(&[(1, b"a"), (2, b"b")]);
-        assert!(PassthroughFs::<()>::skip_to_cookie(&mut buf, 1));
+        assert!(dir::skip_to_cookie(&mut buf, 1));
         assert_eq!(names(&buf), vec!["b".to_string()]);
     }
 
     #[test]
     fn skip_to_cookie_finds_last_entry() {
         let mut buf = build_dirent_buf(&[(1, b"a"), (2, b"b")]);
-        assert!(PassthroughFs::<()>::skip_to_cookie(&mut buf, 2));
+        assert!(dir::skip_to_cookie(&mut buf, 2));
         assert!(buf.is_empty());
     }
 
     #[test]
     fn skip_to_cookie_not_found() {
         let mut buf = build_dirent_buf(&[(1, b"a"), (2, b"b")]);
-        assert!(!PassthroughFs::<()>::skip_to_cookie(&mut buf, 99));
+        assert!(!dir::skip_to_cookie(&mut buf, 99));
         // Buffer should be left untouched when the cookie is not present.
         assert_eq!(names(&buf), vec!["a".to_string(), "b".to_string()]);
     }
@@ -3190,7 +2944,7 @@ mod readdir_cookie_tests {
         // Simulate the NFS case: a cookie whose high bit is set.
         let large = u64::MAX - 42;
         let mut buf = build_dirent_buf(&[(1, b"a"), (large, b"b"), (3, b"c")]);
-        assert!(PassthroughFs::<()>::skip_to_cookie(&mut buf, large));
+        assert!(dir::skip_to_cookie(&mut buf, large));
         assert_eq!(names(&buf), vec!["c".to_string()]);
     }
 
@@ -3235,7 +2989,7 @@ mod readdir_cookie_tests {
         let mut buf = build_dirent_buf(&[(1, b"a"), (2, b"b")]);
         buf[16..18].copy_from_slice(&0u16.to_ne_bytes());
         let corrupted = buf.clone();
-        assert!(!PassthroughFs::<()>::skip_to_cookie(&mut buf, 2));
+        assert!(!dir::skip_to_cookie(&mut buf, 2));
         assert_eq!(buf, corrupted);
     }
 }

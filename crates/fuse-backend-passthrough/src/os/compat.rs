@@ -5,11 +5,21 @@
 
 use vm_memory::ByteValued;
 
+/// Open a path for metadata purposes only, without read/write permission.
+///
+/// Linux has `O_PATH` for this; macOS's closest equivalent is `O_EVTONLY`
+/// (an fd usable for stat and kqueue, but not for I/O).
+#[cfg(target_os = "linux")]
+pub const O_PATH: libc::c_int = libc::O_PATH;
+
+#[cfg(target_os = "macos")]
+pub const O_PATH: libc::c_int = libc::O_EVTONLY;
+
 #[repr(C, packed)]
 #[derive(Clone, Copy, Debug, Default)]
 pub struct LinuxDirent64 {
-    pub d_ino: libc::ino64_t,
-    pub d_off: libc::off64_t,
+    pub d_ino: u64,
+    pub d_off: i64,
     pub d_reclen: libc::c_ushort,
     pub d_ty: libc::c_uchar,
 }

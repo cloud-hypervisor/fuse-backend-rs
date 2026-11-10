@@ -7,11 +7,12 @@ use std::sync::Arc;
 use super::file_handle::FileHandle;
 use super::statx::StatExt;
 use super::{Inode, InodeData, InodeHandle};
+use fuse_backend_core::abi::fuse_abi::ino64_t;
 
 #[derive(Clone, Copy, Default, PartialOrd, Ord, PartialEq, Eq, Debug)]
 /// Identify an inode in `PassthroughFs` by `InodeId`.
 pub struct InodeId {
-    pub ino: libc::ino64_t,
+    pub ino: ino64_t,
     pub dev: libc::dev_t,
     pub mnt: u64,
 }
