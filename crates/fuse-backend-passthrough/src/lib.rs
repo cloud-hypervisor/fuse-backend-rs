@@ -51,14 +51,18 @@ use fuse_backend_core::api::{
 #[cfg(feature = "async-io")]
 mod async_io;
 mod config;
-mod file_handle;
 mod inode_store;
-mod mount_fd;
-mod os_compat;
+// The file handle, stat, mount-fd, credential, directory-walk and
+// file-operation syscall layers differ per OS. They live in per-OS
+// subtrees under os/ (os/linux/, os/macos/), re-exported here under
+// the bare names the call sites already use, so the rest of the crate
+// needs no cfg.
+mod os;
 mod overlay;
-mod statx;
 mod sync_io;
 mod util;
+
+pub(crate) use self::os::{file_handle, mount_fd, os_compat, statx};
 
 type Inode = u64;
 type Handle = u64;

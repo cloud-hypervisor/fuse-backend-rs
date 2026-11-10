@@ -8,7 +8,7 @@ use std::mem::MaybeUninit;
 use std::os::unix::io::AsRawFd;
 
 use super::os_compat::{statx_st, STATX_BASIC_STATS, STATX_MNT_ID};
-use super::FileHandle;
+use crate::FileHandle;
 use fuse_backend_core::api::EMPTY_CSTR;
 
 pub type MountId = u64;
