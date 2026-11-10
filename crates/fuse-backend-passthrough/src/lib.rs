@@ -32,12 +32,12 @@ use std::time::Duration;
 use vm_memory::{bitmap::BitmapSlice, ByteValued};
 
 pub use self::config::{CachePolicy, Config};
-use self::file_handle::{FileHandle, OpenableFileHandle};
+use self::file_handle::{FileHandle, InodeFile, InodeHandle, OpenableFileHandle};
 use self::inode_store::{InodeId, InodeStore};
 use self::mount_fd::MountFds;
 use self::statx::{statx, StatExt};
 use self::util::{
-    ebadf, einval, enosys, eperm, is_dir, is_safe_inode, openat, reopen_fd_through_proc, stat_fd,
+    ebadf, einval, enosys, eperm, is_dir, is_safe_inode, openat, reopen_fd_through_proc,
     FileFlagGuard, UniqueInodeGenerator,
 };
 use fuse_backend_core::abi::fuse_abi as fuse;
@@ -62,88 +62,16 @@ mod overlay;
 mod sync_io;
 mod util;
 
-pub(crate) use self::os::{file_handle, mount_fd, os_compat, statx};
+pub(crate) use self::os::{
+    dir, drop_cap_fsetid, file_handle, fsops, mount_fd, os_compat, set_creds, statx,
+    ScopedSuppGroups,
+};
 
 type Inode = u64;
 type Handle = u64;
 
 /// Maximum host inode number supported by passthroughfs
 const MAX_HOST_INO: u64 = 0x7fff_ffff_ffff;
-
-/**
- * Represents the file associated with an inode (`InodeData`).
- *
- * When obtaining such a file, it may either be a new file (the `Owned` variant), in which case the
- * object's lifetime is static, or it may reference `InodeData.file` (the `Ref` variant), in which
- * case the object's lifetime is that of the respective `InodeData` object.
- */
-#[derive(Debug)]
-enum InodeFile<'a> {
-    Owned(File),
-    Ref(&'a File),
-}
-
-impl AsRawFd for InodeFile<'_> {
-    /// Return a file descriptor for this file
-    /// Note: This fd is only valid as long as the `InodeFile` exists.
-    fn as_raw_fd(&self) -> RawFd {
-        match self {
-            Self::Owned(file) => file.as_raw_fd(),
-            Self::Ref(file_ref) => file_ref.as_raw_fd(),
-        }
-    }
-}
-
-impl AsFd for InodeFile<'_> {
-    fn as_fd(&self) -> BorrowedFd<'_> {
-        match self {
-            Self::Owned(file) => file.as_fd(),
-            Self::Ref(file_ref) => file_ref.as_fd(),
-        }
-    }
-}
-
-#[derive(Debug)]
-enum InodeHandle {
-    File(File),
-    Handle(Arc<OpenableFileHandle>),
-}
-
-impl InodeHandle {
-    fn file_handle(&self) -> Option<&FileHandle> {
-        match self {
-            InodeHandle::File(_) => None,
-            InodeHandle::Handle(h) => Some(h.file_handle().deref()),
-        }
-    }
-
-    fn get_file(&self) -> io::Result<InodeFile<'_>> {
-        match self {
-            InodeHandle::File(f) => Ok(InodeFile::Ref(f)),
-            InodeHandle::Handle(h) => {
-                let f = h.open(libc::O_PATH)?;
-                Ok(InodeFile::Owned(f))
-            }
-        }
-    }
-
-    fn open_file(&self, flags: libc::c_int, proc_self_fd: &File) -> io::Result<File> {
-        match self {
-            InodeHandle::File(f) => reopen_fd_through_proc(f, flags, proc_self_fd),
-            InodeHandle::Handle(h) => h.open(flags),
-        }
-    }
-
-    fn stat(&self) -> io::Result<libc::stat64> {
-        match self {
-            InodeHandle::File(f) => stat_fd(f, None),
-            InodeHandle::Handle(_h) => {
-                let file = self.get_file()?;
-                stat_fd(&file, None)
-            }
-        }
-    }
-}
 
 /// Represents an inode in `PassthroughFs`.
 #[derive(Debug)]
@@ -579,7 +507,7 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
         let proc_self_fd = Self::open_file(
             &libc::AT_FDCWD,
             proc_self_fd_cstr,
-            libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            os_compat::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC,
             0,
         )?;
 
@@ -825,14 +753,7 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
         flags: i32,
         mode: u32,
     ) -> io::Result<File> {
-        let flags = libc::O_NOFOLLOW | libc::O_CLOEXEC | flags;
-
-        // TODO
-        //if self.os_facts.has_openat2 {
-        //    oslib::do_open_relative_to(dir, pathname, flags, mode)
-        //} else {
-        openat(dir, pathname, flags, mode)
-        //}
+        file_handle::open_file_restricted(dir, pathname, flags, mode)
     }
 
     /// Create a File or File Handle for `name` under directory `dir_fd` to support `lookup()`.
@@ -841,7 +762,7 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
         dir: &impl AsRawFd,
         name: &CStr,
     ) -> io::Result<(File, Option<FileHandle>, StatExt)> {
-        let path_file = self.open_file_restricted(dir, name, libc::O_PATH, 0)?;
+        let path_file = self.open_file_restricted(dir, name, os_compat::O_PATH, 0)?;
         let st = statx(&path_file, None)?;
         let handle = if self.cfg.inode_file_handles {
             FileHandle::from_fd(&path_file)?
@@ -1157,136 +1078,6 @@ impl<S: BitmapSlice + Send + Sync + 'static> BackendFileSystem for PassthroughFs
     }
 }
 
-macro_rules! scoped_cred {
-    ($name:ident, $ty:ty, $syscall_nr:expr) => {
-        #[derive(Debug)]
-        pub(crate) struct $name;
-
-        impl $name {
-            // Changes the effective uid/gid of the current thread to `val`.  Changes
-            // the thread's credentials back to root when the returned struct is dropped.
-            fn new(val: $ty) -> io::Result<Option<$name>> {
-                if val == 0 {
-                    // Nothing to do since we are already uid 0.
-                    return Ok(None);
-                }
-
-                // We want credential changes to be per-thread because otherwise
-                // we might interfere with operations being carried out on other
-                // threads with different uids/gids.  However, posix requires that
-                // all threads in a process share the same credentials.  To do this
-                // libc uses signals to ensure that when one thread changes its
-                // credentials the other threads do the same thing.
-                //
-                // So instead we invoke the syscall directly in order to get around
-                // this limitation.  Another option is to use the setfsuid and
-                // setfsgid systems calls.   However since those calls have no way to
-                // return an error, it's preferable to do this instead.
-
-                // This call is safe because it doesn't modify any memory and we
-                // check the return value.
-                let res = unsafe { libc::syscall($syscall_nr, -1, val, -1) };
-                if res == 0 {
-                    Ok(Some($name))
-                } else {
-                    Err(io::Error::last_os_error())
-                }
-            }
-        }
-
-        impl Drop for $name {
-            fn drop(&mut self) {
-                let res = unsafe { libc::syscall($syscall_nr, -1, 0, -1) };
-                if res < 0 {
-                    error!(
-                        "fuse: failed to change credentials back to root: {}",
-                        io::Error::last_os_error(),
-                    );
-                }
-            }
-        }
-    };
-}
-scoped_cred!(ScopedUid, libc::uid_t, libc::SYS_setresuid);
-scoped_cred!(ScopedGid, libc::gid_t, libc::SYS_setresgid);
-
-fn set_creds(
-    uid: libc::uid_t,
-    gid: libc::gid_t,
-) -> io::Result<(Option<ScopedUid>, Option<ScopedGid>)> {
-    // We have to change the gid before we change the uid because if we change the uid first then we
-    // lose the capability to change the gid.  However changing back can happen in any order.
-    ScopedGid::new(gid).and_then(|gid| Ok((ScopedUid::new(uid)?, gid)))
-}
-
-/// RAII guard that temporarily adds a supplementary group to the current
-/// thread's group list.
-///
-/// The FUSE_CREATE_SUPP_GROUP extension tells the server which supplementary
-/// group of the caller matches the parent directory's group, so that objects
-/// created in setgid directories get the correct group ownership.
-#[cfg(target_os = "linux")]
-#[derive(Debug)]
-pub(crate) struct ScopedSuppGroups {
-    old_groups: Vec<libc::gid_t>,
-}
-
-#[cfg(target_os = "linux")]
-impl ScopedSuppGroups {
-    /// Add `supp_gid` to the supplementary group list of the current thread.
-    /// Does nothing and returns `None` if `supp_gid` is `None`.  The original
-    /// group list is restored when the returned guard is dropped.
-    fn new(supp_gid: Option<libc::gid_t>) -> io::Result<Option<Self>> {
-        let gid = match supp_gid {
-            Some(gid) => gid,
-            None => return Ok(None),
-        };
-
-        // Save the current supplementary group list.
-        let count = unsafe { libc::getgroups(0, std::ptr::null_mut()) };
-        if count < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        let mut old_groups = vec![0 as libc::gid_t; count as usize];
-        if count > 0 {
-            let res = unsafe { libc::getgroups(count, old_groups.as_mut_ptr()) };
-            if res < 0 {
-                return Err(io::Error::last_os_error());
-            }
-            old_groups.truncate(res as usize);
-        }
-
-        // Like scoped_cred!, invoke the syscall directly so that only the
-        // calling thread's credentials are changed.  And setgroups() needs
-        // CAP_SETGID, so this must run before set_creds() drops privileges.
-        let res = unsafe { libc::syscall(libc::SYS_setgroups, 1, [gid].as_ptr()) };
-        if res < 0 {
-            return Err(io::Error::last_os_error());
-        }
-
-        Ok(Some(ScopedSuppGroups { old_groups }))
-    }
-}
-
-#[cfg(target_os = "linux")]
-impl Drop for ScopedSuppGroups {
-    fn drop(&mut self) {
-        let res = unsafe {
-            libc::syscall(
-                libc::SYS_setgroups,
-                self.old_groups.len(),
-                self.old_groups.as_ptr(),
-            )
-        };
-        if res < 0 {
-            error!(
-                "fuse: failed to restore supplementary groups: {}",
-                io::Error::last_os_error(),
-            );
-        }
-    }
-}
-
 // The macOS kernel never sends the FUSE_EXT_GROUPS extension.
 #[cfg(not(target_os = "linux"))]
 #[derive(Debug)]
@@ -1294,34 +1085,9 @@ pub(crate) struct ScopedSuppGroups;
 
 #[cfg(not(target_os = "linux"))]
 impl ScopedSuppGroups {
-    fn new(_supp_gid: Option<libc::gid_t>) -> io::Result<Option<Self>> {
+    pub(crate) fn new(_supp_gid: Option<libc::gid_t>) -> io::Result<Option<Self>> {
         Ok(None)
     }
-}
-
-struct CapFsetid {}
-
-impl Drop for CapFsetid {
-    fn drop(&mut self) {
-        if let Err(e) = caps::raise(None, caps::CapSet::Effective, caps::Capability::CAP_FSETID) {
-            error!("fail to restore thread cap_fsetid: {}", e);
-        };
-    }
-}
-
-fn drop_cap_fsetid() -> io::Result<Option<CapFsetid>> {
-    if !caps::has_cap(None, caps::CapSet::Effective, caps::Capability::CAP_FSETID)
-        .map_err(|_e| io::Error::new(io::ErrorKind::PermissionDenied, "no CAP_FSETID capability"))?
-    {
-        return Ok(None);
-    }
-    caps::drop(None, caps::CapSet::Effective, caps::Capability::CAP_FSETID).map_err(|_e| {
-        io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            "failed to drop CAP_FSETID capability",
-        )
-    })?;
-    Ok(Some(CapFsetid {}))
 }
 
 #[cfg(test)]

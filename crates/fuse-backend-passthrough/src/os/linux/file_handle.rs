@@ -8,13 +8,15 @@ use std::ffi::CStr;
 use std::fmt::{Debug, Formatter};
 use std::fs::File;
 use std::io;
-use std::os::fd::AsFd;
+use std::ops::Deref;
+use std::os::fd::{AsFd, BorrowedFd};
 use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
 use std::sync::Arc;
 
 use vmm_sys_util::fam::{FamStruct, FamStructWrapper};
 
 use super::mount_fd::{MPRResult, MountFd, MountFds, MountId};
+use crate::util::{openat, reopen_fd_through_proc, stat_fd};
 use fuse_backend_core::api::EMPTY_CSTR;
 
 /// An arbitrary maximum size for CFileHandle::f_handle.
@@ -315,6 +317,100 @@ impl OpenableFileHandle {
     pub fn file_handle(&self) -> &Arc<FileHandle> {
         &self.handle
     }
+}
+
+/**
+ * Represents the file associated with an inode (`InodeData`).
+ *
+ * When obtaining such a file, it may either be a new file (the `Owned` variant), in which case the
+ * object's lifetime is static, or it may reference `InodeData.file` (the `Ref` variant), in which
+ * case the object's lifetime is that of the respective `InodeData` object.
+ */
+#[derive(Debug)]
+pub(crate) enum InodeFile<'a> {
+    Owned(File),
+    Ref(&'a File),
+}
+
+impl AsRawFd for InodeFile<'_> {
+    /// Return a file descriptor for this file
+    /// Note: This fd is only valid as long as the `InodeFile` exists.
+    fn as_raw_fd(&self) -> RawFd {
+        match self {
+            Self::Owned(file) => file.as_raw_fd(),
+            Self::Ref(file_ref) => file_ref.as_raw_fd(),
+        }
+    }
+}
+
+impl AsFd for InodeFile<'_> {
+    fn as_fd(&self) -> BorrowedFd<'_> {
+        match self {
+            Self::Owned(file) => file.as_fd(),
+            Self::Ref(file_ref) => file_ref.as_fd(),
+        }
+    }
+}
+
+#[derive(Debug)]
+pub(crate) enum InodeHandle {
+    File(File),
+    Handle(Arc<OpenableFileHandle>),
+}
+
+impl InodeHandle {
+    pub(crate) fn file_handle(&self) -> Option<&FileHandle> {
+        match self {
+            InodeHandle::File(_) => None,
+            InodeHandle::Handle(h) => Some(h.file_handle().deref()),
+        }
+    }
+
+    pub(crate) fn get_file(&self) -> io::Result<InodeFile<'_>> {
+        match self {
+            InodeHandle::File(f) => Ok(InodeFile::Ref(f)),
+            InodeHandle::Handle(h) => {
+                let f = h.open(libc::O_PATH)?;
+                Ok(InodeFile::Owned(f))
+            }
+        }
+    }
+
+    pub(crate) fn open_file(&self, flags: libc::c_int, proc_self_fd: &File) -> io::Result<File> {
+        match self {
+            InodeHandle::File(f) => reopen_fd_through_proc(f, flags, proc_self_fd),
+            InodeHandle::Handle(h) => h.open(flags),
+        }
+    }
+
+    pub(crate) fn stat(&self) -> io::Result<libc::stat64> {
+        match self {
+            InodeHandle::File(f) => stat_fd(f, None),
+            InodeHandle::Handle(_h) => {
+                let file = self.get_file()?;
+                stat_fd(&file, None)
+            }
+        }
+    }
+}
+
+/// Open `pathname` relative to `dir`, hardened for path traversal: the
+/// `O_NOFOLLOW` and `O_CLOEXEC` flags are forced on top of the caller's
+/// `flags`.
+pub(crate) fn open_file_restricted(
+    dir: &impl AsRawFd,
+    pathname: &CStr,
+    flags: libc::c_int,
+    mode: u32,
+) -> io::Result<File> {
+    let flags = libc::O_NOFOLLOW | libc::O_CLOEXEC | flags;
+
+    // TODO
+    //if self.os_facts.has_openat2 {
+    //    oslib::do_open_relative_to(dir, pathname, flags, mode)
+    //} else {
+    openat(dir, pathname, flags, mode)
+    //}
 }
 
 #[cfg(test)]
