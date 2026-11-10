@@ -20,9 +20,7 @@ use std::ffi::CStr;
 use std::io::{self, Read};
 use std::marker::PhantomData;
 use std::mem::size_of;
-#[cfg(target_os = "linux")]
-use std::sync::atomic::AtomicU32;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use crate::abi::fuse_abi::*;
 use crate::api::filesystem::{Context, FileSystem, ZeroCopyReader, ZeroCopyWriter};
@@ -33,8 +31,8 @@ use crate::{bytes_to_cstr, BitmapSlice, Error, Result};
 #[cfg(feature = "async-io")]
 mod async_io;
 mod sync_io;
-// MockFS is only exercised by the linux-only sync_io tests, so parts of the
-// module may be unused on other platforms or feature combinations.
+// MockFS is exercised by the sync_io and async_io tests, but not by every
+// feature combination, so parts of the module may be unused.
 #[cfg(test)]
 #[allow(dead_code)]
 mod test_util;
@@ -66,7 +64,6 @@ pub struct Server<F: FileSystem + Sync> {
     #[cfg(all(target_os = "linux", feature = "fusedev-uring"))]
     negotiated_init_flags: AtomicU64,
     /// Max stack depth sent in the INIT reply with `FsOptions::PASSTHROUGH`.
-    #[cfg(target_os = "linux")]
     max_stack_depth: AtomicU32,
 }
 
@@ -81,7 +78,6 @@ impl<F: FileSystem + Sync> Server<F> {
             extra_init_flags: AtomicU64::new(0),
             #[cfg(all(target_os = "linux", feature = "fusedev-uring"))]
             negotiated_init_flags: AtomicU64::new(0),
-            #[cfg(target_os = "linux")]
             max_stack_depth: AtomicU32::new(1),
         }
     }
@@ -93,7 +89,9 @@ impl<F: FileSystem + Sync> Server<F> {
     ///
     /// Fails with `EINVAL` for other depths. The kernel turns passthrough off for them, and
     /// every `fuse_backing_open()` would then fail.
-    #[cfg(target_os = "linux")]
+    ///
+    /// On macOS this is inert: macFUSE never offers `FsOptions::PASSTHROUGH`, so the depth
+    /// never reaches the INIT reply.
     pub fn set_max_stack_depth(&self, depth: u32) -> io::Result<()> {
         // FILESYSTEM_MAX_STACK_DEPTH in the kernel is 2.
         if !(1..=2).contains(&depth) {

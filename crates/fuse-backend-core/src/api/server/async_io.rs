@@ -204,13 +204,9 @@ impl<F: AsyncFileSystem + Sync> Server<F> {
             x if x == Opcode::NotifyReply as u32 => self.notify_reply(ctx),
             x if x == Opcode::BatchForget as u32 => self.batch_forget(ctx),
             x if x == Opcode::Fallocate as u32 => self.async_fallocate(ctx).await,
-            #[cfg(target_os = "linux")]
             x if x == Opcode::Readdirplus as u32 => self.async_do_readdir(ctx, true).await,
-            #[cfg(target_os = "linux")]
             x if x == Opcode::Rename2 as u32 => self.rename2(ctx),
-            #[cfg(target_os = "linux")]
             x if x == Opcode::Lseek as u32 => self.lseek(ctx),
-            #[cfg(target_os = "linux")]
             x if x == Opcode::CopyFileRange as u32 => self.copy_file_range(ctx),
             #[cfg(feature = "virtiofs")]
             x if x == Opcode::SetupMapping as u32 => self.setupmapping(ctx, vu_req),
@@ -766,7 +762,7 @@ impl<'a, F: AsyncFileSystem, S: BitmapSlice, W: Writer> SrvContext<'a, F, S, W> 
     }
 }
 
-#[cfg(all(test, target_os = "linux"))]
+#[cfg(test)]
 mod tests {
     use std::ffi::CStr;
     use std::sync::atomic::AtomicUsize;

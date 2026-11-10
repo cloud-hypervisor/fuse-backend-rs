@@ -37,7 +37,6 @@ use crate::{bytes_to_cstr, encode_io_error_kind, BitmapSlice, Error, Result};
 /// The whole extension chain is validated: unknown extension types are
 /// skipped, but truncated, inconsistent, unaligned or trailing-garbage
 /// payloads are rejected with EINVAL.
-#[cfg(target_os = "linux")]
 pub(super) fn parse_create_extensions(options: &FsOptions, mut tail: &[u8]) -> Result<Option<u32>> {
     const LINUX_NRGROUPS_MAX: u32 = 65536;
 
@@ -102,12 +101,6 @@ pub(super) fn parse_create_extensions(options: &FsOptions, mut tail: &[u8]) -> R
     }
 
     Ok(supp_gid)
-}
-
-// The macOS kernel doesn't support request extensions.
-#[cfg(not(target_os = "linux"))]
-pub(super) fn parse_create_extensions(_options: &FsOptions, _tail: &[u8]) -> Result<Option<u32>> {
-    Ok(None)
 }
 
 impl<F: FileSystem + Sync> Server<F> {
@@ -281,13 +274,9 @@ impl<F: FileSystem + Sync> Server<F> {
             x if x == Opcode::NotifyReply as u32 => self.notify_reply(ctx),
             x if x == Opcode::BatchForget as u32 => self.batch_forget(ctx),
             x if x == Opcode::Fallocate as u32 => self.fallocate(ctx),
-            #[cfg(target_os = "linux")]
             x if x == Opcode::Readdirplus as u32 => self.readdirplus(ctx),
-            #[cfg(target_os = "linux")]
             x if x == Opcode::Rename2 as u32 => self.rename2(ctx),
-            #[cfg(target_os = "linux")]
             x if x == Opcode::Lseek as u32 => self.lseek(ctx),
-            #[cfg(target_os = "linux")]
             x if x == Opcode::CopyFileRange as u32 => self.copy_file_range(ctx),
             #[cfg(feature = "virtiofs")]
             x if x == Opcode::SetupMapping as u32 => self.setupmapping(ctx, vu_req),
@@ -558,15 +547,13 @@ impl<F: FileSystem + Sync> Server<F> {
         self.do_rename(ctx, size_of::<RenameIn>(), newdir, 0)
     }
 
-    #[cfg(target_os = "linux")]
     pub(super) fn rename2<S: BitmapSlice, W: Writer>(
         &self,
         mut ctx: SrvContext<'_, F, S, W>,
     ) -> Result<usize> {
         let Rename2In { newdir, flags, .. } = ctx.r.read_obj().map_err(Error::DecodeMessage)?;
 
-        let flags =
-            flags & (libc::RENAME_EXCHANGE | libc::RENAME_NOREPLACE | libc::RENAME_WHITEOUT);
+        let flags = flags & (RENAME_EXCHANGE | RENAME_NOREPLACE | RENAME_WHITEOUT);
 
         self.do_rename(ctx, size_of::<Rename2In>(), newdir, flags)
     }
@@ -1006,9 +993,10 @@ impl<F: FileSystem + Sync> Server<F> {
                 // FUSE_INIT_EXT in flags (see process_init_reply() in
                 // fs/fuse/inode.c).  Echo the flag whenever any upper bit is
                 // enabled, or the kernel would silently drop the whole flags2
-                // set.  The extended flag set only exists in the Linux ABI:
-                // macFUSE carries no capability bits above 32, so there is
-                // nothing to echo there.
+                // set.  This stays Linux-only: the extended flag set is a
+                // Linux protocol concept, and macFUSE assigns INIT_EXT's bit
+                // 30 to its own VOL_RENAME capability, so echoing or parsing
+                // it there would corrupt the macFUSE handshake.
                 #[cfg(target_os = "linux")]
                 let enabled = if enabled.bits() >> 32 != 0 {
                     enabled | FsOptions::INIT_EXT
@@ -1032,12 +1020,10 @@ impl<F: FileSystem + Sync> Server<F> {
                 if enabled.contains(FsOptions::BIG_WRITES) {
                     out.max_write = MAX_REQ_PAGES as u32 * pagesize() as u32;
                 }
-                #[cfg(target_os = "linux")]
                 if enabled.contains(FsOptions::MAX_PAGES) {
                     out.max_pages = MAX_REQ_PAGES;
                     out.max_write = MAX_REQ_PAGES as u32 * pagesize() as u32; // 1MB
                 }
-                #[cfg(target_os = "linux")]
                 if enabled.contains(FsOptions::PASSTHROUGH) {
                     out.max_stack_depth = self.max_stack_depth.load(Ordering::Relaxed);
                 }
@@ -1150,7 +1136,6 @@ impl<F: FileSystem + Sync> Server<F> {
         self.do_readdir(ctx, false)
     }
 
-    #[cfg(target_os = "linux")]
     fn readdirplus<S: BitmapSlice, W: Writer>(
         &self,
         ctx: SrvContext<'_, F, S, W>,
@@ -1488,7 +1473,6 @@ impl<F: FileSystem + Sync> Server<F> {
         }
     }
 
-    #[cfg(target_os = "linux")]
     pub(super) fn lseek<S: BitmapSlice, W: Writer>(
         &self,
         mut ctx: SrvContext<'_, F, S, W>,
@@ -1510,7 +1494,6 @@ impl<F: FileSystem + Sync> Server<F> {
         }
     }
 
-    #[cfg(target_os = "linux")]
     pub(super) fn copy_file_range<S: BitmapSlice, W: Writer>(
         &self,
         mut ctx: SrvContext<'_, F, S, W>,
@@ -1793,7 +1776,7 @@ pub(super) fn add_dirent<W: Writer>(
 // and reply encoding logic, so they run against an empty mock filesystem and
 // a writer capturing replies into a plain byte buffer instead of a real
 // filesystem driver and transport.
-#[cfg(all(test, target_os = "linux"))]
+#[cfg(test)]
 mod tests {
     use super::super::test_util::{MockFS, TestWriter};
     use super::*;
@@ -1808,7 +1791,6 @@ mod tests {
         SrvContext::new(in_header, reader, writer)
     }
 
-    #[cfg(target_os = "linux")]
     mod tests_parse_extensions {
         use super::super::*;
 
@@ -2008,6 +1990,10 @@ mod tests {
         assert_eq!(res, 24);
     }
 
+    // The INIT_EXT family below stays Linux-only on purpose: macFUSE assigns
+    // bit 30 (INIT_EXT's Linux value) to its own VOL_RENAME capability, so the
+    // macOS ABI deliberately does not define the symbol.
+    #[cfg(target_os = "linux")]
     #[test]
     fn test_server_init_ext_without_payload() {
         let server = Server::new(MockFS);
@@ -2038,7 +2024,9 @@ mod tests {
     // A file system negotiating FUSE_CREATE_SUPP_GROUP (bit 34) when the
     // kernel offers it, like Vfs and PassthroughFs do.  Its other
     // operations keep the default implementations.
+    #[cfg(target_os = "linux")]
     struct SuppGroupFs;
+    #[cfg(target_os = "linux")]
     impl FileSystem for SuppGroupFs {
         type Inode = u64;
         type Handle = u64;
@@ -2048,6 +2036,7 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn test_server_init_echoes_init_ext_for_64bit_caps() {
         // A kernel >= 6.3 sends the full 64-byte fuse_init_in: INIT_EXT in
@@ -2091,6 +2080,7 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn test_server_restore_init() {
         let init_in = InitIn {
@@ -2118,6 +2108,7 @@ mod tests {
         assert_eq!(new.init_state(), (version, options));
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn test_server_reply_keeps_unique_resend() {
         let server = Server::new(MockFS);
@@ -2138,6 +2129,7 @@ mod tests {
         assert_eq!(out.unique, unique);
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn test_server_init_passthrough() {
         struct PassthroughFs;
@@ -2182,7 +2174,7 @@ mod tests {
         assert_eq!(out.max_stack_depth, 2);
     }
 
-    #[cfg(feature = "fusedev-uring")]
+    #[cfg(all(target_os = "linux", feature = "fusedev-uring"))]
     #[test]
     fn test_server_init_uring_negotiation() {
         // Kernel capability set carrying INIT_EXT plus FUSE_OVER_IO_URING
@@ -2344,7 +2336,6 @@ mod tests {
         assert_eq!(server.forget(ctx).unwrap(), 0);
     }
 
-    #[cfg(target_os = "linux")]
     #[test]
     fn test_server_copy_file_range() {
         use crate::api::filesystem::Context;
@@ -2414,7 +2405,6 @@ mod tests {
         assert_eq!(out.padding, 0);
     }
 
-    #[cfg(target_os = "linux")]
     #[test]
     fn test_server_copy_file_range_enosys() {
         // The default implementation answers ENOSYS, on which the kernel
@@ -2434,7 +2424,6 @@ mod tests {
         assert_eq!(out.error, -libc::ENOSYS);
     }
 
-    #[cfg(target_os = "linux")]
     #[test]
     fn test_server_lseek() {
         use crate::api::filesystem::Context;
@@ -2498,7 +2487,6 @@ mod tests {
         assert_eq!(out.offset, 8192);
     }
 
-    #[cfg(target_os = "linux")]
     #[test]
     fn test_server_lseek_enosys() {
         // The default implementation answers ENOSYS, on which the kernel
@@ -2518,6 +2506,9 @@ mod tests {
         assert_eq!(out.error, -libc::ENOSYS);
     }
 
+    // macOS `GetxattrIn` carries macFUSE's `position` field, so the wire
+    // layouts differ; these tests encode the Linux layout.
+    #[cfg(target_os = "linux")]
     #[test]
     fn test_server_getxattr() {
         use crate::api::filesystem::Context;
@@ -2613,6 +2604,7 @@ mod tests {
         assert_eq!(out.padding, 0);
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn test_server_getxattr_count() {
         use crate::api::filesystem::Context;
@@ -2674,6 +2666,7 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn test_server_listxattr() {
         use crate::api::filesystem::Context;
@@ -2764,6 +2757,7 @@ mod tests {
         assert_eq!(out.padding, 0);
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn test_server_listxattr_count() {
         use crate::api::filesystem::Context;
