@@ -28,6 +28,10 @@ pub(crate) mod linux;
 #[cfg(target_os = "linux")]
 pub(crate) use self::linux::compat as os_compat;
 #[cfg(target_os = "linux")]
+pub use self::linux::kernel_passthrough::BackingFiles;
+#[cfg(target_os = "linux")]
+pub(crate) use self::linux::kernel_passthrough::KernelPassthrough;
+#[cfg(target_os = "linux")]
 pub(crate) use self::linux::{
     credentials::{drop_cap_fsetid, set_creds, ScopedSuppGroups},
     dir, file_handle, fsops, mount_fd, statx,
@@ -37,6 +41,10 @@ pub(crate) use self::linux::{
 pub(crate) mod macos;
 #[cfg(target_os = "macos")]
 pub(crate) use self::macos::compat as os_compat;
+#[cfg(target_os = "macos")]
+pub use self::macos::kernel_passthrough::BackingFiles;
+#[cfg(target_os = "macos")]
+pub(crate) use self::macos::kernel_passthrough::KernelPassthrough;
 #[cfg(target_os = "macos")]
 pub(crate) use self::macos::{
     credentials::{drop_cap_fsetid, set_creds, ScopedSuppGroups},

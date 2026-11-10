@@ -14,6 +14,7 @@ pub(crate) mod credentials;
 pub(crate) mod dir;
 pub(crate) mod file_handle;
 pub(crate) mod fsops;
+pub(crate) mod kernel_passthrough;
 pub(crate) mod mount_fd;
 pub(crate) mod statx;
 
