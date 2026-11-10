@@ -75,9 +75,12 @@ mod overlay;
 mod sync_io;
 mod util;
 
+// `BackingFiles` is part of the crate's public API (it names the transport
+// callback `set_backing_files()` takes), so it re-exports at full visibility.
+pub use self::os::BackingFiles;
 pub(crate) use self::os::{
     dir, drop_cap_fsetid, file_handle, fsops, mount_fd, os_compat, set_creds, statx,
-    ScopedSuppGroups,
+    KernelPassthrough, ScopedSuppGroups,
 };
 
 type Inode = u64;
@@ -199,109 +202,6 @@ impl InodeMap {
 
     fn insert_locked(inodes: &mut InodeStore, data: Arc<InodeData>) {
         inodes.insert(data);
-    }
-}
-
-/// Registers the backing files of Linux kernel FUSE passthrough, which passes reads, writes and
-/// mmap of open files to the host files without involving the server. See
-/// `PassthroughFs::set_backing_files()`.
-#[cfg(target_os = "linux")]
-pub trait BackingFiles: Send + Sync {
-    /// Register `fd` as a backing file and return its backing id, such as with
-    /// `fuse_backing_open()` of the fusedev transport.
-    fn open(&self, fd: BorrowedFd<'_>) -> io::Result<u32>;
-
-    /// Release a backing id returned by `open()`, such as with `fuse_backing_close()`.
-    fn close(&self, backing_id: u32) -> io::Result<()>;
-}
-
-/// The backing ids of the inodes open in kernel passthrough mode.
-#[cfg(target_os = "linux")]
-struct KernelPassthrough {
-    files: Arc<dyn BackingFiles>,
-    /// The backing id and the number of open handles of each inode. The kernel fails an open of
-    /// an inode that is already open in passthrough mode unless it passes through to the same
-    /// backing file, so all the handles of an inode share one id.
-    ids: Mutex<HashMap<Inode, (u32, usize)>>,
-}
-
-#[cfg(target_os = "linux")]
-impl KernelPassthrough {
-    /// Get the backing id of `inode` for a new handle if the inode has one.
-    fn share(&self, inode: Inode) -> Option<u32> {
-        // Do not expect poisoned lock here, so safe to unwrap().
-        let mut ids = self.ids.lock().unwrap();
-        let (id, handles) = ids.get_mut(&inode)?;
-        *handles += 1;
-        Some(*id)
-    }
-
-    /// Get the backing id of `inode` for a new handle, registering `file` if the inode has none.
-    fn acquire(&self, inode: Inode, file: &File) -> io::Result<u32> {
-        if let Some(id) = self.share(inode) {
-            return Ok(id);
-        }
-        // Register the file without the lock, so that a slow ioctl doesn't hold up the opens and
-        // releases of other inodes.
-        let new_id = self.files.open(file.as_fd());
-        let mut ids = self.ids.lock().unwrap();
-        if let Some((id, handles)) = ids.get_mut(&inode) {
-            // Another open of the inode registered it meanwhile, and the kernel needs all the
-            // opens of an inode to use the same id. Use that id, even if registering this file
-            // failed.
-            *handles += 1;
-            let id = *id;
-            drop(ids);
-            if let Ok(new_id) = new_id {
-                self.close(inode, new_id);
-            }
-            return Ok(id);
-        }
-        let new_id = new_id?;
-        ids.insert(inode, (new_id, 1));
-        Ok(new_id)
-    }
-
-    fn close(&self, inode: Inode, id: u32) {
-        if let Err(e) = self.files.close(id) {
-            warn!(
-                "fuse: failed to close backing id {} of inode {}: {}",
-                id, inode, e
-            );
-        }
-    }
-
-    /// Drop the reference of a released handle, and close the backing id of `inode` with the last
-    /// one. Files that the kernel opened with the id keep using the backing file.
-    fn release(&self, inode: Inode) {
-        let mut ids = self.ids.lock().unwrap();
-        if let std::collections::hash_map::Entry::Occupied(mut e) = ids.entry(inode) {
-            e.get_mut().1 -= 1;
-            if e.get().1 == 0 {
-                let (id, _) = e.remove();
-                // Nothing needs the map during the ioctl.
-                drop(ids);
-                self.close(inode, id);
-            }
-        }
-    }
-
-    /// Close the backing ids of all inodes. Otherwise the kernel keeps them until the connection
-    /// ends.
-    fn close_all(&self) {
-        let ids: Vec<u32> = self
-            .ids
-            .lock()
-            .unwrap()
-            .drain()
-            .map(|(_, (id, _))| id)
-            .collect();
-        for id in ids {
-            // This fails once the connection has ended, and then there is nothing to close.
-            if let Err(e) = self.files.close(id) {
-                debug!("fuse: failed to close backing id {}: {}", id, e);
-            }
-        }
     }
 }
 
@@ -471,14 +371,11 @@ pub struct PassthroughFs<S: BitmapSlice + Send + Sync = ()> {
     perfile_dax: AtomicBool,
 
     // The backing files of kernel passthrough, see `set_backing_files()`.
-    #[cfg(target_os = "linux")]
     kernel_passthrough: Option<KernelPassthrough>,
     // Whether kernel passthrough is enabled. This will only be true when `set_backing_files()`
     // was called and `init` was called with `FsOptions::PASSTHROUGH`.
-    #[cfg(target_os = "linux")]
     passthrough: AtomicBool,
     // Whether a backing file the kernel refused was logged at warn level already.
-    #[cfg(target_os = "linux")]
     backing_refusal_logged: AtomicBool,
 
     // Whether to offload the synchronous handlers to the blocking thread
@@ -567,11 +464,8 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
             no_readdir: AtomicBool::new(cfg.no_readdir),
             seal_size: AtomicBool::new(cfg.seal_size),
             perfile_dax: AtomicBool::new(false),
-            #[cfg(target_os = "linux")]
             kernel_passthrough: None,
-            #[cfg(target_os = "linux")]
             passthrough: AtomicBool::new(false),
-            #[cfg(target_os = "linux")]
             backing_refusal_logged: AtomicBool::new(false),
             #[cfg(all(feature = "async-io", target_os = "linux"))]
             async_thread_pool_enabled: AtomicBool::new(false),
@@ -646,12 +540,11 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
     ///
     /// To use it with the blocking thread pool of the `async-io` feature, create the file system
     /// with `new()`, call this, and then share it with `into_shared()`.
-    #[cfg(target_os = "linux")]
+    ///
+    /// On macOS this accepts and drops the files, and passthrough never activates: macFUSE
+    /// doesn't offer `FsOptions::PASSTHROUGH`.
     pub fn set_backing_files(&mut self, files: Arc<dyn BackingFiles>) {
-        self.kernel_passthrough = Some(KernelPassthrough {
-            files,
-            ids: Mutex::new(HashMap::new()),
-        });
+        self.kernel_passthrough = Some(KernelPassthrough::new(files));
     }
 
     /// Register the backing file of a new handle of `inode` if kernel passthrough is enabled, and
@@ -666,7 +559,6 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
     /// With passthrough off, an inode that still has handles with a backing id keeps sharing it.
     /// The kernel fails an open of an inode in passthrough mode unless the open uses the same
     /// backing file.
-    #[cfg(target_os = "linux")]
     fn acquire_backing_id(&self, inode: Inode, file: &File) -> Option<u32> {
         let kp = self.kernel_passthrough.as_ref()?;
         if !self.passthrough.load(Ordering::Relaxed) {
@@ -699,11 +591,6 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
                 None
             }
         }
-    }
-
-    #[cfg(not(target_os = "linux"))]
-    fn acquire_backing_id(&self, _inode: Inode, _file: &File) -> Option<u32> {
-        None
     }
 
     /// Get the list of file descriptors which should be reserved across live upgrade.
@@ -1005,7 +892,6 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
         self.handle_map.remove_cookie(handle);
         // Directories and handles opened without passthrough have no backing id to release.
         if data.has_backing_id {
-            #[cfg(target_os = "linux")]
             if let Some(kp) = &self.kernel_passthrough {
                 kp.release(inode);
             }

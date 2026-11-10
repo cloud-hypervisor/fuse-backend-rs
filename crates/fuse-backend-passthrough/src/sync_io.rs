@@ -496,7 +496,6 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
         // through the daemon. The kernel opens the backing file with the client's open flags, so
         // an O_DIRECT open still does direct IO on the host. Changing O_DIRECT later with fcntl()
         // only reaches the backing file for async IO, which carries the flag per call.
-        #[cfg(target_os = "linux")]
         if backing_id.is_some() {
             opts = OpenOptions::PASSTHROUGH;
         }
@@ -735,9 +734,7 @@ impl<S: BitmapSlice + Send + Sync> FileSystem for PassthroughFs<S> {
 
         // A takeover can call init() again with other options, so passthrough stays on only if
         // this negotiation enables it again.
-        #[cfg(target_os = "linux")]
         self.passthrough.store(false, Ordering::Relaxed);
-        #[cfg(target_os = "linux")]
         if self.kernel_passthrough.is_some() && capable.contains(FsOptions::PASSTHROUGH) {
             // The kernel ignores FUSE_PASSTHROUGH along with FUSE_WRITEBACK_CACHE, and needs open
             // requests to get the backing ids. Passthrough writes skip the seal_size check. The
@@ -773,7 +770,6 @@ impl<S: BitmapSlice + Send + Sync> FileSystem for PassthroughFs<S> {
         self.inode_map.clear();
         // `Vfs::umount()` destroys a file system while the connection goes on, so release the
         // backing ids.
-        #[cfg(target_os = "linux")]
         if let Some(kp) = &self.kernel_passthrough {
             kp.close_all();
             self.passthrough.store(false, Ordering::Relaxed);
@@ -1060,7 +1056,6 @@ impl<S: BitmapSlice + Send + Sync> FileSystem for PassthroughFs<S> {
             _ => {}
         };
         // Like in `do_open()`, a passthrough open gets no other option.
-        #[cfg(target_os = "linux")]
         if backing_id.is_some() {
             opts = OpenOptions::PASSTHROUGH;
         }

@@ -97,6 +97,11 @@ const FOPEN_NONSEEKABLE: u32 = 4;
 /// filesystem drivers can build open replies uniformly.
 const FOPEN_CACHE_DIR: u32 = 8;
 
+///
+/// An upstream FUSE protocol value (from `fuse_kernel.h`, Linux 6.9): the
+/// open goes through to the backing file. macFUSE never negotiates it.
+const FOPEN_PASSTHROUGH: u32 = 1 << 7;
+
 const FOPEN_PURGE_ATTR: u32 = 1 << 30;
 
 const FOPEN_PURGE_UBC: u32 = 1 << 31;
@@ -114,6 +119,10 @@ bitflags! {
 
         /// Indicate that the lookup reply is for a directory cache.
         const CACHE_DIR = FOPEN_CACHE_DIR;
+
+        /// The open goes through to the backing file (Linux 6.9; requires
+        /// `FsOptions::PASSTHROUGH`, which macFUSE never negotiates).
+        const PASSTHROUGH = FOPEN_PASSTHROUGH;
 
         const PURGE_ATTR = FOPEN_PURGE_ATTR;
 
@@ -188,6 +197,10 @@ const CREATE_SUPP_GROUP: u64 = 1_u64 << 34;
 /// The kernel can serve shared mmaps of files opened with DIRECT_IO
 /// (added in Linux 6.14; macFUSE never offers it).
 const DIRECT_IO_ALLOW_MMAP: u64 = 1_u64 << 36;
+
+/// The kernel can pass reads, writes and mmap of open files through to
+/// backing files (added in Linux 6.9; macFUSE never offers it).
+const PASSTHROUGH: u64 = 1_u64 << 37;
 
 /**
  *
@@ -271,6 +284,10 @@ bitflags! {
         const PERFILE_DAX = PERFILE_DAX;
         const CREATE_SUPP_GROUP = CREATE_SUPP_GROUP;
         const DIRECT_IO_ALLOW_MMAP = DIRECT_IO_ALLOW_MMAP;
+        /// The kernel can pass reads, writes and mmap of open files through
+        /// to backing files; requires the kernel to also offer
+        /// `FsOptions::PASSTHROUGH` (macFUSE never offers it).
+        const PASSTHROUGH = PASSTHROUGH;
     }
 }
 
