@@ -204,6 +204,12 @@ const NO_OPENDIR_SUPPORT: u64 = 0x100_0000;
 const MAX_PAGES: u64 = 0x40_0000;
 
 /// Filesystem is responsible for clearing suid/sgid/capability bits.
+///
+/// Note: this Linux protocol value aliases macFUSE's own `EXCHANGE_DATA`
+/// capability (also bit 28), which macFUSE kernels do advertise. Code that
+/// manipulates `HANDLE_KILLPRIV_V2` in `FsOptions` on macOS therefore touches
+/// `EXCHANGE_DATA` too; macFUSE never offers the killpriv_v2 semantics, so the
+/// negotiation keeps the bit off unless a caller opts in explicitly.
 const HANDLE_KILLPRIV_V2: u64 = 0x1000_0000;
 
 /// The kernel honors per-file DAX indications in lookup replies.

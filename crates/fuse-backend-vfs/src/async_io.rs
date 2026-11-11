@@ -77,7 +77,6 @@ impl AsyncFileSystem for Vfs {
         OpenOptions,
         Option<u32>,
     )> {
-        #[cfg(target_os = "linux")]
         if self.opts.load().no_open {
             return Err(Error::from_raw_os_error(libc::ENOSYS));
         }
@@ -209,7 +208,6 @@ impl AsyncFileSystem for Vfs {
         inode: <Self as FileSystem>::Inode,
         flags: u32,
     ) -> Result<(Option<<Self as FileSystem>::Handle>, OpenOptions)> {
-        #[cfg(target_os = "linux")]
         if self.opts.load().no_opendir {
             return Err(Error::from_raw_os_error(libc::ENOSYS));
         }
@@ -551,7 +549,6 @@ mod tests {
         handle.await.unwrap();
     }
 
-    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn test_vfs_async_opendir() {
         let ctx = Context::default();

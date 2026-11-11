@@ -19,7 +19,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
-use fuse_backend_core::abi::fuse_abi::{stat64, Attr};
+use fuse_backend_core::abi::fuse_abi::{stat64, Attr, S_IFDIR, S_IRWXG, S_IRWXO, S_IRWXU};
 use fuse_backend_core::api::filesystem::*;
 
 // ID 0 is reserved for invalid entry, and ID 1 is used for ROOT_ID.
@@ -264,14 +264,7 @@ impl PseudoFs {
             ..Default::default()
         };
         attr.ino = ino;
-        #[cfg(target_os = "linux")]
-        {
-            attr.mode = libc::S_IFDIR | libc::S_IRWXU | libc::S_IRWXG | libc::S_IRWXO;
-        }
-        #[cfg(target_os = "macos")]
-        {
-            attr.mode = (libc::S_IFDIR | libc::S_IRWXU | libc::S_IRWXG | libc::S_IRWXO) as u32;
-        }
+        attr.mode = S_IFDIR | S_IRWXU | S_IRWXG | S_IRWXO;
         let now = SystemTime::now();
         attr.ctime = now
             .duration_since(SystemTime::UNIX_EPOCH)

@@ -196,21 +196,20 @@ pub struct VfsOptions {
     pub id_mapping: (u32, u32, u32),
 
     /// Disable fuse open request handling. When enabled, fuse open
-    /// requests are always replied with ENOSYS.
-    #[cfg(target_os = "linux")]
+    /// requests are always replied with ENOSYS. init() turns this off
+    /// again unless the kernel offered `FsOptions::ZERO_MESSAGE_OPEN`,
+    /// so on macFUSE (which never offers it) open handling stays enabled.
     pub no_open: bool,
     /// Disable fuse opendir request handling. When enabled, fuse opendir
-    /// requests are always replied with ENOSYS.
-    #[cfg(target_os = "linux")]
+    /// requests are always replied with ENOSYS. init() turns this off
+    /// again unless the kernel offered `FsOptions::ZERO_MESSAGE_OPENDIR`.
     pub no_opendir: bool,
     /// Disable fuse WRITEBACK_CACHE option so that kernel will not cache
     /// buffer writes.
-    #[cfg(target_os = "linux")]
     pub no_writeback: bool,
     /// Enable fuse killpriv_v2 support. When enabled, fuse file system makes sure
     /// to remove security.capability xattr and setuid/setgid bits. See details in
     /// comments for HANDLE_KILLPRIV_V2
-    #[cfg(target_os = "linux")]
     pub killpriv_v2: bool,
 }
 
@@ -221,8 +220,12 @@ impl VfsOptions {
 }
 
 impl Default for VfsOptions {
-    #[cfg(target_os = "linux")]
     fn default() -> Self {
+        // The capability set Vfs advertises is a genuine per-OS value: the
+        // Linux set negotiates bits macFUSE never offers (and some of its
+        // bit positions are taken by macFUSE-specific capabilities), so the
+        // macOS set stays minimal.
+        #[cfg(target_os = "linux")]
         let out_opts = FsOptions::ASYNC_READ
             | FsOptions::PARALLEL_DIROPS
             | FsOptions::BIG_WRITES
@@ -242,25 +245,18 @@ impl Default for VfsOptions {
             | FsOptions::CREATE_SUPP_GROUP
             | FsOptions::DIRECT_IO_ALLOW_MMAP
             | FsOptions::PERFILE_DAX;
+        #[cfg(target_os = "macos")]
+        let out_opts = FsOptions::ASYNC_READ | FsOptions::BIG_WRITES | FsOptions::ATOMIC_O_TRUNC;
         VfsOptions {
+            // The no_open/no_opendir desires are negotiated in init():
+            // they survive only when the kernel offered the corresponding
+            // capability, which macFUSE never does.
             no_open: true,
             no_opendir: true,
             no_writeback: false,
             no_readdir: false,
             seal_size: false,
             killpriv_v2: false,
-            in_opts: FsOptions::empty(),
-            out_opts,
-            id_mapping: (0, 0, 0),
-        }
-    }
-
-    #[cfg(target_os = "macos")]
-    fn default() -> Self {
-        let out_opts = FsOptions::ASYNC_READ | FsOptions::BIG_WRITES | FsOptions::ATOMIC_O_TRUNC;
-        VfsOptions {
-            no_readdir: false,
-            seal_size: false,
             in_opts: FsOptions::empty(),
             out_opts,
             id_mapping: (0, 0, 0),
@@ -902,13 +898,9 @@ pub mod persist {
         id_mapping_external: u32,
         id_mapping_range: u32,
 
-        #[cfg(target_os = "linux")]
         no_open: bool,
-        #[cfg(target_os = "linux")]
         no_opendir: bool,
-        #[cfg(target_os = "linux")]
         no_writeback: bool,
-        #[cfg(target_os = "linux")]
         killpriv_v2: bool,
     }
 
@@ -923,13 +915,9 @@ pub mod persist {
                 id_mapping_external: self.id_mapping.1,
                 id_mapping_range: self.id_mapping.2,
 
-                #[cfg(target_os = "linux")]
                 no_open: self.no_open,
-                #[cfg(target_os = "linux")]
                 no_opendir: self.no_opendir,
-                #[cfg(target_os = "linux")]
                 no_writeback: self.no_writeback,
-                #[cfg(target_os = "linux")]
                 killpriv_v2: self.killpriv_v2,
             }
         }
@@ -950,13 +938,9 @@ pub mod persist {
                     state.id_mapping_range,
                 ),
 
-                #[cfg(target_os = "linux")]
                 no_open: state.no_open,
-                #[cfg(target_os = "linux")]
                 no_opendir: state.no_opendir,
-                #[cfg(target_os = "linux")]
                 no_writeback: state.no_writeback,
-                #[cfg(target_os = "linux")]
                 killpriv_v2: state.killpriv_v2,
             })
         }
@@ -1424,55 +1408,63 @@ mod tests {
     #[test]
     fn test_vfs_init() {
         let vfs = Vfs::default();
-        assert_eq!(vfs.initialized(), false);
+        assert!(!vfs.initialized());
 
         let opts = vfs.opts.load();
         let out_opts = opts.out_opts;
 
-        #[cfg(target_os = "linux")]
-        {
-            assert_eq!(opts.no_open, true);
-            assert_eq!(opts.no_opendir, true);
-            assert_eq!(opts.no_writeback, false);
-            assert_eq!(opts.killpriv_v2, false);
-        }
-        assert_eq!(opts.no_readdir, false);
-        assert_eq!(opts.seal_size, false);
-        assert_eq!(opts.in_opts.is_empty(), true);
+        assert!(opts.no_open);
+        assert!(opts.no_opendir);
+        assert!(!opts.no_writeback);
+        assert!(!opts.killpriv_v2);
+        assert!(!opts.no_readdir);
+        assert!(!opts.seal_size);
+        assert!(opts.in_opts.is_empty());
 
         vfs.init(FsOptions::ASYNC_READ).unwrap();
-        assert_eq!(vfs.initialized(), true);
+        assert!(vfs.initialized());
 
         let opts = vfs.opts.load();
-        #[cfg(target_os = "linux")]
-        {
-            assert_eq!(opts.no_open, false);
-            assert_eq!(opts.no_opendir, false);
-            assert_eq!(opts.no_writeback, false);
-            assert_eq!(opts.killpriv_v2, false);
-        }
-        assert_eq!(opts.no_readdir, false);
-        assert_eq!(opts.seal_size, false);
+        assert!(!opts.no_open);
+        assert!(!opts.no_opendir);
+        assert!(!opts.no_writeback);
+        assert!(!opts.killpriv_v2);
+        assert!(!opts.no_readdir);
+        assert!(!opts.seal_size);
 
         vfs.destroy();
-        assert_eq!(vfs.initialized(), false);
+        assert!(!vfs.initialized());
 
         let vfs = Vfs::default();
-        #[cfg(target_os = "linux")]
         let in_opts =
             FsOptions::ASYNC_READ | FsOptions::ZERO_MESSAGE_OPEN | FsOptions::ZERO_MESSAGE_OPENDIR;
-        #[cfg(target_os = "macos")]
-        let in_opts = FsOptions::ASYNC_READ;
         vfs.init(in_opts).unwrap();
         let opts = vfs.opts.load();
-        #[cfg(target_os = "linux")]
-        {
-            assert_eq!(opts.no_open, true);
-            assert_eq!(opts.no_opendir, true);
-            assert_eq!(opts.no_writeback, false);
-            assert_eq!(opts.killpriv_v2, false);
-        }
+        assert!(opts.no_open);
+        assert!(opts.no_opendir);
+        assert!(!opts.no_writeback);
+        assert!(!opts.killpriv_v2);
         assert_eq!(opts.out_opts, out_opts & in_opts);
+
+        // A kernel that offers ATOMIC_O_TRUNC but not zero-message open (the
+        // macFUSE shape) keeps atomic trunc handling: the capability is only
+        // dropped when no_open survives negotiation.
+        let vfs = Vfs::default();
+        vfs.init(FsOptions::ASYNC_READ | FsOptions::ATOMIC_O_TRUNC)
+            .unwrap();
+        let opts = vfs.opts.load();
+        assert!(!opts.no_open);
+        assert!(opts.out_opts.contains(FsOptions::ATOMIC_O_TRUNC));
+
+        // ... and when no_open does survive negotiation, the capability is
+        // stripped (an O_TRUNC open never reaches the fs, so it can't be
+        // handled atomically here).
+        let vfs = Vfs::default();
+        vfs.init(FsOptions::ASYNC_READ | FsOptions::ZERO_MESSAGE_OPEN | FsOptions::ATOMIC_O_TRUNC)
+            .unwrap();
+        let opts = vfs.opts.load();
+        assert!(opts.no_open);
+        assert!(!opts.out_opts.contains(FsOptions::ATOMIC_O_TRUNC));
     }
 
     #[test]
