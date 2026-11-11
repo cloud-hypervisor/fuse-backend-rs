@@ -20,12 +20,19 @@ impl FileSystem for Vfs {
             return Err(Error::from_raw_os_error(libc::EINVAL));
         }
         let mut n_opts = *self.opts.load().deref().deref();
-        #[cfg(target_os = "linux")]
         {
             if n_opts.no_open {
                 n_opts.no_open = !(opts & FsOptions::ZERO_MESSAGE_OPEN).is_empty();
-                // We can't support FUSE_ATOMIC_O_TRUNC with no_open
-                n_opts.out_opts.remove(FsOptions::ATOMIC_O_TRUNC);
+                if n_opts.no_open {
+                    // We can't support FUSE_ATOMIC_O_TRUNC with no_open: opens
+                    // never reach us, so an O_TRUNC open can't truncate here.
+                    // Only strip it when no_open actually survives negotiation
+                    // though — a kernel that doesn't offer zero-message open
+                    // keeps atomic O_TRUNC handling (the backends negotiate
+                    // the same way, and macFUSE offers ATOMIC_O_TRUNC but
+                    // never zero-message open).
+                    n_opts.out_opts.remove(FsOptions::ATOMIC_O_TRUNC);
+                }
             } else {
                 n_opts.out_opts.remove(FsOptions::ZERO_MESSAGE_OPEN);
             }
@@ -306,7 +313,6 @@ impl FileSystem for Vfs {
         flags: u32,
         fuse_flags: u32,
     ) -> Result<(Option<u64>, OpenOptions, Option<u32>)> {
-        #[cfg(target_os = "linux")]
         if self.opts.load().no_open {
             return Err(Error::from_raw_os_error(libc::ENOSYS));
         }
@@ -524,7 +530,6 @@ impl FileSystem for Vfs {
         inode: VfsInode,
         flags: u32,
     ) -> Result<(Option<VfsHandle>, OpenOptions)> {
-        #[cfg(target_os = "linux")]
         if self.opts.load().no_opendir {
             return Err(Error::from_raw_os_error(libc::ENOSYS));
         }

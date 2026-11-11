@@ -31,7 +31,19 @@
   gates. The `overlay::Layer` contract compiles on both platforms once the
   `mode_t`/`ENOTSUP`/`ENOATTR` libc vocabulary differences are bridged, and the
   server test module now runs on macOS too, exercising the un-gated
-  handlers there.
+  handlers there. `fuse-backend-vfs` gets the same treatment: the
+  `no_open`/`no_opendir`/`no_writeback`/`killpriv_v2` options and their
+  negotiation run on both platforms (macFUSE never offers the
+  zero-message capabilities, so the negotiation keeps open/opendir
+  handling enabled there), and the ABIs gain u32 `S_IF*`/`S_IRWX*` mode
+  vocabulary replacing per-OS widening casts. `init()` strips
+  `ATOMIC_O_TRUNC` only when `no_open` actually survives negotiation
+  (the backends already negotiated this way), preserving the macFUSE
+  atomic-trunc advertisement; on Linux only pre-4.20 kernels (no
+  `ZERO_MESSAGE_OPEN`) see a changed reply. `VfsOptionsState` gains the
+  four capability fields on macOS, so macOS persist blobs saved before
+  this change cannot be restored (the Linux layout and version are
+  unchanged).
 - [254](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/254): Split the library into a layered Cargo workspace and break the layers out into
   their own crates — `fuse-backend-core` (ABI, API/server, buffers),
   `fuse-backend-fusedev` and `fuse-backend-virtiofs` (transports), and
