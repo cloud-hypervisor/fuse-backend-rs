@@ -121,12 +121,20 @@ jobs:
 
   Macos-CI:
     runs-on: macos-latest
+    # The e2e mounts a fuse-t filesystem; a hung request through a hard NFS
+    # mount never returns, and without a timeout the job sits for GitHub's
+    # 360-minute default.
+    timeout-minutes: 30
     steps:
       - name: Install macfuse
         run: |
           brew install --cask macfuse
-          wget https://github.com/macos-fuse-t/fuse-t/releases/download/1.0.24/fuse-t-macos-installer-1.0.24.pkg
-          sudo installer -pkg fuse-t-macos-installer-1.0.24.pkg -target /
+          # fuse-t 1.0.24 (the original pin, 2023-era) emits xattr requests no
+          # macFUSE-shaped daemon can parse, which hung the e2e's hard NFS
+          # mount; 1.2.9 is the current release and is what the e2e runs
+          # against.
+          wget https://github.com/macos-fuse-t/fuse-t/releases/download/1.2.9/fuse-t-macos-installer-1.2.9.pkg
+          sudo installer -pkg fuse-t-macos-installer-1.2.9.pkg -target /
       - uses: actions/checkout@v3
       - name: build and check
         run: |

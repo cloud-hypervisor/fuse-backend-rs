@@ -159,7 +159,14 @@ check-macos: build-macos
 	${CARGO} test -p fuse-backend-fusedev --features="fuse-backend-fusedev/fuse-t" -- --nocapture --skip integration
 
 smoke-macos: check-macos
-	${CARGO} test --features="fusedev,fuse-t" -- --nocapture
+	# A cfg-drifted test binary silently runs zero tests and stays green;
+	# fail the row if the passthrough integration test is not in it.
+	${CARGO} test --features="fusedev,fuse-t" --test macfuse_smoke -- --list --format terse | grep -q integration_test_macfuse_passthrough
+	# One mount at a time: each test mounts its own fuse-t filesystem, and
+	# go-nfsv4 instances pick their listen port from the same default first
+	# (two concurrent sessions raced for port 52100 in CI), while upstream has
+	# concurrent fuse-t sessions interfering with each other (#116, #124).
+	${CARGO} test --features="fusedev,fuse-t" -- --nocapture --test-threads=1
 
 docker-smoke:
 	docker run --env RUST_BACKTRACE=1 --rm --privileged --volume ${current_dir}:/fuse-rs rust:1.86 sh -c "rustup component add clippy rustfmt; cd /fuse-rs; make smoke-all"

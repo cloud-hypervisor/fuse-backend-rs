@@ -3,8 +3,13 @@
 //! `PassthroughFs` serves READ and WRITE on the tokio runtime, with and without the blocking
 //! thread pool. The crate fixes the runtime type once per process, so these tests run in a binary
 //! of their own.
+//!
+//! The async-io feature is also accepted on non-Linux builds (an empty
+//! `AsyncFileSystem` impl falls back to the sync handlers), but
+//! `new_shared()`/`enable_async_thread_pool()` themselves stay Linux-only
+//! together with the native async path in `async_io.rs`.
 
-#![cfg(feature = "async-io")]
+#![cfg(all(feature = "async-io", target_os = "linux"))]
 
 use std::ffi::CString;
 use std::future::Future;

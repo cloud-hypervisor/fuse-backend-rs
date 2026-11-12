@@ -437,11 +437,24 @@ fn fuse_kern_mount(
             std::env::set_var("_FUSE_MONFD", format!("{}", mon_fd0));
             std::env::set_var("_FUSE_COMMVERS", "2");
 
+            // Mirror libfuse-t's mount_darwin.c: the server is daemonized
+            // before exec -- a fresh session and stdio on /dev/null -- so it
+            // is not tied to the daemon's session, terminal or pipes.  The
+            // server logs to ~/Library/Logs/fuse-t, not stdio, so nothing is
+            // lost by detaching it.
+            unsafe { libc::setsid() };
+            if let Ok(devnull) = File::options().read(true).write(true).open("/dev/null") {
+                let null_fd = devnull.as_raw_fd();
+                unsafe {
+                    libc::dup2(null_fd, libc::STDIN_FILENO);
+                    libc::dup2(null_fd, libc::STDOUT_FILENO);
+                    libc::dup2(null_fd, libc::STDERR_FILENO);
+                }
+            }
+
             let mut cmd = Command::new(FUSE_NFSSRV_PATH);
             cmd.arg("--noatime=true")
                 .arg("--dontbrowse=true")
-                // .arg("-d")
-                // .arg("-c")
                 .args(["--volname", &format!("{}-{}", fsname, subtype)]);
             if rd_only {
                 cmd.arg("-r");
