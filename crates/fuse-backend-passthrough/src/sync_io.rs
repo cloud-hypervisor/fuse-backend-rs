@@ -5,7 +5,11 @@
 
 //! Fuse passthrough file system, mirroring an existing FS hierarchy.
 
-use std::ffi::{CStr, CString};
+use std::ffi::CStr;
+// Only the Linux by-path metadata route (and the Linux-only tests below)
+// builds C strings in this module.
+#[cfg(target_os = "linux")]
+use std::ffi::CString;
 use std::fs::File;
 use std::io;
 use std::mem::{self, size_of, ManuallyDrop};
@@ -346,6 +350,10 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
             // to it, in which case this position is exactly right; if some entries were not
             // delivered (reply buffer full) the cookie is never requested and the cached
             // value just goes unused.
+            //
+            // This is the Linux `getdents64` contract; the macOS twin ignores
+            // `cookie_hit` and repositions by rewind-and-skip on every call,
+            // so the cache is recorded but never consumed there.
             self.cache_cookie(handle, &buf);
 
             // Explicitly drop the lock so that it's not held while we fill in the fuse buffer.
@@ -1159,24 +1167,40 @@ impl<S: BitmapSlice + Send + Sync> FileSystem for PassthroughFs<S> {
 
         enum Data {
             Handle(Arc<HandleData>),
+            // Linux: handle-less requests resolve the descriptor by path
+            // through /proc/self/fd, because the O_PATH descriptors this
+            // crate tracks reject fchmod()/futimens().
+            #[cfg(target_os = "linux")]
             ProcPath(CString),
+            // macOS: the O_EVTONLY descriptors accept fchmod()/futimens()
+            // directly, so handle-less requests operate on the descriptor
+            // itself (`file` below).
+            #[cfg(target_os = "macos")]
+            Fd,
         }
 
         let file = inode_data.get_file()?;
-        let data = if self.no_open.load(Ordering::Relaxed) {
+
+        // Handle-less requests — chmod/touch style, and every request when
+        // zero-message opens are negotiated — have no kernel-issued handle.
+        // The macOS route is also race-free: the pinned inode is what gets
+        // modified, not whatever a path names at that moment.
+        #[cfg(target_os = "linux")]
+        let handleless = || -> io::Result<Data> {
             let pathname = CString::new(format!("{}", file.as_raw_fd()))
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-            Data::ProcPath(pathname)
+            Ok(Data::ProcPath(pathname))
+        };
+        #[cfg(target_os = "macos")]
+        let handleless = || -> io::Result<Data> { Ok(Data::Fd) };
+
+        // If we have a handle then use it, otherwise operate without one.
+        let data = if self.no_open.load(Ordering::Relaxed) {
+            handleless()?
+        } else if let Some(handle) = handle {
+            Data::Handle(self.handle_map.get(handle, inode)?)
         } else {
-            // If we have a handle then use it otherwise get a new fd from the inode.
-            if let Some(handle) = handle {
-                let hd = self.handle_map.get(handle, inode)?;
-                Data::Handle(hd)
-            } else {
-                let pathname = CString::new(format!("{}", file.as_raw_fd()))
-                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-                Data::ProcPath(pathname)
-            }
+            handleless()?
         };
 
         if valid.contains(SetattrValid::SIZE) && self.seal_size.load(Ordering::Relaxed) {
@@ -1188,9 +1212,17 @@ impl<S: BitmapSlice + Send + Sync> FileSystem for PassthroughFs<S> {
             let res = unsafe {
                 match data {
                     Data::Handle(ref h) => libc::fchmod(h.borrow_fd().as_raw_fd(), attr.st_mode),
+                    // Linux: an O_PATH descriptor rejects fchmod(), so the
+                    // mode is set by path through /proc/self/fd.
+                    #[cfg(target_os = "linux")]
                     Data::ProcPath(ref p) => {
                         libc::fchmodat(self.proc_self_fd.as_raw_fd(), p.as_ptr(), attr.st_mode, 0)
                     }
+                    // macOS: fchmod() accepts the O_EVTONLY descriptor
+                    // directly (the reason Linux routes by path does not
+                    // apply).
+                    #[cfg(target_os = "macos")]
+                    Data::Fd => libc::fchmod(file.as_raw_fd(), attr.st_mode),
                 }
             };
             if res < 0 {
@@ -1272,9 +1304,16 @@ impl<S: BitmapSlice + Send + Sync> FileSystem for PassthroughFs<S> {
                 Data::Handle(ref h) => unsafe {
                     libc::futimens(h.borrow_fd().as_raw_fd(), tvs.as_ptr())
                 },
+                // Linux: an O_PATH descriptor rejects futimens(), so the
+                // timestamps are set by path through /proc/self/fd.
+                #[cfg(target_os = "linux")]
                 Data::ProcPath(ref p) => unsafe {
                     libc::utimensat(self.proc_self_fd.as_raw_fd(), p.as_ptr(), tvs.as_ptr(), 0)
                 },
+                // macOS: futimens() accepts the O_EVTONLY descriptor directly
+                // (same reasoning as the fchmod arm above).
+                #[cfg(target_os = "macos")]
+                Data::Fd => unsafe { libc::futimens(file.as_raw_fd(), tvs.as_ptr()) },
             };
             if res < 0 {
                 return Err(io::Error::last_os_error());

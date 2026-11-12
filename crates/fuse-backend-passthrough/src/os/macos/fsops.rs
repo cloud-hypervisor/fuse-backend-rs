@@ -262,10 +262,18 @@ pub(crate) fn renameat2(
 /// Position the descriptor `fd` at `offset`, interpreting `whence` as the raw
 /// `SEEK_*` value carried by the FUSE protocol.
 pub(crate) fn lseek(fd: RawFd, offset: u64, whence: u32) -> io::Result<u64> {
-    // The FUSE protocol carries Linux's SEEK_* values, where 3 is SEEK_DATA
-    // and 4 is SEEK_HOLE. Darwin defines the two the other way around
-    // (SEEK_HOLE is 3, SEEK_DATA is 4), so translate them instead of passing
-    // the wire value through; 0/1/2 coincide on both systems.
+    // The only FUSE clients that actually send FUSE_LSEEK today are Linux
+    // kernels (native FUSE and virtiofs guests), and they put their own
+    // SEEK_* values on the wire: 3 is SEEK_DATA and 4 is SEEK_HOLE.  Darwin
+    // defines the two the other way around (SEEK_HOLE is 3, SEEK_DATA is
+    // 4), so translate; 0/1/2 coincide on both systems.
+    //
+    // macFUSE does not implement FUSE_LSEEK at all (macfuse#1121), so this
+    // mapping is currently unreachable from a macFUSE mount.  If a macOS
+    // transport adds FUSE_LSEEK following the FreeBSD lineage (which
+    // forwards the local BSD whence values), it would deliver Darwin's
+    // values and this mapping would have to be inverted — re-verify against
+    // the transport's source before relying on sparse seeks through it.
     let whence = match whence {
         3 => libc::SEEK_DATA,
         4 => libc::SEEK_HOLE,
