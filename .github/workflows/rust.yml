@@ -83,7 +83,9 @@ jobs:
     # dev-dependencies, whose MSRV is not ours to promise (today
     # `simple_logger` 5.2 floors `time` at a release needing rustc 1.88), so
     # they are excluded; the stable-toolchain jobs still build them (`CI`
-    # runs the benchmark smoke, `xfstests` and `benchmark` build the daemons).
+    # runs the benchmark smoke, `xfstests` and `benchmark` build the
+    # daemons, and the label-gated `fuser-compare` job builds the fuser
+    # one).
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -117,7 +119,7 @@ jobs:
       # rust-version.
       env:
         CARGO_RESOLVER_INCOMPATIBLE_RUST_VERSIONS: fallback
-      run: cargo check --workspace --all-features --all-targets --exclude passthrough --exclude overlay --exclude fuse-backend-rs-benchmark
+      run: cargo check --workspace --all-features --all-targets --exclude passthrough --exclude overlay --exclude fuse-backend-rs-benchmark --exclude passthrough-fuser
 
   Macos-CI:
     runs-on: macos-latest
