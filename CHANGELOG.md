@@ -20,7 +20,12 @@
   native async path stays Linux-only (`preadv2`/`RWF_NOWAIT`, io_uring), and
   the async traits fall back to the default methods that delegate to the
   synchronous handlers. A macFUSE e2e smoke test (readdir/read/write/
-  xattr/link through the mount) joins the macOS CI. `fallocate`,
+  xattr/link plus handle-less chmod/touch and a stale-reopen probe through
+  the mount) joins the macOS CI. Handle-less setattr
+  (chmod/touch with no fh) goes through `fchmod()`/`futimens()` on the
+  tracked descriptor instead of the Linux `/proc/self/fd` by-path route,
+  which answered `ENOTDIR` against the macOS placeholder dirfd.
+  `fallocate`,
   `copy_file_range` and the `RENAME_*` flags stay `ENOSYS` (the FUSE clients
   have fallbacks; `F_PREALLOCATE`/`fcopyfile` are future work).
 - [285](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/285): Add `uring_available()`, which tells
