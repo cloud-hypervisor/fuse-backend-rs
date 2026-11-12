@@ -5,14 +5,12 @@
 //! macOS file-operation syscall shims.
 //!
 //! Implements the shims that have a portable macOS equivalent — `stat_fd`,
-//! `sync_fd`, `fstatvfs`, `fchown`, `lseek`, `getpath_by_fd` and plain
-//! `renameat` — and answers
+//! `sync_fd`, `fstatvfs`, `fchown`, `lseek`, `getpath_by_fd`, plain
+//! `renameat` and the xattr family — and answers
 //! `ENOSYS` for the Linux-only ones: `fallocate` (macOS has no
-//! `fallocate(2)`), the raw `copy_file_range` syscall, `AT_EMPTY_PATH`-based
-//! hard links and the `/proc/self/fd` path behind the xattr shims.  A macOS
-//! mount thus fails cleanly on those operations instead of half-working; the
-//! future port can fill them with real macOS equivalents (e.g. the
-//! `f{set,get,remove,list}xattr` family and `F_PREALLOCATE`).
+//! `fallocate(2)`), the raw `copy_file_range` syscall and
+//! `AT_EMPTY_PATH`-based hard links.  A macOS
+//! mount thus fails cleanly on those operations instead of half-working.
 
 use std::ffi::{CStr, CString};
 use std::io;
@@ -212,38 +210,124 @@ pub(crate) fn copy_file_range(
 
 /// Set the extended attribute `name` of the file referenced by `fd`.
 ///
-/// `ENOSYS`: the Linux shim reaches the file through `/proc/self/fd`, which
-/// macOS lacks; the port will use the `fsetxattr()` family instead.
-pub(crate) fn setxattr(_fd: RawFd, _name: &CStr, _value: &[u8], _flags: u32) -> io::Result<()> {
-    Err(enosys())
+/// Darwin's `fsetxattr()` accepts the `O_EVTONLY` descriptors the handle map
+/// hands out (unlike Linux, where the `O_PATH` handles force the xattr
+/// operations through `/proc/self/fd`), so the fd-based call needs no path
+/// dance.  `flags` is passed through verbatim: macFUSE's kernel forwards the
+/// macOS caller's `XATTR_*` options (Darwin values, e.g. `XATTR_CREATE` and
+/// `XATTR_REPLACE`, which differ from Linux's) to `FUSE_SETXATTR` unchanged,
+/// so translating them here would corrupt them.  The same symmetry holds for
+/// errnos: Darwin reports a missing attribute as `ENOATTR`, and the kernel
+/// passes it back to the macOS caller unchanged.
+pub(crate) fn setxattr(fd: RawFd, name: &CStr, value: &[u8], flags: u32) -> io::Result<()> {
+    // Safe because this doesn't modify any memory and we check the return value.
+    let res = unsafe {
+        libc::fsetxattr(
+            fd,
+            name.as_ptr(),
+            value.as_ptr() as *const libc::c_void,
+            value.len(),
+            0,
+            flags as libc::c_int,
+        )
+    };
+    if res == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
 }
 
 /// Get the extended attribute `name` of the file referenced by `fd`.
 ///
-/// `ENOSYS`; see [`setxattr`].
-pub(crate) fn getxattr(_fd: RawFd, _name: &CStr, _size: u32) -> io::Result<GetxattrReply> {
-    Err(enosys())
+/// Like the Linux twin, a `size` of 0 turns the call into a size query; see
+/// [`setxattr`] for the fd and errno conventions.
+pub(crate) fn getxattr(fd: RawFd, name: &CStr, size: u32) -> io::Result<GetxattrReply> {
+    let mut buf = Vec::<u8>::with_capacity(size as usize);
+
+    // Safe because this will only modify the contents of `buf`.
+    let res = unsafe {
+        libc::fgetxattr(
+            fd,
+            name.as_ptr(),
+            buf.as_mut_ptr() as *mut libc::c_void,
+            size as libc::size_t,
+            0,
+            0,
+        )
+    };
+    if res < 0 {
+        return Err(io::Error::last_os_error());
+    }
+
+    if size == 0 {
+        Ok(GetxattrReply::Count(res as u32))
+    } else {
+        // Safe because we trust the value returned by kernel.
+        unsafe { buf.set_len(res as usize) };
+        Ok(GetxattrReply::Value(buf))
+    }
 }
 
 /// List the extended attribute names of the file referenced by `fd`.
 ///
-/// `ENOSYS`; see [`setxattr`].
-pub(crate) fn listxattr(_fd: RawFd, _size: u32) -> io::Result<ListxattrReply> {
-    Err(enosys())
+/// Like the Linux twin, a `size` of 0 turns the call into a size query; see
+/// [`setxattr`] for the fd and errno conventions.
+pub(crate) fn listxattr(fd: RawFd, size: u32) -> io::Result<ListxattrReply> {
+    let mut buf = Vec::<u8>::with_capacity(size as usize);
+
+    // Safe because this will only modify the contents of `buf`.
+    let res = unsafe {
+        libc::flistxattr(
+            fd,
+            buf.as_mut_ptr() as *mut libc::c_char,
+            size as libc::size_t,
+            0,
+        )
+    };
+    if res < 0 {
+        return Err(io::Error::last_os_error());
+    }
+
+    if size == 0 {
+        Ok(ListxattrReply::Count(res as u32))
+    } else {
+        // Safe because we trust the value returned by kernel.
+        unsafe { buf.set_len(res as usize) };
+        Ok(ListxattrReply::Names(buf))
+    }
 }
 
 /// Remove the extended attribute `name` from the file referenced by `fd`.
 ///
-/// `ENOSYS`; see [`setxattr`].
-pub(crate) fn removexattr(_fd: RawFd, _name: &CStr) -> io::Result<()> {
-    Err(enosys())
+/// See [`setxattr`] for the fd and errno conventions.
+pub(crate) fn removexattr(fd: RawFd, name: &CStr) -> io::Result<()> {
+    // Safe because this doesn't modify any memory and we check the return value.
+    let res = unsafe { libc::fremovexattr(fd, name.as_ptr(), 0) };
+    if res == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::fs;
+    use std::os::fd::FromRawFd;
     use vmm_sys_util::tempdir::TempDir;
+
+    /// Open `path` with `flags` and hand back an owned descriptor, so the
+    /// tests close what they open.
+    fn open_owned(path: &CStr, flags: libc::c_int) -> fs::File {
+        // Safe because `path` is a valid NUL-terminated string, this does
+        // not modify any memory, and we check the return value.
+        let fd = unsafe { libc::open(path.as_ptr(), flags) };
+        assert!(fd >= 0);
+        // Safe because we just opened this fd.
+        unsafe { fs::File::from_raw_fd(fd) }
+    }
 
     #[test]
     fn test_getpath_by_fd() {
@@ -261,5 +345,59 @@ mod tests {
         let st2 = stat_fd(&reopened, None).unwrap();
         assert_eq!(st1.st_dev, st2.st_dev);
         assert_eq!(st1.st_ino, st2.st_ino);
+    }
+
+    #[test]
+    fn test_xattr_roundtrip_on_evtonly_fd() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.as_path().join("file.txt");
+        fs::write(&path, "hello").unwrap();
+
+        // The handle map hands out O_EVTONLY descriptors; the fd-based xattr
+        // calls must work on them.
+        let cpath = path
+            .to_str()
+            .and_then(|p| CString::new(p).ok())
+            .expect("valid path");
+        let file = open_owned(&cpath, libc::O_EVTONLY);
+        let fd = file.as_raw_fd();
+        let name = CStr::from_bytes_with_nul(b"user.probe\0").unwrap();
+
+        setxattr(fd, name, b"value", 0).unwrap();
+        match getxattr(fd, name, 16).unwrap() {
+            GetxattrReply::Value(v) => assert_eq!(v, b"value"),
+            GetxattrReply::Count(_) => panic!("expected a value"),
+        }
+        // size == 0 is the size-query form.
+        match getxattr(fd, name, 0).unwrap() {
+            GetxattrReply::Count(n) => assert_eq!(n, 5),
+            GetxattrReply::Value(_) => panic!("expected a count"),
+        }
+        match listxattr(fd, 256).unwrap() {
+            ListxattrReply::Names(names) => {
+                assert!(names.split(|&b| b == 0).any(|n| n == b"user.probe"))
+            }
+            ListxattrReply::Count(_) => panic!("expected names"),
+        }
+        removexattr(fd, name).unwrap();
+        // A missing attribute is ENOATTR, the errno the macFUSE kernel
+        // passes back to the (macOS) caller verbatim.
+        let err = match getxattr(fd, name, 16) {
+            Err(e) => e,
+            Ok(_) => panic!("expected an error for a missing attribute"),
+        };
+        assert_eq!(err.raw_os_error(), Some(libc::ENOATTR));
+        let err = removexattr(fd, name).unwrap_err();
+        assert_eq!(err.raw_os_error(), Some(libc::ENOATTR));
+
+        // Darwin's XATTR_* option values (what macFUSE puts on the wire)
+        // pass through verbatim: CREATE on an existing attribute is EEXIST,
+        // REPLACE on a missing one is ENOATTR.
+        setxattr(fd, name, b"value", 0).unwrap();
+        let err = setxattr(fd, name, b"other", libc::XATTR_CREATE as u32).unwrap_err();
+        assert_eq!(err.raw_os_error(), Some(libc::EEXIST));
+        removexattr(fd, name).unwrap();
+        let err = setxattr(fd, name, b"other", libc::XATTR_REPLACE as u32).unwrap_err();
+        assert_eq!(err.raw_os_error(), Some(libc::ENOATTR));
     }
 }
