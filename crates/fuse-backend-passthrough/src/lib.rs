@@ -49,15 +49,18 @@ use fuse_backend_core::api::{
     validate_path_component, BackendFileSystem, CURRENT_DIR_CSTR, EMPTY_CSTR, PARENT_DIR_CSTR,
     SLASH_ASCII, VFS_MAX_INO,
 };
-
-// The async-io support builds on Linux-only syscalls (`preadv2`/`RWF_NOWAIT`,
-// io_uring in the core runtime), so the whole feature stays Linux-only for
-// now; a macOS port of the async path is future work.
+// Only the non-Linux `AsyncFileSystem` fallback impl below pulls it in; the
+// Linux one lives in `async_io.rs`.
 #[cfg(all(feature = "async-io", not(target_os = "linux")))]
-compile_error!(
-    "the `async-io` feature of fuse-backend-passthrough is Linux-only \
-     (preadv2/RWF_NOWAIT, io_uring); do not enable it on this platform"
-);
+use fuse_backend_core::api::filesystem::AsyncFileSystem;
+
+// The native asynchronous IO path in `async_io.rs` builds on Linux-only
+// syscalls (`preadv2`/`RWF_NOWAIT`, io_uring in the core runtime), so it stays
+// Linux-only; a port of the native path is future work. The umbrella crate
+// forwards `async-io` to the driver whenever it is in the build, and cargo
+// cannot make feature forwarding platform-conditional, so on the other
+// platforms the feature is accepted and the `AsyncFileSystem` impl below falls
+// back to the default methods, which delegate to the synchronous handlers.
 #[cfg(all(feature = "async-io", target_os = "linux"))]
 mod async_io;
 mod config;
@@ -984,7 +987,15 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
     }
 }
 
-#[cfg(not(feature = "async-io"))]
+// `async_io.rs` provides the `BackendFileSystem` impl (and the native async
+// handlers) on Linux with the `async-io` feature. Everywhere else this impl
+// stands: under core's `async-io` the trait requires `AsyncFileSystem`, whose
+// default methods delegate to the synchronous handlers -- the pattern core's
+// `SyncFs` uses -- so an async server can still drive the driver.
+#[cfg(all(feature = "async-io", not(target_os = "linux")))]
+impl<S: BitmapSlice + Send + Sync + 'static> AsyncFileSystem for PassthroughFs<S> {}
+
+#[cfg(any(not(feature = "async-io"), not(target_os = "linux")))]
 impl<S: BitmapSlice + Send + Sync + 'static> BackendFileSystem for PassthroughFs<S> {
     fn mount(&self) -> io::Result<(Entry, u64)> {
         let entry = self.do_lookup(fuse::ROOT_ID, &CString::new(".").unwrap())?;

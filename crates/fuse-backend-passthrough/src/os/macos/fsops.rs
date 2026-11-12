@@ -6,16 +6,15 @@
 //!
 //! Implements the shims that have a portable macOS equivalent — `stat_fd`,
 //! `sync_fd`, `fstatvfs`, `fchown`, `lseek`, `getpath_by_fd`, plain
-//! `renameat` and the xattr family — and answers
-//! `ENOSYS` for the Linux-only ones: `fallocate` (macOS has no
-//! `fallocate(2)`), the raw `copy_file_range` syscall and
-//! `AT_EMPTY_PATH`-based hard links.  A macOS
+//! `renameat`, the xattr family and the F_GETPATH-based `linkat_by_fd` —
+//! and answers `ENOSYS` for the Linux-only ones: `fallocate` (macOS has
+//! no `fallocate(2)`) and the raw `copy_file_range` syscall.  A macOS
 //! mount thus fails cleanly on those operations instead of half-working.
 
 use std::ffi::{CStr, CString};
 use std::io;
 use std::mem::MaybeUninit;
-use std::os::unix::io::{AsRawFd, RawFd};
+use std::os::unix::io::{AsRawFd, BorrowedFd, RawFd};
 
 use fuse_backend_core::abi::fuse_abi as fuse;
 use fuse_backend_core::api::filesystem::{GetxattrReply, ListxattrReply};
@@ -118,20 +117,120 @@ pub(crate) fn fchown_by_fd(fd: RawFd, uid: u32, gid: u32) -> io::Result<()> {
     }
 }
 
+/// The derived path can go stale: the file (or a parent directory) may be
+/// renamed between `F_GETPATH` and `linkat()`, leaving the path to name
+/// another inode.  Validate the path against the descriptor before linking —
+/// the same dev/ino check the reopen hub uses — and report `ESTALE` on
+/// mismatch, the conventional stale-file-handle errno (the Linux FUSE kernel
+/// drops its entry cache and retries the lookup on seeing it).  Returns the
+/// descriptor's stat for the caller's post-link verification.
+fn validate_pathnames_inode(fd: &BorrowedFd, oldpath: &CStr) -> io::Result<fuse::stat64> {
+    let st_fd = stat_fd(fd, None)?;
+
+    let mut st_path = MaybeUninit::<libc::stat>::zeroed();
+    // Safe because the kernel will only write data in `st_path` and we check
+    // the return value.
+    let res = unsafe { libc::lstat(oldpath.as_ptr(), st_path.as_mut_ptr()) };
+    if res < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // Safe because the kernel guarantees that the struct is now fully
+    // initialized.
+    let st_path = unsafe { st_path.assume_init() };
+
+    if st_path.st_dev != st_fd.st_dev || st_path.st_ino != st_fd.st_ino {
+        return Err(io::Error::from_raw_os_error(libc::ESTALE));
+    }
+    Ok(st_fd)
+}
+
 /// Create a hard link named `newname` in directory `newdir_fd` to the file
 /// referenced by `fd`.
 ///
-/// `ENOSYS`: macOS has no `AT_EMPTY_PATH` for `linkat()` and no
-/// `/proc/self/fd` magic symlinks to fall back on, so a file cannot be
-/// linked by descriptor.
+/// macOS has no `AT_EMPTY_PATH` for `linkat()`, so the old path comes from
+/// `fcntl(F_GETPATH)`: the descriptor pins the file's vnode and the kernel
+/// returns its current path (renames included).  A plain `linkat()` does not
+/// follow the final path component, so the link lands on the inode the
+/// descriptor refers to — a symlink inode links the symlink itself, matching
+/// the FUSE LINK semantics (and Linux's `AT_EMPTY_PATH`, which does not
+/// follow either).
+///
+/// Unlike Linux's fd-atomic `AT_EMPTY_PATH` link, the fd+path model leaves a
+/// check-to-link race on the source path, so what was linked is verified
+/// before reporting success.
 pub(crate) fn linkat_by_fd(
-    _fd: RawFd,
+    fd: RawFd,
     _proc_self_fd: RawFd,
     _mode: u32,
-    _newdir_fd: RawFd,
-    _newname: &CStr,
+    newdir_fd: RawFd,
+    newname: &CStr,
 ) -> io::Result<()> {
-    Err(enosys())
+    // Safe because `fd` and `newdir_fd` refer to descriptors the caller
+    // keeps alive for the duration of this call.
+    let old_fd = unsafe { BorrowedFd::borrow_raw(fd) };
+    let new_dir = unsafe { BorrowedFd::borrow_raw(newdir_fd) };
+    let oldpath = getpath_by_fd(&old_fd)?;
+    let st_fd = validate_pathnames_inode(&old_fd, &oldpath)?;
+
+    // `oldpath` is absolute (F_GETPATH's form), so the old-dir descriptor is
+    // unused.
+    //
+    // Safe because this doesn't modify any memory and we check the return
+    // value.
+    let res = unsafe {
+        libc::linkat(
+            libc::AT_FDCWD,
+            oldpath.as_ptr(),
+            newdir_fd,
+            newname.as_ptr(),
+            0,
+        )
+    };
+    if res != 0 {
+        return Err(io::Error::last_os_error());
+    }
+
+    // If the source path was replaced between the validation lstat and the
+    // linkat, the link landed on the wrong inode — and the shared link()
+    // would confirm it, because do_lookup(newparent, newname) returns
+    // whatever now sits at the name without comparing it against the source.
+    // Verify the linked inode instead of trusting the race-free common case.
+    let st_new = stat_fd(&new_dir, Some(newname))?;
+    if st_new.st_dev == st_fd.st_dev && st_new.st_ino == st_fd.st_ino {
+        return Ok(());
+    }
+
+    // The name is not the tracked inode.  Undo the link only when the name
+    // refers to the inode the source path names right now: that is the wrong
+    // link this call just created in the source-replacement race, and
+    // removing it restores the innocent replacement's link count.  Any other
+    // inode at the name was placed there by a third party after the linkat
+    // and is not ours to remove.
+    //
+    // If the replacement file is moved away from `oldpath` between the
+    // verification and this lstat (or the lstat fails), the guard correctly
+    // declines and a stray hard link to the wrong inode survives at
+    // `newname` — the caller still sees ESTALE, and removing the name
+    // without the guard's evidence would risk unlinking a third party's
+    // file.  This residue is the fd+path model's price; Linux's atomic
+    // `AT_EMPTY_PATH` link cannot produce it, and Darwin offers no way to
+    // pin the source.
+    let mut st_old = MaybeUninit::<libc::stat>::zeroed();
+    // Safe because the kernel will only write data in `st_old` and we check
+    // the return value.
+    let res = unsafe { libc::lstat(oldpath.as_ptr(), st_old.as_mut_ptr()) };
+    if res >= 0 {
+        // Safe because the kernel guarantees that the struct is now fully
+        // initialized.
+        let st_old = unsafe { st_old.assume_init() };
+        if st_old.st_dev == st_new.st_dev && st_old.st_ino == st_new.st_ino {
+            // Safe because this doesn't modify any memory and the return
+            // value only decides whether to report the undo failure instead
+            // of the stale name.
+            let _ = unsafe { libc::unlinkat(newdir_fd, newname.as_ptr(), 0) };
+        }
+    }
+    Err(io::Error::from_raw_os_error(libc::ESTALE))
 }
 
 /// Rename `oldpath` under `olddir_fd` to `newpath` under `newdir_fd`,
@@ -316,6 +415,7 @@ mod tests {
     use super::*;
     use std::fs;
     use std::os::fd::FromRawFd;
+    use std::os::unix::fs::MetadataExt;
     use vmm_sys_util::tempdir::TempDir;
 
     /// Open `path` with `flags` and hand back an owned descriptor, so the
@@ -399,5 +499,80 @@ mod tests {
         removexattr(fd, name).unwrap();
         let err = setxattr(fd, name, b"other", libc::XATTR_REPLACE as u32).unwrap_err();
         assert_eq!(err.raw_os_error(), Some(libc::ENOATTR));
+    }
+
+    #[test]
+    fn test_linkat_by_fd() {
+        let dir = TempDir::new().unwrap();
+        let old = dir.as_path().join("old.txt");
+        fs::write(&old, "hello").unwrap();
+
+        let dir_fd = fs::File::open(dir.as_path()).unwrap();
+        let newname = CStr::from_bytes_with_nul(b"new.txt\0").unwrap();
+
+        // The handle map hands out O_EVTONLY descriptors; the link derives
+        // the old path from one.
+        let cold = old
+            .to_str()
+            .and_then(|p| CString::new(p).ok())
+            .expect("valid path");
+        let file = open_owned(&cold, libc::O_EVTONLY);
+        let fd = file.as_raw_fd();
+
+        linkat_by_fd(fd, -1, 0, dir_fd.as_raw_fd(), newname).unwrap();
+
+        // The new name is a hard link to the same inode.
+        let st_old = fs::metadata(&old).unwrap();
+        let st_new = fs::metadata(dir.as_path().join("new.txt")).unwrap();
+        assert_eq!(st_old.dev(), st_new.dev());
+        assert_eq!(st_old.ino(), st_new.ino());
+        assert_eq!(st_new.nlink(), 2);
+        assert_eq!(
+            fs::read_to_string(dir.as_path().join("new.txt")).unwrap(),
+            "hello"
+        );
+
+        // A symlink inode links the symlink itself: the new name is a
+        // symlink, not a copy of the target.
+        let target = dir.as_path().join("target.txt");
+        fs::write(&target, "target").unwrap();
+        std::os::unix::fs::symlink("target.txt", dir.as_path().join("link.lnk")).unwrap();
+        let clink = dir
+            .as_path()
+            .join("link.lnk")
+            .to_str()
+            .and_then(|p| CString::new(p).ok())
+            .expect("valid path");
+        let sfile = open_owned(&clink, libc::O_SYMLINK | libc::O_EVTONLY);
+        let sfd = sfile.as_raw_fd();
+        let newname = CStr::from_bytes_with_nul(b"new.lnk\0").unwrap();
+        linkat_by_fd(sfd, -1, 0, dir_fd.as_raw_fd(), newname).unwrap();
+        let st = fs::symlink_metadata(dir.as_path().join("new.lnk")).unwrap();
+        assert!(st.file_type().is_symlink());
+        let link_target = fs::read_link(dir.as_path().join("new.lnk")).unwrap();
+        assert_eq!(link_target.to_str().unwrap(), "target.txt");
+
+        // Linking onto an existing name is EEXIST.
+        let err = linkat_by_fd(fd, -1, 0, dir_fd.as_raw_fd(), newname).unwrap_err();
+        assert_eq!(err.raw_os_error(), Some(libc::EEXIST));
+
+        // A stale path is refused: unlinked files keep their last known path
+        // in F_GETPATH, and a re-created file at that path would otherwise
+        // be linked instead of the descriptor's inode.  The dev/ino check
+        // catches it and reports ESTALE.
+        let gone = dir.as_path().join("gone.txt");
+        fs::write(&gone, "gone").unwrap();
+        let cgone = gone
+            .to_str()
+            .and_then(|p| CString::new(p).ok())
+            .expect("valid path");
+        let gfile = open_owned(&cgone, libc::O_EVTONLY);
+        let gfd = gfile.as_raw_fd();
+        fs::remove_file(&gone).unwrap();
+        fs::write(&gone, "replaced").unwrap();
+        let newname = CStr::from_bytes_with_nul(b"stale.txt\0").unwrap();
+        let err = linkat_by_fd(gfd, -1, 0, dir_fd.as_raw_fd(), newname).unwrap_err();
+        assert_eq!(err.raw_os_error(), Some(libc::ESTALE));
+        assert!(!dir.as_path().join("stale.txt").exists());
     }
 }

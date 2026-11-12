@@ -129,9 +129,9 @@ impl FileSystem for HelloFileSystem {
         } else {
             size as usize
         };
-        let read_end = (offset as usize) + read_size;
-        buf.extend_from_slice(&content[(offset as usize)..(read_end as usize)]);
-        w.write(buf.as_slice())?;
+        let read_end = offset + read_size;
+        buf.extend_from_slice(&content[offset..read_end]);
+        w.write_all(buf.as_slice())?;
         Ok(read_size)
     }
 
@@ -148,7 +148,7 @@ impl FileSystem for HelloFileSystem {
                 .duration_since(SystemTime::UNIX_EPOCH)
                 .unwrap()
                 .as_secs() as time_t;
-            return Ok((
+            Ok((
                 libc::stat {
                     st_dev: 0,
                     st_mode: (libc::S_IFDIR
@@ -180,7 +180,7 @@ impl FileSystem for HelloFileSystem {
                     st_qspare: [0, 0],
                 },
                 Duration::from_secs(1),
-            ));
+            ))
         } else {
             let content = "hello, fuse".as_bytes();
             let now = SystemTime::now();
@@ -188,7 +188,7 @@ impl FileSystem for HelloFileSystem {
                 .duration_since(SystemTime::UNIX_EPOCH)
                 .unwrap()
                 .as_secs() as time_t;
-            return Ok((
+            Ok((
                 libc::stat {
                     st_dev: 0,
                     st_mode: (libc::S_IFREG
@@ -220,13 +220,13 @@ impl FileSystem for HelloFileSystem {
                     st_qspare: [0, 0],
                 },
                 Duration::from_secs(1),
-            ));
+            ))
         }
     }
 
     #[allow(unused_variables)]
     fn access(&self, ctx: &Context, inode: Self::Inode, mask: u32) -> Result<()> {
-        return Ok(());
+        Ok(())
     }
 }
 

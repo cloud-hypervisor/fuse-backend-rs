@@ -1,6 +1,28 @@
 # Changelog
 ## [Unreleased]
 ### Added
+- [303](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/303): Fill in the macOS twin of the passthrough driver, turning the
+  PR #182 prototype (akitaSummer's macOS port) into a working mount on top of
+  the cross-platform framework. Reopen-for-IO goes through a hub on the
+  `O_EVTONLY` handle: `fcntl(F_GETPATH)` derives the file's current path on
+  demand (the descriptor pins the vnode, so renames are tracked) and the
+  reopen validates `(st_dev, st_ino)` against the inode's id, answering
+  `ESTALE` on mismatch so the client re-looks-up. `getdents64()` synthesizes a
+  Linux-format buffer from `fdopendir()`/`readdir()` with self-issued
+  entry-index cookies (Darwin's `d_seekoff` reads zero on APFS, `telldir()`
+  cookies are stream-local), resuming by rewinding and skipping. The xattr
+  family maps onto the fd-based `f{set,get,remove,list}xattr()` calls with
+  pass-through flags and errnos (macFUSE forwards Darwin `XATTR_*` values and
+  returns daemon errnos verbatim, so `ENOATTR` reaches macOS callers
+  correctly). Hard links derive the old path via `F_GETPATH` with the same
+  dev/ino validation. The umbrella crate re-exports `fuse_backend_rs::
+  passthrough` on macOS, and its `async-io` feature is accepted there: the
+  native async path stays Linux-only (`preadv2`/`RWF_NOWAIT`, io_uring), and
+  the async traits fall back to the default methods that delegate to the
+  synchronous handlers. A macFUSE e2e smoke test (readdir/read/write/
+  xattr/link through the mount) joins the macOS CI. `fallocate`,
+  `copy_file_range` and the `RENAME_*` flags stay `ENOSYS` (the FUSE clients
+  have fallbacks; `F_PREALLOCATE`/`fcopyfile` are future work).
 - [285](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/285): Add `uring_available()`, which tells
   whether the kernel lets the process serve FUSE over io_uring: the fuse module's `enable_uring`
   parameter is on and the process may create an io_uring. Checking it before mounting saves a
