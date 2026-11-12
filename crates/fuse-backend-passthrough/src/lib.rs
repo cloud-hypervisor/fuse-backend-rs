@@ -114,7 +114,7 @@ impl InodeData {
     }
 
     fn open_file(&self, flags: libc::c_int, proc_self_fd: &File) -> io::Result<File> {
-        self.handle.open_file(flags, proc_self_fd)
+        self.handle.open_file(flags, proc_self_fd, &self.id)
     }
 }
 

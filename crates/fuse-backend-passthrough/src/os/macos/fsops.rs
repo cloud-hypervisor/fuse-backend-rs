@@ -5,7 +5,8 @@
 //! macOS file-operation syscall shims.
 //!
 //! Implements the shims that have a portable macOS equivalent — `stat_fd`,
-//! `sync_fd`, `fstatvfs`, `fchown`, `lseek` and plain `renameat` — and answers
+//! `sync_fd`, `fstatvfs`, `fchown`, `lseek`, `getpath_by_fd` and plain
+//! `renameat` — and answers
 //! `ENOSYS` for the Linux-only ones: `fallocate` (macOS has no
 //! `fallocate(2)`), the raw `copy_file_range` syscall, `AT_EMPTY_PATH`-based
 //! hard links and the `/proc/self/fd` path behind the xattr shims.  A macOS
@@ -13,7 +14,7 @@
 //! future port can fill them with real macOS equivalents (e.g. the
 //! `f{set,get,remove,list}xattr` family and `F_PREALLOCATE`).
 
-use std::ffi::CStr;
+use std::ffi::{CStr, CString};
 use std::io;
 use std::mem::MaybeUninit;
 use std::os::unix::io::{AsRawFd, RawFd};
@@ -64,6 +65,32 @@ pub(crate) fn stat_fd(dir: &impl AsRawFd, path: Option<&CStr>) -> io::Result<fus
     } else {
         Err(io::Error::last_os_error())
     }
+}
+
+/// Get the absolute pathname of the file referenced by `fd` via
+/// `fcntl(F_GETPATH)`.
+///
+/// The descriptor pins the file's vnode, and the kernel keeps the vnode's
+/// name chain up to date, so the returned path is the file's *current* path:
+/// renames of the file, or of any directory above it, are reflected.  For a
+/// file with no remaining path (i.e. unlinked), the last known path is
+/// returned; opening it fails with `ENOENT`.  This is macOS's only way back
+/// from a descriptor to a path — there is no `/proc/self/fd`.
+pub(crate) fn getpath_by_fd(fd: &impl AsRawFd) -> io::Result<CString> {
+    // F_GETPATH requires a buffer of at least MAXPATHLEN bytes and
+    // NUL-terminates the path inside it.
+    let mut buf = vec![0u8; libc::PATH_MAX as usize];
+
+    // Safe because the kernel will only write up to PATH_MAX bytes into `buf`
+    // and we check the return value.
+    let res = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETPATH, buf.as_mut_ptr()) };
+    if res < 0 {
+        return Err(io::Error::last_os_error());
+    }
+
+    let len = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+    buf.truncate(len);
+    CString::new(buf).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
 }
 
 /// Flush the file data (and metadata, unless `datasync` is set) of `fd`.
@@ -210,4 +237,29 @@ pub(crate) fn listxattr(_fd: RawFd, _size: u32) -> io::Result<ListxattrReply> {
 /// `ENOSYS`; see [`setxattr`].
 pub(crate) fn removexattr(_fd: RawFd, _name: &CStr) -> io::Result<()> {
     Err(enosys())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use vmm_sys_util::tempdir::TempDir;
+
+    #[test]
+    fn test_getpath_by_fd() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.as_path().join("file.txt");
+        fs::write(&path, "hello").unwrap();
+
+        let file = fs::File::open(&path).unwrap();
+        let path = getpath_by_fd(&file).unwrap();
+        assert!(path.to_string_lossy().ends_with("file.txt"));
+
+        // The derived path must name the same file as the descriptor.
+        let st1 = stat_fd(&file, None).unwrap();
+        let reopened = fs::File::open(path.to_string_lossy().as_ref()).unwrap();
+        let st2 = stat_fd(&reopened, None).unwrap();
+        assert_eq!(st1.st_dev, st2.st_dev);
+        assert_eq!(st1.st_ino, st2.st_ino);
+    }
 }
