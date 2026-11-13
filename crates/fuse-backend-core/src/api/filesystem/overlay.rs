@@ -187,12 +187,7 @@ pub trait Layer: FileSystem {
         }
 
         // Also check for the unprivileged version of the xattr "user.overlay.opaque".
-        let is_opaque = check_attr(ino.into(), UNPRIVILEGED_OPAQUE_XATTR, OPAQUE_XATTR_LEN)?;
-        if is_opaque {
-            return Ok(true);
-        }
-
-        Ok(false)
+        check_attr(ino.into(), UNPRIVILEGED_OPAQUE_XATTR, OPAQUE_XATTR_LEN)
     }
 }
 
