@@ -159,6 +159,9 @@ check-macos: build-macos
 	${CARGO} test -p fuse-backend-fusedev --features="fuse-backend-fusedev/fuse-t" -- --nocapture --skip integration
 
 smoke-macos: check-macos
+	# A cfg-drifted test binary silently runs zero tests and stays green;
+	# fail the row if the passthrough integration test is not in it.
+	${CARGO} test --features="fusedev,fuse-t" --test macfuse_smoke -- --list --format terse | grep -q integration_test_macfuse_passthrough
 	${CARGO} test --features="fusedev,fuse-t" -- --nocapture
 
 docker-smoke:

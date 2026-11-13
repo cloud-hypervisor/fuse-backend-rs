@@ -40,8 +40,11 @@ fuse-backend-vfs = { path = "../fuse-backend-vfs", version = "0.14.0" }
 [features]
 default = []
 # The native asynchronous IO path builds on Linux-only syscalls
-# (`preadv2`/`RWF_NOWAIT`, io_uring), so the feature is Linux-only; enabling
-# it on other platforms fails the build.
+# (`preadv2`/`RWF_NOWAIT`, io_uring), so it is Linux-only. The umbrella crate
+# forwards `async-io` to the driver whenever it is in the build, and feature
+# forwarding cannot be platform-conditional, so the feature is accepted on the
+# other platforms and falls back to `AsyncFileSystem`'s default methods, which
+# delegate to the synchronous handlers.
 async-io = ["async-trait", "tokio/rt", "fuse-backend-core/async-io"]
 # The DAX window callbacks (`setupmapping`/`removemapping`) operate on
 # `fuse_backend_core::abi::virtio_fs` types, which are gated on core's
@@ -51,8 +54,10 @@ async-io = ["async-trait", "tokio/rt", "fuse-backend-core/async-io"]
 virtiofs = ["fuse-backend-core/virtiofs"]
 
 # `all-features = true` above means docs.rs must not cross-build the darwin
-# targets: `async-io` is Linux-only (enforced by a `compile_error!` in lib.rs)
-# and would fail every non-Linux doc build. Add them back when that port lands.
+# targets: the `virtiofs` feature turns on core's DAX callbacks
+# (`Opcode::SetupMapping`/`RemoveMapping`), which are Linux-only and fail every
+# non-Linux build. `async-io` alone would be fine since the driver falls back
+# to the synchronous handlers on darwin.
 [package.metadata.docs.rs]
 all-features = true
 targets = [

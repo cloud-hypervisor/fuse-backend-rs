@@ -18,6 +18,7 @@ use vmm_sys_util::fam::{FamStruct, FamStructWrapper};
 use super::mount_fd::{MPRResult, MountFd, MountFds, MountId};
 use super::os_compat;
 use crate::fsops::stat_fd;
+use crate::inode_store::InodeId;
 use crate::util::{openat, reopen_fd_through_proc};
 use fuse_backend_core::abi::fuse_abi as fuse;
 use fuse_backend_core::api::EMPTY_CSTR;
@@ -379,7 +380,17 @@ impl InodeHandle {
         }
     }
 
-    pub(crate) fn open_file(&self, flags: libc::c_int, proc_self_fd: &File) -> io::Result<File> {
+    /// Open the tracked file again with `flags`.
+    ///
+    /// The reopen goes through `/proc/self/fd`, which resolves to the same
+    /// inode by construction, so the inode `id` that the macOS twin needs
+    /// for its path-based reopen validation is unused here.
+    pub(crate) fn open_file(
+        &self,
+        flags: libc::c_int,
+        proc_self_fd: &File,
+        _id: &InodeId,
+    ) -> io::Result<File> {
         match self {
             InodeHandle::File(f) => reopen_fd_through_proc(f, flags, proc_self_fd),
             InodeHandle::Handle(h) => h.open(flags),

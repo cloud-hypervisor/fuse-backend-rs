@@ -49,15 +49,18 @@ use fuse_backend_core::api::{
     validate_path_component, BackendFileSystem, CURRENT_DIR_CSTR, EMPTY_CSTR, PARENT_DIR_CSTR,
     SLASH_ASCII, VFS_MAX_INO,
 };
-
-// The async-io support builds on Linux-only syscalls (`preadv2`/`RWF_NOWAIT`,
-// io_uring in the core runtime), so the whole feature stays Linux-only for
-// now; a macOS port of the async path is future work.
+// Only the non-Linux `AsyncFileSystem` fallback impl below pulls it in; the
+// Linux one lives in `async_io.rs`.
 #[cfg(all(feature = "async-io", not(target_os = "linux")))]
-compile_error!(
-    "the `async-io` feature of fuse-backend-passthrough is Linux-only \
-     (preadv2/RWF_NOWAIT, io_uring); do not enable it on this platform"
-);
+use fuse_backend_core::api::filesystem::AsyncFileSystem;
+
+// The native asynchronous IO path in `async_io.rs` builds on Linux-only
+// syscalls (`preadv2`/`RWF_NOWAIT`, io_uring in the core runtime), so it stays
+// Linux-only; a port of the native path is future work. The umbrella crate
+// forwards `async-io` to the driver whenever it is in the build, and cargo
+// cannot make feature forwarding platform-conditional, so on the other
+// platforms the feature is accepted and the `AsyncFileSystem` impl below falls
+// back to the default methods, which delegate to the synchronous handlers.
 #[cfg(all(feature = "async-io", target_os = "linux"))]
 mod async_io;
 mod config;
@@ -114,7 +117,7 @@ impl InodeData {
     }
 
     fn open_file(&self, flags: libc::c_int, proc_self_fd: &File) -> io::Result<File> {
-        self.handle.open_file(flags, proc_self_fd)
+        self.handle.open_file(flags, proc_self_fd, &self.id)
     }
 }
 
@@ -411,8 +414,10 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
 
         // macOS has no procfs, so there is no `/proc/self/fd` to reopen
         // descriptors through.  Keep a placeholder fd so the field (and
-        // `keep_fds()`) stay meaningful; every path that would actually use
-        // it is a Linux-only syscall seam and returns `ENOSYS` on macOS.
+        // `keep_fds()`) stay meaningful; no consumer remains on macOS: the
+        // reopen hub and hard links go through F_GETPATH, and setattr's
+        // by-path branches (fchmodat/utimensat) are Linux-only, with the
+        // macOS twin setting mode and timestamps on the descriptor itself.
         #[cfg(target_os = "linux")]
         let proc_self_fd = {
             // Safe because this is a constant value and a valid C string.
@@ -984,7 +989,15 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
     }
 }
 
-#[cfg(not(feature = "async-io"))]
+// `async_io.rs` provides the `BackendFileSystem` impl (and the native async
+// handlers) on Linux with the `async-io` feature. Everywhere else this impl
+// stands: under core's `async-io` the trait requires `AsyncFileSystem`, whose
+// default methods delegate to the synchronous handlers -- the pattern core's
+// `SyncFs` uses -- so an async server can still drive the driver.
+#[cfg(all(feature = "async-io", not(target_os = "linux")))]
+impl<S: BitmapSlice + Send + Sync + 'static> AsyncFileSystem for PassthroughFs<S> {}
+
+#[cfg(any(not(feature = "async-io"), not(target_os = "linux")))]
 impl<S: BitmapSlice + Send + Sync + 'static> BackendFileSystem for PassthroughFs<S> {
     fn mount(&self) -> io::Result<(Entry, u64)> {
         let entry = self.do_lookup(fuse::ROOT_ID, &CString::new(".").unwrap())?;
@@ -1434,6 +1447,57 @@ mod tests {
             let entry = fs.lookup(&ctx, ROOT_ID, &child).unwrap();
             assert_eq!(entry.inode & MAX_HOST_INO, meta.ino());
         }
+    }
+
+    #[test]
+    fn test_setattr_without_handle() {
+        use std::os::unix::fs::MetadataExt;
+
+        let source = TempDir::new().expect("Cannot create temporary directory.");
+        let child_path = TempFile::new_in(source.as_path()).expect("Cannot create temporary file.");
+        let child = CString::new(
+            child_path
+                .as_path()
+                .file_name()
+                .unwrap()
+                .to_str()
+                .expect("path to string"),
+        )
+        .unwrap();
+        let ctx = Context::default();
+        let fs_cfg = Config {
+            writeback: true,
+            do_import: true,
+            no_open: false,
+            inode_file_handles: false,
+            root_dir: source
+                .as_path()
+                .to_str()
+                .expect("source path to string")
+                .to_string(),
+            ..Default::default()
+        };
+        let fs = PassthroughFs::<()>::new(fs_cfg).unwrap();
+        fs.import().unwrap();
+        let entry = fs.lookup(&ctx, ROOT_ID, &child).unwrap();
+
+        // A chmod/touch-style request carries no handle, so the daemon must
+        // set mode and timestamps on the tracked inode alone.  On macOS that
+        // goes through fchmod()/futimens() on the pinned O_EVTONLY
+        // descriptor; resolving the descriptor by path — the Linux
+        // /proc/self/fd way — fails ENOTDIR against the placeholder dirfd.
+        let (mut attr, _) = fs.getattr(&ctx, entry.inode, None).unwrap();
+        attr.st_mode = 0o600;
+        attr.st_mtime = 12345;
+        attr.st_mtime_nsec = 0;
+        let valid = SetattrValid::MODE | SetattrValid::MTIME;
+        fs.setattr(&ctx, entry.inode, attr, None, valid).unwrap();
+
+        let meta = child_path.as_file().metadata().unwrap();
+        assert_eq!(meta.mode() & 0o7777, 0o600);
+        assert_eq!(meta.mtime(), 12345);
+
+        fs.forget(&ctx, entry.inode, 1);
     }
 
     #[test]

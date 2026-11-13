@@ -92,9 +92,10 @@ pub use fuse_backend_core::{bytes_to_cstr, encode_io_error_kind, Error, Result};
 
 pub use self::common::*;
 
-// The drivers are Linux-only, exactly like the in-crate modules they replace.
-// They are bundled with the `fusedev`/`virtiofs` transports and can also be
-// selected on their own via the `passthrough`/`overlayfs` features.
+// The overlayfs driver is Linux-only, exactly like the in-crate module it
+// replaces. The passthrough driver also builds on macOS since the
+// fd+path port; it is bundled with the `fusedev`/`virtiofs` transports and
+// can also be selected on its own via the `passthrough` feature.
 #[cfg(all(
     any(feature = "fusedev", feature = "virtiofs", feature = "overlayfs"),
     target_os = "linux"
@@ -102,7 +103,7 @@ pub use self::common::*;
 pub use fuse_backend_overlayfs as overlayfs;
 #[cfg(all(
     any(feature = "fusedev", feature = "virtiofs", feature = "passthrough"),
-    target_os = "linux"
+    any(target_os = "linux", target_os = "macos")
 ))]
 pub use fuse_backend_passthrough as passthrough;
 pub mod transport;

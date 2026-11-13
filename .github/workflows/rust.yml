@@ -121,6 +121,10 @@ jobs:
 
   Macos-CI:
     runs-on: macos-latest
+    # The e2e mounts a fuse-t filesystem; a hung request through a hard NFS
+    # mount never returns, and without a timeout the job sits for GitHub's
+    # 360-minute default.
+    timeout-minutes: 30
     steps:
       - name: Install macfuse
         run: |
