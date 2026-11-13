@@ -388,9 +388,16 @@ fn fuse_kern_mount(mountpoint: &Path, fsname: &str, subtype: &str, rd_only: bool
                     })?;
                     c_args.push(c_arg);
                 }
-                execv(&prog_path, &c_args)
-                    .map_err(|e| SessionFailure(format!("exec mount_macfuse failed {:?}", e)))?;
-                panic!("never arrive here")
+                // execv()'s Ok type is `Infallible`: a successful exec
+                // replaces the child's image and control never comes back,
+                // so only the error arm can run. unwrap_err() keeps the
+                // child on the session's error path; a `?` here would make
+                // the following code unreachable (rustc 1.100 rejects that).
+                let exec_err = execv(&prog_path, &c_args).unwrap_err();
+                return Err(SessionFailure(format!(
+                    "exec mount_macfuse failed {:?}",
+                    exec_err
+                )));
             }
         }
     };
