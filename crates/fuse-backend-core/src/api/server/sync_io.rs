@@ -1050,7 +1050,20 @@ impl<F: FileSystem + Sync> Server<F> {
                         ),
                         None,
                     )
-                } else if minor < KERNEL_MINOR_VERSION_INIT_22_OUT_SIZE {
+                } else if cfg!(target_os = "macos") || minor < KERNEL_MINOR_VERSION_INIT_22_OUT_SIZE
+                {
+                    // macFUSE's fuse_init_out never grew past the 24-byte
+                    // FUSE_COMPAT_22 shape: its libfuse replies
+                    // `arg->minor < 5 ? 8 : sizeof(outarg)` however new a
+                    // minor version the client advertises.  That reply size
+                    // is wire-visible -- fuse-t 1.2.x reads it to tell
+                    // macFUSE-profile daemons from libfuse3 ones, and a
+                    // 64-byte Linux-shaped reply makes it negotiate the
+                    // libfuse3 profile and parse every later reply with
+                    // Linux field offsets, garbling our macFUSE-shaped
+                    // fuse_attr (CI caught it reading a directory's mode as
+                    // Gid).  So on macOS the full-struct branch below is
+                    // unreachable by design.
                     ctx.reply_ok(
                         Some(
                             *<[u8; FUSE_COMPAT_22_INIT_OUT_SIZE]>::from_slice(
