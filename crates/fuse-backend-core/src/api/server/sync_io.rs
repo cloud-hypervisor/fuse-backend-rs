@@ -763,14 +763,23 @@ impl<F: FileSystem + Sync> Server<F> {
             ServerUtil::get_message_body(&mut ctx.r, &ctx.in_header, size_of::<SetxattrIn>())?;
 
         // The name and value and encoded one after another and separated by a '\0' character.
-        let split_pos = buf
-            .iter()
-            .position(|c| *c == b'\0')
-            .map(|p| p + 1)
-            .ok_or(Error::MissingParameter)?;
+        let split_pos = match buf.iter().position(|c| *c == b'\0').map(|p| p + 1) {
+            Some(p) => p,
+            // A fully-received request that fails validation must still be
+            // answered: FUSE has no request timeout, so dropping it blocks
+            // the client forever (an uninterruptible sleep on /dev/fuse, a
+            // permanent stall on a hard-mount transport such as fuse-t).
+            None => {
+                let _ = ctx.reply_error(io::Error::from_raw_os_error(libc::EINVAL));
+                return Err(Error::MissingParameter);
+            }
+        };
         let (name, value) = buf.split_at(split_pos);
 
         if size != value.len() as u32 {
+            // Same as above: the message was received in full, so answer it
+            // even though it fails validation.
+            let _ = ctx.reply_error(io::Error::from_raw_os_error(libc::EINVAL));
             return Err(Error::InvalidXattrSize((size, value.len())));
         }
         let name = bytes_to_cstr(name).map_err(|e| {
