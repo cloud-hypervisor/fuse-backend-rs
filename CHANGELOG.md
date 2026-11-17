@@ -45,7 +45,7 @@
   `BackingFiles` trait compiling. Linux behavior is unchanged
   (the seams are 1:1 delegations), and `make build-macos`/`check-macos` grow
   matching rows for the crate.
-- [NNN](link): Symmetrize `fuse-backend-core`'s per-OS ABIs and un-gate the
+- [302](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/302): Symmetrize `fuse-backend-core`'s per-OS ABIs and un-gate the
   server code that only carried `target_os` predicates because the macOS ABI
   lacked symbols: the macOS ABI now defines the Linux protocol values
   macFUSE never sends (opcodes 44..47, `Rename2In`/`LseekIn`/`LseekOut`,
@@ -215,6 +215,23 @@
   and no code in the workspace relied on it.
 
 ### Fixed
+- [303](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/303): The sync server answers a SETXATTR request it received in full
+  but cannot decode — no NUL separator in the attribute name, or a value size
+  that disagrees with the body — with `EINVAL` instead of dropping it. FUSE
+  has no request timeout, so a dropped request hung the client forever: an
+  uninterruptible sleep against `/dev/fuse` on Linux, and a permanent stall
+  under fuse-t's hard NFS mount. (The async server dispatches SETXATTR to the
+  same shared handler, so it had the identical silent exits; fixing the sync
+  handler covers both serving paths.)
+- [303](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/303): The macOS `INIT` reply keeps the 24-byte macFUSE shape for any client
+  version, instead of growing to the full 64-byte Linux struct for clients
+  that advertise a newer minor. macFUSE's own `fuse_init_out` never grew past
+  the `FUSE_COMPAT_22` shape, and the reply size is wire-visible: fuse-t 1.2.x
+  reads it to classify the daemon's client family, and a Linux-shaped reply
+  made it negotiate its libfuse3 profile and parse every later reply with
+  Linux field offsets, tearing the mount down right after the handshake.
+  macFUSE kernels (minor 19) already received the 24-byte reply, so only such
+  probed transports are answered differently.
 - A shared mmap of a file opened with O_DIRECT on a `PassthroughFs` mount failed with ENODEV,
   because the open replies `DIRECT_IO`. `PassthroughFs` and the `Vfs` defaults now negotiate the
   new `FsOptions::DIRECT_IO_ALLOW_MMAP` when the kernel offers it, so the kernel maps such a file
