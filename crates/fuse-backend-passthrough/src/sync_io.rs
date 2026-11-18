@@ -768,6 +768,12 @@ impl<S: BitmapSlice + Send + Sync> FileSystem for PassthroughFs<S> {
                 opts |= FsOptions::PASSTHROUGH;
                 self.passthrough.store(true, Ordering::Relaxed);
             }
+        } else if self.kernel_passthrough.is_some() {
+            warn!(
+                "fuse: INIT doesn't offer kernel passthrough, serving IO in the daemon. It needs \
+                 Linux 6.9+ with CONFIG_FUSE_PASSTHROUGH, and a Vfs needs FsOptions::PASSTHROUGH \
+                 in its out_opts"
+            );
         }
 
         Ok(opts)
