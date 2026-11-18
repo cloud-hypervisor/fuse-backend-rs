@@ -169,10 +169,12 @@ jobs:
           prepare: |
             # rustup.sh needs curl.
             pkg install -y curl gmake
+            # The fusedev tests mount through fusefs(5).
+            kldload -n fusefs
             # rustup keeps the VM on the latest stable toolchain, like the
             # Linux rows, instead of the quarterly pkg snapshot.
             fetch https://sh.rustup.rs -o /tmp/rustup.sh
-            sh /tmp/rustup.sh -y --profile minimal --component rustfmt
+            sh /tmp/rustup.sh -y --profile minimal --component clippy,rustfmt
           run: |
             . $HOME/.cargo/env
             gmake check-freebsd
