@@ -13,6 +13,11 @@ pub mod fuse_abi;
 #[path = "fuse_abi_macos.rs"]
 pub mod fuse_abi;
 
+/// FreeBSD Fuse Application Binary Interfaces.
+#[cfg(target_os = "freebsd")]
+#[path = "fuse_abi_freebsd.rs"]
+pub mod fuse_abi;
+
 #[cfg(feature = "virtiofs")]
 pub mod virtio_fs;
 

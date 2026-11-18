@@ -212,12 +212,14 @@ pub(crate) fn is_whiteout(st: stat64) -> bool {
 // spellings in one pattern trips the compiler's unreachable-pattern lint
 // there; macOS keeps them distinct, its xattr stack answers ENOTSUP, and
 // its getxattr reports a missing attribute as ENOATTR (where Linux says
-// ENODATA).
+// ENODATA). FreeBSD has no ENODATA at all: its kernels report a missing
+// extended attribute as ENOATTR, like Darwin's.
 fn is_xattr_unsupported(raw_error: libc::c_int) -> bool {
     #[cfg(target_os = "linux")]
     let unsupported = [libc::ENODATA, libc::EOPNOTSUPP, libc::ENOSYS];
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "freebsd"))]
     let unsupported = [
+        #[cfg(target_os = "macos")]
         libc::ENODATA,
         libc::ENOATTR,
         libc::EOPNOTSUPP,
@@ -235,6 +237,13 @@ pub(crate) fn to_cstring(name: &str) -> Result<CString> {
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    // The errno a layer answers for a missing xattr, in the platform's
+    // vocabulary: Linux reports ENODATA, the BSDs ENOATTR.
+    #[cfg(target_os = "linux")]
+    const XATTR_ABSENT: libc::c_int = libc::ENODATA;
+    #[cfg(not(target_os = "linux"))]
+    const XATTR_ABSENT: libc::c_int = libc::ENOATTR;
 
     // Test double for a Layer: getattr reports a file of <mode> and getxattr
     // answers from a closure, so is_opaque()'s handling of the getxattr
@@ -291,7 +300,7 @@ mod tests {
     // disabled answers ENOSYS. Such a filesystem can never be opaque.
     #[test]
     fn test_is_opaque_xattr_unsupported() {
-        for errno in [libc::ENODATA, libc::EOPNOTSUPP, libc::ENOTSUP, libc::ENOSYS] {
+        for errno in [XATTR_ABSENT, libc::EOPNOTSUPP, libc::ENOTSUP, libc::ENOSYS] {
             let opaque =
                 is_opaque_with(libc::S_IFDIR, |_| Err(Error::from_raw_os_error(errno))).unwrap();
             assert!(!opaque, "errno {} must mean not opaque", errno);
@@ -311,7 +320,7 @@ mod tests {
                 if probe == cname.as_c_str() {
                     Ok(GetxattrReply::Value(b"y".to_vec()))
                 } else {
-                    Err(Error::from_raw_os_error(libc::ENODATA))
+                    Err(Error::from_raw_os_error(XATTR_ABSENT))
                 }
             })
             .unwrap();
@@ -341,7 +350,7 @@ mod tests {
     #[test]
     fn test_is_opaque_rejects_non_directory() {
         let e = is_opaque_with(libc::S_IFREG, |_| {
-            Err(Error::from_raw_os_error(libc::ENODATA))
+            Err(Error::from_raw_os_error(XATTR_ABSENT))
         })
         .unwrap_err();
         assert_eq!(e.raw_os_error(), Some(libc::ENOTDIR));
