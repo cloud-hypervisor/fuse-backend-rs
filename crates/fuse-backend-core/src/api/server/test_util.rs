@@ -122,6 +122,7 @@ pub(crate) fn request_bodies() -> Vec<(Opcode, Vec<u8>)> {
         (Opcode::Rename2, body(Rename2In::default(), b"old\0new\0")),
         (Opcode::Lseek, body(LseekIn::default(), &[])),
         (Opcode::CopyFileRange, body(CopyFileRangeIn::default(), &[])),
+        (Opcode::Statx, body(StatxIn::default(), &[])),
         #[cfg(feature = "virtiofs")]
         (Opcode::SetupMapping, body(SetupmappingIn::default(), &[])),
         #[cfg(feature = "virtiofs")]

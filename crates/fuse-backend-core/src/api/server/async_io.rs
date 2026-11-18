@@ -19,7 +19,7 @@ use crate::abi::fuse_abi::{
     stat64, AccessIn, AttrOut, CopyFileRangeIn, CreateIn, EntryOut, FallocateIn, FlushIn,
     FsOptions, FsyncIn, GetattrIn, GetxattrIn, GetxattrOut, Kstatfs, LinkIn, LseekIn, LseekOut,
     MkdirIn, MknodIn, Opcode, OpenIn, OpenOut, OutHeader, ReadIn, ReleaseIn, Rename2In, RenameIn,
-    SetattrIn, SetattrValid, SetxattrIn, WriteIn, WriteOut, FATTR_FH, GETATTR_FH,
+    SetattrIn, SetattrValid, SetxattrIn, StatxIn, WriteIn, WriteOut, FATTR_FH, GETATTR_FH,
     KERNEL_MINOR_VERSION_LOOKUP_NEGATIVE_ENTRY_ZERO, READ_LOCKOWNER, WRITE_CACHE, WRITE_LOCKOWNER,
 };
 use crate::api::filesystem::FsCacheReqHandler;
@@ -230,6 +230,7 @@ impl<F: AsyncFileSystem + Sync> Server<F> {
             x if x == Opcode::Rename2 as u32 => self.async_rename2(ctx).await,
             x if x == Opcode::Lseek as u32 => self.async_lseek(ctx).await,
             x if x == Opcode::CopyFileRange as u32 => self.async_copy_file_range(ctx).await,
+            x if x == Opcode::Statx as u32 => self.async_statx(ctx).await,
             #[cfg(feature = "virtiofs")]
             x if x == Opcode::SetupMapping as u32 => self.setupmapping(ctx, vu_req),
             #[cfg(feature = "virtiofs")]
@@ -307,6 +308,36 @@ impl<F: AsyncFileSystem + Sync> Server<F> {
             .await;
 
         ctx.async_handle_attr_result(result).await
+    }
+
+    async fn async_statx<S: BitmapSlice, W: Writer>(
+        &self,
+        ctx: &mut SrvContext<'_, F, S, W>,
+    ) -> Result<usize> {
+        let StatxIn {
+            getattr_flags,
+            fh,
+            sx_flags,
+            sx_mask,
+            ..
+        } = ctx.r.read_obj().map_err(Error::DecodeMessage)?;
+        let handle = if (getattr_flags & GETATTR_FH) != 0 {
+            Some(fh.into())
+        } else {
+            None
+        };
+
+        match self
+            .fs
+            .async_statx(ctx.context(), ctx.nodeid(), handle, sx_flags, sx_mask)
+            .await
+        {
+            Ok(res) => {
+                ctx.async_reply_ok(Some(ServerUtil::statx_out(res)), None)
+                    .await
+            }
+            Err(e) => ctx.async_reply_error(e).await,
+        }
     }
 
     async fn async_setattr<S: BitmapSlice, W: Writer>(
@@ -1194,7 +1225,10 @@ mod tests {
         MockFS, NoDax, TestWriter, OVERSIZED_OPCODES,
     };
     use super::*;
-    use crate::abi::fuse_abi::{statvfs64, Dirent, InHeader, RENAME_NOREPLACE, S_IFCHR};
+    use crate::abi::fuse_abi::{
+        statvfs64, Dirent, InHeader, Statx, StatxOut, RENAME_NOREPLACE, STATX_BASIC_STATS,
+        STATX_BTIME, S_IFCHR,
+    };
     use crate::api::filesystem::{Context, FileSystem, GetxattrReply, ListxattrReply, OpenOptions};
     use crate::async_runtime;
 
@@ -1971,8 +2005,8 @@ mod tests {
 
     /// Serves a request for `nodeid` with the sync and with the async server, checks that both
     /// send the same reply, and returns it.
-    async fn serve<T: ByteValued>(
-        server: &Server<DirFs>,
+    async fn serve<F: AsyncFileSystem + Sync, T: ByteValued>(
+        server: &Server<F>,
         opcode: Opcode,
         nodeid: u64,
         body: T,
@@ -1981,8 +2015,8 @@ mod tests {
     }
 
     /// Like `serve()`, with the request body in `body`.
-    async fn serve_bytes(
-        server: &Server<DirFs>,
+    async fn serve_bytes<F: AsyncFileSystem + Sync>(
+        server: &Server<F>,
         opcode: Opcode,
         nodeid: u64,
         body: &[u8],
@@ -2049,6 +2083,64 @@ mod tests {
             size,
             ..Default::default()
         }
+    }
+
+    /// Answers STATX with its arguments in the reply.
+    struct StatxFs;
+
+    impl FileSystem for StatxFs {
+        type Inode = u64;
+        type Handle = u64;
+
+        fn statx(
+            &self,
+            _ctx: &Context,
+            inode: u64,
+            handle: Option<u64>,
+            flags: u32,
+            mask: u32,
+        ) -> io::Result<(Statx, Duration)> {
+            let stat = Statx {
+                mask,
+                ino: inode,
+                size: handle.unwrap_or(0),
+                attributes: flags.into(),
+                ..Default::default()
+            };
+            Ok((stat, Duration::new(3, 4)))
+        }
+    }
+
+    impl AsyncFileSystem for StatxFs {}
+
+    #[tokio::test]
+    async fn test_statx() {
+        // AT_STATX_FORCE_SYNC, which libc doesn't define for macOS.
+        const SX_FLAGS: u32 = 0x2000;
+        let statx_in = |getattr_flags| StatxIn {
+            getattr_flags,
+            fh: 9,
+            sx_flags: SX_FLAGS,
+            sx_mask: STATX_BASIC_STATS | STATX_BTIME,
+            ..Default::default()
+        };
+        let server = Server::new(StatxFs);
+        for (getattr_flags, size) in [(GETATTR_FH, 9), (0, 0)] {
+            let reply = serve(&server, Opcode::Statx, 5, statx_in(getattr_flags)).await;
+            let mut out = StatxOut::default();
+            out.as_mut_slice()
+                .copy_from_slice(&reply[size_of::<OutHeader>()..]);
+            assert_eq!((out.attr_valid, out.attr_valid_nsec), (3, 4));
+            let sx = out.stat;
+            assert_eq!(sx.mask, STATX_BASIC_STATS | STATX_BTIME);
+            assert_eq!((sx.ino, sx.size), (5, size));
+            assert_eq!(sx.attributes, u64::from(SX_FLAGS));
+        }
+
+        // DirFs keeps the default, which answers ENOSYS.
+        let server = Server::new(DirFs::default());
+        let reply = serve(&server, Opcode::Statx, 5, statx_in(0)).await;
+        assert_eq!(reply_error(&reply), -libc::ENOSYS);
     }
 
     #[tokio::test]

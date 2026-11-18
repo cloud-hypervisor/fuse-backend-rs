@@ -23,6 +23,7 @@ use std::mem::size_of;
 #[cfg(all(target_os = "linux", feature = "fusedev-uring"))]
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::time::Duration;
 
 use crate::abi::fuse_abi::*;
 use crate::api::filesystem::{Context, FileSystem, ZeroCopyReader, ZeroCopyWriter};
@@ -369,6 +370,16 @@ impl ServerUtil {
         Err(Error::DecodeMessage(std::io::Error::from_raw_os_error(
             libc::EINVAL,
         )))
+    }
+
+    /// The STATX reply for what `FileSystem::statx()` returned.
+    fn statx_out((stat, timeout): (Statx, Duration)) -> StatxOut {
+        StatxOut {
+            attr_valid: timeout.as_secs(),
+            attr_valid_nsec: timeout.subsec_nanos(),
+            stat,
+            ..Default::default()
+        }
     }
 }
 
