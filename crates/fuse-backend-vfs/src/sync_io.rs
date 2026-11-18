@@ -673,6 +673,21 @@ impl FileSystem for Vfs {
         })
     }
 
+    fn poll(
+        &self,
+        ctx: &Context,
+        inode: VfsInode,
+        handle: u64,
+        khandle: u64,
+        flags: u32,
+        events: u32,
+    ) -> Result<u32> {
+        match self.get_real_rootfs(inode)? {
+            (Left(fs), idata) => fs.poll(ctx, idata.ino(), handle, khandle, flags, events),
+            (Right(fs), idata) => fs.poll(ctx, idata.ino(), handle, khandle, flags, events),
+        }
+    }
+
     #[inline]
     fn id_remap(&self, ctx: &mut Context) -> Result<()> {
         // Without an inode there is no way to identify the target mount, so

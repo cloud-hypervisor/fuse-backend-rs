@@ -1325,6 +1325,18 @@ mod tests {
             attr.ino = 1;
             Ok((attr.into(), Duration::from_secs(1)))
         }
+        // Returns the inode and the kernel handle it gets.
+        fn poll(
+            &self,
+            _ctx: &Context,
+            inode: Self::Inode,
+            _handle: Self::Handle,
+            khandle: Self::Handle,
+            _flags: u32,
+            _events: u32,
+        ) -> Result<u32> {
+            Ok((inode << 16 | khandle) as u32)
+        }
     }
 
     pub(crate) struct FakeFileSystemTwo {}
@@ -1730,6 +1742,17 @@ mod tests {
             .getattr(&ctx, VfsInode(0x100_0000_0000_0001), None)
             .unwrap();
         assert_eq!(stat.st_ino, 0x100_0000_0000_0001);
+    }
+
+    #[test]
+    fn test_vfs_poll() {
+        let vfs = Vfs::new(VfsOptions::default());
+        let ctx = Context::new();
+        vfs.mount(Box::new(FakeFileSystemOne {}), "/x").unwrap();
+
+        // The mounted file system gets its own inode number and the kernel's handle.
+        let polled = vfs.poll(&ctx, VfsInode(0x100_0000_0000_0001), 0, 7, 0, 0);
+        assert_eq!(polled.unwrap(), 1 << 16 | 7);
     }
 
     #[test]
