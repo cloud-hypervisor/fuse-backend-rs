@@ -14,6 +14,7 @@
 use std::ffi::CString;
 use std::future::Future;
 use std::io;
+use std::os::unix::fs::FileExt;
 use std::pin::Pin;
 use std::sync::mpsc::channel;
 use std::sync::Arc;
@@ -105,10 +106,15 @@ impl AsyncZeroCopyWriter for ReplyBuf {
     }
 }
 
-/// The payload of a WRITE. `native` records whether the native asynchronous path wrote it.
+/// The payload of a WRITE. `inline` scripts the first `read_to()`, the inline attempt when the
+/// pool is enabled: fail with an errno, or write a part through another descriptor of the file,
+/// like a page cache that takes only that part. `reads` records the count and offset of each
+/// `read_to()`, and `native` whether the native asynchronous path wrote a part.
 struct Payload {
     data: Vec<u8>,
     pos: usize,
+    inline: Option<Result<(usize, std::fs::File), i32>>,
+    reads: Vec<(usize, u64)>,
     native: bool,
 }
 
@@ -117,8 +123,21 @@ impl Payload {
         Payload {
             data: data.to_vec(),
             pos: 0,
+            inline: None,
+            reads: Vec::new(),
             native: false,
         }
+    }
+
+    fn inline(data: &[u8], inline: Result<(usize, std::fs::File), i32>) -> Self {
+        Payload {
+            inline: Some(inline),
+            ..Payload::new(data)
+        }
+    }
+
+    fn would_block(data: &[u8]) -> Self {
+        Payload::inline(data, Err(libc::EAGAIN))
     }
 }
 
@@ -138,11 +157,22 @@ impl ZeroCopyReader for Payload {
         count: usize,
         off: u64,
     ) -> io::Result<usize> {
-        let n = std::cmp::min(count, self.data.len() - self.pos);
-        // Safe because the slice doesn't outlive `self.data`.
-        let slice =
-            unsafe { FileVolatileSlice::from_raw_ptr(self.data[self.pos..].as_mut_ptr(), n) };
-        let n = f.write_at_volatile(slice, off)?;
+        self.reads.push((count, off));
+        let n = match self.inline.take() {
+            Some(Err(errno)) => return Err(io::Error::from_raw_os_error(errno)),
+            Some(Ok((part, file))) => {
+                file.write_all_at(&self.data[self.pos..self.pos + part], off)?;
+                part
+            }
+            None => {
+                let n = std::cmp::min(count, self.data.len() - self.pos);
+                // Safe because the slice doesn't outlive `self.data`.
+                let slice = unsafe {
+                    FileVolatileSlice::from_raw_ptr(self.data[self.pos..].as_mut_ptr(), n)
+                };
+                f.write_at_volatile(slice, off)?
+            }
+        };
         self.pos += n;
         Ok(n)
     }
@@ -248,6 +278,8 @@ fn test_read_cache_misses() {
     }
 }
 
+/// With the pool, a WRITE tries inline first and the pool writes what would block. Without it,
+/// the native path writes it all.
 #[test]
 fn test_writes() {
     let flags = libc::O_RDWR as u32;
@@ -259,17 +291,57 @@ fn test_writes() {
         fs.enable_async_thread_pool(pool);
         std::fs::write(&path, b"").unwrap();
         let payload = pattern(100_000);
-        let mut r = Payload::new(&payload);
+        let mut r = Payload::would_block(&payload);
         let n = async_runtime::block_on(fs.async_write(
             &ctx, inode, handle, &mut r, 100_000, 10, None, false, flags, 0,
         ))
         .unwrap();
         assert_eq!(n, payload.len());
         assert_eq!(r.native, !pool);
+        assert_eq!(r.inline.is_none(), pool);
         let written = std::fs::read(&path).unwrap();
         assert_eq!(&written[..10], &[0u8; 10]);
         assert!(written[10..] == payload[..], "pool {}", pool);
     }
+}
+
+/// The pool writes what the inline attempt left, and after a file rejects non-blocking writes,
+/// its handle doesn't try inline again. The pool copies the payload with offset 0, the inline
+/// attempt with the file offset.
+#[test]
+fn test_write_nowait() {
+    let flags = libc::O_RDWR as u32;
+    let (fs, dir, inode, handle) = setup(b"", FsOptions::empty(), flags);
+    fs.enable_async_thread_pool(true);
+    let ctx = context();
+    let path = dir.as_path().join("file");
+    let payload = pattern(5000);
+    let write = |r: &mut Payload| {
+        let n = async_runtime::block_on(
+            fs.async_write(&ctx, inode, handle, r, 5000, 10, None, false, flags, 0),
+        )
+        .unwrap();
+        assert_eq!(n, 5000);
+        assert!(!r.native);
+        assert!(std::fs::read(&path).unwrap()[10..] == payload[..]);
+    };
+
+    let mut r = Payload::would_block(&payload);
+    write(&mut r);
+    assert_eq!(r.reads, [(5000, 10), (5000, 0)]);
+
+    std::fs::write(&path, b"").unwrap();
+    let file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+    let mut r = Payload::inline(&payload, Ok((3000, file)));
+    write(&mut r);
+    assert_eq!(r.reads, [(5000, 10), (2000, 0)]);
+
+    let mut r = Payload::inline(&payload, Err(libc::EOPNOTSUPP));
+    write(&mut r);
+    assert_eq!(r.reads, [(5000, 10), (5000, 0)]);
+    let mut r = Payload::new(&payload);
+    write(&mut r);
+    assert_eq!(r.reads, [(5000, 0)]);
 }
 
 /// A WRITE_KILL_PRIV write runs the synchronous handler, on a pool thread with the pool enabled.
@@ -364,7 +436,7 @@ fn test_dropped_write() {
     let ctx = context();
     let path = dir.as_path().join("file");
 
-    let mut r = Payload::new(b"old");
+    let mut r = Payload::would_block(b"old");
     with_busy_pool(async {
         let mut write =
             Box::pin(fs.async_write(&ctx, inode, handle, &mut r, 3, 0, None, false, flags, 0));

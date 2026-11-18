@@ -25,11 +25,12 @@
 //!
 //! The thread pool also serves READ and WRITE when their IO would block the
 //! runtime thread. These are the relayed READ and WRITE requests, and on the
-//! tokio runtime also READ cache misses and every WRITE. A pool thread runs
-//! the synchronous handler on its own copy of the data, see `read_on_pool()`
-//! and `write_on_pool()`. Without the thread pool, a WRITE is a `pwritev()`
-//! on the runtime thread with either runtime, except for zero-copy data, which
-//! the transport writes to the file, see `async_write()`.
+//! tokio runtime also READ cache misses and WRITE requests that would block.
+//! A pool thread runs the synchronous handler on its own copy of the data,
+//! see `read_on_pool()` and `write_on_pool()`. Without the thread pool, a
+//! WRITE is a `pwritev()` on the runtime thread with either runtime, except
+//! for zero-copy data, which the transport writes to the file, see
+//! `async_write()`.
 //!
 //! # Runtime requirement
 //!
@@ -105,11 +106,12 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
     /// requests that would otherwise block the runtime thread. These are the
     /// O_DIRECT and WRITE_KILL_PRIV requests, which they relay to the
     /// synchronous handlers, and on the tokio runtime also READ cache misses
-    /// and every WRITE. On a file system without `RWF_NOWAIT`, such as tmpfs,
-    /// overlayfs or FUSE, every READ counts as a cache miss. Pool threads
-    /// can't access the transport buffers, so the data takes one more copy.
-    /// With io_uring, cache misses and WRITE requests stay on native
-    /// asynchronous IO.
+    /// and WRITE requests that would block. On a file system without
+    /// `RWF_NOWAIT`, such as tmpfs, overlayfs or FUSE, every READ counts as a
+    /// cache miss, and on ext4 or tmpfs every WRITE counts as one that would
+    /// block. Pool threads can't access the transport buffers, so the data
+    /// takes one more copy. With io_uring, cache misses and WRITE requests
+    /// stay on native asynchronous IO.
     ///
     /// If a request future is dropped, for example for a takeover, a request
     /// that no pool thread has started yet doesn't run. One that already runs
@@ -210,22 +212,47 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
                     served += n;
                     offset += n as u64;
                 }
-                Err(e)
-                    if matches!(
-                        e.raw_os_error(),
-                        Some(libc::EAGAIN)
-                            | Some(libc::EINVAL)
-                            | Some(libc::ENOSYS)
-                            | Some(libc::EOPNOTSUPP)
-                    ) =>
-                {
-                    return Ok((served, true));
-                }
+                Err(e) if nowait_fallback(&e) => return Ok((served, true)),
                 Err(e) => return Err(e),
             }
         }
 
         Ok((served, false))
+    }
+
+    /// Try to serve a buffered WRITE request inline with `pwritev2(RWF_NOWAIT)`,
+    /// like `read_nowait()` does for READ, before the tokio runtime hands it
+    /// to the thread pool. On tokio-uring, io_uring makes the same attempt
+    /// itself.
+    ///
+    /// Returns the number of bytes it wrote, and the pool writes the rest.
+    /// XFS and btrfs take most writes this way, and fail with `EAGAIN` the
+    /// ones that would wait, for example for a timestamp update or dirty page
+    /// throttling. ext4 and tmpfs fail every one with `EOPNOTSUPP`, so after
+    /// the first the handle skips the attempt.
+    fn write_nowait(
+        &self,
+        data: &Arc<HandleData>,
+        r: &mut (dyn AsyncZeroCopyReader + Send),
+        count: usize,
+        offset: u64,
+        flags: u32,
+    ) -> io::Result<usize> {
+        if data.no_nowait_write.load(Ordering::Relaxed) {
+            return Ok(0);
+        }
+        let fd = data.borrow_fd();
+        // Hold the guard over the write, like `read_nowait()`.
+        let _flags_guard = self.ensure_file_flags(data, &fd, flags)?;
+        match r.read_to(&mut NowaitFile { fd }, count, offset) {
+            Err(e) if nowait_fallback(&e) => {
+                if e.raw_os_error() == Some(libc::EOPNOTSUPP) {
+                    data.no_nowait_write.store(true, Ordering::Relaxed);
+                }
+                Ok(0)
+            }
+            res => res,
+        }
     }
 }
 
@@ -320,13 +347,13 @@ impl<S: BitmapSlice + Send + Sync + 'static> PassthroughFs<S> {
     /// the pool thread never accesses the transport buffer behind `r`, which
     /// the request owns, see `read_on_pool()`. If this future is dropped
     /// before a pool thread starts the WRITE, it doesn't run, and one that
-    /// already runs finishes, see `run_on_pool()`.
+    /// already runs finishes, see `run_on_pool()`. `data` keeps the file
+    /// descriptor open until the write returns.
     #[allow(clippy::too_many_arguments)]
     async fn write_on_pool(
         fs: Arc<Self>,
         ctx: &Context,
-        inode: Inode,
-        handle: Handle,
+        data: Arc<HandleData>,
         r: &mut (dyn AsyncZeroCopyReader + Send),
         size: u32,
         offset: u64,
@@ -336,7 +363,6 @@ impl<S: BitmapSlice + Send + Sync + 'static> PassthroughFs<S> {
         let mut buf = PoolBuf::new(size as usize)?;
         r.read_to(&mut PayloadSink(&mut buf), size as usize, 0)?;
         Self::run_on_pool(fs, ctx, move |fs, _ctx| {
-            let data = fs.get_data(handle, inode, libc::O_RDWR)?;
             fs.do_write(&data, &mut buf, size, offset, flags, fuse_flags, true)
         })
         .await
@@ -417,73 +443,69 @@ impl<F: Future> Future for SendZeroCopyFuture<F> {
     }
 }
 
-/// A read-only view of a handle's fd that serves positioned reads with
-/// `preadv2()` and the `RWF_NOWAIT` flag.
+/// A view of a handle's fd that serves positioned reads and writes with
+/// `preadv2()` and `pwritev2()` and the `RWF_NOWAIT` flag.
 ///
-/// `RWF_NOWAIT` copies whatever the page cache already holds and fails with
-/// `EAGAIN` as soon as the read would have to wait for IO, so an inline read
-/// through this adapter never blocks the runtime thread. Only the positioned
-/// read side of [`FileReadWriteVolatile`] is implemented; the write side is
-/// out of scope for the READ fast path and always fails with `EINVAL`.
+/// With `RWF_NOWAIT`, a read copies what the page cache holds and a write
+/// goes to the page cache, and both fail with `EAGAIN` as soon as they would
+/// have to wait, so IO through this adapter never blocks the runtime thread.
+/// The unpositioned methods of [`FileReadWriteVolatile`] always fail with
+/// `EINVAL`.
 struct NowaitFile<'a> {
     fd: BorrowedFd<'a>,
 }
 
-impl FileReadWriteVolatile for NowaitFile<'_> {
-    fn read_volatile(&mut self, _slice: FileVolatileSlice) -> io::Result<usize> {
-        Err(io::Error::from_raw_os_error(libc::EINVAL))
+/// Whether IO that failed with `RWF_NOWAIT` can go on with IO that may block,
+/// because it would have blocked or the file or kernel doesn't take the flag.
+fn nowait_fallback(e: &io::Error) -> bool {
+    matches!(
+        e.raw_os_error(),
+        Some(libc::EAGAIN | libc::EINVAL | libc::ENOSYS | libc::EOPNOTSUPP)
+    )
+}
+
+/// The result of a WRITE that wrote `served` bytes inline and then `rest`.
+/// If the rest fails after an inline write, this reports the short write, as
+/// `pwritev()` would, because those bytes are in the file.
+fn after_inline(served: usize, rest: io::Result<usize>) -> io::Result<usize> {
+    match rest {
+        Ok(n) => Ok(served + n),
+        Err(_) if served > 0 => Ok(served),
+        Err(e) => Err(e),
     }
+}
 
-    fn write_volatile(&mut self, _slice: FileVolatileSlice) -> io::Result<usize> {
-        Err(io::Error::from_raw_os_error(libc::EINVAL))
-    }
+/// The signature that `preadv2()` and `pwritev2()` share.
+type IoFn = unsafe extern "C" fn(
+    libc::c_int,
+    *const libc::iovec,
+    libc::c_int,
+    libc::off_t,
+    libc::c_int,
+) -> libc::ssize_t;
 
-    fn read_at_volatile(&mut self, slice: FileVolatileSlice, offset: u64) -> io::Result<usize> {
-        let iov = libc::iovec {
-            iov_base: slice.as_ptr() as *mut libc::c_void,
-            iov_len: slice.len(),
+impl NowaitFile<'_> {
+    /// `preadv2()` or `pwritev2()` with `RWF_NOWAIT` on `bufs`.
+    fn io(&self, bufs: &[FileVolatileSlice], offset: u64, op: IoFn) -> io::Result<usize> {
+        let iovec = |s: &FileVolatileSlice| libc::iovec {
+            iov_base: s.as_ptr() as *mut libc::c_void,
+            iov_len: s.len(),
         };
-
-        // Safe: the iovec points into `slice`, which the caller guarantees to
-        // be valid for the duration of the call, and the kernel only writes
-        // within its bounds.
-        let ret = unsafe {
-            libc::preadv2(
-                self.fd.as_raw_fd(),
-                &iov,
-                1,
-                offset as libc::off_t,
-                libc::RWF_NOWAIT,
-            )
-        };
-        if ret >= 0 {
-            Ok(ret as usize)
+        // A single buffer, the common case, needs no allocation.
+        let one;
+        let many: Vec<libc::iovec>;
+        let iovecs: &[libc::iovec] = if let [slice] = bufs {
+            one = [iovec(slice)];
+            &one
         } else {
-            Err(io::Error::last_os_error())
-        }
-    }
-
-    fn read_vectored_at_volatile(
-        &mut self,
-        bufs: &[FileVolatileSlice],
-        offset: u64,
-    ) -> io::Result<usize> {
-        if bufs.len() == 1 {
-            return self.read_at_volatile(bufs[0], offset);
-        }
-
-        let iovecs: Vec<libc::iovec> = bufs
-            .iter()
-            .map(|s| libc::iovec {
-                iov_base: s.as_ptr() as *mut libc::c_void,
-                iov_len: s.len(),
-            })
-            .collect();
-
+            many = bufs.iter().map(iovec).collect();
+            &many
+        };
         // Safe: the iovecs point into `bufs`, which the caller guarantees to
-        // be valid for the duration of the call.
+        // be valid for the duration of the call, and the kernel only accesses
+        // memory within their bounds.
         let ret = unsafe {
-            libc::preadv2(
+            op(
                 self.fd.as_raw_fd(),
                 iovecs.as_ptr(),
                 iovecs.len() as libc::c_int,
@@ -497,9 +519,39 @@ impl FileReadWriteVolatile for NowaitFile<'_> {
             Err(io::Error::last_os_error())
         }
     }
+}
 
-    fn write_at_volatile(&mut self, _slice: FileVolatileSlice, _offset: u64) -> io::Result<usize> {
+impl FileReadWriteVolatile for NowaitFile<'_> {
+    fn read_volatile(&mut self, _slice: FileVolatileSlice) -> io::Result<usize> {
         Err(io::Error::from_raw_os_error(libc::EINVAL))
+    }
+
+    fn write_volatile(&mut self, _slice: FileVolatileSlice) -> io::Result<usize> {
+        Err(io::Error::from_raw_os_error(libc::EINVAL))
+    }
+
+    fn read_at_volatile(&mut self, slice: FileVolatileSlice, offset: u64) -> io::Result<usize> {
+        self.io(&[slice], offset, libc::preadv2)
+    }
+
+    fn read_vectored_at_volatile(
+        &mut self,
+        bufs: &[FileVolatileSlice],
+        offset: u64,
+    ) -> io::Result<usize> {
+        self.io(bufs, offset, libc::preadv2)
+    }
+
+    fn write_at_volatile(&mut self, slice: FileVolatileSlice, offset: u64) -> io::Result<usize> {
+        self.io(&[slice], offset, libc::pwritev2)
+    }
+
+    fn write_vectored_at_volatile(
+        &mut self,
+        bufs: &[FileVolatileSlice],
+        offset: u64,
+    ) -> io::Result<usize> {
+        self.io(bufs, offset, libc::pwritev2)
     }
 }
 
@@ -938,8 +990,8 @@ impl<S: BitmapSlice + Send + Sync + 'static> AsyncFileSystem for PassthroughFs<S
         r: &mut (dyn AsyncZeroCopyReader + Send),
         size: u32,
         offset: u64,
-        lock_owner: Option<u64>,
-        delayed_write: bool,
+        _lock_owner: Option<u64>,
+        _delayed_write: bool,
         flags: u32,
         fuse_flags: u32,
     ) -> io::Result<usize> {
@@ -953,41 +1005,42 @@ impl<S: BitmapSlice + Send + Sync + 'static> AsyncFileSystem for PassthroughFs<S
         // issued while this future is suspended could run with the capability
         // already dropped and lose the setgid bit it must preserve.
         // With the thread pool enabled, a pool thread serves these relayed
-        // requests, and on the tokio runtime every WRITE, with `do_write()`
-        // from its page-aligned buffer, which needs no bounce buffer, see
-        // `write_on_pool()`. `do_write()` drops and restores CAP_FSETID on
-        // the pool thread, with no `.await` in between.
+        // requests, and on the tokio runtime every WRITE that would block,
+        // with `do_write()` from its page-aligned buffer, which needs no
+        // bounce buffer, see `write_on_pool()`. `do_write()` drops and
+        // restores CAP_FSETID on the pool thread, with no `.await` in between.
         let relay = flags & (os_compat::O_DIRECT as u32) != 0
             || (self.killpriv_v2.load(Ordering::Relaxed) && fuse_flags & WRITE_KILL_PRIV != 0);
-        let mut pool = self.pool_fs();
-        if relay || async_runtime::runtime_type().file_io_blocks() {
-            if let Some(fs) = pool.take() {
-                return Self::write_on_pool(
-                    fs, ctx, inode, handle, r, size, offset, flags, fuse_flags,
-                )
-                .await;
-            }
-        }
-        if relay {
-            return self.write(
-                ctx,
-                inode,
-                handle,
-                r,
-                size,
-                offset,
-                lock_owner,
-                delayed_write,
-                flags,
-                fuse_flags,
-            );
-        }
-
         let data = self.get_data(handle, inode, libc::O_RDWR)?;
+        let pool = self.pool_fs();
+        if relay {
+            return match pool {
+                Some(fs) => {
+                    Self::write_on_pool(fs, ctx, data, r, size, offset, flags, fuse_flags).await
+                }
+                None => self.do_write(&data, r, size, offset, flags, fuse_flags, false),
+            };
+        }
 
         if self.seal_size.load(Ordering::Relaxed) {
             let st = fsops::stat_fd(data.get_file(), None)?;
             self.seal_size_check(Opcode::Write, st.st_size as u64, offset, size as u64, 0)?;
+        }
+
+        // On the tokio runtime with the pool, first try a non-blocking write
+        // on this thread. If the page cache takes it, it needs no copy and no
+        // pool thread. The pool writes the rest.
+        if async_runtime::runtime_type().file_io_blocks() {
+            if let Some(fs) = pool {
+                let served = self.write_nowait(&data, r, size as usize, offset, flags)?;
+                if served == size as usize {
+                    return Ok(served);
+                }
+                let (size, offset) = (size - served as u32, offset + served as u64);
+                let res =
+                    Self::write_on_pool(fs, ctx, data, r, size, offset, flags, fuse_flags).await;
+                return after_inline(served, res);
+            }
         }
 
         // Borrow the fd of the handle for the duration of the write: the
@@ -1386,7 +1439,11 @@ mod tests {
         let source = TempDir::new().unwrap();
         let path = source.as_path().join("testfile");
         std::fs::write(&path, b"hello world").unwrap();
-        let file = std::fs::File::open(&path).unwrap();
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
         // Safe: `fd` doesn't out-live `file`.
         let mut f = NowaitFile {
             fd: unsafe { BorrowedFd::borrow_raw(file.as_raw_fd()) },
@@ -1403,14 +1460,33 @@ mod tests {
                 assert_eq!(n, 11);
                 assert_eq!(&buf, b"hello world");
             }
-            Err(e) => assert!(matches!(
-                e.raw_os_error(),
-                Some(libc::EAGAIN)
-                    | Some(libc::EINVAL)
-                    | Some(libc::ENOSYS)
-                    | Some(libc::EOPNOTSUPP)
-            )),
+            Err(e) => assert!(nowait_fallback(&e), "{}", e),
         }
+
+        // XFS takes non-blocking writes, and ext4 and tmpfs fail them with
+        // EOPNOTSUPP.
+        let mut data = *b"HELLO";
+        // Safe: the slice points into `data` and doesn't out-live it.
+        let slice = unsafe { FileVolatileSlice::from_raw_ptr(data.as_mut_ptr(), 5) };
+        match f.write_at_volatile(slice, 6) {
+            Ok(n) => {
+                assert_eq!(n, 5);
+                assert_eq!(std::fs::read(&path).unwrap(), b"hello HELLO");
+            }
+            Err(e) => assert!(nowait_fallback(&e), "{}", e),
+        }
+    }
+
+    // A WRITE that fails after a partial inline write reports the short write.
+    #[test]
+    fn test_after_inline() {
+        let err = || Err(io::Error::from_raw_os_error(libc::ENOSPC));
+        assert_eq!(after_inline(3, Ok(7)).unwrap(), 10);
+        assert_eq!(after_inline(3, err()).unwrap(), 3);
+        assert_eq!(
+            after_inline(0, err()).unwrap_err().raw_os_error(),
+            Some(libc::ENOSPC)
+        );
     }
 
     #[test]
