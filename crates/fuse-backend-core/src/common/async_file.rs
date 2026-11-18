@@ -176,7 +176,7 @@ impl File {
                 (res, bufs[0])
             }
             #[cfg(target_os = "linux")]
-            File::Uring(f) => f.write_at(buf, offset).await,
+            File::Uring(f) => f.write_at(buf, offset).submit().await,
             File::Borrowed { fd, .. } => {
                 #[cfg(target_os = "linux")]
                 if self.uses_io_uring() {
@@ -185,7 +185,7 @@ impl File {
                     // cancellation of the IO) so it never closes the
                     // borrowed descriptor.
                     let file = unsafe { tokio_uring::fs::File::from_raw_fd(*fd) };
-                    return ForgetOnDrop::new(file).write_at(buf, offset).await;
+                    return ForgetOnDrop::new(file).write_at(buf, offset).submit().await;
                 }
                 let bufs = [buf];
                 let res = pwritev(*fd, &bufs, offset);

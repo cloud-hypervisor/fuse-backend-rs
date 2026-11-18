@@ -144,6 +144,9 @@
   systems.
 
 ### Changed
+- [NNN](link): `fuse-backend-core` uses tokio-uring 0.5 and io-uring 0.6 instead of 0.4 and 0.5.
+  Dropping an `async_file::File` that owns its descriptor closes it with `close(2)` instead of an
+  io_uring close operation.
 - [294](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/294): `PassthroughFs` negotiates
   `FsOptions::DIRECT_IO_ALLOW_MMAP` under the `Never` and `Metadata` cache policies only when the
   new `Config::allow_mmap` opts in (default off), so shared mmaps keep failing with `ENODEV` there
