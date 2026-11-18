@@ -2,8 +2,8 @@
 name = "fuse-backend-fusedev"
 version = "0.14.0"
 keywords = ["fuse", "fusedev", "fuse-t"]
-categories = ["filesystem", "os::linux-apis"]
-description = "The /dev/fuse and FUSE-over-io_uring transport for FUSE servers, and the macFUSE/fuse-t transport for macOS"
+categories = ["filesystem", "os::linux-apis", "os::freebsd-apis"]
+description = "The /dev/fuse transport for FUSE servers on Linux and FreeBSD, FUSE-over-io_uring on Linux, and the macFUSE/fuse-t transport for macOS"
 authors = [
     "Liu Bo <bo.liu@linux.alibaba.com>",
     "Liu Jiang <gerry@linux.alibaba.com>",
@@ -29,7 +29,8 @@ libc = "0.2.68"
 log = "0.4.6"
 # nix dropped its default features in 0.27, so the modules the sessions use
 # are listed explicitly. `time` covers the timerfd the async-serving tests
-# drive tokio's IO driver with; `event` provides epoll on Linux.
+# drive tokio's IO driver with; `event` provides epoll on Linux and the
+# eventfd that wakes the FreeBSD channels.
 nix = { version = "0.31", features = [
     "event",
     "fs",

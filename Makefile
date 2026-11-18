@@ -169,19 +169,16 @@ smoke-macos: check-macos
 	# concurrent fuse-t sessions interfering with each other (#116, #124).
 	${CARGO} test --features="fusedev,fuse-t" -- --nocapture --test-threads=1
 
-# FreeBSD coverage starts with the two crates that are FreeBSD-clean today:
-# core (through its FreeBSD ABI arm reusing the Linux wire protocol) and
-# vfs. The nix 0.31 upgrade makes the fusedev transport build there too,
-# though without a session module it is an empty shell — building it still
-# proves the dependency tree (nix, libc, vm-memory, ...) is FreeBSD-clean, so
-# the future session port starts from a compiling crate. tokio needs the
-# async-io feature to enter the build graph, and a FreeBSD session will want
-# async serving, so the second row pins that compile path down too. The
-# filesystem drivers (passthrough, overlayfs) remain FreeBSD-unbuildable. Clippy is
-# deliberately absent: no Linux CI row lints core/vfs test code either
-# (the umbrella rows lint the root package only), so this row sticks to
-# the verification the other platforms actually guarantee: it compiles,
-# and the unit tests pass.
+# FreeBSD coverage is the three crates that build there: core (through its
+# FreeBSD ABI arm reusing the Linux wire protocol), vfs and the fusedev
+# transport. tokio needs the async-io feature to enter the build graph, so
+# fusedev builds and tests with and without it. The filesystem drivers
+# (passthrough, overlayfs) don't build on FreeBSD, and the umbrella crate
+# pulls passthrough in with `fusedev`, so no umbrella row exists. Clippy
+# lints only the fusedev library, whose FreeBSD session no other platform
+# compiles; the Linux rows lint the core and vfs libraries. The fusedev
+# tests mount a file system when they run as root with fusefs loaded, and
+# skip otherwise.
 build-freebsd:
 	${CARGO} build -p fuse-backend-core --no-default-features
 	${CARGO} build -p fuse-backend-core
@@ -192,11 +189,14 @@ build-freebsd:
 
 check-freebsd: build-freebsd
 	${CARGO} fmt --all -- --check
+	${CARGO} clippy -p fuse-backend-fusedev -- -Dwarnings
 	${CARGO} test -p fuse-backend-core --no-default-features -- --nocapture --skip integration
 	${CARGO} test -p fuse-backend-core -- --nocapture --skip integration
 	${CARGO} test -p fuse-backend-core --features="async-io" -- --nocapture --skip integration
 	${CARGO} test -p fuse-backend-vfs --no-default-features -- --nocapture --skip integration
 	${CARGO} test -p fuse-backend-vfs -- --nocapture --skip integration
+	${CARGO} test -p fuse-backend-fusedev -- --nocapture --skip integration
+	${CARGO} test -p fuse-backend-fusedev --features async-io -- --nocapture --skip integration
 
 docker-smoke:
 	docker run --env RUST_BACKTRACE=1 --rm --privileged --volume ${current_dir}:/fuse-rs rust:1.86 sh -c "rustup component add clippy rustfmt; cd /fuse-rs; make smoke-all"
