@@ -1435,13 +1435,14 @@ impl<F: FileSystem + Sync> Server<F> {
 
     pub(super) fn notify_reply<S: BitmapSlice, W: Writer>(
         &self,
-        mut ctx: SrvContext<'_, F, S, W>,
+        _ctx: SrvContext<'_, F, S, W>,
     ) -> Result<usize> {
-        if let Err(e) = self.fs.notify_reply() {
-            ctx.reply_error(e)
-        } else {
-            Ok(0)
-        }
+        // NOTIFY_REPLY takes no reply. It comes under the unique number that the server picked
+        // for NOTIFY_RETRIEVE, so a reply could even end another request.
+        self.fs
+            .notify_reply()
+            .map(|()| 0)
+            .map_err(Error::InvalidMessage)
     }
 
     pub(super) fn batch_forget<S: BitmapSlice, W: Writer>(
@@ -2952,5 +2953,28 @@ mod tests {
             let out = OutHeader::from_slice(&write_buf[..size_of::<OutHeader>()]).unwrap();
             assert_eq!((out.error, out.unique), (-libc::EINVAL, 42), "{opcode:?}");
         }
+    }
+
+    #[test]
+    fn test_server_doesnt_reply_to_notify_reply() {
+        // MockFS fails notify_reply() with ENOSYS.
+        let server = Server::new(MockFS);
+        let header = InHeader {
+            len: size_of::<InHeader>() as u32,
+            opcode: Opcode::NotifyReply as u32,
+            unique: 42,
+            nodeid: ROOT_ID,
+            ..Default::default()
+        };
+        let mut read_buf = header.as_slice().to_vec();
+        let mut write_buf = [0u8; 4096];
+        let res = server.handle_message(
+            Reader::<()>::from_slice(&mut read_buf),
+            TestWriter::new(&mut write_buf),
+            None,
+            None,
+        );
+        assert!(matches!(res, Err(Error::InvalidMessage(_))));
+        assert!(write_buf.iter().all(|&b| b == 0));
     }
 }

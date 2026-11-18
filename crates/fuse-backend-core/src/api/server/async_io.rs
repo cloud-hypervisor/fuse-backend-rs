@@ -1228,6 +1228,28 @@ mod tests {
     }
 
     #[test]
+    fn test_async_server_doesnt_reply_to_notify_reply() {
+        // BackingFs fails notify_reply() with ENOSYS.
+        let header = InHeader {
+            len: size_of::<InHeader>() as u32,
+            opcode: Opcode::NotifyReply as u32,
+            unique: 42,
+            nodeid: 1,
+            ..Default::default()
+        };
+        let mut read_buf = header.as_slice().to_vec();
+        let mut write_buf = [0u8; 4096];
+        let server = Server::new(BackingFs);
+        let res = async_runtime::block_on(async {
+            let reader = Reader::<()>::from_slice(&mut read_buf);
+            let writer = TestWriter::new(&mut write_buf);
+            unsafe { server.async_handle_message(reader, writer, None, None) }.await
+        });
+        assert!(matches!(res, Err(Error::InvalidMessage(_))));
+        assert!(write_buf.iter().all(|&b| b == 0));
+    }
+
+    #[test]
     fn test_async_open_backing_id() {
         let open_in = OpenIn::default();
         let reply = serve_backing(Opcode::Open, open_in.as_slice());
