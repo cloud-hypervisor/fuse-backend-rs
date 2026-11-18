@@ -680,8 +680,18 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
         name: &CStr,
     ) -> io::Result<(File, Option<FileHandle>, StatExt)> {
         let path_file = self.open_file_restricted(dir, name, os_compat::O_PATH, 0)?;
+        self.stat_and_handle(path_file, true)
+    }
+
+    /// Like `open_file_and_handle()`, for an `O_PATH` file that is already open. Without
+    /// `use_handle`, the file gets no file handle even if `inode_file_handles` is set.
+    fn stat_and_handle(
+        &self,
+        path_file: File,
+        use_handle: bool,
+    ) -> io::Result<(File, Option<FileHandle>, StatExt)> {
         let st = statx(&path_file, None)?;
-        let handle = if self.cfg.inode_file_handles {
+        let handle = if use_handle && self.cfg.inode_file_handles {
             FileHandle::from_fd(&path_file)?
         } else {
             None
@@ -740,7 +750,15 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
 
         let dir = self.inode_map.get(parent)?;
         let dir_file = dir.get_file()?;
-        let (path_fd, handle_opt, st) = Self::open_file_and_handle(self, &dir_file, name)?;
+        let path_file = self.open_file_restricted(&dir_file, name, os_compat::O_PATH, 0)?;
+        self.lookup_path_file(path_file, true)
+    }
+
+    /// The `Entry` of the file that the `O_PATH` file `path_file` opens, which takes a lookup
+    /// count on its inode. Without `use_handle`, a new inode keeps `path_file` open instead of
+    /// a file handle.
+    fn lookup_path_file(&self, path_file: File, use_handle: bool) -> io::Result<Entry> {
+        let (path_fd, handle_opt, st) = self.stat_and_handle(path_file, use_handle)?;
         let id = InodeId::from_stat(&st);
 
         let mut found = None;

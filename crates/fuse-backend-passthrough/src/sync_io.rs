@@ -529,6 +529,47 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
         OpenOptions::empty()
     }
 
+    /// Registers `file`, which `create()` or `tmpfile()` opened for `entry`, and builds their
+    /// reply. `flags` are the client's open flags, without O_TMPFILE.
+    fn finish_create(
+        &self,
+        entry: Entry,
+        file: File,
+        flags: u32,
+    ) -> (Entry, Option<Handle>, OpenOptions, Option<u32>) {
+        let zero_copy = self.zero_copy_option(flags);
+        let mut backing_id = None;
+        let ret_handle = if !self.no_open.load(Ordering::Relaxed) {
+            backing_id = self.acquire_backing_id(entry.inode, &file);
+            let handle = self.next_handle.fetch_add(1, Ordering::Relaxed);
+            self.handle_map.insert(
+                handle,
+                HandleData::new(entry.inode, file, flags, backing_id.is_some()),
+            );
+            Some(handle)
+        } else {
+            None
+        };
+
+        let mut opts = OpenOptions::empty();
+        match self.cfg.cache_policy {
+            CachePolicy::Never => opts |= OpenOptions::DIRECT_IO,
+            CachePolicy::Metadata => opts |= OpenOptions::DIRECT_IO,
+            CachePolicy::Always => opts |= OpenOptions::KEEP_CACHE,
+            _ => {}
+        };
+        // Like in `do_open()`, a passthrough open gets no other option.
+        if backing_id.is_some() {
+            opts = OpenOptions::PASSTHROUGH;
+        }
+        // Kernel passthrough serves the IO itself, without the daemon.
+        if backing_id.is_none() {
+            opts |= zero_copy;
+        }
+
+        (entry, ret_handle, opts, backing_id)
+    }
+
     fn do_getattr(&self, inode: Inode, handle: Option<Handle>) -> io::Result<(stat64, Duration)> {
         let data = self.inode_map.get(inode).map_err(|e| {
             error!("fuse: do_getattr ino {} Not find err {:?}", inode, e);
@@ -1067,37 +1108,40 @@ impl<S: BitmapSlice + Send + Sync> FileSystem for PassthroughFs<S> {
             }
         };
 
-        let zero_copy = self.zero_copy_option(args.flags);
-        let mut backing_id = None;
-        let ret_handle = if !self.no_open.load(Ordering::Relaxed) {
-            backing_id = self.acquire_backing_id(entry.inode, &file);
-            let handle = self.next_handle.fetch_add(1, Ordering::Relaxed);
-            self.handle_map.insert(
-                handle,
-                HandleData::new(entry.inode, file, args.flags, backing_id.is_some()),
-            );
-            Some(handle)
-        } else {
-            None
+        Ok(self.finish_create(entry, file, args.flags))
+    }
+
+    #[cfg(target_os = "linux")]
+    fn tmpfile(
+        &self,
+        ctx: &Context,
+        parent: Inode,
+        args: CreateIn,
+    ) -> io::Result<(Entry, Option<Handle>, OpenOptions, Option<u32>)> {
+        let dir = self.inode_map.get(parent)?;
+        let dir_file = dir.get_file()?;
+
+        let file = {
+            let _groups = ScopedSuppGroups::new(ctx.supp_gid)?;
+            let (_uid, _gid) = set_creds(ctx.uid, ctx.gid)?;
+
+            let flags = self.host_open_flags(args.flags as i32)
+                & !(libc::O_CREAT | libc::O_TRUNC | libc::O_NOFOLLOW)
+                | libc::O_TMPFILE;
+            let mode = args.mode & !(args.umask & 0o777);
+            // Safe because this is a constant value and a valid C string.
+            let dot = unsafe { CStr::from_bytes_with_nul_unchecked(CURRENT_DIR_CSTR) };
+            openat(&dir_file, dot, flags, mode)?
         };
 
-        let mut opts = OpenOptions::empty();
-        match self.cfg.cache_policy {
-            CachePolicy::Never => opts |= OpenOptions::DIRECT_IO,
-            CachePolicy::Metadata => opts |= OpenOptions::DIRECT_IO,
-            CachePolicy::Always => opts |= OpenOptions::KEEP_CACHE,
-            _ => {}
-        };
-        // Like in `do_open()`, a passthrough open gets no other option.
-        if backing_id.is_some() {
-            opts = OpenOptions::PASSTHROUGH;
-        }
-        // Kernel passthrough serves the IO itself, without the daemon.
-        if backing_id.is_none() {
-            opts |= zero_copy;
-        }
-
-        Ok((entry, ret_handle, opts, backing_id))
+        // The file has no name to look up, so the inode gets an O_PATH fd reopened from it. It
+        // keeps that fd even with `inode_file_handles`, because once the handle is released
+        // nothing else holds the unlinked file open, and open_by_handle_at() can't reopen it.
+        let path_file = reopen_fd_through_proc(&file, os_compat::O_PATH, &self.proc_self_fd)?;
+        let entry = self.lookup_path_file(path_file, false)?;
+        // O_TMPFILE includes the bit of O_DIRECTORY, which would keep zero_copy_option() from
+        // offering zero-copy to a regular file.
+        Ok(self.finish_create(entry, file, args.flags & !(libc::O_TMPFILE as u32)))
     }
 
     fn unlink(&self, _ctx: &Context, parent: Inode, name: &CStr) -> io::Result<()> {
@@ -1819,10 +1863,11 @@ mod tests {
         (fs, source)
     }
 
-    // create() and open() build the host file's flags the same way. With the writeback cache
-    // and without allow_direct_io, both open O_WRONLY | O_APPEND | O_DIRECT as O_RDWR.
+    // create(), open() and tmpfile() build the host file's flags the same way. With the
+    // writeback cache and without allow_direct_io, all three open O_WRONLY | O_APPEND |
+    // O_DIRECT as O_RDWR.
     #[test]
-    fn test_create_and_open_build_the_same_host_flags() {
+    fn test_create_open_and_tmpfile_build_the_same_host_flags() {
         let (mut fs, _source) = prepare_fs_writeback_no_handles();
         fs.cfg.allow_direct_io = false;
         let ctx = prepare_context();
@@ -1844,6 +1889,64 @@ mod tests {
         assert_eq!(host_flags(entry.inode, created), libc::O_RDWR);
         let (opened, ..) = fs.open(&ctx, entry.inode, flags as u32, 0).unwrap();
         assert_eq!(host_flags(entry.inode, opened), libc::O_RDWR);
+        let args = CreateIn {
+            flags: (flags | libc::O_TMPFILE) as u32,
+            ..args
+        };
+        let (entry, tmp, ..) = fs.tmpfile(&ctx, ROOT_ID, args).unwrap();
+        assert_eq!(host_flags(entry.inode, tmp), libc::O_RDWR);
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn test_tmpfile() {
+        use std::os::unix::fs::MetadataExt;
+
+        let (fs, source) = prepare_fs_writeback_no_handles();
+        let ctx = prepare_context();
+        let args = CreateIn {
+            flags: (libc::O_RDWR | libc::O_TMPFILE) as u32,
+            mode: 0o640,
+            umask: 0o022,
+            fuse_flags: 0,
+        };
+        let (entry, handle, _, _) = fs.tmpfile(&ctx, ROOT_ID, args).unwrap();
+        assert!(handle.is_some());
+        assert_eq!(entry.attr.st_nlink, 0);
+        assert_eq!(entry.attr.st_mode, libc::S_IFREG | 0o640);
+        assert_eq!(std::fs::read_dir(source.as_path()).unwrap().count(), 0);
+
+        // link() names it, and the second lookup count goes to the same inode.
+        let name = CString::new("file").unwrap();
+        let linked = fs.link(&ctx, entry.inode, ROOT_ID, &name).unwrap();
+        assert_eq!(linked.inode, entry.inode);
+        let md = std::fs::metadata(source.as_path().join("file")).unwrap();
+        assert_eq!((md.ino(), md.nlink()), (entry.attr.st_ino, 1));
+
+        // With O_EXCL the file can't be linked.
+        let args = CreateIn {
+            flags: args.flags | libc::O_EXCL as u32,
+            ..args
+        };
+        let (entry, _, _, _) = fs.tmpfile(&ctx, ROOT_ID, args).unwrap();
+        let name = CString::new("excl").unwrap();
+        let err = fs.link(&ctx, entry.inode, ROOT_ID, &name).unwrap_err();
+        assert_eq!(err.raw_os_error(), Some(libc::ENOENT));
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn test_tmpfile_zero_copy() {
+        let (mut fs, _source) = prepare_fs_writeback_no_handles();
+        fs.cfg.uring_zero_copy = true;
+        let args = CreateIn {
+            flags: (libc::O_RDWR | libc::O_TMPFILE) as u32,
+            mode: 0o600,
+            umask: 0,
+            fuse_flags: 0,
+        };
+        let (_, _, opts, _) = fs.tmpfile(&prepare_context(), ROOT_ID, args).unwrap();
+        assert!(opts.contains(OpenOptions::IO_URING_ZERO_COPY));
     }
 
     #[test]

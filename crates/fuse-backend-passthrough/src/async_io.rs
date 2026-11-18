@@ -743,6 +743,15 @@ fn undo_lookup<S: BitmapSlice + Send + Sync>(fs: &PassthroughFs<S>, entry: Entry
     fs.forget(&Context::default(), entry.inode, 1);
 }
 
+/// Release the handle and drop the lookup count that `create()` or `tmpfile()` returned.
+fn undo_create<S: BitmapSlice + Send + Sync>(
+    fs: &PassthroughFs<S>,
+    (entry, handle, _, _): (Entry, Option<Handle>, OpenOptions, Option<u32>),
+) {
+    undo_open(fs, entry.inode, handle);
+    undo_lookup(fs, entry);
+}
+
 /// Release a handle that `opendir()` returned.
 fn undo_opendir<S: BitmapSlice + Send + Sync>(
     fs: &PassthroughFs<S>,
@@ -854,10 +863,28 @@ impl<S: BitmapSlice + Send + Sync + 'static> AsyncFileSystem for PassthroughFs<S
             [let name = name.to_owned();],
             self.create(ctx, parent, name, args),
             move |fs: &Self, ctx: Context| fs.create(&ctx, parent, &name, args),
-            undo: |fs: &Self, (entry, handle, _, _): (Entry, _, _, _)| {
-                undo_open(fs, entry.inode, handle);
-                undo_lookup(fs, entry);
-            }
+            undo: undo_create
+        )
+    }
+
+    async fn async_tmpfile(
+        &self,
+        ctx: &Context,
+        parent: <Self as FileSystem>::Inode,
+        args: CreateIn,
+    ) -> io::Result<(
+        Entry,
+        Option<<Self as FileSystem>::Handle>,
+        OpenOptions,
+        Option<u32>,
+    )> {
+        async_relay!(
+            self,
+            ctx,
+            [],
+            self.tmpfile(ctx, parent, args),
+            move |fs: &Self, ctx: Context| fs.tmpfile(&ctx, parent, args),
+            undo: undo_create
         )
     }
 
@@ -2461,6 +2488,7 @@ mod tests {
         let name = |s: &str| CString::new(s).unwrap();
         let (dir, link, fifo, pipe) = (name("dir"), name("link"), name("fifo"), name("pipe"));
         let (file, hardlink, xattr) = (name("file"), name("hardlink"), name("user.test"));
+        let tmpfile = name("tmpfile");
         std::fs::write(source.as_path().join("file"), b"hello").unwrap();
 
         async_runtime::block_on(async {
@@ -2511,6 +2539,21 @@ mod tests {
             fs.async_release(&ctx, ino, flags, fh, false, false, None)
                 .await
                 .unwrap();
+
+            // Create an O_TMPFILE file and name it with LINK.
+            let args = CreateIn {
+                flags,
+                mode: 0o600,
+                umask: 0,
+                fuse_flags: 0,
+            };
+            let (entry, fh, _, _) = fs.async_tmpfile(&ctx, ROOT_ID, args).await.unwrap();
+            let linked = fs.async_link(&ctx, entry.inode, ROOT_ID, &tmpfile).await;
+            assert_eq!(linked.unwrap().inode, entry.inode);
+            fs.async_release(&ctx, entry.inode, flags, fh.unwrap(), false, false, None)
+                .await
+                .unwrap();
+            assert!(source.as_path().join("tmpfile").exists());
 
             match fs.async_setxattr(&ctx, ino, &xattr, b"value", 0).await {
                 Err(e) if e.raw_os_error() == Some(libc::EOPNOTSUPP) => {
