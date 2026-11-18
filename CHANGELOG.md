@@ -238,6 +238,8 @@
   under fuse-t's hard NFS mount. (The async server dispatches SETXATTR to the
   same shared handler, so it had the identical silent exits; fixing the sync
   handler covers both serving paths.)
+- SYMLINK, RENAME and RENAME2 also answer `EINVAL` when the body lacks one of
+  its two NUL-terminated names, for the same reason as SETXATTR above.
 - [303](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/303): The macOS `INIT` reply keeps the 24-byte macFUSE shape for any client
   version, instead of growing to the full 64-byte Linux struct for clients
   that advertise a newer minor. macFUSE's own `fuse_init_out` never grew past

@@ -405,7 +405,10 @@ impl<F: FileSystem + Sync> Server<F> {
     ) -> Result<usize> {
         let buf = ServerUtil::get_message_body(&mut ctx.r, &ctx.in_header, 0)?;
         // The name and linkname are encoded one after another and separated by a nul character.
-        let (name, linkname) = ServerUtil::extract_two_cstrs(&buf)?;
+        let (name, linkname) = ServerUtil::extract_two_cstrs(&buf).inspect_err(|_| {
+            // Answer a malformed body, or the client waits forever.
+            let _ = ctx.reply_error(io::Error::from_raw_os_error(libc::EINVAL));
+        })?;
         let supp_gid = parse_create_extensions(
             &FsOptions::from_bits_truncate(self.options.load(Ordering::Acquire)),
             &buf[name.to_bytes_with_nul().len() + linkname.to_bytes_with_nul().len()..],
@@ -523,7 +526,10 @@ impl<F: FileSystem + Sync> Server<F> {
         flags: u32,
     ) -> Result<usize> {
         let buf = ServerUtil::get_message_body(&mut ctx.r, &ctx.in_header, msg_size)?;
-        let (oldname, newname) = ServerUtil::extract_two_cstrs(&buf)?;
+        let (oldname, newname) = ServerUtil::extract_two_cstrs(&buf).inspect_err(|_| {
+            // Answer a malformed body, or the client waits forever.
+            let _ = ctx.reply_error(io::Error::from_raw_os_error(libc::EINVAL));
+        })?;
 
         match self.fs.rename(
             ctx.context(),
@@ -2834,6 +2840,44 @@ mod tests {
                 // EINVAL is a header-only error reply.
                 assert_eq!(res, size_of::<OutHeader>());
             }
+        }
+    }
+
+    #[test]
+    fn test_server_replies_to_malformed_bodies() {
+        // Each body arrives in full but fails validation. The server must
+        // still answer it, or the client waits forever.
+        let rename_in = RenameIn::default();
+        let rename2_in = Rename2In::default();
+        let setxattr_in = SetxattrIn { size: 4, flags: 0 };
+        let cases: &[(Opcode, &[u8], &[u8])] = &[
+            // A name without a NUL, and a name without a link target.
+            (Opcode::Symlink, &[], b"name"),
+            (Opcode::Symlink, &[], b"name\0"),
+            (Opcode::Rename, rename_in.as_slice(), b"old\0"),
+            (Opcode::Rename2, rename2_in.as_slice(), b"old\0new"),
+            // A name without a NUL, and a value shorter than its size.
+            (Opcode::Setxattr, setxattr_in.as_slice(), b"user.a"),
+            (Opcode::Setxattr, setxattr_in.as_slice(), b"user.a\0ab"),
+        ];
+
+        let server = Server::new(MockFS);
+        for &(opcode, arg, names) in cases {
+            let header = InHeader {
+                len: (size_of::<InHeader>() + arg.len() + names.len()) as u32,
+                opcode: opcode as u32,
+                unique: 42,
+                nodeid: ROOT_ID,
+                ..Default::default()
+            };
+            let mut read_buf = [header.as_slice(), arg, names].concat();
+            let mut write_buf = [0u8; 4096];
+            let reader = Reader::<()>::from_slice(&mut read_buf);
+            let writer = TestWriter::new(&mut write_buf);
+            // The server still returns the error, for the caller to log.
+            assert!(server.handle_message(reader, writer, None, None).is_err());
+            let out = OutHeader::from_slice(&write_buf[..size_of::<OutHeader>()]).unwrap();
+            assert_eq!((out.error, out.unique), (-libc::EINVAL, 42), "{opcode:?}");
         }
     }
 }
