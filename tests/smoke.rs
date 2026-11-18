@@ -321,6 +321,41 @@ mod fusedev_tests {
 
     #[test]
     #[ignore] // it depends on privileged mode to pass through /dev/fuse
+    fn integration_test_statx_btime() -> Result<()> {
+        // A statx(2) that asks for the birth time sends FUSE_STATX. Without a reply to it, the
+        // kernel answers from GETATTR, which has no birth time.
+        if !kernel_at_least(6, 6) {
+            eprintln!(
+                "skipping integration_test_statx_btime: kernel {} does not send FUSE_STATX (needs >= 6.6)",
+                kernel_release()
+            );
+            return Ok(());
+        }
+
+        let src_dir = TempDir::new().unwrap();
+        let mnt_dir = TempDir::new().unwrap();
+        let src = src_dir.as_path().to_str().unwrap().to_string();
+        let mnt = mnt_dir.as_path().to_str().unwrap().to_string();
+        let src_file = src_dir.as_path().join("file");
+        std::fs::write(&src_file, b"data").unwrap();
+        let Ok(btime) = std::fs::metadata(&src_file).and_then(|md| md.created()) else {
+            eprintln!(
+                "skipping integration_test_statx_btime: {} has no birth times",
+                src
+            );
+            return Ok(());
+        };
+
+        let mut daemon = passthroughfs::Daemon::new(&src, &mnt, 1).unwrap();
+        daemon.mount().unwrap();
+        let created = std::fs::metadata(mnt_dir.as_path().join("file")).and_then(|md| md.created());
+        daemon.umount().unwrap();
+        assert_eq!(created.expect("birth time through the mount"), btime);
+        Ok(())
+    }
+
+    #[test]
+    #[ignore] // it depends on privileged mode to pass through /dev/fuse
     fn integration_test_direct_io_shared_mmap() -> Result<()> {
         // An O_DIRECT open of a file on the mount gets DIRECT_IO, and the kernel fails a shared
         // mmap of such a file with ENODEV unless the server negotiated FUSE_DIRECT_IO_ALLOW_MMAP.
