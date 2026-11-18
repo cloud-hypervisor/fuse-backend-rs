@@ -8,6 +8,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::thread;
 
+use fuse_backend_rs::abi::fuse_abi::FsOptions;
 use fuse_backend_rs::api::{server::Server, Vfs, VfsOptions};
 use fuse_backend_rs::passthrough::{Config, PassthroughFs};
 use fuse_backend_rs::transport::{FuseChannel, FuseSession};
@@ -29,22 +30,42 @@ pub struct Daemon {
 impl Daemon {
     /// Creates a fusedev daemon instance
     pub fn new(src: &str, mountpoint: &str, thread_cnt: u32) -> Result<Self> {
+        // For the xattr steps of the macOS e2e test, skipped on fuse-t.
+        // On Linux the config stays at the historical default.
+        Self::with_options(
+            src,
+            mountpoint,
+            thread_cnt,
+            FsOptions::empty(),
+            cfg!(target_os = "macos"),
+        )
+    }
+
+    /// Like `new()`, with `extra_opts` added to the options the Vfs negotiates, and `xattr`
+    /// passed to the PassthroughFs config.
+    pub fn with_options(
+        src: &str,
+        mountpoint: &str,
+        thread_cnt: u32,
+        extra_opts: FsOptions,
+        xattr: bool,
+    ) -> Result<Self> {
         // create vfs
-        let vfs = Vfs::new(VfsOptions {
+        let mut opts = VfsOptions {
             #[cfg(not(target_os = "macos"))]
             no_open: false,
             #[cfg(not(target_os = "macos"))]
             no_opendir: false,
             ..Default::default()
-        });
+        };
+        opts.out_opts |= extra_opts;
+        let vfs = Vfs::new(opts);
 
         // create passthrough fs
         let cfg = Config {
             root_dir: src.to_string(),
             do_import: false,
-            // For the xattr steps of the macOS e2e test, skipped on fuse-t.
-            // On Linux the config stays at the historical default.
-            xattr: cfg!(target_os = "macos"),
+            xattr,
             ..Default::default()
         };
         let fs = PassthroughFs::<()>::new(cfg).unwrap();

@@ -21,6 +21,8 @@ use std::time::Duration;
 use super::os_compat;
 use super::*;
 use crate::os::LinuxDirent64;
+#[cfg(target_os = "linux")]
+use fuse_backend_core::abi::fuse_abi::SETXATTR_ACL_KILL_SGID;
 use fuse_backend_core::abi::fuse_abi::{
     stat64, statvfs64, CreateIn, Opcode, FOPEN_IN_KILL_SUIDGID, WRITE_KILL_PRIV,
 };
@@ -738,6 +740,11 @@ impl<S: BitmapSlice + Send + Sync> FileSystem for PassthroughFs<S> {
         // The handlers unconditionally honor Context.supp_gid. This also covers standalone
         // mounts not sitting behind a Vfs, which negotiates the flag on its own.
         opts |= capable & FsOptions::CREATE_SUPP_GROUP;
+        // setxattr() reads the flags of the extended request.
+        #[cfg(target_os = "linux")]
+        {
+            opts |= capable & FsOptions::SETXATTR_EXT;
+        }
         // The kernel fails a shared mmap of a file opened with DIRECT_IO with ENODEV unless
         // DIRECT_IO_ALLOW_MMAP was negotiated. Under Auto and Always only an explicit O_DIRECT
         // open gets that reply, so mirror the flag for them unconditionally. Under Never and
@@ -1588,7 +1595,7 @@ impl<S: BitmapSlice + Send + Sync> FileSystem for PassthroughFs<S> {
 
     fn setxattr(
         &self,
-        _ctx: &Context,
+        #[cfg_attr(not(target_os = "linux"), allow(unused_variables))] ctx: &Context,
         inode: Inode,
         name: &CStr,
         value: &[u8],
@@ -1600,6 +1607,19 @@ impl<S: BitmapSlice + Send + Sync> FileSystem for PassthroughFs<S> {
 
         let data = self.inode_map.get(inode)?;
         let file = data.get_file()?;
+
+        // The kernel sets the flag when the caller can't keep the set-group-ID bit. Setting the
+        // ACL as a daemon with CAP_FSETID keeps it, so clear it first, as virtiofsd does.
+        #[cfg(target_os = "linux")]
+        if ctx.setxattr_flags & SETXATTR_ACL_KILL_SGID != 0
+            && name.to_bytes() == b"system.posix_acl_access"
+        {
+            let mut st = data.handle.stat()?;
+            if st.st_mode & libc::S_ISGID != 0 {
+                st.st_mode &= !libc::S_ISGID;
+                self.setattr(ctx, inode, st, None, SetattrValid::MODE)?;
+            }
+        }
 
         fsops::setxattr(file.as_raw_fd(), name, value, flags)
     }
@@ -2235,6 +2255,44 @@ mod tests {
         // no_open opens the file again for each request.
         fs.no_open.store(true, Ordering::Relaxed);
         io(entry.inode, 0);
+    }
+
+    #[test]
+    fn test_setxattr_acl_kill_sgid() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let source = TempDir::new().unwrap();
+        let fs = PassthroughFs::<()>::new(Config {
+            xattr: true,
+            root_dir: source.as_path().to_str().unwrap().to_string(),
+            ..Default::default()
+        })
+        .unwrap();
+        fs.import().unwrap();
+        let mut ctx = prepare_context();
+        let path = source.as_path().join("file");
+        std::fs::write(&path, b"").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o2755)).unwrap();
+        let entry = fs
+            .lookup(&ctx, ROOT_ID, &CString::new("file").unwrap())
+            .unwrap();
+        let name = CString::new("system.posix_acl_access").unwrap();
+        // The xattr form of user::rwx, group::r-x, other::r-x.
+        let mut acl = 2u32.to_le_bytes().to_vec();
+        for (tag, perm) in [(0x01u16, 7u16), (0x04, 5), (0x20, 5)] {
+            acl.extend_from_slice(&tag.to_le_bytes());
+            acl.extend_from_slice(&perm.to_le_bytes());
+            acl.extend_from_slice(&u32::MAX.to_le_bytes());
+        }
+
+        fs.setxattr(&ctx, entry.inode, &name, &acl, 0).unwrap();
+        let (st, _) = fs.getattr(&ctx, entry.inode, None).unwrap();
+        assert_eq!(st.st_mode & 0o7777, 0o2755);
+
+        ctx.setxattr_flags = SETXATTR_ACL_KILL_SGID;
+        fs.setxattr(&ctx, entry.inode, &name, &acl, 0).unwrap();
+        let (st, _) = fs.getattr(&ctx, entry.inode, None).unwrap();
+        assert_eq!(st.st_mode & 0o7777, 0o755);
     }
 
     #[test]
