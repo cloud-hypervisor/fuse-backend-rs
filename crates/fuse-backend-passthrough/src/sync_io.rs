@@ -92,18 +92,9 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
         if !is_safe_inode(data.mode) {
             Err(ebadf())
         } else {
-            // `os_compat::O_DIRECT` is 0 on macOS (no `open()` flag
-            // equivalent), so the flag-stripping branch is compiled out and
-            // the guest's direct-IO request is silently ignored there.
-            #[cfg_attr(target_os = "macos", allow(unused_mut))]
-            let mut new_flags = flags;
-            #[cfg(target_os = "linux")]
-            if !self.cfg.allow_direct_io && flags & os_compat::O_DIRECT != 0 {
-                new_flags &= !os_compat::O_DIRECT;
-            }
-            let writeback_flags = self.get_writeback_open_flags(new_flags);
-            match data.open_file(writeback_flags | libc::O_CLOEXEC, &self.proc_self_fd) {
-                // With writeback cache enabled, `get_writeback_open_flags()` promotes O_WRONLY
+            let host_flags = self.host_open_flags(flags);
+            match data.open_file(host_flags | libc::O_CLOEXEC, &self.proc_self_fd) {
+                // With writeback cache enabled, `host_open_flags()` promotes O_WRONLY
                 // to O_RDWR so the kernel can issue read requests on the handle.  However, a
                 // file the caller may only write (e.g. mode 0o200: the owner has no read
                 // permission) rejects the promoted flags with EACCES, failing an open that
@@ -112,9 +103,9 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
                 // fails with the real error instead.
                 Err(e)
                     if e.raw_os_error() == Some(libc::EACCES)
-                        && writeback_flags & libc::O_ACCMODE != new_flags & libc::O_ACCMODE =>
+                        && host_flags & libc::O_ACCMODE != flags & libc::O_ACCMODE =>
                 {
-                    let fallback_flags = restore_access_mode(writeback_flags, flags);
+                    let fallback_flags = restore_access_mode(host_flags, flags);
                     data.open_file(fallback_flags | libc::O_CLOEXEC, &self.proc_self_fd)
                 }
                 res => res,
@@ -1002,7 +993,7 @@ impl<S: BitmapSlice + Send + Sync> FileSystem for PassthroughFs<S> {
             let _groups = ScopedSuppGroups::new(ctx.supp_gid)?;
             let (_uid, _gid) = set_creds(ctx.uid, ctx.gid)?;
 
-            let flags = self.get_writeback_open_flags(args.flags as i32);
+            let flags = self.host_open_flags(args.flags as i32);
             let mode = args.mode & !(args.umask & 0o777);
             // Same writeback O_WRONLY -> O_RDWR promotion rationale as the fallback in
             // `open_inode()`: a file created with a mode that denies read access to its owner
@@ -1788,6 +1779,33 @@ mod tests {
         fs.init(FsOptions::all()).unwrap();
 
         (fs, source)
+    }
+
+    // create() and open() build the host file's flags the same way. With the writeback cache
+    // and without allow_direct_io, both open O_WRONLY | O_APPEND | O_DIRECT as O_RDWR.
+    #[test]
+    fn test_create_and_open_build_the_same_host_flags() {
+        let (mut fs, _source) = prepare_fs_writeback_no_handles();
+        fs.cfg.allow_direct_io = false;
+        let ctx = prepare_context();
+        let flags = libc::O_WRONLY | libc::O_APPEND | libc::O_DIRECT;
+        let host_flags = |inode: Inode, handle: Option<Handle>| {
+            let data = fs.handle_map.get(handle.unwrap(), inode).unwrap();
+            let fd_flags = unsafe { libc::fcntl(data.borrow_fd().as_raw_fd(), libc::F_GETFL) };
+            fd_flags & (libc::O_ACCMODE | libc::O_APPEND | libc::O_DIRECT)
+        };
+
+        let name = CString::new("file").unwrap();
+        let args = CreateIn {
+            flags: flags as u32,
+            mode: 0o600,
+            umask: 0,
+            fuse_flags: 0,
+        };
+        let (entry, created, ..) = fs.create(&ctx, ROOT_ID, &name, args).unwrap();
+        assert_eq!(host_flags(entry.inode, created), libc::O_RDWR);
+        let (opened, ..) = fs.open(&ctx, entry.inode, flags as u32, 0).unwrap();
+        assert_eq!(host_flags(entry.inode, opened), libc::O_RDWR);
     }
 
     #[test]
