@@ -224,6 +224,8 @@
   took.
 
 ### Changed
+- [339](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/339): `fuse-backend-core` no longer enables vm-memory's unused `backend-mmap` feature,
+  which doesn't build on FreeBSD. A crate that uses vm-memory's mmap types has to enable it itself.
 - [325](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/325): The `fuse-backend-fusedev` `uring` transport uses io-uring 0.6 instead of 0.5,
   and depends on it only on Linux.
 - [324](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/324): `fuse-backend-core` uses bitflags 2 instead of 1. The flag types (`FsOptions`,
