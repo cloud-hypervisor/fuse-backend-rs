@@ -264,6 +264,8 @@
   the needed size the kernel expects, and a count for a nonzero size is answered with
   EINVAL instead of being copied out as the value or the list. The `getxattr`/`listxattr`
   trait docs say so.
+- `Vfs` no longer runs xattr names through its path component checks. They failed a name with
+  '/', which Linux allows, and the names '.' and '..' with EINVAL. The file system now gets them.
 - READDIR and READDIRPLUS answer ENOMEM when the reply can't hold the reply header plus the
   requested size. The check left out the header, so a writer short by up to 16 bytes started the
   listing and failed partway.

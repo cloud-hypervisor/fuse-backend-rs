@@ -485,8 +485,6 @@ impl FileSystem for Vfs {
         value: &[u8],
         flags: u32,
     ) -> Result<()> {
-        validate_path_component(name)?;
-
         match self.get_real_rootfs(inode)? {
             (Left(fs), idata) => fs.setxattr(ctx, idata.ino(), name, value, flags),
             (Right(fs), idata) => fs.setxattr(ctx, idata.ino(), name, value, flags),
@@ -500,8 +498,6 @@ impl FileSystem for Vfs {
         name: &CStr,
         size: u32,
     ) -> Result<GetxattrReply> {
-        validate_path_component(name)?;
-
         match self.get_real_rootfs(inode)? {
             (Left(fs), idata) => fs.getxattr(ctx, idata.ino(), name, size),
             (Right(fs), idata) => fs.getxattr(ctx, idata.ino(), name, size),
@@ -516,8 +512,6 @@ impl FileSystem for Vfs {
     }
 
     fn removexattr(&self, ctx: &Context, inode: VfsInode, name: &CStr) -> Result<()> {
-        validate_path_component(name)?;
-
         match self.get_real_rootfs(inode)? {
             (Left(fs), idata) => fs.removexattr(ctx, idata.ino(), name),
             (Right(fs), idata) => fs.removexattr(ctx, idata.ino(), name),
@@ -673,6 +667,8 @@ impl FileSystem for Vfs {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tests::FakeFileSystemOne;
+    use std::ffi::CString;
 
     #[test]
     fn test_id_remap_reverse_direction_without_underflow() {
@@ -822,5 +818,26 @@ mod tests {
         ctx.supplementary_groups = None;
         vfs.id_remap(&mut ctx).unwrap();
         assert_eq!(ctx.supplementary_groups, None);
+    }
+
+    #[test]
+    fn test_xattr_name_with_slash() {
+        fn errno<T>(res: Result<T>) -> Option<i32> {
+            res.err().and_then(|e| e.raw_os_error())
+        }
+
+        let vfs = Vfs::new(VfsOptions::default());
+        vfs.mount(Box::new(FakeFileSystemOne {}), "/x").unwrap();
+        let ctx = Context::new();
+        let x = vfs.lookup(&ctx, ROOT_ID.into(), &CString::new("x").unwrap());
+        let inode = x.unwrap().inode.into();
+
+        // Linux allows '/' in xattr names, so the requests reach the file system, whose
+        // default handlers answer ENOSYS.
+        let name = CString::new("user.a/b").unwrap();
+        let enosys = Some(libc::ENOSYS);
+        assert_eq!(errno(vfs.setxattr(&ctx, inode, &name, b"v", 0)), enosys);
+        assert_eq!(errno(vfs.getxattr(&ctx, inode, &name, 0)), enosys);
+        assert_eq!(errno(vfs.removexattr(&ctx, inode, &name)), enosys);
     }
 }
