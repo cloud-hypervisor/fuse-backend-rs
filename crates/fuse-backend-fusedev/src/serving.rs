@@ -64,7 +64,7 @@ use std::thread::{self, JoinHandle};
 use fuse_backend_core::api::filesystem::FileSystem;
 use fuse_backend_core::api::server::Server;
 
-#[cfg(all(target_os = "linux", feature = "async-io"))]
+#[cfg(all(target_os = "linux", any(feature = "async-io", feature = "uring")))]
 use crate::StopSignal;
 use crate::{Error, FuseChannelExt, FuseSession, Result};
 
@@ -333,8 +333,8 @@ fn svc_loop<F: FileSystem + Send + Sync + 'static, C: FuseChannelExt>(
 /// of [`WorkerSet::stop`].
 pub(crate) struct WorkerSet {
     exit: Arc<AtomicBool>,
-    // Wakes the `FuseDevTask` workers when `stop()` sets `exit`.
-    #[cfg(all(target_os = "linux", feature = "async-io"))]
+    // Wakes the `FuseDevTask` and io_uring workers when `stop()` sets `exit`.
+    #[cfg(all(target_os = "linux", any(feature = "async-io", feature = "uring")))]
     signal: Option<StopSignal>,
     tracker: Arc<WorkerExitTracker>,
     handles: Vec<JoinHandle<()>>,
@@ -344,7 +344,7 @@ impl WorkerSet {
     pub(crate) fn new() -> Self {
         WorkerSet {
             exit: Arc::new(AtomicBool::new(false)),
-            #[cfg(all(target_os = "linux", feature = "async-io"))]
+            #[cfg(all(target_os = "linux", any(feature = "async-io", feature = "uring")))]
             signal: None,
             tracker: Arc::new(WorkerExitTracker::default()),
             handles: Vec::new(),
@@ -352,16 +352,16 @@ impl WorkerSet {
     }
 
     /// The exit flag shared with every worker.
-    // Only the uring serving layer hands the flag to its workers, so the
-    // accessor only exists in configurations that compile it.
+    // Only the `/dev/fuse` thread of the uring serving layer takes the bare
+    // flag, so the accessor only exists in configurations that compile it.
     #[cfg(all(target_os = "linux", feature = "uring"))]
     pub(crate) fn exit_flag(&self) -> Arc<AtomicBool> {
         self.exit.clone()
     }
 
-    /// A stop signal for `FuseDevTask` workers, which sets the exit flag and
-    /// wakes them when the set stops.
-    #[cfg(all(target_os = "linux", feature = "async-io"))]
+    /// A stop signal for `FuseDevTask` and io_uring workers, which sets the
+    /// exit flag and wakes them when the set stops.
+    #[cfg(all(target_os = "linux", any(feature = "async-io", feature = "uring")))]
     pub(crate) fn stop_signal(&mut self) -> Result<StopSignal> {
         if let Some(signal) = &self.signal {
             return Ok(signal.clone());
@@ -383,20 +383,25 @@ impl WorkerSet {
     /// Signal all workers to stop, tear the session down and join them.
     ///
     /// `wake` wakes the epoll-based channels registered with the session,
-    /// which snaps their `epoll_wait` out immediately; blocking channels
-    /// and io_uring workers instead exit through the `ENODEV`/ring-error
-    /// completion that tearing the connection down produces. In-flight
-    /// requests are still served and replied before a worker exits.
+    /// which snaps their `epoll_wait` out immediately. The stop signal
+    /// wakes `FuseDevTask` and io_uring workers after the unmount. Blocking
+    /// channels exit through the `ENODEV` that tearing the connection down
+    /// produces. In-flight requests are still served and replied before a
+    /// worker exits.
     pub(crate) fn stop(&mut self, session: &mut FuseSession, wake: bool) {
         self.exit.store(true, Ordering::Release);
-        #[cfg(all(target_os = "linux", feature = "async-io"))]
-        if let Some(signal) = &self.signal {
-            signal.stop();
-        }
         if wake {
             let _ = session.wake();
         }
         let _ = session.umount();
+        // Stop the signal after the unmount. A stopped io_uring worker ends a
+        // connection that is still up, and umount() leaves the mount of an
+        // ended connection in place. With auto_unmount, fusermount unmounts
+        // later, dead mount or not.
+        #[cfg(all(target_os = "linux", any(feature = "async-io", feature = "uring")))]
+        if let Some(signal) = &self.signal {
+            signal.stop();
+        }
         let handles = std::mem::take(&mut self.handles);
         for handle in handles {
             let _ = handle.join();

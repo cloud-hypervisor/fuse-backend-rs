@@ -74,7 +74,7 @@ use vm_memory::mmap::MmapRegion;
 use crate::serving::{FuseServing, WorkerSet};
 #[cfg(feature = "async-io")]
 use crate::FuseDevTask;
-use crate::{FuseChannel, FuseDevReaderExt, FuseSession, FUSE_HEADER_SIZE};
+use crate::{FuseChannel, FuseDevReaderExt, FuseSession, StopSignal, FUSE_HEADER_SIZE};
 
 /// Size of `fuse_in_header`/`fuse_out_header` on the wire.
 const IN_HEADER_SIZE: usize = 40;
@@ -1026,6 +1026,10 @@ static ZERO_COPY_BOUNCES: std::sync::atomic::AtomicUsize = std::sync::atomic::At
 /// count the operations of that entry. Entry indexes never reach it.
 const ZERO_COPY_FLAG: u64 = 1 << 63;
 
+/// The `user_data` of the poll on the stop signal, which completes once the
+/// signal stops. Entry indexes never reach it.
+const STOP_USER_DATA: u64 = ZERO_COPY_FLAG - 1;
+
 /// Lock `mutex`, also if a thread panicked while it held the lock.
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
@@ -1079,8 +1083,10 @@ struct Completions {
     /// The zero-copy operation of each entry's request.
     ops: Vec<ZeroCopyOp>,
     /// The async worker loop, to wake when a request takes entry
-    /// completions off the ring.
+    /// completions or the stop off the ring.
     waker: Option<Waker>,
+    /// Whether the poll on the stop signal completed.
+    stopped: bool,
 }
 
 /// The zero-copy operation that the request in an entry runs on the ring.
@@ -1112,6 +1118,7 @@ impl Completions {
             armed: nr_entries,
             ops: vec![ZeroCopyOp::default(); nr_entries],
             waker: None,
+            stopped: false,
         }
     }
 
@@ -1138,11 +1145,23 @@ impl Completions {
             } else if (user_data as usize) < self.ops.len() {
                 self.armed = self.armed.saturating_sub(1);
                 self.queue.push_back((user_data as usize, cqe.result()));
+            } else if user_data == STOP_USER_DATA {
+                // If the kernel can't arm the poll, only the end of the
+                // connection stops the worker, and the stopped workers wait
+                // for it.
+                match cqe.result() {
+                    res if res < 0 => warn!(
+                        "uring worker: waiting for the stop signal failed: {}",
+                        io::Error::from_raw_os_error(-res)
+                    ),
+                    _ => self.stopped = true,
+                }
             } else {
                 warn!("uring worker: CQE with unexpected user_data {user_data}");
             }
         }
-        if self.queue.len() > queued {
+        // queued() takes no waker once stopped.
+        if self.queue.len() > queued || self.stopped {
             if let Some(waker) = self.waker.take() {
                 waker.wake();
             }
@@ -1788,7 +1807,7 @@ impl UringEntry {
 
 /// The function a worker thread runs: `UringWorker::run()`, or
 /// `UringWorker::run_async()` for asynchronous handlers.
-type RunFn<F> = fn(UringWorker<F>, Arc<AtomicBool>, Sender<io::Result<()>>) -> io::Result<()>;
+type RunFn<F> = fn(UringWorker<F>, StopSignal, Sender<io::Result<()>>) -> io::Result<()>;
 
 /// Prepare the body of the thread that serves the requests the kernel sends
 /// through `/dev/fuse`: `UringFuseServing::fallback_sync()`, or
@@ -1820,6 +1839,8 @@ struct UringWorker<F: FileSystem + Send + Sync + 'static> {
     server: Arc<Server<F>>,
     /// Ends the connection when the worker fails.
     abort: Arc<ConnectionAbort>,
+    /// Lets the workers end the connection once all have stopped.
+    barrier: Arc<StopBarrier>,
 }
 
 /// Lets the workers register their entries in rounds, see
@@ -1945,17 +1966,107 @@ impl ConnectionAbort {
     }
 
     /// End the connection, unless another worker did.
-    fn abort(&self) {
+    fn abort(&self) -> io::Result<()> {
         if self.done.swap(true, Ordering::AcqRel) {
-            return;
+            return Ok(());
         }
         let Some(path) = &self.path else {
-            error!("uring: can't end the FUSE connection without fusectl, unmount it by hand");
-            return;
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "fusectl isn't mounted",
+            ));
         };
-        if let Err(e) = std::fs::write(path, b"1") {
+        std::fs::write(path, b"1")
+    }
+
+    /// End the connection after a worker failed while it was up.
+    fn abort_failed(&self) {
+        if let Err(e) = self.abort() {
             error!("uring: can't end the FUSE connection, unmount it by hand: {e}");
         }
+    }
+}
+
+/// Holds stopped workers back from releasing their entries until no worker
+/// serves anymore. The kernel keeps the entries until the connection ends,
+/// and the connection of a busy mount outlives the unmount. So once the
+/// workers have served the requests they took, the last one to stop ends
+/// such a connection, like closing `/dev/fuse` ends a classic one.
+///
+/// Every worker leaves, also when it fails before serving, see
+/// `BarrierGuard`. A worker that never starts can't leave, but then no
+/// worker serves either, because the registration rounds fail.
+struct StopBarrier {
+    state: Mutex<BarrierState>,
+    cv: Condvar,
+}
+
+struct BarrierState {
+    /// The number of workers that haven't left.
+    serving: usize,
+    /// Whether a worker took the stop off its ring. The serving layer sets
+    /// the exit flag before it unmounts, but stops the signal only after.
+    stopped: bool,
+}
+
+impl StopBarrier {
+    fn new(workers: usize) -> StopBarrier {
+        StopBarrier {
+            state: Mutex::new(BarrierState {
+                serving: workers,
+                stopped: false,
+            }),
+            cv: Condvar::new(),
+        }
+    }
+
+    /// Leave as a worker that took the stop off its ring if `stopped`. The
+    /// last worker to leave ends the connection if a worker stopped and
+    /// `fd` finds the connection up. A stopped worker then waits until all
+    /// workers have left.
+    fn leave(&self, stopped: bool, fd: &File, abort: &ConnectionAbort) {
+        // This runs while a panic unwinds too, so it must not panic on a
+        // poisoned lock.
+        let mut state = lock(&self.state);
+        state.serving -= 1;
+        state.stopped |= stopped;
+        if state.serving == 0 {
+            if state.stopped && !crate::linux_session::is_torn_down(fd) {
+                if let Err(e) = abort.abort() {
+                    warn!("uring: can't end the FUSE connection that outlived the unmount: {e}");
+                }
+            }
+            self.cv.notify_all();
+        }
+        if stopped {
+            let _state = self
+                .cv
+                .wait_while(state, |s| s.serving > 0)
+                .unwrap_or_else(PoisonError::into_inner);
+        }
+    }
+}
+
+/// A worker's place at the `StopBarrier`, which it leaves when the guard
+/// drops, without waiting unless `leave()` says it stopped.
+struct BarrierGuard<'a> {
+    barrier: &'a StopBarrier,
+    fd: &'a File,
+    abort: &'a ConnectionAbort,
+    stopped: bool,
+}
+
+impl BarrierGuard<'_> {
+    /// Leave once done serving, as a worker that took the stop off its ring
+    /// if `stopped`.
+    fn leave(mut self, stopped: bool) {
+        self.stopped = stopped;
+    }
+}
+
+impl Drop for BarrierGuard<'_> {
+    fn drop(&mut self) {
+        self.barrier.leave(self.stopped, self.fd, self.abort);
     }
 }
 
@@ -1963,7 +2074,7 @@ impl ConnectionAbort {
 /// was up. Commands fail with ENOTCONN, ENODEV or ECANCELED once it ended,
 /// also through an unmount from outside, and its minor number may then
 /// belong to a new connection already.
-fn failed_while_connected(result: &io::Result<()>, exit: &AtomicBool) -> bool {
+fn failed_while_connected(result: &io::Result<()>, exit: &StopSignal) -> bool {
     match result {
         Ok(()) => false,
         Err(e)
@@ -1974,17 +2085,28 @@ fn failed_while_connected(result: &io::Result<()>, exit: &AtomicBool) -> bool {
         {
             false
         }
-        Err(_) => !exit.load(Ordering::Relaxed),
+        Err(_) => !exit.is_stopped(),
     }
 }
 
 impl<F: FileSystem + Send + Sync + 'static> UringWorker<F> {
+    /// The worker's place at the stop barrier.
+    fn barrier_guard(&self) -> BarrierGuard<'_> {
+        BarrierGuard {
+            barrier: &self.barrier,
+            fd: &self.fd,
+            abort: &self.abort,
+            stopped: false,
+        }
+    }
+
     /// Create the worker's ring and entries and register the entries,
     /// reporting the outcome through `ready_tx`. The kernel holds all
-    /// entries afterwards. `prepare` runs on the new ring before the
-    /// registration, and its failure fails the setup.
+    /// entries afterwards, and the ring polls `stop`. `prepare` runs on the
+    /// new ring before the registration, and its failure fails the setup.
     fn setup<T>(
         &self,
+        stop: &StopSignal,
         ready_tx: &Sender<io::Result<()>>,
         prepare: impl FnOnce(&FuseRing) -> io::Result<T>,
     ) -> io::Result<(FuseRing, Vec<UringEntry>, T)> {
@@ -1994,8 +2116,10 @@ impl<F: FileSystem + Send + Sync + 'static> UringWorker<F> {
         let fail = |e: &io::Error| {
             let _ = ready_tx.send(Err(io::Error::other(e.to_string())));
         };
-        let created = self.create_ring().and_then(|ring| {
+        let created = self.create_ring().and_then(|mut ring| {
             let prepared = prepare(&ring)?;
+            // The first registration round submits the poll.
+            poll_stop(&mut ring, stop)?;
             Ok((ring, prepared))
         });
         let (mut ring, prepared) = match created {
@@ -2102,8 +2226,9 @@ impl<F: FileSystem + Send + Sync + 'static> UringWorker<F> {
         Ok(())
     }
 
-    fn run(self, exit: Arc<AtomicBool>, ready_tx: Sender<io::Result<()>>) -> io::Result<()> {
-        let (ring, mut entries, ()) = self.setup(&ready_tx, |_| Ok(()))?;
+    fn run(self, exit: StopSignal, ready_tx: Sender<io::Result<()>>) -> io::Result<()> {
+        let barrier = self.barrier_guard();
+        let (ring, mut entries, ()) = self.setup(&exit, &ready_tx, |_| Ok(()))?;
         let fd = self.fd.as_raw_fd();
         let state = RingState::new(ring, entries.len());
         // A handler that panics stops the worker like an error, and the
@@ -2123,8 +2248,18 @@ impl<F: FileSystem + Send + Sync + 'static> UringWorker<F> {
                 // A request's zero-copy operation may take more completions
                 // off the ring, which join the queue. The lock is released
                 // before the request runs.
-                let next = lock(&state).completions.queue.pop_front();
-                let Some((idx, res)) = next else { break };
+                let (idx, res) = {
+                    let mut state = lock(&state);
+                    match state.completions.queue.pop_front() {
+                        Some(next) => next,
+                        // Once stopped, the worker has served the requests
+                        // it took.
+                        None if state.completions.stopped => break 'serve submit(&mut state.ring),
+                        // The wait at the top of the loop submits the
+                        // commits.
+                        None => break,
+                    }
+                };
                 let entry = &mut entries[idx];
                 if res < 0 {
                     break 'serve stop_result(&exit, res);
@@ -2141,13 +2276,13 @@ impl<F: FileSystem + Send + Sync + 'static> UringWorker<F> {
                     break 'serve Err(e);
                 }
             }
-            // The wait at the top of the loop submits the queued commits.
         };
         // The kernel gives the entries back once the connection ends.
         if failed_while_connected(&result, &exit) {
-            self.abort.abort();
+            self.abort.abort_failed();
         }
         let (ring, completions) = RingState::into_parts(state);
+        barrier.leave(completions.stopped);
         release_entries(ring, entries, completions);
         if let Some(payload) = panic {
             error!("uring worker: a request handler panicked");
@@ -2215,6 +2350,21 @@ fn submit(ring: &mut FuseRing) -> io::Result<()> {
     }
 }
 
+/// Queue a poll on the eventfd of `stop`, which completes with
+/// `STOP_USER_DATA` once the signal stops.
+fn poll_stop(ring: &mut FuseRing, stop: &StopSignal) -> io::Result<()> {
+    let event = stop
+        .event()
+        .ok_or_else(|| io::Error::other("the stop signal has no eventfd"))?;
+    let sqe = opcode::PollAdd::new(types::Fd(event.as_raw_fd()), libc::POLLIN as u32)
+        .build()
+        .user_data(STOP_USER_DATA);
+    // Safe because a poll has no buffer, and the kernel holds a reference
+    // to the eventfd while it waits.
+    unsafe { ring.submission().push(&squeue::Entry128::from(sqe)) }
+        .map_err(|_| io::Error::other("submission queue full"))
+}
+
 /// Submit what is queued on `ring` and wait for `want` completions, retrying
 /// when a signal interrupts the wait.
 fn submit_and_wait(ring: &mut FuseRing, want: usize) -> io::Result<()> {
@@ -2231,14 +2381,15 @@ fn submit_and_wait(ring: &mut FuseRing, want: usize) -> io::Result<()> {
 impl<F: AsyncFileSystem + Send + Sync + 'static> UringWorker<F> {
     /// Serve requests with the asynchronous handlers, each in its own
     /// future, on an async runtime of this thread.
-    fn run_async(self, exit: Arc<AtomicBool>, ready_tx: Sender<io::Result<()>>) -> io::Result<()> {
+    fn run_async(self, exit: StopSignal, ready_tx: Sender<io::Result<()>>) -> io::Result<()> {
         // Create the runtime and register the ring fd with it before the
         // registration, so a failure fails the constructor and can't free
         // entries the kernel holds. Runtime::new() panics on failure. That
         // has to become an error here, because the other workers keep the
         // ready channel open and the constructor would never see this
         // thread exit.
-        let (ring, entries, (runtime, ring_ready)) = self.setup(&ready_tx, |ring| {
+        let barrier = self.barrier_guard();
+        let (ring, entries, (runtime, ring_ready)) = self.setup(&exit, &ready_tx, |ring| {
             let runtime = std::panic::catch_unwind(Runtime::new)
                 .map_err(|_| io::Error::other("failed to create the async runtime"))?;
             // Safe because the AsyncFd is dropped in serve_async(), before
@@ -2258,6 +2409,7 @@ impl<F: AsyncFileSystem + Send + Sync + 'static> UringWorker<F> {
         let result =
             runtime.block_on(self.serve_async(&state, ring_ready, &mut entries, &exit, &mut panic));
         let (ring, completions) = RingState::into_parts(state);
+        barrier.leave(completions.stopped);
         release_entries(ring, entries.into_iter().flatten().collect(), completions);
         if let Some(payload) = panic {
             error!("uring worker: a request handler panicked");
@@ -2277,15 +2429,14 @@ impl<F: AsyncFileSystem + Send + Sync + 'static> UringWorker<F> {
     /// the commits in one `io_uring_enter()`. It lets the runtime park every
     /// `PARK_AFTER_REQUESTS` requests.
     ///
-    /// Tearing the connection down fails the commands of the armed entries,
-    /// which stops the loop. While no entry is armed, no command can fail,
-    /// so the loop checks `exit` every `EXIT_POLL` instead.
+    /// The loop stops once the poll on the stop signal completes, or when
+    /// tearing the connection down fails the command of an armed entry.
     async fn serve_async(
         &self,
         state: &Mutex<RingState>,
         ring_ready: AsyncFd<RawFd>,
         entries: &mut [Option<UringEntry>],
-        exit: &AtomicBool,
+        exit: &StopSignal,
         panic: &mut Option<Box<dyn std::any::Any + Send>>,
     ) -> io::Result<()> {
         let fd = self.fd.as_raw_fd();
@@ -2295,14 +2446,15 @@ impl<F: AsyncFileSystem + Send + Sync + 'static> UringWorker<F> {
         let mut taken = 0;
 
         let result = 'serve: loop {
-            {
+            let stopped = {
                 let mut state = lock(state);
                 // The loop takes these completions itself, so it needn't
                 // wake up for them.
                 state.completions.waker = None;
                 state.receive();
                 std::mem::swap(&mut state.completions.queue, &mut completed);
-            }
+                state.completions.stopped
+            };
             while let Some((idx, res)) = completed.pop_front() {
                 let Some(mut entry) = entries[idx].take() else {
                     break 'serve Err(io::Error::other(format!(
@@ -2323,15 +2475,19 @@ impl<F: AsyncFileSystem + Send + Sync + 'static> UringWorker<F> {
                 });
                 taken += 1;
             }
-            let idle = {
+            {
                 let mut state = lock(state);
                 if !state.ring.submission().is_empty() {
                     if let Err(e) = submit(&mut state.ring) {
                         break 'serve Err(e);
                     }
                 }
-                state.completions.armed == 0
-            };
+            }
+            // The requests delivered before the stop finish in the drain
+            // below.
+            if stopped {
+                break 'serve Ok(());
+            }
             if taken >= PARK_AFTER_REQUESTS {
                 taken = 0;
                 async_runtime::park().await;
@@ -2359,8 +2515,9 @@ impl<F: AsyncFileSystem + Send + Sync + 'static> UringWorker<F> {
                         done = inflight.next().now_or_never().flatten();
                     }
                 }
-                // Entry completions that a request took off the ring, or a
-                // zero-copy operation that a request couldn't submit.
+                // Entry completions or the stop that a request took off the
+                // ring, or a zero-copy operation that a request couldn't
+                // submit.
                 () = queued(state) => {}
                 ready = ring_ready.readable() => match ready {
                     // Clear the readiness before draining the completion
@@ -2369,20 +2526,13 @@ impl<F: AsyncFileSystem + Send + Sync + 'static> UringWorker<F> {
                     Ok(mut guard) => guard.clear_ready(),
                     Err(e) => break 'serve Err(e),
                 },
-                // Lazy, because select! builds the futures of disabled
-                // branches too.
-                _ = async { tokio::time::sleep(EXIT_POLL).await }, if idle => {
-                    if exit.load(Ordering::Relaxed) {
-                        break 'serve Ok(());
-                    }
-                }
             }
         };
 
         // A failed worker ends the connection now, so the requests on its
         // queues don't wait for it, and the kernel gives its entries back.
         if failed_while_connected(&result, exit) {
-            self.abort.abort();
+            self.abort.abort_failed();
         }
 
         // Let the requests in flight finish before release_entries() can
@@ -2459,13 +2609,16 @@ impl<F: AsyncFileSystem + Send + Sync + 'static> UringWorker<F> {
     }
 }
 
-/// Wait until the queue in `state` holds entry completions, or its ring
-/// operations to submit.
+/// Wait until the queue in `state` holds entry completions, its ring
+/// operations to submit, or the stop.
 #[cfg(feature = "async-io")]
 async fn queued(state: &Mutex<RingState>) {
     std::future::poll_fn(|cx| {
         let mut state = lock(state);
-        if state.completions.queue.is_empty() && state.ring.submission().is_empty() {
+        if state.completions.queue.is_empty()
+            && state.ring.submission().is_empty()
+            && !state.completions.stopped
+        {
             state.completions.waker = Some(cx.waker().clone());
             Poll::Pending
         } else {
@@ -2490,11 +2643,6 @@ const PARK_AFTER_REQUESTS: usize = 64;
 #[cfg(feature = "async-io")]
 const DRAIN_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// How often an async worker without armed entries checks whether the
-/// serving layer is stopping.
-#[cfg(feature = "async-io")]
-const EXIT_POLL: Duration = Duration::from_millis(100);
-
 /// Stage an EIO reply in `entry` if its handler failed, and return the
 /// panic payload if it panicked.
 fn settle(
@@ -2516,8 +2664,8 @@ fn settle(
 /// the serving layer is stopping, which fails the commands as it tears the
 /// connection down, and the error otherwise. A failed command leaves the
 /// entry in an undefined state, so the worker stops instead of guessing.
-fn stop_result(exit: &AtomicBool, res: i32) -> io::Result<()> {
-    if exit.load(Ordering::Relaxed) {
+fn stop_result(exit: &StopSignal, res: i32) -> io::Result<()> {
+    if exit.is_stopped() {
         Ok(())
     } else {
         Err(io::Error::from_raw_os_error(-res))
@@ -2721,6 +2869,7 @@ impl<F: FileSystem + Send + Sync + 'static> UringFuseServing<F> {
         // Build one worker per entry set, cloning the fuse fd up front so
         // cloning failures are reported before any thread is spawned.
         let abort = Arc::new(ConnectionAbort::new(session.mountpoint()));
+        let barrier = Arc::new(StopBarrier::new(workers));
         let nr_rounds = spread.iter().flatten().map(|&(_, round)| round + 1).max();
         let rounds = Arc::new(RegisterRounds::new(workers, nr_rounds.unwrap_or(1)));
         let mut worker_list = Vec::with_capacity(workers);
@@ -2746,11 +2895,12 @@ impl<F: FileSystem + Send + Sync + 'static> UringFuseServing<F> {
                 rounds: rounds.clone(),
                 server: server.clone(),
                 abort: abort.clone(),
+                barrier: barrier.clone(),
             });
         }
 
         let mut set = WorkerSet::new();
-        let exit = set.exit_flag();
+        let exit = set.stop_signal()?;
         let tracker = set.tracker();
         let (ready_tx, ready_rx) = channel();
         for (id, worker) in worker_list.into_iter().enumerate() {
@@ -2953,10 +3103,12 @@ impl<F: AsyncFileSystem + Send + Sync + 'static> UringFuseServing<F> {
 
 impl<F: FileSystem + Send + Sync + 'static> Drop for UringFuseServing<F> {
     fn drop(&mut self) {
-        // Tearing down the connection completes all outstanding ring entries
-        // with an error, which unblocks the worker threads. The fallback
-        // thread is woken through its epoll channel, or with the async
-        // handlers through its stop signal.
+        // The unmount ends the connection, which fails the commands of the
+        // armed entries and stops the workers. The stop signal stops them
+        // when a busy mount keeps the connection up, and they end it once
+        // they have served the requests they took. The fallback thread wakes
+        // through its epoll channel, or with the async handlers through its
+        // stop signal or the end of the connection.
         self.workers.stop(&mut self.session, true);
     }
 }
@@ -3743,6 +3895,7 @@ mod tests {
                 path: None,
                 done: AtomicBool::new(false),
             }),
+            barrier: Arc::new(StopBarrier::new(1)),
         };
         (worker, source)
     }
@@ -4409,6 +4562,156 @@ mod tests {
         check_handler_panic(UringFuseServing::new_async);
     }
 
+    /// Like `mount_uring()` with 2 workers and 2 entries per queue, but
+    /// return None also where fusectl isn't mounted.
+    fn mount_with_fusectl<F: FileSystem + Send + Sync + 'static>(
+        server: Arc<Server<F>>,
+        mnt: &std::path::Path,
+        start: StartFn<F>,
+    ) -> Option<UringFuseServing<F>> {
+        let cfg = UringConfig {
+            workers: 2,
+            entries_per_queue: 2,
+            bufs_per_queue: 0,
+            zero_copy: false,
+        };
+        let serving = mount_uring(server, mnt, cfg, start)?;
+        if ConnectionAbort::new(serving.session.mountpoint())
+            .path
+            .is_none()
+        {
+            eprintln!("fusectl isn't mounted, skipping");
+            return None;
+        }
+        Some(serving)
+    }
+
+    /// Drop `serving` on another thread, and return how long that took.
+    fn timed_drop<T: Send + 'static>(serving: T) -> std::sync::mpsc::Receiver<Duration> {
+        let (tx, rx) = channel();
+        thread::spawn(move || {
+            let start = Instant::now();
+            drop(serving);
+            let _ = tx.send(start.elapsed());
+        });
+        rx
+    }
+
+    /// A busy mount keeps the connection up after the unmount. Stopping
+    /// still stops the workers, which end the connection and get their
+    /// entries back instead of waiting for the mount to go idle.
+    fn check_busy_stop(start: StartFn<PassthroughFs<()>>) {
+        let src = TempDir::new().unwrap();
+        let mnt = TempDir::new().unwrap();
+        let server = passthrough_server(src.as_path(), false);
+        let Some(serving) = mount_with_fusectl(server, mnt.as_path(), start) else {
+            return;
+        };
+        let mountpoint = serving.session.mountpoint().to_path_buf();
+        let busy = File::open(mnt.as_path()).unwrap();
+        let stopped = timed_drop(serving).recv_timeout(Duration::from_secs(5));
+        assert!(stopped.expect("the workers didn't stop") < RELEASE_TIMEOUT);
+        // The stop unmounted, and left no dead mount behind.
+        let mountinfo = std::fs::read_to_string("/proc/self/mountinfo").unwrap();
+        assert_eq!(mount_minor(&mountinfo, &mountpoint), None);
+        // A LOOKUP in the busy directory fails once the connection ended.
+        // Safe because the path is a valid C string and the fd is open.
+        let name = b"missing\0".as_ptr() as *const libc::c_char;
+        let fd = unsafe { libc::openat(busy.as_raw_fd(), name, libc::O_RDONLY) };
+        assert_eq!(fd, -1);
+        assert_eq!(
+            io::Error::last_os_error().raw_os_error(),
+            Some(libc::ENOTCONN)
+        );
+    }
+
+    #[test]
+    fn test_uring_serving_busy_stop() {
+        check_busy_stop(UringFuseServing::new);
+    }
+
+    #[cfg(feature = "async-io")]
+    #[test]
+    fn test_uring_async_serving_busy_stop() {
+        check_busy_stop(UringFuseServing::new_async);
+    }
+
+    /// A file system whose LOOKUP reports on `entered` and then waits until
+    /// the test drops the sender of `open`.
+    struct GateFs {
+        entered: Sender<()>,
+        open: Mutex<std::sync::mpsc::Receiver<()>>,
+    }
+
+    impl FileSystem for GateFs {
+        type Inode = u64;
+        type Handle = u64;
+
+        fn lookup(
+            &self,
+            _ctx: &fuse_backend_core::api::filesystem::Context,
+            _parent: u64,
+            _name: &std::ffi::CStr,
+        ) -> io::Result<fuse_backend_core::api::filesystem::Entry> {
+            let _ = self.entered.send(());
+            let _ = lock(&self.open).recv();
+            Err(io::Error::from_raw_os_error(libc::ENOENT))
+        }
+
+        fn getattr(
+            &self,
+            ctx: &fuse_backend_core::api::filesystem::Context,
+            inode: u64,
+            handle: Option<u64>,
+        ) -> io::Result<(fuse_backend_core::abi::fuse_abi::stat64, Duration)> {
+            PanicFs.getattr(ctx, inode, handle)
+        }
+    }
+
+    // The async defaults call the sync handlers.
+    #[cfg(feature = "async-io")]
+    impl fuse_backend_core::api::filesystem::AsyncFileSystem for GateFs {}
+
+    /// A request in flight when the serving layer stops still gets its
+    /// reply, so the first worker to stop doesn't end the connection.
+    fn check_stop_in_flight(start: StartFn<GateFs>) {
+        let mnt = TempDir::new().unwrap();
+        let (entered, entered_rx) = channel();
+        let (open, open_rx) = channel();
+        let server = Arc::new(Server::new(GateFs {
+            entered,
+            open: Mutex::new(open_rx),
+        }));
+        let Some(serving) = mount_with_fusectl(server, mnt.as_path(), start) else {
+            return;
+        };
+        let path = mnt.as_path().join("gated");
+        let client = thread::spawn(move || std::fs::metadata(path).map(|_| ()));
+        entered_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the LOOKUP didn't arrive");
+        let stopped = timed_drop(serving);
+        // Let the stop reach the workers before the gate opens.
+        thread::sleep(Duration::from_millis(100));
+        drop(open);
+        let reply = client.join().unwrap().unwrap_err();
+        assert_eq!(reply.raw_os_error(), Some(libc::ENOENT));
+        stopped
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the workers didn't stop");
+    }
+
+    #[test]
+    fn test_uring_serving_stop_in_flight() {
+        check_stop_in_flight(UringFuseServing::new);
+    }
+
+    #[cfg(feature = "async-io")]
+    #[test]
+    fn test_uring_async_serving_stop_in_flight() {
+        check_stop_in_flight(UringFuseServing::new_async);
+    }
+
     /// Ending the connection, as a failed worker does, stops every worker,
     /// so `wait()` returns instead of serving on with a hanging queue.
     #[test]
@@ -4443,7 +4746,7 @@ mod tests {
         };
         std::fs::read_dir(mnt.as_path()).unwrap().for_each(drop);
 
-        abort.abort();
+        abort.abort().unwrap();
         let (tx, rx) = channel();
         let waiting = serving.clone();
         std::thread::spawn(move || {
