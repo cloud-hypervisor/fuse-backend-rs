@@ -32,6 +32,13 @@
   directly by the fusedev build script.
 
 ### Added
+- [345](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/345): Add `FsOptions::ALLOW_IDMAP` (Linux 6.12 and later), which
+  lets the FUSE mount be idmapped with `mount_setattr(MOUNT_ATTR_IDMAP)`.
+  `PassthroughFs` negotiates it on its own when the new
+  `Config::allow_idmap` is set; behind a `Vfs`, add it to
+  `VfsOptions::out_opts`. `OverlayFs` isn't ready for it: it copies files
+  up with the ids of the request, which are then invalid.
+
 - [304](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/304): Give FreeBSD a verification path. The Linux wire-format ABI
   body moves out of `fuse_abi_linux.rs` into a shared `fuse_abi_wire.rs`
   (each per-OS prelude re-exports the libc names the body uses), and a new

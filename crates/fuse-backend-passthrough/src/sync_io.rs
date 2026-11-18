@@ -753,6 +753,11 @@ impl<S: BitmapSlice + Send + Sync> FileSystem for PassthroughFs<S> {
             opts |= capable & FsOptions::DIRECT_IO_ALLOW_MMAP;
         }
 
+        #[cfg(target_os = "linux")]
+        if self.cfg.allow_idmap {
+            opts |= capable & FsOptions::ALLOW_IDMAP;
+        }
+
         if capable.contains(FsOptions::PERFILE_DAX) {
             opts |= FsOptions::PERFILE_DAX;
             self.perfile_dax.store(true, Ordering::Relaxed);

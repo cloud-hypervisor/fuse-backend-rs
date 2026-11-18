@@ -853,6 +853,22 @@ mod tests {
     }
 
     #[test]
+    fn test_id_remap_keeps_invalid_ids() {
+        // A mapping whose range ends at u32::MAX.
+        let vfs = Vfs::new(VfsOptions {
+            id_mapping: (0, 1, u32::MAX),
+            ..Default::default()
+        });
+        let mut ctx = Context {
+            uid: u32::MAX,
+            gid: u32::MAX,
+            ..Default::default()
+        };
+        vfs.id_remap(&mut ctx).unwrap();
+        assert_eq!((ctx.uid, ctx.gid), (u32::MAX, u32::MAX));
+    }
+
+    #[test]
     fn test_id_remap_reverse_direction_without_underflow() {
         let vfs = Vfs::new(VfsOptions {
             id_mapping: (0, 100000, 65536),
