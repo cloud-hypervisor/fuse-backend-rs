@@ -124,7 +124,11 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
         flags: u32,
     ) -> io::Result<FileFlagGuard<'a, u32>> {
         let guard = data.open_flags.read().unwrap();
-        if *guard & os_compat::O_DIRECT as u32 == flags & os_compat::O_DIRECT as u32 {
+        // Without allow_direct_io the host fd never gets O_DIRECT, because do_read() and
+        // do_write() then skip the aligned path.
+        if !self.cfg.allow_direct_io
+            || *guard & os_compat::O_DIRECT as u32 == flags & os_compat::O_DIRECT as u32
+        {
             return Ok(FileFlagGuard::Reader(guard));
         }
         drop(guard);
@@ -2145,6 +2149,66 @@ mod tests {
         let fd_flags = fd_flags();
         assert_eq!(fd_flags & (libc::O_DIRECT | libc::O_APPEND), 0);
         assert_eq!(*data.open_flags.read().unwrap(), args.flags);
+    }
+
+    // With `allow_direct_io` off, do_read() and do_write() take the buffered path, which fails
+    // with EINVAL on an O_DIRECT host fd. So neither a create with O_DIRECT nor an O_DIRECT
+    // READ or WRITE may give the host fd that flag, through a handle or under no_open.
+    #[test]
+    fn test_no_direct_io_keeps_host_fd_buffered() {
+        let (mut fs, _source) = prepare_fs_writeback_no_handles();
+        fs.cfg.allow_direct_io = false;
+        let ctx = prepare_context();
+        let direct = libc::O_DIRECT as u32;
+        // Direct IO rejects the unaligned length of this payload.
+        let payload = b"hello";
+        let size = payload.len() as u32;
+        // After the buffered WRITE, the O_DIRECT requests differ from the handle's flags, even on
+        // the handle created with O_DIRECT.
+        let io = |inode: Inode, handle: Handle| {
+            for flags in [0, direct] {
+                let mut r = MemReader(payload.to_vec());
+                let n = fs
+                    .write(&ctx, inode, handle, &mut r, size, 0, None, false, flags, 0)
+                    .unwrap();
+                assert_eq!(n, payload.len());
+            }
+            let mut w = MemWriter::new();
+            let n = fs
+                .read(&ctx, inode, handle, &mut w, size, 0, None, direct)
+                .unwrap();
+            assert_eq!(&w.0[..n], payload);
+        };
+        let host_direct_io = |inode: Inode, handle: Handle| {
+            let data = fs.handle_map.get(handle, inode).unwrap();
+            let flags = unsafe { libc::fcntl(data.borrow_fd().as_raw_fd(), libc::F_GETFL) };
+            flags & libc::O_DIRECT != 0
+        };
+
+        let name = CString::new("file").unwrap();
+        let args = CreateIn {
+            flags: libc::O_RDWR as u32 | direct,
+            mode: 0o600,
+            umask: 0,
+            fuse_flags: 0,
+        };
+        let (entry, handle, ..) = fs.create(&ctx, ROOT_ID, &name, args).unwrap();
+        let handle = handle.unwrap();
+        io(entry.inode, handle);
+        assert!(!host_direct_io(entry.inode, handle));
+
+        // A handle opened without O_DIRECT, as after fcntl() turns it on in the client.
+        let handle = fs
+            .open(&ctx, entry.inode, libc::O_RDWR as u32, 0)
+            .unwrap()
+            .0
+            .unwrap();
+        io(entry.inode, handle);
+        assert!(!host_direct_io(entry.inode, handle));
+
+        // no_open opens the file again for each request.
+        fs.no_open.store(true, Ordering::Relaxed);
+        io(entry.inode, 0);
     }
 
     #[test]
