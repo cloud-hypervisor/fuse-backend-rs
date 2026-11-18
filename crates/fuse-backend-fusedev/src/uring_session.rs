@@ -236,6 +236,7 @@ fn op_args(opcode: u32) -> Option<(usize, bool)> {
         Opcode::Rename2 => (16, false),                      // Rename2In
         Opcode::Lseek => (24, true),                         // LseekIn
         Opcode::CopyFileRange => (56, true),                 // CopyFileRangeIn
+        Opcode::Tmpfile => (16, true),                       // CreateIn
         // SETUPMAPPING/REMOVEMAPPING only exist on the virtiofs DAX window
         // path, never on /dev/fuse. Opcode::from() maps the numbers without
         // a variant to MaxOpcode and never returns the byte-swapped INIT
@@ -2128,6 +2129,7 @@ mod tests {
                 Opcode::CopyFileRange as u32,
                 std::mem::size_of::<CopyFileRangeIn>(),
             ),
+            (Opcode::Tmpfile as u32, std::mem::size_of::<CreateIn>()),
         ];
         for &(op, len) in expected {
             assert_eq!(op_args(op).map(|a| a.0), Some(len), "opcode {}", op);

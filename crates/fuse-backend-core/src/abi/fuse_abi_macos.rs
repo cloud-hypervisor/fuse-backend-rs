@@ -588,6 +588,7 @@ pub enum Opcode {
     Rename2 = 45,
     Lseek = 46,
     CopyFileRange = 47,
+    Tmpfile = 51,
     Setvolname = 61,
     Getxtimes = 62,
     Exchange = 63,
@@ -601,7 +602,7 @@ pub enum Opcode {
 impl From<u32> for Opcode {
     fn from(op: u32) -> Opcode {
         // Don't use `mem::transmute` here: the value range contains holes
-        // (e.g. 0, 7, 19, 48..61), and transmuting an invalid value into the
+        // (e.g. 0, 7, 19, 48..=50, 52..=60), and transmuting an invalid value into the
         // enum is undefined behavior. Unknown values are mapped to
         // `MaxOpcode`, which callers treat as an unsupported opcode.
         match op {
@@ -650,6 +651,7 @@ impl From<u32> for Opcode {
             45 => Opcode::Rename2,
             46 => Opcode::Lseek,
             47 => Opcode::CopyFileRange,
+            51 => Opcode::Tmpfile,
             61 => Opcode::Setvolname,
             62 => Opcode::Getxtimes,
             63 => Opcode::Exchange,
@@ -1406,6 +1408,7 @@ mod tests {
             Opcode::Rename2,
             Opcode::Lseek,
             Opcode::CopyFileRange,
+            Opcode::Tmpfile,
             Opcode::Setvolname,
             Opcode::Getxtimes,
             Opcode::Exchange,
