@@ -46,9 +46,6 @@ nix = { version = "0.31", features = [
 tokio = { version = "1.53.3", optional = true }
 vm-memory = { workspace = true }
 
-[target.'cfg(target_os = "macos")'.dependencies]
-core-foundation-sys = ">=0.8"
-
 # Linux-only runtime dependencies: mio's epoll-backed `Poll`/`Waker` drives
 # the exit channel of the Linux session, only the asyncio module of the Linux
 # session consumes futures-util (so the `async-io` feature stays meaningful

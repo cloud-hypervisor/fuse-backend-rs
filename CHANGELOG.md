@@ -23,6 +23,13 @@
   `cargo build -p fuse-backend-fusedev` rows (default and `async-io`) in
   `make check-freebsd`. 0.32 is deliberately not taken (released days
   earlier, its accept/accept4 fd-type breakage buys nothing here).
+  Related cleanup: the macFUSE session's few CoreFoundation declarations
+  (`CFStringCreateWithBytes`/`CFURLCreateWithFileSystemPath`/`CFRelease`)
+  move out of the `core-foundation-sys` crate into local `extern "C"`
+  declarations — the crate sat unused in the `fuse-t` build, where the
+  macFUSE session is compiled out, and the DADisk calls next to them were
+  already declared locally; the CoreFoundation framework is now linked
+  directly by the fusedev build script.
 
 ### Added
 - [304](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/304): Give FreeBSD a verification path. The Linux wire-format ABI
