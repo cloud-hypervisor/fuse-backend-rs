@@ -1878,6 +1878,23 @@ mod tests {
     }
 
     #[test]
+    fn test_process_malformed_request_gets_einval() {
+        let (worker, _source) = make_worker();
+        let mut entry = UringEntry::new(0, Payload::Own(worker.payload_cap));
+
+        // A name without its NUL: the server answers EINVAL, and the
+        // worker commits that reply instead of its EIO.
+        plant_request(&mut entry, Opcode::Lookup as u32, &[], b"fuse-file");
+        worker.process(&mut entry).unwrap();
+        let out = parse_out_header(&entry);
+        assert_eq!(
+            (out.len as usize, out.error),
+            (OUT_HEADER_SIZE, -libc::EINVAL)
+        );
+        assert_eq!(entry.header().ring_ent_in_out.payload_sz, 0);
+    }
+
+    #[test]
     fn test_process_unknown_opcode_gets_enosys() {
         /// The STATX opcode, which the transport's table doesn't know.
         const FUSE_STATX: u32 = 52;
