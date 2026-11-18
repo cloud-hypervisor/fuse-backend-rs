@@ -189,6 +189,10 @@ pub struct VfsOptions {
     /// File system options passed in from client
     pub in_opts: FsOptions,
     /// File system options returned to client
+    ///
+    /// Add `FsOptions::PASSTHROUGH` for kernel passthrough. If the kernel offers it, init()
+    /// sets `no_writeback` and clears `no_open` for all mounts, because passthrough needs open
+    /// requests and no writeback cache.
     pub out_opts: FsOptions,
     /// Declaration of ID mapping, in the format (internal ID, external ID, range).
     /// For example, (0, 1, 65536) represents mapping the external UID/GID range of `1~65536`
@@ -199,13 +203,14 @@ pub struct VfsOptions {
     /// requests are always replied with ENOSYS. init() turns this off
     /// again unless the kernel offered `FsOptions::ZERO_MESSAGE_OPEN`,
     /// so on macFUSE (which never offers it) open handling stays enabled.
+    /// Negotiated kernel passthrough turns it off too, see `out_opts`.
     pub no_open: bool,
     /// Disable fuse opendir request handling. When enabled, fuse opendir
     /// requests are always replied with ENOSYS. init() turns this off
     /// again unless the kernel offered `FsOptions::ZERO_MESSAGE_OPENDIR`.
     pub no_opendir: bool,
     /// Disable fuse WRITEBACK_CACHE option so that kernel will not cache
-    /// buffer writes.
+    /// buffer writes. Negotiated kernel passthrough turns it on, see `out_opts`.
     pub no_writeback: bool,
     /// Enable fuse killpriv_v2 support. When enabled, fuse file system makes sure
     /// to remove security.capability xattr and setuid/setgid bits. See details in
@@ -1467,6 +1472,52 @@ mod tests {
         let opts = vfs.opts.load();
         assert!(opts.no_open);
         assert!(!opts.out_opts.contains(FsOptions::ATOMIC_O_TRUNC));
+    }
+
+    #[test]
+    fn test_vfs_init_passthrough() {
+        // Spell the options out, because the macOS defaults have no writeback cache.
+        let wanted = FsOptions::WRITEBACK_CACHE
+            | FsOptions::ZERO_MESSAGE_OPEN
+            | FsOptions::ATOMIC_O_TRUNC
+            | FsOptions::PASSTHROUGH;
+        let vfs_with = |out_opts| {
+            Vfs::new(VfsOptions {
+                out_opts,
+                ..Default::default()
+            })
+        };
+
+        // Passthrough turns off the writeback cache and no_open, so atomic O_TRUNC stays.
+        let vfs = vfs_with(wanted);
+        assert_eq!(
+            vfs.init(wanted).unwrap(),
+            FsOptions::ATOMIC_O_TRUNC | FsOptions::PASSTHROUGH
+        );
+        let opts = vfs.options();
+        assert!(opts.no_writeback);
+        assert!(!opts.no_open);
+
+        // A kernel without passthrough changes nothing.
+        let offered = wanted - FsOptions::PASSTHROUGH;
+        let vfs = vfs_with(wanted);
+        assert_eq!(
+            vfs.init(offered).unwrap(),
+            FsOptions::WRITEBACK_CACHE | FsOptions::ZERO_MESSAGE_OPEN
+        );
+        let opts = vfs.options();
+        assert!(!opts.no_writeback);
+        assert!(opts.no_open);
+
+        // Without it in out_opts, the kernel offering it changes nothing.
+        let vfs = vfs_with(offered);
+        assert_eq!(
+            vfs.init(wanted).unwrap(),
+            FsOptions::WRITEBACK_CACHE | FsOptions::ZERO_MESSAGE_OPEN
+        );
+        let opts = vfs.options();
+        assert!(!opts.no_writeback);
+        assert!(opts.no_open);
     }
 
     #[test]
