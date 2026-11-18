@@ -1,7 +1,7 @@
 # Changelog
 ## [Unreleased]
 ### Added
-- [NNN](link): Give FreeBSD a verification path. The Linux wire-format ABI
+- [304](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/304): Give FreeBSD a verification path. The Linux wire-format ABI
   body moves out of `fuse_abi_linux.rs` into a shared `fuse_abi_wire.rs`
   (each per-OS prelude re-exports the libc names the body uses), and a new
   FreeBSD ABI arm reuses it — FreeBSD's in-kernel fusefs speaks the Linux
