@@ -45,6 +45,7 @@
 use std::future::Future;
 use std::io;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicIsize, AtomicUsize};
 
 use async_trait::async_trait;
 
@@ -61,6 +62,79 @@ use fuse_backend_core::async_runtime::{self, Runtime};
 use fuse_backend_core::buffer::pagesize;
 use fuse_backend_core::file_buf::FileVolatileSlice;
 use fuse_backend_core::file_traits::{AsyncFileReadWriteVolatile, FileReadWriteVolatile};
+
+/// Keeps native asynchronous IO and O_DIRECT requests on a handle apart.
+///
+/// The native path releases the O_DIRECT flag guard of `ensure_file_flags()`
+/// before its IO runs, and io_uring only submits the IO when the runtime
+/// parks. An O_DIRECT request served on the same handle in the meantime, on
+/// this worker or another one, sets O_DIRECT on the shared file description,
+/// and the native IO then fails with `EINVAL` on its unaligned transport
+/// buffer. So both kinds enter the gate before they touch the file, and wait
+/// until the requests of the other kind have left. The gate isn't fair:
+/// requests of one kind that keep overlapping on a handle delay a request of
+/// the other kind.
+#[derive(Default)]
+pub(crate) struct IoGate {
+    /// The number of native IOs in the gate if positive, of O_DIRECT
+    /// requests if negative.
+    state: AtomicIsize,
+    /// The number of requests waiting for `empty`. A request that leaves the
+    /// gate only notifies if there are any.
+    waiting: AtomicUsize,
+    empty: tokio::sync::Notify,
+}
+
+impl IoGate {
+    /// Wait until no request of the other kind is in the gate of `data`, and
+    /// enter it. The request stays in the gate until the guard is dropped.
+    async fn enter(data: &Arc<HandleData>, direct: bool) -> IoGateGuard {
+        let gate = &data.io_gate;
+        let step = if direct { -1 } else { 1 };
+        loop {
+            let state = gate.state.load(Ordering::SeqCst);
+            if state * step >= 0 {
+                if gate
+                    .state
+                    .compare_exchange(state, state + step, Ordering::SeqCst, Ordering::SeqCst)
+                    .is_ok()
+                {
+                    return IoGateGuard {
+                        data: data.clone(),
+                        step,
+                    };
+                }
+                continue;
+            }
+            // Register for the wakeup and check again, so one sent in
+            // between isn't lost.
+            let mut empty = std::pin::pin!(gate.empty.notified());
+            empty.as_mut().enable();
+            gate.waiting.fetch_add(1, Ordering::SeqCst);
+            if gate.state.load(Ordering::SeqCst) * step < 0 {
+                empty.await;
+            }
+            gate.waiting.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+}
+
+/// A request in the `IoGate` of a handle.
+struct IoGateGuard {
+    data: Arc<HandleData>,
+    step: isize,
+}
+
+impl Drop for IoGateGuard {
+    fn drop(&mut self) {
+        let gate = &self.data.io_gate;
+        if gate.state.fetch_sub(self.step, Ordering::SeqCst) == self.step
+            && gate.waiting.load(Ordering::SeqCst) > 0
+        {
+            gate.empty.notify_waiters();
+        }
+    }
+}
 
 impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
     /// Create a Passthrough file system instance shared between threads,
@@ -141,9 +215,9 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
         // Reconcile the O_DIRECT flag of the shared file description before
         // the request is served with native asynchronous IO. The guard is
         // dropped right away instead of being held over the IO like the
-        // synchronous handlers do: the zero-copy future must stay `Send`,
-        // and the asynchronous engines submit with the flags in effect at
-        // submission time.
+        // synchronous handlers do, because the zero-copy future must stay
+        // `Send`. The caller's `IoGate` keeps O_DIRECT off until the IO is
+        // done.
         drop(self.ensure_file_flags(data, &data.borrow_fd(), flags)?);
 
         Ok(Arc::new(AsyncFile::borrow_fd(fd, data.clone())))
@@ -873,6 +947,7 @@ impl<S: BitmapSlice + Send + Sync + 'static> AsyncFileSystem for PassthroughFs<S
         // `read_on_pool()`, and otherwise the runtime thread.
         let data = self.get_data(handle, inode, libc::O_RDONLY)?;
         if flags & (os_compat::O_DIRECT as u32) != 0 {
+            let _gate = IoGate::enter(&data, true).await;
             return match self.pool_fs() {
                 Some(fs) => Self::read_on_pool(fs, ctx, data, w, size, offset, flags).await,
                 None => self.do_read(&data, w, size, offset, flags, false),
@@ -881,7 +956,8 @@ impl<S: BitmapSlice + Send + Sync + 'static> AsyncFileSystem for PassthroughFs<S
 
         // Buffered requests first try an inline non-blocking read: the
         // page cache serves them without a round trip through the
-        // asynchronous IO engine.
+        // asynchronous IO engine. It holds the O_DIRECT flag guard like the
+        // pool path below, so neither needs the `IoGate`.
         let (served, miss) = self.read_nowait(&data, w, size as usize, offset, flags)?;
         if !miss {
             return Ok(served);
@@ -909,6 +985,7 @@ impl<S: BitmapSlice + Send + Sync + 'static> AsyncFileSystem for PassthroughFs<S
         // Cache miss: serve the remainder with native asynchronous IO,
         // continuing at the writer's position and the file offset where
         // the inline attempt stopped.
+        let _gate = IoGate::enter(&data, false).await;
         let file = self.async_file_from_data(&data, flags)?;
         let n = SendZeroCopyFuture(w.async_write_from(
             file,
@@ -947,8 +1024,15 @@ impl<S: BitmapSlice + Send + Sync + 'static> AsyncFileSystem for PassthroughFs<S
         // from its page-aligned buffer, which needs no bounce buffer, see
         // `write_on_pool()`. `do_write()` drops and restores CAP_FSETID on
         // the pool thread, with no `.await` in between.
-        let relay = flags & (os_compat::O_DIRECT as u32) != 0
+        let direct = flags & (os_compat::O_DIRECT as u32) != 0;
+        let relay = direct
             || (self.killpriv_v2.load(Ordering::Relaxed) && fuse_flags & WRITE_KILL_PRIV != 0);
+        // With no_open every request opens a file of its own, which needs no gate.
+        let _gate = if direct && !self.no_open.load(Ordering::Relaxed) {
+            Some(IoGate::enter(&self.get_data(handle, inode, libc::O_RDWR)?, true).await)
+        } else {
+            None
+        };
         if relay || async_runtime::runtime_type().file_io_blocks() {
             if let Some(fs) = self.pool_fs() {
                 return Self::write_on_pool(
@@ -983,6 +1067,7 @@ impl<S: BitmapSlice + Send + Sync + 'static> AsyncFileSystem for PassthroughFs<S
         // asynchronous file object holds a reference to the handle data,
         // which keeps the descriptor valid until the request completes,
         // avoiding the `dup()`/`close()` syscall pair per request.
+        let _gate = IoGate::enter(&data, false).await;
         let file = self.async_file_from_data(&data, flags)?;
 
         // Serve the request with native asynchronous IO: the transport
@@ -1826,6 +1911,73 @@ mod tests {
 
         let content = std::fs::read(dir.as_path().join("async_killpriv_file")).unwrap();
         assert_eq!(content, killpriv_payload);
+    }
+
+    // A native write waits for io_uring while an O_DIRECT write on the same
+    // handle is served. The O_DIRECT write must not set O_DIRECT on the
+    // shared file description under the native write, whose unaligned buffer
+    // would then fail with EINVAL. The tokio runtime runs the native write to
+    // completion in its first poll, so only io_uring can reorder the two.
+    #[test]
+    fn test_async_native_write_with_direct_io() {
+        const BLOCK: usize = 4096;
+
+        let (fs, source) = prepare_async_fs();
+        if !supports_direct_io(&source, "test_async_native_write_with_direct_io") {
+            return;
+        }
+        let ctx = prepare_context();
+        let name = CString::new("mixed_io_file").unwrap();
+
+        async_runtime::block_on(async {
+            let args = CreateIn {
+                flags: (libc::O_RDWR | libc::O_CREAT | libc::O_TRUNC) as u32,
+                mode: 0o600,
+                umask: 0,
+                fuse_flags: 0,
+            };
+            let (entry, handle, _opts, _) =
+                fs.async_create(&ctx, ROOT_ID, &name, args).await.unwrap();
+            let handle = handle.unwrap();
+
+            // `MemReader` writes from its buffer at the file offset, so the
+            // native write at offset 1 has an unaligned buffer too.
+            let mut native_reader = MemReader(vec![1; BLOCK + 1]);
+            let mut direct_reader = MemReader(vec![2; 3 * BLOCK]);
+            let native = fs.async_write(
+                &ctx,
+                entry.inode,
+                handle,
+                &mut native_reader,
+                BLOCK as u32,
+                1,
+                None,
+                false,
+                libc::O_RDWR as u32,
+                0,
+            );
+            let direct = fs.async_write(
+                &ctx,
+                entry.inode,
+                handle,
+                &mut direct_reader,
+                BLOCK as u32,
+                2 * BLOCK as u64,
+                None,
+                false,
+                (libc::O_RDWR | libc::O_DIRECT) as u32,
+                0,
+            );
+            // Poll the native write first, so it waits for io_uring while
+            // the O_DIRECT write is served.
+            let (native_res, direct_res) = tokio::join!(biased; native, direct);
+            assert_eq!(native_res.unwrap(), BLOCK);
+            assert_eq!(direct_res.unwrap(), BLOCK);
+        });
+
+        let content = std::fs::read(source.as_path().join("mixed_io_file")).unwrap();
+        assert_eq!(&content[1..=BLOCK], &[1; BLOCK][..]);
+        assert_eq!(&content[2 * BLOCK..], &[2; BLOCK][..]);
     }
 
     // With the thread pool, O_DIRECT requests do their IO on the pool's

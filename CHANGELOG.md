@@ -391,6 +391,10 @@
   disabled answers `ENOSYS`).
 - [269](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/269): For a session mounted with `set_target_mntns()`,
   `FuseSession::umount()` unmounts in that mount namespace. It no longer follows a symlink at the mountpoint.
+- [336](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/336): The async `PassthroughFs` handlers no longer fail buffered reads (EIO for the
+  reader) and writes (`EINVAL`) while an O_DIRECT request runs on the same handle. The O_DIRECT
+  request set O_DIRECT on the shared file description under the buffered IO. Now each kind
+  waits until the other has left the handle.
 
 ### Removed
 - [254](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/254): Drop the vestigial `vhost` and `virtio-bindings` dependencies that the
