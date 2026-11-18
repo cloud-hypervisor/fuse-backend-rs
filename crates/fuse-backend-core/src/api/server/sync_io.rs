@@ -3,6 +3,8 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE-BSD-3-Clause file.
 
+#[cfg(feature = "fusedev")]
+use std::ffi::CStr;
 use std::io::{self, IoSlice, Read};
 use std::mem::size_of;
 use std::sync::atomic::Ordering;
@@ -181,71 +183,166 @@ impl XattrReply {
 }
 
 impl<F: FileSystem + Sync> Server<F> {
+    /// Send the notification `code` with the body `parts` through `w`.
+    #[cfg(feature = "fusedev")]
+    fn notify<W: Writer>(mut w: W, code: NotifyOpcode, parts: &[&[u8]]) -> Result<usize> {
+        let len = size_of::<OutHeader>() + parts.iter().map(|part| part.len()).sum::<usize>();
+        if len > u32::MAX as usize {
+            return Err(Error::EncodeMessage(io::Error::from_raw_os_error(
+                libc::EINVAL,
+            )));
+        }
+        let header = OutHeader {
+            len: len as u32,
+            unique: 0,
+            error: code as i32,
+        };
+        let mut buffer_writer = w.split_at(0).map_err(Error::FailedToSplitWriter)?;
+        buffer_writer
+            .write_obj(header)
+            .map_err(Error::FailedToWrite)?;
+        for part in parts {
+            buffer_writer
+                .write_all(part)
+                .map_err(Error::FailedToWrite)?;
+        }
+        buffer_writer.commit(None).map_err(Error::InvalidMessage)
+    }
+
+    #[cfg(feature = "fusedev")]
+    fn notify_entry<W: Writer>(w: W, parent: u64, name: &CStr, flags: u32) -> Result<usize> {
+        let entry = NotifyInvalEntryOut {
+            parent,
+            namelen: name.to_bytes().len() as u32,
+            flags,
+        };
+        Self::notify(
+            w,
+            NotifyOpcode::InvalEntry,
+            &[entry.as_slice(), name.to_bytes_with_nul()],
+        )
+    }
+
     #[cfg(feature = "fusedev")]
     /// Use to send notify msg to kernel fuse
     ///
     /// The write waits for the lock of `parent`, which a lookup in it holds until its reply, so
     /// don't call this from a thread that serves requests. Any fd of the connection works.
-    pub fn notify_inval_entry<W: Writer>(
-        &self,
-        mut w: W,
-        parent: u64,
-        name: &std::ffi::CStr,
-    ) -> Result<usize> {
-        let mut buffer_writer = w.split_at(0).map_err(Error::FailedToSplitWriter)?;
-        let mut entry = NotifyInvalEntryOut::default();
-        let mut header = OutHeader::default();
-        let name_with_null = name.to_bytes_with_nul();
-        header.unique = 0;
-        header.error = NotifyOpcode::InvalEntry as i32;
-        header.len = std::mem::size_of::<OutHeader>() as u32
-            + std::mem::size_of::<NotifyInvalEntryOut>() as u32
-            + name_with_null.len() as u32;
-        // the namelne don't contains the nul
-        entry.namelen = (name_with_null.len() - 1) as u32;
-        entry.parent = parent;
-
-        buffer_writer
-            .write_obj(header)
-            .map_err(Error::FailedToWrite)?;
-        buffer_writer
-            .write_obj(entry)
-            .map_err(Error::FailedToWrite)?;
-        buffer_writer
-            .write(name_with_null)
-            .map_err(Error::FailedToWrite)?;
-        buffer_writer.commit(None).map_err(Error::InvalidMessage)
+    pub fn notify_inval_entry<W: Writer>(&self, w: W, parent: u64, name: &CStr) -> Result<usize> {
+        Self::notify_entry(w, parent, name, 0)
     }
+
+    /// Expire the kernel's entry for `name` in `parent` without dropping it. The kernel looks the
+    /// name up again on its next use, and open files and mounts on the entry stay.
+    ///
+    /// Fails with `ENOSYS` unless the file system enabled `FsOptions::HAS_EXPIRE_ONLY` at INIT,
+    /// because an older kernel would drop the entry. The write waits for the lock of `parent`,
+    /// as in `notify_inval_entry()`.
+    #[cfg(all(feature = "fusedev", target_os = "linux"))]
+    pub fn notify_expire_entry<W: Writer>(&self, w: W, parent: u64, name: &CStr) -> Result<usize> {
+        let options = FsOptions::from_bits_truncate(self.options.load(Ordering::Acquire));
+        if !options.contains(FsOptions::HAS_EXPIRE_ONLY) {
+            return Err(Error::EncodeMessage(io::Error::from_raw_os_error(
+                libc::ENOSYS,
+            )));
+        }
+        Self::notify_entry(w, parent, name, EXPIRE_ONLY)
+    }
+
+    /// Tell the kernel that `name` in `parent`, the inode `child`, was deleted.
+    ///
+    /// This drops the entry like `notify_inval_entry()`. If the entry is `child`, the kernel also
+    /// unlinks it, so its open files get a link count of 0. The kernel fails with `ENOENT` if it
+    /// has no such entry or the entry is another inode, `ENOTEMPTY` for a directory with cached
+    /// entries, and `EBUSY` for a mount point. The write waits for the locks of `parent` and
+    /// `child`, so don't call this from a thread that serves requests.
+    #[cfg(feature = "fusedev")]
+    pub fn notify_delete<W: Writer>(
+        &self,
+        w: W,
+        parent: u64,
+        child: u64,
+        name: &CStr,
+    ) -> Result<usize> {
+        let delete = NotifyDeleteOut {
+            parent,
+            child,
+            namelen: name.to_bytes().len() as u32,
+            padding: 0,
+        };
+        Self::notify(
+            w,
+            NotifyOpcode::Delete,
+            &[delete.as_slice(), name.to_bytes_with_nul()],
+        )
+    }
+
     /// Notify the kernel that an inode's data has been invalidated.
     #[cfg(feature = "fusedev")]
     pub fn notify_inval_inode<W: Writer>(
         &self,
-        mut w: W,
+        w: W,
         ino: u64,
         off: u64,
         len: u64,
     ) -> Result<usize> {
-        let mut buffer_writer = w.split_at(0).map_err(Error::FailedToSplitWriter)?;
-        let mut header = OutHeader::default();
-        let mut inode = NotifyInvalInodeOut::default();
-
-        header.unique = 0;
-        header.error = NotifyOpcode::InvalInode as i32;
-        header.len = std::mem::size_of::<OutHeader>() as u32
-            + std::mem::size_of::<NotifyInvalInodeOut>() as u32;
-
-        inode.ino = ino;
-        inode.off = off as i64;
-        inode.len = len as i64;
-
-        buffer_writer
-            .write_obj(header)
-            .map_err(Error::FailedToWrite)?;
-        buffer_writer
-            .write_obj(inode)
-            .map_err(Error::FailedToWrite)?;
-        buffer_writer.commit(None).map_err(Error::InvalidMessage)
+        let inode = NotifyInvalInodeOut {
+            ino,
+            off: off as i64,
+            len: len as i64,
+        };
+        Self::notify(w, NotifyOpcode::InvalInode, &[inode.as_slice()])
     }
+
+    /// Put `data` into the kernel's page cache of the regular file `ino`, at `offset`.
+    ///
+    /// Reads of the stored range don't reach the file system. The exception is a page that wasn't
+    /// cached and that the data covers only in part, unless the data runs from the start of that
+    /// page to the end of the file. Data past the end of the file grows it. `w` needs room for
+    /// `data` and 40 bytes of headers. The kernel fails with `ENOENT` if it has no inode `ino`.
+    #[cfg(feature = "fusedev")]
+    pub fn notify_store<W: Writer>(
+        &self,
+        w: W,
+        ino: u64,
+        offset: u64,
+        data: &[u8],
+    ) -> Result<usize> {
+        let store = NotifyStoreOut {
+            nodeid: ino,
+            offset,
+            size: data.len() as u32,
+            padding: 0,
+        };
+        Self::notify(w, NotifyOpcode::Store, &[store.as_slice(), data])
+    }
+
+    /// Ask the kernel for up to `size` bytes of the regular file `ino` from its page cache,
+    /// starting at `offset`.
+    ///
+    /// The kernel answers with a request that the server passes to `FileSystem::notify_reply()`
+    /// along with `unique`. The data ends at the first page that isn't cached, at the end of
+    /// the file or at the connection's max write size, so it can be shorter than `size` or
+    /// empty. The kernel fails with `ENOENT` if it has no inode `ino`.
+    #[cfg(feature = "fusedev")]
+    pub fn notify_retrieve<W: Writer>(
+        &self,
+        w: W,
+        unique: u64,
+        ino: u64,
+        offset: u64,
+        size: u32,
+    ) -> Result<usize> {
+        let retrieve = Notify_Retrieve_Out {
+            notify_unique: unique,
+            nodeid: ino,
+            offset,
+            size,
+            padding: 0,
+        };
+        Self::notify(w, NotifyOpcode::Retrieve, &[retrieve.as_slice()])
+    }
+
     #[cfg(feature = "fusedev")]
     /// Send a resend notification message to the kernel via FUSE. This function should be invoked as part of
     /// the crash recovery routine. Given that FUSE initialization does not occur again during recovery,
@@ -253,20 +350,31 @@ impl<F: FileSystem + Sync> Server<F> {
     /// of the upper layers to verify and persist the kernel's support for this feature upon the initial FUSE setup.
     ///
     /// Resent requests have `UNIQUE_RESEND` set in their unique id, which the reply keeps.
-    pub fn notify_resend<W: Writer>(&self, mut w: W) -> Result<()> {
-        let mut buffer_writer = w.split_at(0).map_err(Error::FailedToSplitWriter)?;
-        let header = {
-            OutHeader {
-                len: std::mem::size_of::<OutHeader>() as u32,
-                unique: 0,
-                error: NotifyOpcode::Resend as i32,
-            }
+    pub fn notify_resend<W: Writer>(&self, w: W) -> Result<()> {
+        Self::notify(w, NotifyOpcode::Resend, &[]).map(|_| ())
+    }
+
+    /// Make the kernel look up again every entry it cached before this call (Linux 6.16).
+    ///
+    /// Older kernels fail with `EINVAL`.
+    #[cfg(all(feature = "fusedev", target_os = "linux"))]
+    pub fn notify_increment_epoch<W: Writer>(&self, w: W) -> Result<usize> {
+        Self::notify(w, NotifyOpcode::IncEpoch, &[])
+    }
+
+    /// Ask the kernel to drop the unused entries of `inodes` (Linux 6.17), so that it forgets each
+    /// inode that no open file or other entry holds.
+    ///
+    /// Older kernels fail with `EINVAL`.
+    #[cfg(all(feature = "fusedev", target_os = "linux"))]
+    pub fn notify_prune<W: Writer>(&self, w: W, inodes: &[u64]) -> Result<usize> {
+        let prune = NotifyPruneOut {
+            count: inodes.len() as u32,
+            padding: 0,
+            spare: 0,
         };
-        buffer_writer
-            .write_obj(header)
-            .map_err(Error::FailedToWrite)?;
-        buffer_writer.commit(None).map_err(Error::InvalidMessage)?;
-        Ok(())
+        let ids: Vec<u8> = inodes.iter().flat_map(|ino| ino.to_ne_bytes()).collect();
+        Self::notify(w, NotifyOpcode::Prune, &[prune.as_slice(), &ids])
     }
 
     /// Main entrance to handle requests from the transport layer.
@@ -1363,14 +1471,27 @@ impl<F: FileSystem + Sync> Server<F> {
 
     pub(super) fn notify_reply<S: BitmapSlice, W: Writer>(
         &self,
-        _ctx: &mut SrvContext<'_, F, S, W>,
+        ctx: &mut SrvContext<'_, F, S, W>,
     ) -> Result<usize> {
         // NOTIFY_REPLY takes no reply. It comes under the unique number that the server picked
         // for NOTIFY_RETRIEVE, so a reply could even end another request.
-        self.fs
-            .notify_reply()
-            .map(|()| 0)
-            .map_err(Error::InvalidMessage)
+        let NotifyRetrieveIn { offset, size, .. } =
+            ctx.r.read_obj().map_err(Error::DecodeMessage)?;
+        if size as usize > ctx.r.available_bytes() {
+            return Err(Error::DecodeMessage(io::Error::from_raw_os_error(
+                libc::EINVAL,
+            )));
+        }
+        let mut data_reader = ZcReader(ctx.take_reader());
+        self.fs.notify_reply(
+            ctx.context(),
+            ctx.nodeid(),
+            ctx.unique(),
+            offset,
+            size,
+            &mut data_reader,
+        );
+        Ok(0)
     }
 
     pub(super) fn batch_forget<S: BitmapSlice, W: Writer>(
@@ -2428,6 +2549,18 @@ mod tests {
     }
 
     #[test]
+    #[cfg(all(feature = "fusedev", target_os = "linux"))]
+    fn test_server_notify_expire_entry_needs_expire_only() {
+        let server = Server::new(MockFS);
+        let mut buf = [0u8; 64];
+        let name = CStr::from_bytes_with_nul(b"name\0").unwrap();
+        match server.notify_expire_entry(TestWriter::new(&mut buf), ROOT_ID, name) {
+            Err(Error::EncodeMessage(e)) => assert_eq!(e.raw_os_error(), Some(libc::ENOSYS)),
+            other => panic!("unexpected result: {:?}", other),
+        }
+    }
+
+    #[test]
     fn test_server_copy_file_range() {
         use crate::api::filesystem::Context;
 
@@ -2926,7 +3059,7 @@ mod tests {
 
     #[test]
     fn test_server_doesnt_reply_to_notify_reply() {
-        // MockFS fails notify_reply() with ENOSYS.
+        // The request lacks its NotifyRetrieveIn, so it fails to decode.
         let server = Server::new(MockFS);
         let header = InHeader {
             len: size_of::<InHeader>() as u32,
@@ -2943,8 +3076,77 @@ mod tests {
             None,
             None,
         );
-        assert!(matches!(res, Err(Error::InvalidMessage(_))));
+        assert!(matches!(res, Err(Error::DecodeMessage(_))));
         assert!(write_buf.iter().all(|&b| b == 0));
+    }
+
+    #[test]
+    fn test_server_notify_reply() {
+        use crate::api::filesystem::{Context, ZeroCopyReader};
+        use std::sync::Mutex;
+
+        type Retrieved = (u64, u64, u64, Vec<u8>);
+        #[derive(Default)]
+        struct RetrieveFs(Mutex<Vec<Retrieved>>);
+        impl FileSystem for RetrieveFs {
+            type Inode = u64;
+            type Handle = u64;
+
+            fn notify_reply(
+                &self,
+                _ctx: &Context,
+                inode: u64,
+                unique: u64,
+                offset: u64,
+                size: u32,
+                r: &mut dyn ZeroCopyReader,
+            ) {
+                let mut data = vec![0; size as usize];
+                r.read_exact(&mut data).unwrap();
+                self.0.lock().unwrap().push((inode, unique, offset, data));
+            }
+        }
+
+        let server = Server::new(RetrieveFs::default());
+        let retrieve_in = NotifyRetrieveIn {
+            offset: 4096,
+            size: 5,
+            ..Default::default()
+        };
+        let header = InHeader {
+            len: (size_of::<InHeader>() + size_of::<NotifyRetrieveIn>() + 5) as u32,
+            opcode: Opcode::NotifyReply as u32,
+            unique: 7,
+            nodeid: 10,
+            ..Default::default()
+        };
+        let mut read_buf = [header.as_slice(), retrieve_in.as_slice(), b"hello"].concat();
+        let mut write_buf = [0u8; 4096];
+        let res = server.handle_message(
+            Reader::<()>::from_slice(&mut read_buf),
+            TestWriter::new(&mut write_buf),
+            None,
+            None,
+        );
+
+        assert_eq!(res.unwrap(), 0);
+        assert!(write_buf.iter().all(|&b| b == 0));
+        assert_eq!(
+            *server.fs.0.lock().unwrap(),
+            [(10, 7, 4096, b"hello".to_vec())]
+        );
+
+        // A size past the end of the request doesn't reach the file system.
+        read_buf.pop();
+        let res = server.handle_message(
+            Reader::<()>::from_slice(&mut read_buf),
+            TestWriter::new(&mut write_buf),
+            None,
+            None,
+        );
+        assert!(matches!(res, Err(Error::DecodeMessage(_))));
+        assert!(write_buf.iter().all(|&b| b == 0));
+        assert_eq!(server.fs.0.lock().unwrap().len(), 1);
     }
 
     #[test]

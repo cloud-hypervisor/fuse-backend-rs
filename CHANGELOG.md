@@ -44,6 +44,11 @@
   permission bits, owner and group of the directories `Vfs` serves itself: its root while no file
   system is mounted at `/`, and the directories on the path to each mount point. The defaults
   keep today's root-owned `0777` ([#148](https://github.com/cloud-hypervisor/fuse-backend-rs/issues/148)).
+- [330](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/330): `Server` sends the other FUSE notifications: `notify_delete()`,
+  `notify_store()`, `notify_retrieve()`, `notify_expire_entry()` (Linux 6.2, needs
+  `FsOptions::HAS_EXPIRE_ONLY`, which `Vfs` now negotiates), `notify_increment_epoch()` (Linux
+  6.16) and `notify_prune()` (Linux 6.17). `Vfs` passes NOTIFY_REPLY on to the mounted file
+  system.
 - [304](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/304): Give FreeBSD a verification path. The Linux wire-format ABI
   body moves out of `fuse_abi_linux.rs` into a shared `fuse_abi_wire.rs`
   (each per-OS prelude re-exports the libc names the body uses), and a new
@@ -224,6 +229,9 @@
   took.
 
 ### Changed
+- [330](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/330): `FileSystem::notify_reply()` takes the retrieved data and returns nothing, which
+  breaks file systems that implement it. `NotifyInvalEntryOut::padding` is now `flags`, as in the
+  kernel.
 - [325](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/325): The `fuse-backend-fusedev` `uring` transport uses io-uring 0.6 instead of 0.5,
   and depends on it only on Linux.
 - [324](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/324): `fuse-backend-core` uses bitflags 2 instead of 1. The flag types (`FsOptions`,
@@ -351,10 +359,9 @@
   io_uring worker replaced the reply with `EIO`, and a virtio-fs device may never return the
   descriptor. FORGET, BATCH_FORGET, INTERRUPT and NOTIFY_REPLY get no reply, now also when they
   are oversized.
-- [329](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/329): The servers no longer reply to NOTIFY_REPLY when `FileSystem::notify_reply()`
-  fails, which the default implementation does. The kernel takes no reply to NOTIFY_REPLY, and
-  sends it under the unique number that the server picked for NOTIFY_RETRIEVE, so the reply
-  could end another request. `handle_message()` returns the error instead.
+- [329](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/329): The servers no longer reply to NOTIFY_REPLY. The kernel takes no reply to it, and
+  sends it under the unique number that the server picked for NOTIFY_RETRIEVE, so a reply could
+  end another request.
 - [NNN](link): With `allow_direct_io` off, a create with O_DIRECT no longer opens the new host
   file with O_DIRECT, which made buffered IO on it fail with EINVAL. `PassthroughFs::create()`
   now builds the host open flags with the same helper as `open_inode()`.

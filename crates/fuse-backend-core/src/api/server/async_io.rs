@@ -2475,7 +2475,7 @@ mod tests {
 
     #[test]
     fn test_async_server_doesnt_reply_to_notify_reply() {
-        // BackingFs fails notify_reply() with ENOSYS.
+        // The request lacks its NotifyRetrieveIn, so it fails to decode.
         let header = InHeader {
             len: size_of::<InHeader>() as u32,
             opcode: Opcode::NotifyReply as u32,
@@ -2491,7 +2491,7 @@ mod tests {
             let writer = TestWriter::new(&mut write_buf);
             unsafe { server.async_handle_message(reader, writer, None, None) }.await
         });
-        assert!(matches!(res, Err(Error::InvalidMessage(_))));
+        assert!(matches!(res, Err(Error::DecodeMessage(_))));
         assert!(write_buf.iter().all(|&b| b == 0));
     }
 
