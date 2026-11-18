@@ -145,12 +145,8 @@ pub fn openat(
     // - we check the return value
     // We do not check `flags` because if the kernel cannot handle poorly specified flags then we
     // have much bigger problems.
-    let fd = if flags & libc::O_CREAT == libc::O_CREAT {
-        // The mode argument is used only when O_CREAT is specified
-        unsafe { libc::openat(dir_fd.as_raw_fd(), path.as_ptr(), flags, mode) }
-    } else {
-        unsafe { libc::openat(dir_fd.as_raw_fd(), path.as_ptr(), flags) }
-    };
+    // The kernel reads `mode` with O_CREAT and O_TMPFILE, and ignores it otherwise.
+    let fd = unsafe { libc::openat(dir_fd.as_raw_fd(), path.as_ptr(), flags, mode) };
     if fd >= 0 {
         // Safe because we just opened this fd
         Ok(unsafe { File::from_raw_fd(fd) })

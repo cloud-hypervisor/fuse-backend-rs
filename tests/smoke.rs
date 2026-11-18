@@ -319,6 +319,72 @@ mod fusedev_tests {
         Ok(())
     }
 
+    /// Opens an unnamed file in `dir` with O_TMPFILE and `extra` flags.
+    fn open_tmpfile(dir: &Path, extra: i32) -> Result<std::fs::File> {
+        std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(libc::O_TMPFILE | extra)
+            .mode(0o600)
+            .open(dir)
+    }
+
+    /// Gives the unnamed `file` the name `path`, like `linkat(2)` documents for O_TMPFILE.
+    fn link_tmpfile(file: &std::fs::File, path: &Path) -> nix::Result<()> {
+        use nix::fcntl::{AtFlags, AT_FDCWD};
+        use std::os::fd::AsRawFd;
+
+        let fd_path = Path::new("/proc/self/fd").join(file.as_raw_fd().to_string());
+        nix::unistd::linkat(
+            AT_FDCWD,
+            fd_path.as_path(),
+            AT_FDCWD,
+            path,
+            AtFlags::AT_SYMLINK_FOLLOW,
+        )
+    }
+
+    #[test]
+    #[ignore] // it depends on privileged mode to pass through /dev/fuse
+    fn integration_test_tmpfile() -> Result<()> {
+        // An O_TMPFILE open sends FUSE_TMPFILE. Without a reply to it, the open fails with
+        // EOPNOTSUPP.
+        if !kernel_at_least(6, 1) {
+            eprintln!(
+                "skipping integration_test_tmpfile: kernel {} does not send FUSE_TMPFILE (needs >= 6.1)",
+                kernel_release()
+            );
+            return Ok(());
+        }
+
+        let src_dir = TempDir::new().unwrap();
+        let mnt_dir = TempDir::new().unwrap();
+        let src = src_dir.as_path().to_str().unwrap().to_string();
+        let mnt = mnt_dir.as_path().to_str().unwrap().to_string();
+        let mut daemon = passthroughfs::Daemon::new(&src, &mnt, 1).unwrap();
+        daemon.mount().unwrap();
+
+        let mut file =
+            open_tmpfile(mnt_dir.as_path(), 0).expect("O_TMPFILE open through the mount");
+        std::io::Write::write_all(&mut file, b"data").unwrap();
+        assert_eq!(std::fs::read_dir(src_dir.as_path()).unwrap().count(), 0);
+        link_tmpfile(&file, &mnt_dir.as_path().join("linked")).expect("linkat of the tmpfile");
+        drop(file);
+        assert_eq!(
+            std::fs::read(src_dir.as_path().join("linked")).unwrap(),
+            b"data"
+        );
+
+        // With O_EXCL the file can never get a name.
+        let file = open_tmpfile(mnt_dir.as_path(), libc::O_EXCL).unwrap();
+        let err = link_tmpfile(&file, &mnt_dir.as_path().join("excl")).unwrap_err();
+        assert_eq!(err, nix::errno::Errno::ENOENT);
+        drop(file);
+
+        daemon.umount().unwrap();
+        Ok(())
+    }
+
     #[test]
     #[ignore] // it depends on privileged mode to pass through /dev/fuse
     fn integration_test_direct_io_shared_mmap() -> Result<()> {
