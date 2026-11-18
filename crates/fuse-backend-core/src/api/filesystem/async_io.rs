@@ -282,6 +282,31 @@ pub trait AsyncFileSystem: FileSystem {
         })
     }
 
+    /// Create and open an unnamed file, like `FileSystem::tmpfile()`. The default calls
+    /// `tmpfile()`.
+    fn async_tmpfile<'a, 'b, 'async_trait>(
+        &'a self,
+        ctx: &'b Context,
+        parent: Self::Inode,
+        args: CreateIn,
+    ) -> Pin<CreateFuture<'async_trait, Self::Handle>>
+    where
+        'a: 'async_trait,
+        'b: 'async_trait,
+        Self: 'async_trait,
+    {
+        let result = self
+            .tmpfile(ctx, parent, args)
+            .map(|(entry, handle, opts, backing_id)| {
+                (entry, handle.map(Into::<u64>::into), opts, backing_id)
+            });
+        Box::pin(async move {
+            result.map(|(entry, handle, opts, backing_id)| {
+                (entry, handle.map(From::from), opts, backing_id)
+            })
+        })
+    }
+
     /// Read data from a file.
     ///
     /// Returns `size` bytes of data starting from offset `off` from the file associated with
@@ -1127,6 +1152,20 @@ impl<FS: AsyncFileSystem> AsyncFileSystem for Arc<FS> {
         Self: 'async_trait,
     {
         self.deref().async_create(ctx, parent, name, args)
+    }
+
+    fn async_tmpfile<'a, 'b, 'async_trait>(
+        &'a self,
+        ctx: &'b Context,
+        parent: Self::Inode,
+        args: CreateIn,
+    ) -> Pin<CreateFuture<'async_trait, Self::Handle>>
+    where
+        'a: 'async_trait,
+        'b: 'async_trait,
+        Self: 'async_trait,
+    {
+        self.deref().async_tmpfile(ctx, parent, args)
     }
 
     fn async_read<'a, 'b, 'c, 'async_trait>(

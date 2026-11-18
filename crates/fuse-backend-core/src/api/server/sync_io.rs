@@ -368,6 +368,7 @@ impl<F: FileSystem + Sync> Server<F> {
             x if x == Opcode::Rename2 as u32 => self.rename2(ctx),
             x if x == Opcode::Lseek as u32 => self.lseek(ctx),
             x if x == Opcode::CopyFileRange as u32 => self.copy_file_range(ctx),
+            x if x == Opcode::Tmpfile as u32 => self.create(ctx),
             #[cfg(feature = "virtiofs")]
             x if x == Opcode::SetupMapping as u32 => self.setupmapping(ctx, vu_req),
             #[cfg(feature = "virtiofs")]
@@ -1219,6 +1220,8 @@ impl<F: FileSystem + Sync> Server<F> {
         }
     }
 
+    /// Serves CREATE, and TMPFILE, whose request and reply look the same. The kernel names a
+    /// tmpfile "/", which `FileSystem::tmpfile()` doesn't get.
     fn create<S: BitmapSlice, W: Writer>(
         &self,
         ctx: &mut SrvContext<'_, F, S, W>,
@@ -1235,7 +1238,12 @@ impl<F: FileSystem + Sync> Server<F> {
         )?;
         ctx.context.supp_gid = supp_gid;
 
-        match self.fs.create(ctx.context(), ctx.nodeid(), name, args) {
+        let result = if ctx.in_header.opcode == Opcode::Tmpfile as u32 {
+            self.fs.tmpfile(ctx.context(), ctx.nodeid(), args)
+        } else {
+            self.fs.create(ctx.context(), ctx.nodeid(), name, args)
+        };
+        match result {
             Ok((entry, handle, opts, passthrough)) => {
                 let entry_out = EntryOut {
                     nodeid: entry.inode,
