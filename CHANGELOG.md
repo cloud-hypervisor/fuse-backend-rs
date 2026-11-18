@@ -132,6 +132,9 @@
   with the writeback cache, `no_open`, `seal_size`, `allow_direct_io = false`, and the `Never`
   and `Metadata` cache policies. With the `async-io` feature, `PassthroughFs::into_shared()` shares a file system
   created with `new()`, so the blocking thread pool can use passthrough too.
+- When `VfsOptions::out_opts` has `FsOptions::PASSTHROUGH` and the kernel offers it, `Vfs` turns
+  off the writeback cache and `no_open` for all mounts, so kernel passthrough works without
+  setting them by hand.
 - [269](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/269): `AsyncFileSystem` methods default to calling their `FileSystem`
   counterparts, so a file system only implements the handlers it serves asynchronously.
 - [269](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/269): `FuseSession::detach()` lazily unmounts a Linux session through `&self`,

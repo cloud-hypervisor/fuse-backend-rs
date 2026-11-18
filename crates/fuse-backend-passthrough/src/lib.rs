@@ -520,7 +520,7 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
     /// It takes effect when INIT enables `FsOptions::PASSTHROUGH`. The kernel only allows that
     /// without `FsOptions::WRITEBACK_CACHE`, and the backing ids come from open requests, so it
     /// doesn't work with `no_open`. Under a `Vfs`, add `FsOptions::PASSTHROUGH` to its `out_opts`,
-    /// set `no_writeback`, and set `no_open` to false, because `VfsOptions` enables it by default.
+    /// and the `Vfs` turns off both when the kernel offers passthrough.
     ///
     /// It stays off with `Config::seal_size`, because passthrough writes don't reach the size
     /// check, and with `CachePolicy::Never` and `CachePolicy::Metadata`, which open files with
@@ -1819,6 +1819,53 @@ mod tests {
         // Destroying the file system, as `Vfs::umount()` does, closes the ids still open.
         fs.destroy();
         assert_eq!(*files.closed.lock().unwrap(), vec![1, 2]);
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn test_kernel_passthrough_under_vfs() {
+        // The other default options turn on the writeback cache and no_open.
+        let mut opts = VfsOptions::default();
+        opts.out_opts |= FsOptions::PASSTHROUGH;
+        let vfs = Vfs::new(opts);
+        let tmpdir = TempDir::new().unwrap();
+        let mount = |path| {
+            let mut fs = PassthroughFs::<()>::new(Config {
+                do_import: false,
+                root_dir: tmpdir.as_path().to_string_lossy().to_string(),
+                ..Default::default()
+            })
+            .unwrap();
+            fs.set_backing_files(Arc::new(OneIdFiles));
+            fs.import().unwrap();
+            vfs.mount(Box::new(fs), path).unwrap();
+        };
+        // Mount one file system before INIT and one after.
+        mount("/a");
+        vfs.init(
+            FsOptions::WRITEBACK_CACHE | FsOptions::ZERO_MESSAGE_OPEN | FsOptions::PASSTHROUGH,
+        )
+        .unwrap();
+        mount("/b");
+
+        let ctx = Context::default();
+        let createin = CreateIn {
+            flags: libc::O_CREAT as u32 | libc::O_RDWR as u32,
+            mode: 0o644,
+            umask: 0,
+            fuse_flags: 0,
+        };
+        for dir in ["a", "b"] {
+            let root = vfs
+                .lookup(&ctx, ROOT_ID.into(), &CString::new(dir).unwrap())
+                .unwrap();
+            let name = CString::new(format!("file-{dir}")).unwrap();
+            let (_, _, opts, backing_id) = vfs
+                .create(&ctx, root.inode.into(), &name, createin)
+                .unwrap();
+            assert!(opts.contains(OpenOptions::PASSTHROUGH));
+            assert_eq!(backing_id, Some(1));
+        }
     }
 
     #[test]

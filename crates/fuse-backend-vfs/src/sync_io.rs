@@ -21,6 +21,14 @@ impl FileSystem for Vfs {
         }
         let mut n_opts = *self.opts.load().deref().deref();
         {
+            // The kernel ignores FUSE_PASSTHROUGH along with FUSE_WRITEBACK_CACHE, and the
+            // backing ids come from open replies. So negotiated passthrough overrides the
+            // writeback cache and no_open.
+            if (n_opts.out_opts & opts).contains(FsOptions::PASSTHROUGH) {
+                info!("vfs: kernel passthrough negotiated, writeback cache and no_open off");
+                n_opts.no_writeback = true;
+                n_opts.no_open = false;
+            }
             if n_opts.no_open {
                 n_opts.no_open = !(opts & FsOptions::ZERO_MESSAGE_OPEN).is_empty();
                 if n_opts.no_open {

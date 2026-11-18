@@ -162,7 +162,8 @@ mod daemon {
         let mut opts = VfsOptions {
             no_open: false,
             no_opendir: false,
-            // The kernel ignores FUSE_PASSTHROUGH along with the writeback cache.
+            // The Vfs turns the writeback cache off when the kernel offers passthrough. Keep it off
+            // on other kernels too, so that this mode measures the same as --no-writeback there.
             no_writeback: no_writeback || backing_files.is_some(),
             ..Default::default()
         };

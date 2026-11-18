@@ -2,8 +2,9 @@
 
 //! Mounts file systems whose open files pass through to backing files. A test file system with
 //! one file is served by the sync server and, with `async-io`, by `FuseDevTask`, and a
-//! `PassthroughFs` serves a file opened with O_DIRECT. Needs root in the initial user namespace
-//! and a kernel with CONFIG_FUSE_PASSTHROUGH, and is skipped without them.
+//! `PassthroughFs` serves a file opened with O_DIRECT, and one opened without it under a `Vfs`.
+//! Needs root in the initial user namespace and a kernel with CONFIG_FUSE_PASSTHROUGH, and is
+//! skipped without them.
 
 #[cfg(all(feature = "fusedev", target_os = "linux"))]
 mod fusedev_tests {
@@ -22,6 +23,7 @@ mod fusedev_tests {
     };
     use fuse_backend_rs::api::filesystem::{Context, Entry, FileSystem};
     use fuse_backend_rs::api::server::{MetricsHook, Server};
+    use fuse_backend_rs::api::{Vfs, VfsOptions};
     use fuse_backend_rs::passthrough::{BackingFiles, Config, PassthroughFs};
     use fuse_backend_rs::transport::{fuse_backing_close, fuse_backing_open, FuseSession};
     use vmm_sys_util::tempdir::TempDir;
@@ -214,11 +216,27 @@ mod fusedev_tests {
     struct DeviceFiles {
         fuse_file: File,
         opened: AtomicUsize,
+        /// Whether the kernel refused a registration with EPERM.
+        eperm: AtomicBool,
+    }
+
+    impl DeviceFiles {
+        fn new(fuse_file: File) -> Arc<Self> {
+            Arc::new(DeviceFiles {
+                fuse_file,
+                opened: AtomicUsize::new(0),
+                eperm: AtomicBool::new(false),
+            })
+        }
     }
 
     impl BackingFiles for DeviceFiles {
         fn open(&self, fd: BorrowedFd<'_>) -> io::Result<u32> {
-            let id = fuse_backing_open(&self.fuse_file, fd.as_raw_fd())?;
+            let id = fuse_backing_open(&self.fuse_file, fd.as_raw_fd()).inspect_err(|e| {
+                if e.raw_os_error() == Some(libc::EPERM) {
+                    self.eperm.store(true, Ordering::Relaxed);
+                }
+            })?;
             self.opened.fetch_add(1, Ordering::Relaxed);
             Ok(id)
         }
@@ -255,10 +273,7 @@ mod fusedev_tests {
         let Some((se, mountpoint, fuse_file)) = mount_session(false) else {
             return;
         };
-        let files = Arc::new(DeviceFiles {
-            fuse_file,
-            opened: AtomicUsize::new(0),
-        });
+        let files = DeviceFiles::new(fuse_file);
         let mut fs = PassthroughFs::<()>::new(Config {
             root_dir: source.as_path().to_string_lossy().to_string(),
             allow_direct_io: true,
@@ -294,6 +309,62 @@ mod fusedev_tests {
             assert_eq!(data_requests, 0);
             let data = std::fs::read(&host_path).unwrap();
             assert_eq!(data[4096..], [2; 4096]);
+        });
+    }
+
+    /// A `PassthroughFs` under a `Vfs` passes through with `FsOptions::PASSTHROUGH` added to the
+    /// default `VfsOptions`, which turn on the writeback cache and `no_open`.
+    #[test]
+    fn integration_kernel_passthrough_vfs() {
+        let source = TempDir::new().unwrap();
+        let host_path = source.as_path().join("file");
+        std::fs::write(&host_path, b"passed through").unwrap();
+
+        let Some((se, mountpoint, fuse_file)) = mount_session(false) else {
+            return;
+        };
+        let files = DeviceFiles::new(fuse_file);
+        let mut fs = PassthroughFs::<()>::new(Config {
+            root_dir: source.as_path().to_string_lossy().to_string(),
+            do_import: false,
+            ..Default::default()
+        })
+        .unwrap();
+        fs.set_backing_files(files.clone());
+        fs.import().unwrap();
+        let mut opts = VfsOptions::default();
+        opts.out_opts |= FsOptions::PASSTHROUGH;
+        let vfs = Arc::new(Vfs::new(opts));
+        vfs.mount(Box::new(fs), "/").unwrap();
+        let (handle, requests) = serve(&se, vfs.clone());
+
+        // Read the file and append to it. The server handles no READ or WRITE if it passes
+        // through.
+        let result = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(mountpoint.as_path().join("file"))
+            .and_then(|file| {
+                let mut data = [0; 14];
+                file.read_exact_at(&mut data, 0)?;
+                file.write_all_at(b"!", 14)?;
+                Ok(data)
+            });
+        // PassthroughFs opens the file without passthrough when the kernel refuses it.
+        let result = if !vfs.options().in_opts.contains(FsOptions::PASSTHROUGH) {
+            None
+        } else if files.eperm.load(Ordering::Relaxed) {
+            Some(Err(io::Error::from_raw_os_error(libc::EPERM)))
+        } else {
+            Some(result)
+        };
+        let data_requests = requests.0.load(Ordering::Relaxed);
+
+        stop(se, handle);
+        check_with(result, |data| {
+            assert_eq!(&data, b"passed through");
+            assert_eq!(data_requests, 0);
+            assert_eq!(std::fs::read(&host_path).unwrap(), b"passed through!");
         });
     }
 
