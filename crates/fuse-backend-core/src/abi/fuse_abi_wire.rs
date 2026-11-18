@@ -246,6 +246,9 @@ const OVER_IO_URING: u64 = 1_u64 << 41;
 // group in create/mkdir/symlink/mknod requests (FUSE_EXT_GROUPS extension).
 const CREATE_SUPP_GROUP: u64 = 1_u64 << 34;
 
+// The kernel honors EXPIRE_ONLY in FUSE_NOTIFY_INVAL_ENTRY (protocol 7.38).
+const HAS_EXPIRE_ONLY: u64 = 1_u64 << 35;
+
 // This flag indicates whether to enable fd-passthrough. It was defined in the
 // Anolis kernel but not in the upstream kernel. To avoid collision, we'll set
 // it to the most significant bit.
@@ -537,6 +540,10 @@ bitflags! {
         /// (FUSE_EXT_GROUPS extension), so that objects created in setgid
         /// directories get the correct group ownership.
         const CREATE_SUPP_GROUP = CREATE_SUPP_GROUP;
+
+        /// Indicates that the kernel can expire an entry without dropping it, see
+        /// `Server::notify_expire_entry()`.
+        const HAS_EXPIRE_ONLY = HAS_EXPIRE_ONLY;
     }
 }
 
@@ -619,6 +626,9 @@ pub const ATTR_SUBMOUNT: u32 = 1;
 
 /// Request poll notify.
 pub const POLL_SCHEDULE_NOTIFY: u32 = 1;
+
+/// Flag of `NotifyInvalEntryOut` that expires the entry instead of dropping it.
+pub const EXPIRE_ONLY: u32 = 1;
 
 /// Fsync flags
 ///
@@ -893,7 +903,9 @@ pub enum NotifyOpcode {
     Retrieve = 5,
     Delete = 6,
     Resend = 7,
-    CodeMax = 8,
+    IncEpoch = 8,
+    Prune = 9,
+    CodeMax = 10,
 }
 
 #[repr(C)]
@@ -1408,7 +1420,7 @@ unsafe impl ByteValued for NotifyInvalInodeOut {}
 pub struct NotifyInvalEntryOut {
     pub parent: u64,
     pub namelen: u32,
-    pub padding: u32,
+    pub flags: u32,
 }
 unsafe impl ByteValued for NotifyInvalEntryOut {}
 
@@ -1455,6 +1467,15 @@ pub struct NotifyRetrieveIn {
     pub dummy4: u64,
 }
 unsafe impl ByteValued for NotifyRetrieveIn {}
+
+#[repr(C)]
+#[derive(Debug, Default, Copy, Clone)]
+pub struct NotifyPruneOut {
+    pub count: u32,
+    pub padding: u32,
+    pub spare: u64,
+}
+unsafe impl ByteValued for NotifyPruneOut {}
 
 #[repr(C)]
 #[derive(Debug, Default, Copy, Clone)]
@@ -1520,6 +1541,7 @@ mod tests {
         assert_eq!(std::mem::size_of::<OpenOut>(), 16);
         assert_eq!(std::mem::size_of::<InitOut>(), 64);
         assert_eq!(std::mem::size_of::<BackingMap>(), 16);
+        assert_eq!(std::mem::size_of::<NotifyPruneOut>(), 16);
     }
 
     #[test]
