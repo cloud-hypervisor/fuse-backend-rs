@@ -334,6 +334,11 @@ const IOV_MAX: usize = libc::UIO_MAXIOV as usize;
 /// The most buffers one `preadv()` or `pwritev()` call accepts.
 #[cfg(target_os = "macos")]
 const IOV_MAX: usize = libc::IOV_MAX as usize;
+/// The most buffers one `preadv()` or `pwritev()` call accepts. FreeBSD's
+/// sys/uio.h caps iovec counts at UIO_MAXIOV (1024), which libc does not
+/// expose as a constant.
+#[cfg(target_os = "freebsd")]
+const IOV_MAX: usize = 1024;
 
 /// Transfer `chunks` in order with one call of `io` each, and return the total count. Each
 /// chunk comes with its full length, and `io` gets the file offset of the chunk. It stops after

@@ -33,3 +33,9 @@ pub use libc::{
     off_t as off64_t, pread as pread64, preadv as preadv64, pwrite as pwrite64,
     pwritev as pwritev64,
 };
+#[cfg(target_os = "freebsd")]
+#[doc(hidden)]
+pub use libc::{
+    off_t as off64_t, pread as pread64, preadv as preadv64, pwrite as pwrite64,
+    pwritev as pwritev64,
+};

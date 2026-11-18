@@ -960,7 +960,7 @@ impl<F: FileSystem + Sync> Server<F> {
             return ctx.reply_ok(Some(out), None);
         }
 
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", target_os = "freebsd"))]
         let flags_u64 = flags as u64;
         #[cfg(target_os = "linux")]
         let mut flags_u64 = flags as u64;
