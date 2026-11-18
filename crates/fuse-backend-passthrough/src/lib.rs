@@ -1024,9 +1024,6 @@ mod tests {
     use super::*;
     #[cfg(target_os = "linux")]
     use caps::{CapSet, Capability};
-    // `CreateIn` and the `Read`/`Write` traits are consumed by the
-    // Linux-gated fixtures below.
-    #[cfg(target_os = "linux")]
     use fuse_backend_core::abi::fuse_abi::CreateIn;
     use fuse_backend_core::api::filesystem::*;
     #[cfg(target_os = "linux")]
@@ -1034,6 +1031,7 @@ mod tests {
     // Only the Linux-gated fixtures use the `log` facade directly.
     #[cfg(target_os = "linux")]
     use log;
+    // Only the Linux-gated fixtures use these `std::io` items.
     #[cfg(target_os = "linux")]
     use std::io::{Read, Seek, SeekFrom, Write};
     #[cfg(target_os = "linux")]
@@ -1658,6 +1656,45 @@ mod tests {
     }
 
     #[test]
+    fn test_parallel_direct_writes_with_direct_io() {
+        let tmpdir = TempDir::new().expect("Cannot create temporary directory.");
+        let ctx = Context::default();
+        let createin = CreateIn {
+            flags: libc::O_CREAT as u32 | libc::O_RDWR as u32,
+            mode: 0o644,
+            umask: 0,
+            fuse_flags: 0,
+        };
+        for (policy, file_opts) in [
+            (CachePolicy::Auto, OpenOptions::empty()),
+            (
+                CachePolicy::Never,
+                OpenOptions::DIRECT_IO | OpenOptions::PARALLEL_DIRECT_WRITES,
+            ),
+            (
+                CachePolicy::Metadata,
+                OpenOptions::DIRECT_IO | OpenOptions::PARALLEL_DIRECT_WRITES,
+            ),
+        ] {
+            let fs_cfg = Config {
+                do_import: false,
+                root_dir: tmpdir.as_path().to_string_lossy().to_string(),
+                cache_policy: policy.clone(),
+                ..Default::default()
+            };
+            let fs = PassthroughFs::<()>::new(fs_cfg).unwrap();
+            fs.import().unwrap();
+            fs.init(FsOptions::empty()).unwrap();
+
+            let name = CString::new(format!("{:?}", policy)).unwrap();
+            let (entry, _, opts, _) = fs.create(&ctx, ROOT_ID, &name, createin).unwrap();
+            assert_eq!(opts, file_opts, "create under {:?}", policy);
+            let (_, opts, _) = fs.open(&ctx, entry.inode, libc::O_RDWR as u32, 0).unwrap();
+            assert_eq!(opts, file_opts, "open under {:?}", policy);
+        }
+    }
+
+    #[test]
     #[cfg(target_os = "linux")]
     fn test_generic_read_write_noopen() {
         let tmpdir = TempDir::new().expect("Cannot create temporary directory.");
@@ -2143,7 +2180,10 @@ mod tests {
         assert_eq!(id, None);
         let (_, opts, id) = fs.open(&ctx, entry.inode, flags, 0).unwrap();
         assert_eq!(id, None);
-        assert_eq!(opts, OpenOptions::DIRECT_IO);
+        assert_eq!(
+            opts,
+            OpenOptions::DIRECT_IO | OpenOptions::PARALLEL_DIRECT_WRITES
+        );
     }
 
     /// Backing files for tests in which passthrough stays off.
