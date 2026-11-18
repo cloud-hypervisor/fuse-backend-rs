@@ -237,6 +237,10 @@ const PASSTHROUGH: u64 = 1_u64 << 37;
 // this flag indicates whether the guest kernel enable resend
 const HAS_RESEND: u64 = 1_u64 << 39;
 
+// The kernel aborts the connection when a request waits longer than the
+// request_timeout of the INIT reply (protocol 7.43)
+const REQUEST_TIMEOUT: u64 = 1_u64 << 42;
+
 // Indicates that the daemon supports serving FUSE requests over io_uring
 // (protocol 7.42, kernel 6.14+, experimental fusedev-uring feature).
 #[cfg(feature = "fusedev-uring")]
@@ -531,6 +535,11 @@ bitflags! {
         /// Daemon supports serving FUSE requests over io_uring (experimental).
         #[cfg(feature = "fusedev-uring")]
         const OVER_IO_URING = OVER_IO_URING;
+
+        /// Indicates that the kernel can abort the connection when a request isn't answered in
+        /// time (protocol 7.43). The server negotiates it when `Server::set_request_timeout()`
+        /// set a timeout.
+        const REQUEST_TIMEOUT = REQUEST_TIMEOUT;
 
         /// Indicates that the kernel sends a supplementary group matching the
         /// parent directory's group in create/mkdir/symlink/mknod requests
@@ -1221,7 +1230,8 @@ pub struct InitOut {
     pub map_alignment: u16,
     pub flags2: u32,
     pub max_stack_depth: u32,
-    pub unused: [u32; 6],
+    pub request_timeout: u16,
+    pub unused: [u16; 11],
 }
 unsafe impl ByteValued for InitOut {}
 
@@ -1527,6 +1537,7 @@ mod tests {
         assert_eq!(std::mem::offset_of!(OpenOut, passthrough), 12);
         assert_eq!(std::mem::offset_of!(InitOut, flags2), 32);
         assert_eq!(std::mem::offset_of!(InitOut, max_stack_depth), 36);
+        assert_eq!(std::mem::offset_of!(InitOut, request_timeout), 40);
         assert_eq!(std::mem::offset_of!(BackingMap, flags), 4);
         assert_eq!(std::mem::offset_of!(BackingMap, padding), 8);
         assert_eq!(FsOptions::PASSTHROUGH.bits(), 1 << 37);
