@@ -1,6 +1,9 @@
 # Changelog
 ## [Unreleased]
 ### Added
+- [NNN](link): `OpenOptions::PARALLEL_DIRECT_WRITES` (`FOPEN_PARALLEL_DIRECT_WRITES`, protocol
+  7.38, Linux 6.2) lets the kernel send direct writes to one file concurrently. `PassthroughFs`
+  sets it on every open it answers with `DIRECT_IO`.
 - [NNN](link): Give FreeBSD a verification path. The Linux wire-format ABI
   body moves out of `fuse_abi_linux.rs` into a shared `fuse_abi_wire.rs`
   (each per-OS prelude re-exports the libc names the body uses), and a new
