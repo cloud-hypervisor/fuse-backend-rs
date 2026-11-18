@@ -130,7 +130,7 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
         &self,
         data: &'a Arc<HandleData>,
         fd: &impl AsRawFd,
-        mut flags: u32,
+        flags: u32,
     ) -> io::Result<FileFlagGuard<'a, u32>> {
         let guard = data.open_flags.read().unwrap();
         if *guard & os_compat::O_DIRECT as u32 == flags & os_compat::O_DIRECT as u32 {
@@ -139,18 +139,20 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
         drop(guard);
 
         let mut guard = data.open_flags.write().unwrap();
-        // Update the O_DIRECT flag if needed
+        // Update the O_DIRECT flag if needed. Start from the fd's own status flags, not the
+        // client's open flags in `guard`. With the writeback cache the host fd was opened
+        // without the client's O_APPEND, and F_SETFL would turn it back on.
         if *guard & os_compat::O_DIRECT as u32 != flags & os_compat::O_DIRECT as u32 {
-            if flags & os_compat::O_DIRECT as u32 != 0 {
-                flags = *guard | os_compat::O_DIRECT as u32;
-            } else {
-                flags = *guard & !os_compat::O_DIRECT as u32;
+            let fd_flags = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFL) };
+            if fd_flags < 0 {
+                return Err(io::Error::last_os_error());
             }
-            let ret = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETFL, flags) };
+            let fd_flags = (fd_flags & !os_compat::O_DIRECT) | (flags as i32 & os_compat::O_DIRECT);
+            let ret = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETFL, fd_flags) };
             if ret != 0 {
                 return Err(io::Error::last_os_error());
             }
-            *guard = flags;
+            *guard ^= os_compat::O_DIRECT as u32;
         }
 
         Ok(FileFlagGuard::Writer(guard))
@@ -2076,6 +2078,49 @@ mod tests {
         let read = fs.read_direct(&file, &mut writer, BLOCK, 0).unwrap();
         assert_eq!(read, BLOCK);
         assert_eq!(writer.0, payload);
+    }
+
+    // With writeback cache the host fd is opened without the client's O_APPEND. Toggling
+    // O_DIRECT for a request must not turn O_APPEND back on.
+    #[test]
+    fn test_direct_io_toggle_keeps_writeback_append_off() {
+        let (fs, source) = prepare_fs_writeback_no_handles();
+        let ctx = prepare_context();
+
+        let name = CString::new("file").unwrap();
+        let args = CreateIn {
+            flags: (libc::O_RDWR | libc::O_APPEND) as u32,
+            mode: 0o600,
+            umask: 0,
+            fuse_flags: 0,
+        };
+        let (entry, handle, ..) = fs.create(&ctx, ROOT_ID, &name, args).unwrap();
+        let handle = handle.unwrap();
+        let data = fs.handle_map.get(handle, entry.inode).unwrap();
+        let fd = data.borrow_fd().as_raw_fd();
+        let fd_flags = || unsafe { libc::fcntl(fd, libc::F_GETFL) };
+        assert_eq!(fd_flags() & libc::O_APPEND, 0);
+
+        let flags = args.flags | libc::O_DIRECT as u32;
+        match fs.ensure_file_flags(&data, &fd, flags) {
+            Ok(_) => {}
+            Err(e) if e.raw_os_error() == Some(libc::EINVAL) => {
+                eprintln!(
+                    "skipping test_direct_io_toggle_keeps_writeback_append_off: no O_DIRECT in {:?}",
+                    source.as_path()
+                );
+                return;
+            }
+            Err(e) => panic!("cannot set O_DIRECT: {}", e),
+        }
+        assert_ne!(fd_flags() & libc::O_DIRECT, 0);
+        assert_eq!(fd_flags() & libc::O_APPEND, 0);
+        assert_eq!(*data.open_flags.read().unwrap(), flags);
+
+        drop(fs.ensure_file_flags(&data, &fd, args.flags).unwrap());
+        let fd_flags = fd_flags();
+        assert_eq!(fd_flags & (libc::O_DIRECT | libc::O_APPEND), 0);
+        assert_eq!(*data.open_flags.read().unwrap(), args.flags);
     }
 
     #[test]
