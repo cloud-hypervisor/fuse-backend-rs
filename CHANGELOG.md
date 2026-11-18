@@ -228,6 +228,13 @@
   throttling now stalls the worker, as in the sync server. Zero-copy writes over io_uring don't
   change, and still pay for the io-wq thread on ext4 and tmpfs. For this,
   `async_file::File::borrow_fd_blocking()` borrows a descriptor whose IO never uses io_uring.
+- With the thread pool on the tokio runtime, `PassthroughFs::async_write()` first tries
+  `pwritev2(RWF_NOWAIT)` on the runtime thread, like `async_read()` does with `preadv2()`, and
+  hands only a write that would block to the pool. On XFS that saves the copy and the pool
+  thread for most writes: 4 KiB random writes through `/dev/fuse` with 4 async workers went
+  from 2.34M to 2.48M IOPS, and the daemon used 12% less CPU time on them and 16% less on
+  1 MiB sequential writes. A handle whose file rejects non-blocking writes, on ext4 or tmpfs,
+  stops trying after the first.
 - Bump the declared minimum supported Rust version (MSRV) from 1.80 to 1.86.
   Trait-object upcasting (stabilized in Rust 1.86) is required by the default
   `AsyncFileSystem` read/write handlers and by the passthrough O_DIRECT relay,
