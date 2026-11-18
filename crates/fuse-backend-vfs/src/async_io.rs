@@ -47,6 +47,30 @@ impl AsyncFileSystem for Vfs {
         }
     }
 
+    // Like `statx()`.
+    async fn async_statx(
+        &self,
+        ctx: &Context,
+        inode: <Self as FileSystem>::Inode,
+        handle: Option<<Self as FileSystem>::Handle>,
+        flags: u32,
+        mask: u32,
+    ) -> Result<(Statx, Duration)> {
+        match self.get_real_rootfs(inode)? {
+            (Left(fs), idata) => fs
+                .getattr(ctx, idata.ino(), handle)
+                .map(|(attr, duration)| (attr.into(), duration)),
+            (Right(fs), idata) => match fs.async_statx(ctx, idata.ino(), handle, flags, mask).await
+            {
+                Err(e) if e.raw_os_error() == Some(libc::ENOSYS) => fs
+                    .async_getattr(ctx, idata.ino(), handle)
+                    .await
+                    .map(|(attr, duration)| (self.convert_attr(idata, attr).into(), duration)),
+                res => res.map(|(sx, duration)| (self.convert_statx(idata, sx), duration)),
+            },
+        }
+    }
+
     async fn async_setattr(
         &self,
         ctx: &Context,
@@ -597,7 +621,7 @@ mod tests {
     use fuse_backend_core::buffer::{Reader, Writer};
     use fuse_backend_core::file_traits::FileReadWriteVolatile;
 
-    use super::super::tests::FakeFileSystemOne;
+    use super::super::tests::{mount_statx_backends, FakeFileSystemOne};
     use super::*;
     use crate::Vfs;
 
@@ -847,6 +871,20 @@ mod tests {
         .await
         .unwrap();
         inodes
+    }
+
+    #[tokio::test]
+    async fn test_vfs_async_statx() {
+        let vfs = Vfs::new(VfsOptions::default());
+        let ctx = Context::new();
+        let (one, two) = mount_statx_backends(&vfs);
+        let mask = STATX_BASIC_STATS | STATX_BTIME;
+
+        let (sx, _) = vfs.async_statx(&ctx, one, None, 0, mask).await.unwrap();
+        assert_eq!((sx.mask, sx.ino), (STATX_BASIC_STATS, one.into()));
+        let (sx, _) = vfs.async_statx(&ctx, two, None, 0, mask).await.unwrap();
+        assert_eq!((sx.mask, sx.ino), (mask, two.into()));
+        assert_eq!((sx.uid, sx.btime.tv_sec), (1000, 42));
     }
 
     #[tokio::test]

@@ -620,14 +620,30 @@ impl Vfs {
     /// If `map_internal_to_external` is false, the external IDs will be mapped
     /// to VFS internal IDs.
     fn remap_attr_id(&self, fs_idx: VfsIndex, map_internal_to_external: bool, attr: &mut stat64) {
+        self.remap_ids(
+            fs_idx,
+            map_internal_to_external,
+            &mut attr.st_uid,
+            &mut attr.st_gid,
+        );
+    }
+
+    /// Like `remap_attr_id()`, for any uid/gid pair.
+    fn remap_ids(
+        &self,
+        fs_idx: VfsIndex,
+        map_internal_to_external: bool,
+        uid: &mut u32,
+        gid: &mut u32,
+    ) {
         if let Some((internal_id, external_id, range)) = self.get_effective_id_mapping(fs_idx) {
             let (from_base, to_base) = if map_internal_to_external {
                 (internal_id, external_id)
             } else {
                 (external_id, internal_id)
             };
-            attr.st_uid = remap_id(attr.st_uid, from_base, to_base, range);
-            attr.st_gid = remap_id(attr.st_gid, from_base, to_base, range);
+            *uid = remap_id(*uid, from_base, to_base, range);
+            *gid = remap_id(*gid, from_base, to_base, range);
         }
     }
 
@@ -638,6 +654,13 @@ impl Vfs {
         attr.st_ino = idata.into();
         self.remap_attr_id(idata.fs_idx(), true, &mut attr);
         attr
+    }
+
+    /// Like `convert_attr()`, for the attributes of `statx()`.
+    fn convert_statx(&self, idata: VfsInode, mut sx: Statx) -> Statx {
+        sx.ino = idata.into();
+        self.remap_ids(idata.fs_idx(), true, &mut sx.uid, &mut sx.gid);
+        sx
     }
 
     /// Convert an entry returned by a backend filesystem of the given mount
@@ -1406,6 +1429,25 @@ mod tests {
                 ..Default::default()
             })
         }
+        fn statx(
+            &self,
+            _: &Context,
+            inode: Self::Inode,
+            _: Option<Self::Handle>,
+            _: u32,
+            mask: u32,
+        ) -> Result<(Statx, Duration)> {
+            let sx = Statx {
+                mask,
+                ino: inode,
+                btime: SxTime {
+                    tv_sec: 42,
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            Ok((sx, Duration::from_secs(1)))
+        }
     }
 
     #[cfg(feature = "async-io")]
@@ -1829,6 +1871,35 @@ mod tests {
             .getattr(&ctx, VfsInode(0x100_0000_0000_0001), None)
             .unwrap();
         assert_eq!(stat.st_ino, 0x100_0000_0000_0001);
+    }
+
+    /// Mounts a backend without statx() at /x/y and one with it at /z, whose uid 0 maps to
+    /// 1000, and returns their root inodes.
+    pub(crate) fn mount_statx_backends(vfs: &Vfs) -> (VfsInode, VfsInode) {
+        let one = vfs.mount(Box::new(FakeFileSystemOne {}), "/x/y").unwrap();
+        let two = vfs
+            .mount_with_id_mapping(Box::new(FakeFileSystemTwo {}), "/z", Some((0, 1000, 1)))
+            .unwrap();
+        (VfsInode::new(one, 1), VfsInode::new(two, 1))
+    }
+
+    #[test]
+    fn test_vfs_statx() {
+        let vfs = Vfs::new(VfsOptions::default());
+        let ctx = Context::new();
+        let (one, two) = mount_statx_backends(&vfs);
+        let mask = STATX_BASIC_STATS | STATX_BTIME;
+
+        // The pseudo file system and a backend without statx() answer with getattr(), so that
+        // they don't turn STATX off for the whole mount.
+        let (sx, _) = vfs.statx(&ctx, ROOT_ID.into(), None, 0, mask).unwrap();
+        assert_eq!(sx.mask, STATX_BASIC_STATS);
+        let (sx, _) = vfs.statx(&ctx, one, None, 0, mask).unwrap();
+        assert_eq!((sx.mask, sx.ino), (STATX_BASIC_STATS, one.into()));
+
+        let (sx, _) = vfs.statx(&ctx, two, None, 0, mask).unwrap();
+        assert_eq!((sx.mask, sx.ino), (mask, two.into()));
+        assert_eq!((sx.uid, sx.btime.tv_sec), (1000, 42));
     }
 
     #[test]
