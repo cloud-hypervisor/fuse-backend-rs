@@ -167,6 +167,12 @@
   from 2.34M to 2.48M IOPS, and the daemon used 12% less CPU time on them and 16% less on
   1 MiB sequential writes. A handle whose file rejects non-blocking writes, on ext4 or tmpfs,
   stops trying after the first.
+- `PassthroughFs::async_read()` stops trying `preadv2(RWF_NOWAIT)` on a handle once its file
+  rejects the flag with `EOPNOTSUPP`, as files on tmpfs, overlayfs and FUSE do. Without the
+  thread pool, it then reads them with `preadv()` on the runtime thread, also on tokio-uring,
+  where io_uring handed each such read to an io-wq thread. 4 KiB random reads through
+  `/dev/fuse` from tmpfs with 4 async workers went from 194k-196k to 314k IOPS. A read that
+  misses the cache of overlayfs or FUSE now stalls the worker, as in the sync server.
 - Bump the declared minimum supported Rust version (MSRV) from 1.80 to 1.86.
   Trait-object upcasting (stabilized in Rust 1.86) is required by the default
   `AsyncFileSystem` read/write handlers and by the passthrough O_DIRECT relay,
