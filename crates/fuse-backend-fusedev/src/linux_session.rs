@@ -28,6 +28,7 @@ use nix::mount::{mount, umount2, MntFlags, MsFlags};
 use nix::poll::{poll, PollFd, PollFlags, PollTimeout};
 use nix::sys::epoll::{EpollEvent, EpollFlags};
 use nix::unistd::{getgid, getuid, read};
+use nix::NixPath;
 
 use super::{
     pagesize,
@@ -69,10 +70,12 @@ pub struct FuseSession {
     fusermount: String,
     mount_flags: Option<MsFlags>,
     splice_write: bool,
-    // Set once detach() has unmounted the file system. A detached mount that is still in use
-    // keeps the connection up, so umount() and later detach() calls check this flag to avoid
-    // unmounting the mountpoint again. Another mount may be there by then.
+    // Set once detach() has unmounted the file system, so umount() and later detach() calls
+    // don't unmount the mountpoint again. Another file system may be mounted there by then, and
+    // without a mount ID, is_unmounted() misses that while the detached mount is in use.
     detached: Mutex<bool>,
+    // The unique ID of the mount, on Linux 6.8+. See is_unmounted().
+    mount_id: Option<u64>,
 }
 
 impl FuseSession {
@@ -117,6 +120,7 @@ impl FuseSession {
             mount_flags: None,
             splice_write: false,
             detached: Mutex::new(false),
+            mount_id: None,
         })
     }
 
@@ -241,6 +245,10 @@ impl FuseSession {
         if self.readonly {
             flags |= MsFlags::MS_RDONLY;
         }
+        // On older kernels, the statx after the mount may send a FUSE request that nobody serves
+        // yet, so check for unique mount IDs first. The statx can't see another namespace.
+        let has_mount_ids =
+            self.target_mntns.is_none() && unique_mount_id(&self.mountpoint).is_some();
         let (file, socket) = fuse_kern_mount(
             &self.mountpoint,
             &self.fsname,
@@ -256,6 +264,9 @@ impl FuseSession {
             .map_err(|e| SessionFailure(format!("set fd nonblocking: {e}")))?;
         self.file = Some(file);
         self.keep_alive = socket;
+        self.mount_id = has_mount_ids
+            .then(|| unique_mount_id(&self.mountpoint))
+            .flatten();
         *self
             .detached
             .get_mut()
@@ -265,20 +276,29 @@ impl FuseSession {
     }
 
     /// Destroy a fuse session.
+    ///
+    /// On Linux 6.8+, unless the session mounted in another namespace, this unmounts the session's
+    /// own mount even after an abort through `/sys/fs/fuse/connections`, and never a file system
+    /// mounted at the mountpoint since.
     pub fn umount(&mut self) -> Result<()> {
         let detached = std::mem::take(
             self.detached
                 .get_mut()
                 .unwrap_or_else(PoisonError::into_inner),
         );
+        // Forget the ID, so it doesn't apply to a file set later with set_fuse_file().
+        let mount_id = self.mount_id.take();
         // If we have a keep_alive socket, just drop it,
         // and let fusermount do the unmount.
         if let (None, Some(file)) = (self.keep_alive.take(), self.file.take()) {
-            if detached {
-                // detach() already unmounted it, so just close the fd.
+            // Just close the fd if detach() or someone else unmounted it already.
+            if detached || is_unmounted(&file, &self.mountpoint, mount_id) {
                 return Ok(());
             }
-            fuse_kern_umount(&self.mountpoint, file, &self.fusermount, self.target_mntns)
+            // Drop to close fuse session fd, otherwise synchronous umount can recurse into
+            // filesystem and cause deadlock.
+            drop(file);
+            fuse_lazy_umount(&self.mountpoint, &self.fusermount, self.target_mntns)
         } else {
             Ok(())
         }
@@ -294,15 +314,14 @@ impl FuseSession {
     /// It unmounts at most once, and a later `umount()` doesn't unmount again. So neither of them
     /// unmounts another file system mounted at the mountpoint after the detach. With
     /// `auto_unmount`, fusermount still unmounts the mountpoint once `umount()` closes the session.
-    /// Like `umount()`, it does nothing once the connection is torn down. That includes a
-    /// connection aborted through `/sys/fs/fuse/connections` whose mount is still in place.
+    /// Like `umount()`, it does nothing once the file system is unmounted.
     pub fn detach(&self) -> Result<()> {
         let Some(file) = &self.file else {
             return Ok(());
         };
         // Hold the lock across the unmount, so concurrent calls unmount only once.
         let mut detached = self.detached.lock().unwrap_or_else(PoisonError::into_inner);
-        if *detached || is_torn_down(file) {
+        if *detached || is_unmounted(file, &self.mountpoint, self.mount_id) {
             return Ok(());
         }
         fuse_lazy_umount(&self.mountpoint, &self.fusermount, self.target_mntns)?;
@@ -874,28 +893,88 @@ fn fuse_fusermount_mount(
     }
 }
 
-/// Whether the file system is unmounted already, or its connection was aborted through
-/// /sys/fs/fuse/connections/NNN/abort. In both cases the fuse fd reports only POLLERR.
+/// Whether the connection is torn down, by an unmount or by an abort through
+/// /sys/fs/fuse/connections/NNN/abort. Either way the fuse fd reports only POLLERR.
 fn is_torn_down(file: &File) -> bool {
     let mut fds = [PollFd::new(file.as_fd(), PollFlags::empty())];
     poll(&mut fds, PollTimeout::from(0u16)).is_ok() && fds[0].revents() == Some(PollFlags::POLLERR)
 }
 
-/// Umount a fuse file system
-fn fuse_kern_umount(
-    mountpoint: &Path,
-    file: File,
-    fusermount: &str,
-    target_mntns: Option<libc::pid_t>,
-) -> Result<()> {
-    if is_torn_down(&file) {
-        return Ok(());
-    }
+/// The minor device number of the last mount at `mountpoint`, an
+/// absolute path, in `mountinfo`, the format of /proc/self/mountinfo.
+#[cfg(any(test, feature = "uring"))]
+pub(crate) fn mount_minor(mountinfo: &str, mountpoint: &Path) -> Option<u32> {
+    // mountinfo writes space, tab, newline and backslash as octal escapes.
+    let mountpoint: String = mountpoint
+        .to_str()?
+        .chars()
+        .map(|c| match c {
+            ' ' | '\t' | '\n' | '\\' => format!("\\{:03o}", c as u32),
+            c => c.to_string(),
+        })
+        .collect();
+    mountinfo.lines().rev().find_map(|line| {
+        // ID, parent ID, major:minor, root, mount point, ...
+        let mut fields = line.split(' ');
+        let dev = fields.nth(2)?;
+        let point = fields.nth(1)?;
+        if point != mountpoint {
+            return None;
+        }
+        dev.split_once(':')?.1.parse().ok()
+    })
+}
 
-    // Drop to close fuse session fd, otherwise synchronous umount can recurse into filesystem and
-    // cause deadlock.
-    drop(file);
-    fuse_lazy_umount(mountpoint, fusermount, target_mntns)
+/// The minor device number of the last mount at `mountpoint` in /proc/self/mountinfo.
+#[cfg(any(test, feature = "uring"))]
+pub(crate) fn mount_minor_at(mountpoint: &Path) -> Option<u32> {
+    let mountinfo = std::fs::read_to_string("/proc/self/mountinfo").ok()?;
+    mount_minor(&mountinfo, mountpoint)
+}
+
+/// Whether the file system is unmounted. With the unique `mount_id` of the mount, that's whether
+/// the mount at the mountpoint has another ID. The connection alone can't tell. A mount unmounted
+/// from outside keeps it up while a file on it is open or another mount namespace holds a copy,
+/// and an abort through /sys/fs/fuse/connections tears it down but keeps the mount.
+/// Without an ID, or if the statx fails, a torn down connection counts as unmounted.
+fn is_unmounted(file: &File, mountpoint: &Path, mount_id: Option<u64>) -> bool {
+    match mount_id.map(|id| (id, unique_mount_id(mountpoint))) {
+        Some((id, Some(current))) => current != id,
+        _ => is_torn_down(file),
+    }
+}
+
+/// The unique ID of the mount at `mountpoint`, on Linux 6.8+. The kernel never reuses one.
+fn unique_mount_id(mountpoint: &Path) -> Option<u64> {
+    // From the uapi headers, because older libc releases lack these flags, and statx() on musl.
+    #[repr(C)]
+    #[derive(Default)]
+    struct Statx {
+        stx_mask: u32,
+        _blksize: u32,
+        _fields: [u64; 17],
+        stx_mnt_id: u64,
+        _spare: [u64; 13],
+    }
+    const STATX_MNT_ID_UNIQUE: u32 = 0x4000;
+    const AT_STATX_DONT_SYNC: libc::c_int = 0x4000;
+
+    let mut stx = Statx::default();
+    // Safe because stx has the size of a struct statx, and the kernel writes nothing else.
+    let res = mountpoint
+        .with_nix_path(|path| unsafe {
+            libc::syscall(
+                libc::SYS_statx,
+                libc::AT_FDCWD,
+                path.as_ptr(),
+                // Don't let FUSE refresh the attributes with a GETATTR, or set off an automount.
+                libc::AT_SYMLINK_NOFOLLOW | libc::AT_NO_AUTOMOUNT | AT_STATX_DONT_SYNC,
+                STATX_MNT_ID_UNIQUE,
+                &mut stx as *mut Statx,
+            )
+        })
+        .ok()?;
+    (res == 0 && stx.stx_mask & STATX_MNT_ID_UNIQUE != 0).then_some(stx.stx_mnt_id)
 }
 
 /// Detach a fuse file system from the mount tree. Fall back to fusermount if umount2() fails
@@ -998,6 +1077,7 @@ pub fn fuse_backing_close(fuse_file: &File, backing_id: u32) -> io::Result<()> {
 mod tests {
     use super::*;
     use std::fs::File;
+    use std::os::unix::fs::OpenOptionsExt;
     use std::path::Path;
     use vmm_sys_util::tempdir::TempDir;
 
@@ -1092,6 +1172,103 @@ mod tests {
         // torn down; the timeout guards against a hang.
         assert_eq!(rx.recv_timeout(std::time::Duration::from_secs(5)), Ok(true));
         thread.join().unwrap();
+    }
+
+    #[test]
+    fn test_mount_minor() {
+        let info = "22 1 0:21 / /proc rw - proc proc rw\n\
+                    95 30 0:84 / /tmp/a rw - fuse.x x rw\n\
+                    96 30 0:86 / /tmp/a rw - fuse.x x rw\n";
+        // The last mount at a path is the one in effect.
+        assert_eq!(mount_minor(info, "/tmp/a".as_ref()), Some(86));
+        assert_eq!(mount_minor(info, "/tmp/b".as_ref()), None);
+        // Special characters are octal escapes.
+        let info = "97 30 0:88 / /tmp/a\\040b rw - fuse.x x rw\n";
+        assert_eq!(mount_minor(info, "/tmp/a b".as_ref()), Some(88));
+    }
+
+    /// A connection aborted through /sys/fs/fuse/connections keeps its mount
+    /// until the session unmounts it.
+    #[test]
+    fn test_umount_aborted_connection() {
+        if unsafe { libc::geteuid() } != 0 {
+            eprintln!("not root, skipping");
+            return;
+        }
+        let dir = TempDir::new().unwrap();
+        let mnt = dir.as_path().join("mount point");
+        std::fs::create_dir(&mnt).unwrap();
+        let mut se = FuseSession::new(&mnt, "abort_test", "", false).unwrap();
+        se.mount().unwrap();
+        if se.mount_id.is_none() {
+            eprintln!("the kernel has no unique mount IDs, skipping");
+            return;
+        }
+        let mountpoint = se.mountpoint().to_owned();
+        let minor = mount_minor_at(&mountpoint).unwrap();
+        let abort = format!("/sys/fs/fuse/connections/{minor}/abort");
+        if std::fs::write(abort, b"1").is_err() {
+            eprintln!("fusectl isn't mounted, skipping");
+            return;
+        }
+        assert!(is_torn_down(se.get_fuse_file().unwrap()));
+
+        drop(se);
+        assert_eq!(mount_minor_at(&mountpoint), None);
+    }
+
+    /// Unmount the session from outside, mount a tmpfs in its place, and check that dropping
+    /// the session leaves the tmpfs alone. With `in_use`, a file open on the detached mount keeps
+    /// its connection up.
+    fn check_umount_spares_later_mount(in_use: bool) {
+        if unsafe { libc::geteuid() } != 0 {
+            eprintln!("not root, skipping");
+            return;
+        }
+        let dir = TempDir::new().unwrap();
+        let mut se = FuseSession::new(dir.as_path(), "spare_test", "", false).unwrap();
+        se.mount().unwrap();
+        if in_use && se.mount_id.is_none() {
+            eprintln!("the kernel has no unique mount IDs, skipping");
+            return;
+        }
+        let mountpoint = se.mountpoint().to_owned();
+        // Nobody serves the connection, and an O_PATH open sends it no request.
+        let file = in_use.then(|| {
+            File::options()
+                .read(true)
+                .custom_flags(libc::O_PATH)
+                .open(&mountpoint)
+                .unwrap()
+        });
+        umount2(&mountpoint, MntFlags::MNT_DETACH).unwrap();
+        assert_eq!(is_torn_down(se.get_fuse_file().unwrap()), !in_use);
+        mount(
+            Some("tmpfs"),
+            &mountpoint,
+            Some("tmpfs"),
+            MsFlags::empty(),
+            None::<&str>,
+        )
+        .unwrap();
+
+        drop(se);
+        assert!(mount_minor_at(&mountpoint).is_some());
+        umount2(&mountpoint, MntFlags::MNT_DETACH).unwrap();
+        drop(file);
+    }
+
+    /// Once the file system is unmounted from outside, another one may be
+    /// mounted in its place, and the session leaves that one alone.
+    #[test]
+    fn test_umount_spares_later_mount() {
+        check_umount_spares_later_mount(false);
+    }
+
+    /// The same while the detached mount is in use, so its connection is still up.
+    #[test]
+    fn test_umount_spares_later_mount_in_use() {
+        check_umount_spares_later_mount(true);
     }
 }
 
