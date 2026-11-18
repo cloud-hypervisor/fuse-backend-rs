@@ -61,6 +61,7 @@ const FATTR_CTIME: u32 = 0x400;
 const FATTR_KILL_SUIDGID: u32 = 0x800;
 
 bitflags! {
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
     pub struct SetattrValid: u32 {
         const MODE = FATTR_MODE;
         const UID = FATTR_UID;
@@ -101,6 +102,7 @@ const FOPEN_PASSTHROUGH: u32 = 1 << 7;
 bitflags! {
     /// Options controlling the behavior of files opened by the server in response
     /// to an open or create request.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
     pub struct OpenOptions: u32 {
         /// Bypass page cache for this open file.
         const DIRECT_IO = FOPEN_DIRECT_IO;
@@ -251,6 +253,7 @@ pub const FUSE_ATTR_DAX: u32 = 1 << 1;
 bitflags! {
     /// A bitfield passed in as a parameter to and returned from the `init` method of the
     /// `FileSystem` trait.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
     pub struct FsOptions: u64 {
         /// Indicates that the filesystem supports asynchronous read requests.
         ///
@@ -573,6 +576,7 @@ const IOCTL_COMPAT_X32: u32 = 32;
 const IOCTL_MAX_IOV: u32 = 256;
 
 bitflags! {
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
     pub struct IoctlFlags: u32 {
         /// 32bit compat ioctl on 64bit machine
         const IOCTL_COMPAT = IOCTL_COMPAT;
