@@ -194,6 +194,8 @@ impl<F: AsyncFileSystem + Sync> Server<F> {
             x if x == Opcode::Read as u32 => self.async_read(ctx).await,
             x if x == Opcode::Write as u32 => self.async_write(ctx).await,
             x if x == Opcode::Statfs as u32 => self.statfs(ctx),
+            #[cfg(not(target_os = "macos"))]
+            x if x == Opcode::Syncfs as u32 => self.syncfs(ctx),
             x if x == Opcode::Release as u32 => self.release(ctx),
             x if x == Opcode::Fsync as u32 => self.async_fsync(ctx).await,
             x if x == Opcode::Setxattr as u32 => self.setxattr(ctx),
