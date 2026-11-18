@@ -224,8 +224,10 @@ impl Default for VfsOptions {
         // The capability set Vfs advertises is a genuine per-OS value: the
         // Linux set negotiates bits macFUSE never offers (and some of its
         // bit positions are taken by macFUSE-specific capabilities), so the
-        // macOS set stays minimal.
-        #[cfg(target_os = "linux")]
+        // macOS set stays minimal. FreeBSD's in-kernel fusefs speaks the
+        // Linux wire protocol, so it gets the Linux set; init() still
+        // clamps the advertisement to what the kernel actually offered.
+        #[cfg(any(target_os = "linux", target_os = "freebsd"))]
         let out_opts = FsOptions::ASYNC_READ
             | FsOptions::PARALLEL_DIROPS
             | FsOptions::BIG_WRITES
