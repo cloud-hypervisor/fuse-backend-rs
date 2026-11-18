@@ -168,6 +168,28 @@ smoke-macos: check-macos
 	# concurrent fuse-t sessions interfering with each other (#116, #124).
 	${CARGO} test --features="fusedev,fuse-t" -- --nocapture --test-threads=1
 
+# FreeBSD coverage starts with the two crates that are FreeBSD-clean today:
+# core (through its FreeBSD ABI arm reusing the Linux wire protocol) and
+# vfs. fusedev cannot build there yet (nix 0.24 has no FreeBSD compile
+# support), so no umbrella row exists and the per-crate rows below are the
+# full coverage. Clippy is deliberately absent: no Linux CI row lints
+# core/vfs test code either (the umbrella rows lint the root package
+# only), so this row sticks to the verification the other platforms
+# actually guarantee: it compiles, and the unit tests pass.
+build-freebsd:
+	${CARGO} build -p fuse-backend-core --no-default-features
+	${CARGO} build -p fuse-backend-core
+	${CARGO} build -p fuse-backend-vfs --no-default-features
+	${CARGO} build -p fuse-backend-vfs
+
+check-freebsd: build-freebsd
+	${CARGO} fmt --all -- --check
+	${CARGO} test -p fuse-backend-core --no-default-features -- --nocapture --skip integration
+	${CARGO} test -p fuse-backend-core -- --nocapture --skip integration
+	${CARGO} test -p fuse-backend-core --features="async-io" -- --nocapture --skip integration
+	${CARGO} test -p fuse-backend-vfs --no-default-features -- --nocapture --skip integration
+	${CARGO} test -p fuse-backend-vfs -- --nocapture --skip integration
+
 docker-smoke:
 	docker run --env RUST_BACKTRACE=1 --rm --privileged --volume ${current_dir}:/fuse-rs rust:1.86 sh -c "rustup component add clippy rustfmt; cd /fuse-rs; make smoke-all"
 

@@ -1,6 +1,20 @@
 # Changelog
 ## [Unreleased]
 ### Added
+- [NNN](link): Give FreeBSD a verification path. The Linux wire-format ABI
+  body moves out of `fuse_abi_linux.rs` into a shared `fuse_abi_wire.rs`
+  (each per-OS prelude re-exports the libc names the body uses), and a new
+  FreeBSD ABI arm reuses it — FreeBSD's in-kernel fusefs speaks the Linux
+  wire protocol — bridging the libc spellings (`stat`/`preadv` instead of
+  the glibc LFS-64 names, `u16` `mode_t`, `ENOATTR` for a missing xattr,
+  a literal `UIO_MAXIOV`). `Vfs` advertises the Linux capability set there
+  (the negotiation clamps it to what the kernel offered), and a Cirrus CI
+  task — GitHub Actions has no FreeBSD runner — runs `make check-freebsd`,
+  so `fuse-backend-core` and `fuse-backend-vfs` build and pass their unit
+  tests on a real FreeBSD VM. The transport and the filesystem drivers
+  stay FreeBSD-unbuildable (`nix` 0.24 does not compile there), and nothing
+  here claims runtime behavior against a FreeBSD kernel yet.
+
 - [303](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/303): Fill in the macOS twin of the passthrough driver, turning the
   PR #182 prototype (akitaSummer's macOS port) into a working mount on top of
   the cross-platform framework. Reopen-for-IO goes through a hub on the
@@ -28,6 +42,7 @@
   `fallocate`,
   `copy_file_range` and the `RENAME_*` flags stay `ENOSYS` (the FUSE clients
   have fallbacks; `F_PREALLOCATE`/`fcopyfile` are future work).
+
 - [285](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/285): Add `uring_available()`, which tells
   whether the kernel lets the process serve FUSE over io_uring: the fuse module's `enable_uring`
   parameter is on and the process may create an io_uring. Checking it before mounting saves a
