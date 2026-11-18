@@ -836,7 +836,7 @@ fn fuse_fusermount_mount(
 
 /// Whether the file system is unmounted already, or its connection was aborted through
 /// /sys/fs/fuse/connections/NNN/abort. In both cases the fuse fd reports only POLLERR.
-fn is_torn_down(file: &File) -> bool {
+pub(crate) fn is_torn_down(file: &File) -> bool {
     let mut fds = [PollFd::new(file.as_fd(), PollFlags::empty())];
     poll(&mut fds, PollTimeout::from(0u16)).is_ok() && fds[0].revents() == Some(PollFlags::POLLERR)
 }
@@ -1056,7 +1056,69 @@ mod tests {
 }
 
 #[cfg(feature = "async-io")]
-pub use asyncio::{FuseDevTask, StopSignal};
+pub use asyncio::FuseDevTask;
+
+#[cfg(feature = "async-io")]
+pub use stop_signal::StopSignal;
+// The io_uring workers take one too, but nothing public does without
+// `async-io`.
+#[cfg(all(feature = "uring", not(feature = "async-io")))]
+pub(crate) use stop_signal::StopSignal;
+
+#[cfg(any(feature = "async-io", feature = "uring"))]
+mod stop_signal {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    use vmm_sys_util::eventfd::{EventFd, EFD_CLOEXEC, EFD_NONBLOCK};
+
+    /// A stop flag that, when it stops, wakes the `FuseDevTask`s waiting for
+    /// requests on the tokio runtime. A bare `Arc<AtomicBool>` converts into
+    /// a signal that wakes no one, and an idle task checks it every 100ms.
+    #[derive(Clone, Debug)]
+    pub struct StopSignal {
+        flag: Arc<AtomicBool>,
+        // Becomes readable for good when the signal stops.
+        event: Option<Arc<EventFd>>,
+    }
+
+    impl StopSignal {
+        /// A signal that sets `flag` when it stops. Stop it with `stop()`. An
+        /// idle task with a signal has no timer, so a store to `flag` doesn't
+        /// wake it.
+        pub fn new(flag: Arc<AtomicBool>) -> std::io::Result<Self> {
+            Ok(StopSignal {
+                flag,
+                event: Some(Arc::new(EventFd::new(EFD_NONBLOCK | EFD_CLOEXEC)?)),
+            })
+        }
+
+        /// Set the flag and wake the tasks. The tasks finish the requests in
+        /// flight and return.
+        pub fn stop(&self) {
+            self.flag.store(true, Ordering::Release);
+            if let Some(event) = &self.event {
+                let _ = event.write(1);
+            }
+        }
+
+        pub(crate) fn is_stopped(&self) -> bool {
+            self.flag.load(Ordering::Acquire)
+        }
+
+        /// The eventfd that stays readable once the signal stops, if the
+        /// signal has one.
+        pub(crate) fn event(&self) -> Option<&EventFd> {
+            self.event.as_deref()
+        }
+    }
+
+    impl From<Arc<AtomicBool>> for StopSignal {
+        fn from(flag: Arc<AtomicBool>) -> Self {
+            StopSignal { flag, event: None }
+        }
+    }
+}
 
 #[cfg(feature = "async-io")]
 /// Task context to handle fuse request in asynchronous mode.
@@ -1064,7 +1126,6 @@ mod asyncio {
     use std::cell::{Cell, RefCell};
     use std::os::fd::AsFd;
     use std::os::unix::io::{AsRawFd, RawFd};
-    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
     use std::time::Duration;
 
@@ -1074,7 +1135,7 @@ mod asyncio {
     use nix::sys::timerfd::{ClockId, Expiration, TimerFd, TimerFlags, TimerSetTimeFlags};
     use tokio::io::unix::{AsyncFd, AsyncFdReadyGuard};
     use tokio::io::Interest;
-    use vmm_sys_util::eventfd::{EventFd, EFD_CLOEXEC, EFD_NONBLOCK};
+    use vmm_sys_util::eventfd::EventFd;
 
     use fuse_backend_core::api::filesystem::AsyncFileSystem;
     use fuse_backend_core::api::server::Server;
@@ -1082,7 +1143,7 @@ mod asyncio {
     use fuse_backend_core::buffer::Reader;
     use fuse_backend_core::file_buf::FileVolatileBuf;
 
-    use crate::{FuseBuf, FuseDevReaderExt, FuseDevWriter};
+    use crate::{FuseBuf, FuseDevReaderExt, FuseDevWriter, StopSignal};
 
     /// Default limit on the number of concurrently processed requests.
     ///
@@ -1166,47 +1227,6 @@ mod asyncio {
         server: Arc<Server<F>>,
         buf_size: usize,
         max_inflight: usize,
-    }
-
-    /// A stop flag that, when it stops, wakes the `FuseDevTask`s waiting for
-    /// requests on the tokio runtime. A bare `Arc<AtomicBool>` converts into
-    /// a signal that wakes no one, and an idle task checks it every 100ms.
-    #[derive(Clone, Debug)]
-    pub struct StopSignal {
-        flag: Arc<AtomicBool>,
-        // Becomes readable for good when the signal stops.
-        event: Option<Arc<EventFd>>,
-    }
-
-    impl StopSignal {
-        /// A signal that sets `flag` when it stops. Stop it with `stop()`. An
-        /// idle task with a signal has no timer, so a store to `flag` doesn't
-        /// wake it.
-        pub fn new(flag: Arc<AtomicBool>) -> std::io::Result<Self> {
-            Ok(StopSignal {
-                flag,
-                event: Some(Arc::new(EventFd::new(EFD_NONBLOCK | EFD_CLOEXEC)?)),
-            })
-        }
-
-        /// Set the flag and wake the tasks. The tasks finish the requests in
-        /// flight and return.
-        pub fn stop(&self) {
-            self.flag.store(true, Ordering::Release);
-            if let Some(event) = &self.event {
-                let _ = event.write(1);
-            }
-        }
-
-        fn is_stopped(&self) -> bool {
-            self.flag.load(Ordering::Acquire)
-        }
-    }
-
-    impl From<Arc<AtomicBool>> for StopSignal {
-        fn from(flag: Arc<AtomicBool>) -> Self {
-            StopSignal { flag, event: None }
-        }
     }
 
     impl<F: AsyncFileSystem + Sync> FuseDevTask<F> {
@@ -1514,7 +1534,7 @@ mod asyncio {
 
     impl Wakeup {
         fn new(signal: &StopSignal) -> std::io::Result<Self> {
-            if let Some(event) = &signal.event {
+            if let Some(event) = signal.event() {
                 return Ok(Wakeup::Signal(event.try_clone()?));
             }
             let timer = TimerFd::new(
@@ -1676,6 +1696,8 @@ mod asyncio {
     #[cfg(test)]
     mod tests {
         use super::*;
+        use std::sync::atomic::AtomicBool;
+
         use fuse_backend_core::async_runtime;
         use fuse_backend_passthrough::{Config, PassthroughFs};
         use vmm_sys_util::tempfile::TempFile;
