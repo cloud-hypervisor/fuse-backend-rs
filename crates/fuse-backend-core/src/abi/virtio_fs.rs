@@ -11,6 +11,7 @@ use vm_memory::ByteValued;
 
 bitflags! {
     /// Flags for Setupmapping request.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
     pub struct SetupmappingFlags: u64 {
         /// Mapping with write permission
         const WRITE = 0x1;

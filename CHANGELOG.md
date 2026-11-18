@@ -180,6 +180,11 @@
 ### Changed
 - [325](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/325): The `fuse-backend-fusedev` `uring` transport uses io-uring 0.6 instead of 0.5,
   and depends on it only on Linux.
+- [324](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/324): `fuse-backend-core` uses bitflags 2 instead of 1. The flag types (`FsOptions`,
+  `OpenOptions`, `SetattrValid`, `IoctlFlags`, `virtio_fs::SetupmappingFlags`) keep their traits
+  and methods, except that the safe `from_bits_retain()` replaces the unsafe
+  `from_bits_unchecked()`. `Debug` now prints the type name, as in
+  `FsOptions(ASYNC_READ | POSIX_LOCKS)`, and an empty set prints `FsOptions(0x0)`, not `(empty)`.
 - [294](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/294): `PassthroughFs` negotiates
   `FsOptions::DIRECT_IO_ALLOW_MMAP` under the `Never` and `Metadata` cache policies only when the
   new `Config::allow_mmap` opts in (default off), so shared mmaps keep failing with `ENODEV` there
