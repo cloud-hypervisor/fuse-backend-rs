@@ -963,9 +963,15 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
         Ok(())
     }
 
-    fn get_writeback_open_flags(&self, flags: i32) -> i32 {
+    /// The flags to open a host file with for a client's open or create with `flags`.
+    fn host_open_flags(&self, flags: i32) -> i32 {
         let mut new_flags = flags;
         let writeback = self.writeback.load(Ordering::Relaxed);
+
+        // `os_compat::O_DIRECT` is 0 on macOS, which has no such `open()` flag.
+        if !self.cfg.allow_direct_io {
+            new_flags &= !os_compat::O_DIRECT;
+        }
 
         // When writeback caching is enabled, the kernel may send read requests even if the
         // userspace program opened the file write-only. So we need to ensure that we have opened
@@ -1187,7 +1193,7 @@ mod tests {
     }
 
     #[test]
-    fn test_get_writeback_open_flags() {
+    fn test_host_open_flags() {
         // prepare a fs with writeback cache and open being true, so O_WRONLY should be promoted to
         // O_RDWR, as writeback may read files even if file being opened with write-only. And
         // O_APPEND should be cleared as well.
@@ -1199,22 +1205,22 @@ mod tests {
         assert!(!fs.no_open.load(Ordering::Relaxed));
 
         let flags = libc::O_RDWR;
-        assert_eq!(fs.get_writeback_open_flags(flags), libc::O_RDWR);
+        assert_eq!(fs.host_open_flags(flags), libc::O_RDWR);
 
         let flags = libc::O_RDONLY;
-        assert_eq!(fs.get_writeback_open_flags(flags), libc::O_RDONLY);
+        assert_eq!(fs.host_open_flags(flags), libc::O_RDONLY);
 
         let flags = libc::O_WRONLY;
-        assert_eq!(fs.get_writeback_open_flags(flags), libc::O_RDWR);
+        assert_eq!(fs.host_open_flags(flags), libc::O_RDWR);
 
         let flags = libc::O_RDWR | libc::O_APPEND;
-        assert_eq!(fs.get_writeback_open_flags(flags), libc::O_RDWR);
+        assert_eq!(fs.host_open_flags(flags), libc::O_RDWR);
 
         let flags = libc::O_RDONLY | libc::O_APPEND;
-        assert_eq!(fs.get_writeback_open_flags(flags), libc::O_RDONLY);
+        assert_eq!(fs.host_open_flags(flags), libc::O_RDONLY);
 
         let flags = libc::O_WRONLY | libc::O_APPEND;
-        assert_eq!(fs.get_writeback_open_flags(flags), libc::O_RDWR);
+        assert_eq!(fs.host_open_flags(flags), libc::O_RDWR);
 
         // prepare a fs with writeback cache disabled, open flags should not change
         let mut fs = prepare_passthroughfs();
@@ -1225,31 +1231,28 @@ mod tests {
         assert!(!fs.no_open.load(Ordering::Relaxed));
 
         let flags = libc::O_RDWR;
-        assert_eq!(fs.get_writeback_open_flags(flags), libc::O_RDWR);
+        assert_eq!(fs.host_open_flags(flags), libc::O_RDWR);
 
         let flags = libc::O_RDONLY;
-        assert_eq!(fs.get_writeback_open_flags(flags), libc::O_RDONLY);
+        assert_eq!(fs.host_open_flags(flags), libc::O_RDONLY);
 
         let flags = libc::O_WRONLY;
-        assert_eq!(fs.get_writeback_open_flags(flags), libc::O_WRONLY);
+        assert_eq!(fs.host_open_flags(flags), libc::O_WRONLY);
 
         let flags = libc::O_RDWR | libc::O_APPEND;
-        assert_eq!(
-            fs.get_writeback_open_flags(flags),
-            libc::O_RDWR | libc::O_APPEND
-        );
+        assert_eq!(fs.host_open_flags(flags), libc::O_RDWR | libc::O_APPEND);
 
         let flags = libc::O_RDONLY | libc::O_APPEND;
-        assert_eq!(
-            fs.get_writeback_open_flags(flags),
-            libc::O_RDONLY | libc::O_APPEND
-        );
+        assert_eq!(fs.host_open_flags(flags), libc::O_RDONLY | libc::O_APPEND);
 
         let flags = libc::O_WRONLY | libc::O_APPEND;
-        assert_eq!(
-            fs.get_writeback_open_flags(flags),
-            libc::O_WRONLY | libc::O_APPEND
-        );
+        assert_eq!(fs.host_open_flags(flags), libc::O_WRONLY | libc::O_APPEND);
+
+        // O_DIRECT stays only with allow_direct_io.
+        let flags = libc::O_RDWR | os_compat::O_DIRECT;
+        assert_eq!(fs.host_open_flags(flags), flags);
+        fs.cfg.allow_direct_io = false;
+        assert_eq!(fs.host_open_flags(flags), libc::O_RDWR);
     }
 
     #[test]

@@ -269,6 +269,9 @@
   and no code in the workspace relied on it.
 
 ### Fixed
+- [NNN](link): With `allow_direct_io` off, a create with O_DIRECT no longer opens the new host
+  file with O_DIRECT, which made buffered IO on it fail with EINVAL. `PassthroughFs::create()`
+  now builds the host open flags with the same helper as `open_inode()`.
 - [303](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/303): The sync server answers a SETXATTR request it received in full
   but cannot decode — no NUL separator in the attribute name, or a value size
   that disagrees with the body — with `EINVAL` instead of dropping it. FUSE
