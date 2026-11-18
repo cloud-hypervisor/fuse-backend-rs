@@ -200,6 +200,9 @@
   Implementations that override them need to add it, and `None` keeps the old behavior.
 - `InitOut` has a `max_stack_depth` field, which takes one of its `unused` words, so `unused` is
   now `[u32; 6]`.
+- `PassthroughFs::init()` warns when the file system has backing files but INIT doesn't offer
+  `FsOptions::PASSTHROUGH`, as on a kernel without `CONFIG_FUSE_PASSTHROUGH` or under a `Vfs`
+  whose `out_opts` lacks it. It used to serve all IO in the daemon without logging anything.
 - [267](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/267): With the tokio runtime, `FuseDevTask` no longer retries reads in a loop. It waits for requests
   through the IO driver of the tokio runtime that polls it, and checks its state flag every 100ms
   while idle. Polling it on a tokio runtime without IO enabled panics. `fuse-backend-fusedev`
