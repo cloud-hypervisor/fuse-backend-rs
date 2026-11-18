@@ -113,6 +113,11 @@ const FOPEN_NONSEEKABLE: u32 = 4;
 /// filesystem drivers can build open replies uniformly.
 const FOPEN_CACHE_DIR: u32 = 8;
 
+/// An upstream FUSE protocol value (from `fuse_kernel.h`, Linux 6.2) that
+/// macFUSE doesn't define, so shared drivers can build open replies the
+/// same way on every OS.
+const FOPEN_PARALLEL_DIRECT_WRITES: u32 = 1 << 6;
+
 ///
 /// An upstream FUSE protocol value (from `fuse_kernel.h`, Linux 6.9): the
 /// open goes through to the backing file. macFUSE never negotiates it.
@@ -136,6 +141,10 @@ bitflags! {
 
         /// Indicate that the lookup reply is for a directory cache.
         const CACHE_DIR = FOPEN_CACHE_DIR;
+
+        /// Allow concurrent direct writes on the same inode (Linux 6.2; macFUSE
+        /// doesn't define it).
+        const PARALLEL_DIRECT_WRITES = FOPEN_PARALLEL_DIRECT_WRITES;
 
         /// The open goes through to the backing file (Linux 6.9; requires
         /// `FsOptions::PASSTHROUGH`, which macFUSE never negotiates).
