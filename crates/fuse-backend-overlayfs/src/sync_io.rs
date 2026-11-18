@@ -60,6 +60,11 @@ impl FileSystem for OverlayFs {
             self.killpriv_v2.store(true, Ordering::Relaxed);
         }
 
+        // Mirror CREATE_SUPP_GROUP like PassthroughFs. The overlay passes Context.supp_gid to
+        // its layers, and PassthroughFs layers adopt it. Behind a Vfs, the Vfs negotiates the
+        // flag itself.
+        opts |= capable & FsOptions::CREATE_SUPP_GROUP;
+
         if self.config.perfile_dax && capable.contains(FsOptions::PERFILE_DAX) {
             opts |= FsOptions::PERFILE_DAX;
             self.perfile_dax.store(true, Ordering::Relaxed);

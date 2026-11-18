@@ -8,6 +8,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::thread;
 
+use fuse_backend_rs::api::filesystem::FileSystem;
 use fuse_backend_rs::api::{server::Server, Vfs, VfsOptions};
 use fuse_backend_rs::passthrough::{Config, PassthroughFs};
 use fuse_backend_rs::transport::{FuseChannel, FuseSession};
@@ -16,9 +17,9 @@ use nix::mount::MsFlags;
 
 /// A fusedev daemon example
 #[allow(dead_code)]
-pub struct Daemon {
+pub struct Daemon<F: FileSystem + Send + Sync = Vfs> {
     mountpoint: String,
-    server: Arc<Server<Arc<Vfs>>>,
+    server: Arc<Server<Arc<F>>>,
     thread_cnt: u32,
     session: Option<FuseSession>,
     #[cfg(target_os = "linux")]
@@ -53,14 +54,22 @@ impl Daemon {
         // attach passthrough fs to vfs root
         vfs.mount(Box::new(fs), "/").unwrap();
 
-        Ok(Daemon {
+        Ok(Daemon::with_fs(vfs, mountpoint, thread_cnt))
+    }
+}
+
+#[allow(dead_code)]
+impl<F: FileSystem + Send + Sync + 'static> Daemon<F> {
+    /// Creates a fusedev daemon instance that serves `fs`
+    pub fn with_fs(fs: F, mountpoint: &str, thread_cnt: u32) -> Self {
+        Daemon {
             mountpoint: mountpoint.to_string(),
-            server: Arc::new(Server::new(Arc::new(vfs))),
+            server: Arc::new(Server::new(Arc::new(fs))),
             thread_cnt,
             session: None,
             #[cfg(target_os = "linux")]
             mount_flags: None,
-        })
+        }
     }
 
     /// Set custom mount flags to pass to the session
@@ -115,7 +124,7 @@ impl Daemon {
     }
 }
 
-impl Drop for Daemon {
+impl<F: FileSystem + Send + Sync> Drop for Daemon<F> {
     fn drop(&mut self) {
         // Best-effort mirror of umount(): the tests call umount() explicitly
         // and keep its strictness, but the destructor must not panic — the
@@ -130,12 +139,12 @@ impl Drop for Daemon {
     }
 }
 
-struct FuseServer {
-    server: Arc<Server<Arc<Vfs>>>,
+struct FuseServer<F: FileSystem + Send + Sync> {
+    server: Arc<Server<Arc<F>>>,
     ch: FuseChannel,
 }
 
-impl FuseServer {
+impl<F: FileSystem + Send + Sync> FuseServer<F> {
     fn svc_loop(&mut self) -> Result<()> {
         // Given error EBADF, it means kernel has shut down this session.
         let _ebadf = std::io::Error::from_raw_os_error(libc::EBADF);
