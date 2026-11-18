@@ -236,6 +236,7 @@ fn op_args(opcode: u32) -> Option<(usize, bool)> {
         Opcode::Rename2 => (16, false),                      // Rename2In
         Opcode::Lseek => (24, true),                         // LseekIn
         Opcode::CopyFileRange => (56, true),                 // CopyFileRangeIn
+        Opcode::Statx => (24, true),                         // StatxIn
         // SETUPMAPPING/REMOVEMAPPING only exist on the virtiofs DAX window
         // path, never on /dev/fuse. Opcode::from() maps the numbers without
         // a variant to MaxOpcode and never returns the byte-swapped INIT
@@ -1482,7 +1483,7 @@ impl<F: FileSystem + Send + Sync + 'static> UringWorker<F> {
         };
         // Answer an opcode the table doesn't know with ENOSYS here, rather
         // than dispatch it without its arguments. The kernel then stops
-        // sending it, as it does with FUSE_STATX.
+        // sending it, as it does with FUSE_COPY_FILE_RANGE_64.
         let Some((args_len, has_out_args)) = op_args(in_header.opcode) else {
             entry.stage_error_reply(libc::ENOSYS);
             return Ok(());
@@ -2016,7 +2017,7 @@ mod tests {
         AccessIn, AttrOut, BatchForgetIn, BmapIn, CopyFileRangeIn, CreateIn, EntryOut, FallocateIn,
         FlushIn, ForgetIn, FsyncIn, GetattrIn, GetxattrIn, InHeader, InitIn, InterruptIn, IoctlIn,
         LinkIn, LkIn, LseekIn, MkdirIn, MknodIn, Opcode, OpenIn, OutHeader, PollIn, ReadIn,
-        ReleaseIn, Rename2In, RenameIn, SetattrIn, SetxattrIn, WriteIn, ROOT_ID,
+        ReleaseIn, Rename2In, RenameIn, SetattrIn, SetxattrIn, StatxIn, WriteIn, ROOT_ID,
     };
     use fuse_backend_core::api::filesystem::FsOptions;
     use fuse_backend_passthrough::{Config, PassthroughFs};
@@ -2128,6 +2129,7 @@ mod tests {
                 Opcode::CopyFileRange as u32,
                 std::mem::size_of::<CopyFileRangeIn>(),
             ),
+            (Opcode::Statx as u32, std::mem::size_of::<StatxIn>()),
         ];
         for &(op, len) in expected {
             assert_eq!(op_args(op).map(|a| a.0), Some(len), "opcode {}", op);
@@ -2470,13 +2472,13 @@ mod tests {
 
     #[test]
     fn test_process_unknown_opcode_gets_enosys() {
-        /// The STATX opcode, which the transport's table doesn't know.
-        const FUSE_STATX: u32 = 52;
+        /// The COPY_FILE_RANGE_64 opcode, which the transport's table doesn't know.
+        const FUSE_COPY_FILE_RANGE_64: u32 = 53;
         let (worker, _source) = make_worker();
         let mut entry = UringEntry::new(0, Payload::Own(worker.payload_cap));
 
-        // The kernel only falls back to GETATTR after ENOSYS.
-        plant_request(&mut entry, FUSE_STATX, &[0u8; 24], &[]);
+        // The kernel only falls back to COPY_FILE_RANGE after ENOSYS.
+        plant_request(&mut entry, FUSE_COPY_FILE_RANGE_64, &[0u8; 56], &[]);
         process_entry(&worker, &mut entry).unwrap();
         assert_eq!(parse_out_header(&entry).error, -libc::ENOSYS);
         assert_eq!(entry.header().ring_ent_in_out.payload_sz, 0);
