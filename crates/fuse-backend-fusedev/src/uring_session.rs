@@ -685,8 +685,7 @@ impl<F: FileSystem + Send + Sync + 'static> UringWorker<F> {
     fn run(self, exit: Arc<AtomicBool>, ready_tx: Sender<io::Result<()>>) -> io::Result<()> {
         let total_entries = self.qids.len() * self.entries_per_queue;
         let mut ring: IoUring<squeue::Entry128, cqueue::Entry> =
-            IoUring::<squeue::Entry128, cqueue::Entry>::generic_builder()
-                .build((total_entries * 2) as u32)?;
+            IoUring::builder().build((total_entries * 2) as u32)?;
         let fd = self.fd.as_raw_fd();
 
         let mut entries: Vec<UringEntry> = Vec::with_capacity(total_entries);
