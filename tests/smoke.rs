@@ -27,6 +27,7 @@ mod fusedev_tests {
     use vmm_sys_util::tempdir::TempDir;
 
     use crate::example::passthroughfs;
+    use fuse_backend_rs::abi::fuse_abi::FsOptions;
 
     fn validate_two_git_directory(src: &str, dest: &str) -> bool {
         let str = format!(
@@ -308,6 +309,77 @@ mod fusedev_tests {
         assert_eq!(md.gid(), gid);
 
         daemon.umount().unwrap();
+        Ok(())
+    }
+
+    #[test]
+    #[ignore] // it depends on privileged mode to pass through /dev/fuse
+    fn integration_test_setxattr_acl_kill_sgid() -> Result<()> {
+        // A caller outside the file's group sets a POSIX ACL. The kernel asks the server to
+        // clear the set-group-ID bit, which a daemon with CAP_FSETID would otherwise keep.
+        if !running_as_root() {
+            eprintln!("skipping integration_test_setxattr_acl_kill_sgid: not running as root");
+            return Ok(());
+        }
+        let (uid, file_gid, caller_gid) = (65534, 12345, 65534);
+
+        let src_dir = TempDir::new().unwrap();
+        let mnt_dir = TempDir::new().unwrap();
+        let src = src_dir.as_path().to_str().unwrap().to_string();
+        let mnt = mnt_dir.as_path().to_str().unwrap().to_string();
+        std::fs::set_permissions(src_dir.as_path(), std::fs::Permissions::from_mode(0o755))?;
+        let src_file = src_dir.as_path().join("file");
+        std::fs::write(&src_file, b"")?;
+        std::os::unix::fs::chown(&src_file, Some(uid), Some(file_gid))?;
+        std::fs::set_permissions(&src_file, std::fs::Permissions::from_mode(0o2755))?;
+
+        let opts = FsOptions::POSIX_ACL | FsOptions::SETXATTR_EXT;
+        let mut daemon = passthroughfs::Daemon::with_options(&src, &mnt, 1, opts, true).unwrap();
+        daemon.mount().unwrap();
+
+        let path = CString::new(mnt_dir.as_path().join("file").as_os_str().as_bytes()).unwrap();
+        let name = CString::new("system.posix_acl_access").unwrap();
+        // The xattr form of user::rwx, group::r-x, other::r-x.
+        let mut acl = 2u32.to_le_bytes().to_vec();
+        for (tag, perm) in [(0x01u16, 7u16), (0x04, 5), (0x20, 5)] {
+            acl.extend_from_slice(&tag.to_le_bytes());
+            acl.extend_from_slice(&perm.to_le_bytes());
+            acl.extend_from_slice(&u32::MAX.to_le_bytes());
+        }
+        // The raw syscalls change the credentials of this thread only, and a uid other than 0
+        // drops its capabilities.
+        let res = std::thread::spawn(move || {
+            // SAFETY: the calls take no pointers but `path`, the name and `acl`, which outlive
+            // them.
+            let res = unsafe {
+                if libc::syscall(libc::SYS_setgroups, 0, std::ptr::null::<libc::gid_t>()) < 0
+                    || libc::syscall(libc::SYS_setresgid, -1, caller_gid, -1) < 0
+                    || libc::syscall(libc::SYS_setresuid, -1, uid, -1) < 0
+                {
+                    -1
+                } else {
+                    libc::setxattr(
+                        path.as_ptr(),
+                        name.as_ptr(),
+                        acl.as_ptr().cast(),
+                        acl.len(),
+                        0,
+                    )
+                }
+            };
+            if res < 0 {
+                Err(std::io::Error::last_os_error())
+            } else {
+                Ok(())
+            }
+        })
+        .join()
+        .unwrap();
+        daemon.umount().unwrap();
+        res?;
+
+        let mode = std::fs::metadata(&src_file)?.permissions().mode();
+        assert_eq!(mode & 0o7777, 0o755);
         Ok(())
     }
 
