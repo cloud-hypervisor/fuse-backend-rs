@@ -305,6 +305,10 @@
   and no code in the workspace relied on it.
 
 ### Fixed
+- [327](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/327): io_uring reads and writes on a descriptor from `async_file::File::borrow_fd()` no
+  longer leak 56 bytes each. `PassthroughFs` serves every async read and write that way. Such an
+  operation also keeps the descriptor's guard until the kernel completes it, even if its future is
+  dropped first.
 - [NNN](link): A `FuseDevTask` that keeps finding requests lets its runtime run. On tokio,
   `AsyncFd::ready()` takes none of the task's budget, and the read of a readable fuse fd doesn't
   wait, so a task that kept finding requests never returned to its runtime. The timers, IO and
