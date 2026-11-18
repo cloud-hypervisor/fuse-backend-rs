@@ -2818,7 +2818,7 @@ impl BackendFileSystem for OverlayFs {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fuse_backend_core::api::filesystem::FileSystem;
+    use fuse_backend_core::api::filesystem::{FileSystem, FsOptions};
     use vmm_sys_util::tempdir::TempDir;
 
     fn stat_with(mode: u32, nlink: u64) -> stat64 {
@@ -2843,6 +2843,27 @@ mod tests {
 
         // Symlinks can be hard linked too.
         assert!(is_multi_link_file(stat_with(libc::S_IFLNK | 0o777, 2)));
+    }
+
+    // A standalone mount mirrors CREATE_SUPP_GROUP like PassthroughFs, and requests
+    // DIRECT_IO_ALLOW_MMAP only with Config::allow_mmap. init() doesn't touch the layers
+    // without do_import, so the overlay needs none.
+    #[test]
+    fn test_init_mirrors_kernel_flags() {
+        let offered = FsOptions::CREATE_SUPP_GROUP | FsOptions::DIRECT_IO_ALLOW_MMAP;
+        let fs = OverlayFs::new(None, vec![], Config::default()).unwrap();
+        assert_eq!(
+            fs.init(offered).unwrap() & offered,
+            FsOptions::CREATE_SUPP_GROUP
+        );
+        assert!(!fs.init(FsOptions::empty()).unwrap().intersects(offered));
+
+        let config = Config {
+            allow_mmap: true,
+            ..Default::default()
+        };
+        let fs = OverlayFs::new(None, vec![], config).unwrap();
+        assert!(fs.init(offered).unwrap().contains(offered));
     }
 
     /// An overlay of an empty upper layer over a lower layer with a
