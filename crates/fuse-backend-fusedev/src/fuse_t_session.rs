@@ -10,7 +10,7 @@
 
 use std::fs::File;
 use std::mem::size_of;
-use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
+use std::os::unix::io::{AsFd, AsRawFd};
 use std::os::unix::prelude::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -43,10 +43,10 @@ pub struct RcvBuf;
 impl SetSockOpt for RcvBuf {
     type Val = usize;
 
-    fn set(&self, fd: RawFd, val: &Self::Val) -> nix::Result<()> {
+    fn set<F: AsFd>(&self, fd: &F, val: &Self::Val) -> nix::Result<()> {
         unsafe {
             let res = libc::setsockopt(
-                fd,
+                fd.as_fd().as_raw_fd(),
                 libc::SOL_SOCKET,
                 libc::SO_RCVBUF,
                 val.as_slice().as_ptr() as *const _,
@@ -63,10 +63,10 @@ pub struct SndBuf;
 impl SetSockOpt for SndBuf {
     type Val = usize;
 
-    fn set(&self, fd: RawFd, val: &Self::Val) -> nix::Result<()> {
+    fn set<F: AsFd>(&self, fd: &F, val: &Self::Val) -> nix::Result<()> {
         unsafe {
             let res = libc::setsockopt(
-                fd,
+                fd.as_fd().as_raw_fd(),
                 libc::SOL_SOCKET,
                 libc::SO_SNDBUF,
                 val.as_slice().as_ptr() as *const _,
@@ -274,10 +274,9 @@ impl FuseChannel {
     /// Returns `Ok(false)` once the full `len` bytes have been read.
     fn read(&mut self, len: usize, offset: usize) -> Result<bool> {
         let mut total: usize = 0;
-        let fd = self.file.as_raw_fd();
         while total < len {
             let read_buf = &mut self.buf[offset + total..offset + len];
-            match read(fd, read_buf) {
+            match read(&self.file, read_buf) {
                 Ok(0) => {
                     debug!("reached EOF when reading fuse fd, assuming fuse-t helper exited");
                     return Ok(true);
@@ -306,7 +305,7 @@ impl FuseChannel {
                         return Ok(true);
                     }
                     e => {
-                        warn! {"read fuse dev failed on fd {}: {}", fd, e};
+                        warn! {"read fuse dev failed on fd {}: {}", self.file.as_raw_fd(), e};
                         return Err(SessionFailure(format!("read new request: {:?}", e)));
                     }
                 },
@@ -381,13 +380,13 @@ fn fuse_kern_mount(
     )
     .map_err(|e| SessionFailure(format!("create socket failed {:?}", e)))?;
 
-    setsockopt(fd0, SndBuf, &FS_SND_SIZE)
+    setsockopt(&fd0, SndBuf, &FS_SND_SIZE)
         .map_err(|e| SessionFailure(format!("set fd0 socket snd size {:?}", e)))?;
-    setsockopt(fd0, RcvBuf, &FS_SND_SIZE)
+    setsockopt(&fd0, RcvBuf, &FS_SND_SIZE)
         .map_err(|e| SessionFailure(format!("set fd0 socket rcv size {:?}", e)))?;
-    setsockopt(fd1, SndBuf, &FS_SND_SIZE)
+    setsockopt(&fd1, SndBuf, &FS_SND_SIZE)
         .map_err(|e| SessionFailure(format!("set fd1 socket snd size {:?}", e)))?;
-    setsockopt(fd1, RcvBuf, &FS_SND_SIZE)
+    setsockopt(&fd1, RcvBuf, &FS_SND_SIZE)
         .map_err(|e| SessionFailure(format!("set fd1 socket rcv size {:?}", e)))?;
 
     let (mon_fd0, mon_fd1) = socketpair(
@@ -408,7 +407,7 @@ fn fuse_kern_mount(
             close(fd0).map_err(|e| SessionFailure(format!("parent close fd0 failed {:?}", e)))?;
             close(mon_fd0)
                 .map_err(|e| SessionFailure(format!("parent close mon fd0 failed {:?}", e)))?;
-            unsafe { Ok((File::from_raw_fd(fd1), File::from_raw_fd(mon_fd1))) }
+            Ok((File::from(fd1), File::from(mon_fd1)))
         }
         ForkResult::Child => {
             close(fd1).map_err(|e| SessionFailure(format!("child close fd1 failed {:?}", e)))?;
@@ -433,8 +432,8 @@ fn fuse_kern_mount(
             }
 
             std::env::set_var("_FUSE_CALL_BY_LIB", "1");
-            std::env::set_var("_FUSE_COMMFD", format!("{}", fd0));
-            std::env::set_var("_FUSE_MONFD", format!("{}", mon_fd0));
+            std::env::set_var("_FUSE_COMMFD", format!("{}", fd0.as_raw_fd()));
+            std::env::set_var("_FUSE_MONFD", format!("{}", mon_fd0.as_raw_fd()));
             std::env::set_var("_FUSE_COMMVERS", "2");
 
             // Mirror libfuse-t's mount_darwin.c: the server is daemonized

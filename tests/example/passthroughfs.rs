@@ -10,9 +10,9 @@ use std::thread;
 
 use fuse_backend_rs::api::{server::Server, Vfs, VfsOptions};
 use fuse_backend_rs::passthrough::{Config, PassthroughFs};
-use fuse_backend_rs::transport::{FuseChannel, FuseSession};
 #[cfg(target_os = "linux")]
-use nix::mount::MsFlags;
+use fuse_backend_rs::transport::MsFlags;
+use fuse_backend_rs::transport::{FuseChannel, FuseSession};
 
 /// A fusedev daemon example
 #[allow(dead_code)]

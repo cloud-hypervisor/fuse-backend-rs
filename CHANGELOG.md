@@ -144,6 +144,10 @@
   systems.
 
 ### Changed
+- [NNN](link): `fuse-backend-fusedev` depends on nix 0.32 instead of 0.24, which doesn't build
+  for FreeBSD. `FuseSession::set_mount_flags()` and `get_mount_flags()` take nix's `MsFlags`,
+  which fusedev and `transport` now re-export, so callers don't need nix. `FuseDevWriter::new()`
+  rejects a negative fd with `EBADF`.
 - [294](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/294): `PassthroughFs` negotiates
   `FsOptions::DIRECT_IO_ALLOW_MMAP` under the `Never` and `Metadata` cache policies only when the
   new `Config::allow_mmap` opts in (default off), so shared mmaps keep failing with `ENODEV` there

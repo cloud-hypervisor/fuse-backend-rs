@@ -29,7 +29,7 @@ io-uring = { version = "0.5.8", optional = true }
 libc = "0.2.68"
 log = "0.4.6"
 mio = { version = "0.8", features = ["os-poll", "os-ext"] }
-nix = "0.24"
+nix = { version = "0.32", features = ["fs", "ioctl", "mount", "poll", "process", "signal", "socket", "time", "uio", "user"] }
 tokio = { version = "1.53.3", optional = true }
 vm-memory = { workspace = true }
 vmm-sys-util = { workspace = true }

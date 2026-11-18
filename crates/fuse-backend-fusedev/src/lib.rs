@@ -12,7 +12,7 @@ extern crate log;
 
 use std::io::{self, IoSlice, Write};
 use std::marker::PhantomData;
-use std::os::fd::AsRawFd;
+use std::os::fd::{AsRawFd, BorrowedFd};
 use std::os::unix::io::RawFd;
 
 use nix::sys::uio::writev;
@@ -143,8 +143,13 @@ pub struct FuseDevWriter<'a, S: BitmapSlice = ()> {
 }
 
 impl<'a, S: BitmapSlice + Default> FuseDevWriter<'a, S> {
-    /// Construct a new [Writer].
+    /// Construct a new [Writer]. `fd` must stay open while the writer exists.
+    ///
+    /// Fails with `EBADF` if `fd` is negative.
     pub fn new(fd: RawFd, data_buf: &'a mut [u8]) -> Result<FuseDevWriter<'a, S>> {
+        if fd < 0 {
+            return Err(Error::IoError(io::Error::from_raw_os_error(libc::EBADF)));
+        }
         let buf = BytesCursor::new(data_buf, 0);
         Ok(FuseDevWriter {
             fd,
@@ -157,6 +162,12 @@ impl<'a, S: BitmapSlice + Default> FuseDevWriter<'a, S> {
 }
 
 impl<'a, S: BitmapSlice> FuseDevWriter<'a, S> {
+    fn borrowed_fd(&self) -> BorrowedFd<'_> {
+        // SAFETY: `new()` rejects negative fds and requires `fd` to stay open
+        // while the writer exists.
+        unsafe { BorrowedFd::borrow_raw(self.fd) }
+    }
+
     /// Split the [Writer] at the given offset.
     ///
     /// After the split, `self` will be able to write up to `offset` bytes while the returned
@@ -185,11 +196,11 @@ impl<'a, S: BitmapSlice> FuseDevWriter<'a, S> {
         let o = other.map(|w| w.buf.written()).unwrap_or(&[]);
         let res = match (self.buf.position(), o.len()) {
             (0, 0) => Ok(0),
-            (0, _) => write(self.fd, o),
-            (_, 0) => write(self.fd, self.buf.written()),
+            (0, _) => write(self.borrowed_fd(), o),
+            (_, 0) => write(self.borrowed_fd(), self.buf.written()),
             (_, _) => {
                 let bufs = [IoSlice::new(self.buf.written()), IoSlice::new(o)];
-                writev(self.fd, &bufs)
+                writev(self.borrowed_fd(), &bufs)
             }
         };
 
@@ -231,7 +242,7 @@ impl<'a, S: BitmapSlice> FuseDevWriter<'a, S> {
         if self.buffered {
             Ok(cnt)
         } else {
-            Self::do_write(self.fd, &self.buf.written()[..cnt])
+            self.do_write(&self.buf.written()[..cnt])
         }
     }
 
@@ -258,7 +269,7 @@ impl<'a, S: BitmapSlice> FuseDevWriter<'a, S> {
         if self.buffered {
             Ok(cnt)
         } else {
-            Self::do_write(self.fd, &self.buf.written()[..cnt])
+            self.do_write(&self.buf.written()[..cnt])
         }
     }
 
@@ -292,9 +303,9 @@ impl<'a, S: BitmapSlice> FuseDevWriter<'a, S> {
         self.buf.check_available_space(sz)
     }
 
-    fn do_write(fd: RawFd, data: &[u8]) -> io::Result<usize> {
-        write(fd, data).map_err(|e| {
-            error! {"fail to write to fuse device fd {}: {}, {:?}", fd, e, data};
+    fn do_write(&self, data: &[u8]) -> io::Result<usize> {
+        write(self.borrowed_fd(), data).map_err(|e| {
+            error! {"fail to write to fuse device fd {}: {}, {:?}", self.fd, e, data};
             io::Error::other(format!("{e}"))
         })
     }
@@ -308,7 +319,7 @@ impl<S: BitmapSlice> Write for FuseDevWriter<'_, S> {
             self.buf.extend_from_slice(data);
             Ok(data.len())
         } else {
-            Self::do_write(self.fd, data).inspect(|&x| {
+            self.do_write(data).inspect(|&x| {
                 self.buf.account_written(x);
             })
         }
@@ -328,7 +339,7 @@ impl<S: BitmapSlice> Write for FuseDevWriter<'_, S> {
             if bufs.is_empty() {
                 return Ok(0);
             }
-            writev(self.fd, bufs)
+            writev(self.borrowed_fd(), bufs)
                 .inspect(|&x| {
                     self.buf.account_written(x);
                 })
@@ -485,6 +496,7 @@ mod async_io {
     use super::*;
     use fuse_backend_core::file_buf::FileVolatileBuf;
     use fuse_backend_core::file_traits::AsyncFileReadWriteVolatile;
+    use nix::sys::uio::pwrite;
 
     impl<'a, S: BitmapSlice> FuseDevWriter<'a, S> {
         /// Write data from a buffer into this writer in asynchronous mode.
@@ -498,7 +510,7 @@ mod async_io {
                 self.buf.extend_from_slice(data);
                 Ok(data.len())
             } else {
-                nix::sys::uio::pwrite(self.fd, data, 0)
+                pwrite(self.borrowed_fd(), data, 0)
                     .inspect(|x| self.buf.account_written(*x))
                     .map_err(|e| {
                         error! {"fail to write to fuse device fd {}: {}", self.fd, e};
@@ -521,7 +533,7 @@ mod async_io {
                 Ok(len)
             } else {
                 let bufs = [IoSlice::new(data), IoSlice::new(data2)];
-                writev(self.fd, &bufs)
+                writev(self.borrowed_fd(), &bufs)
                     .inspect(|x| self.buf.account_written(*x))
                     .map_err(|e| {
                         error! {"fail to write to fuse device fd {}: {}", self.fd, e};
@@ -550,7 +562,7 @@ mod async_io {
                 Ok(len)
             } else {
                 let bufs = [IoSlice::new(data), IoSlice::new(data2), IoSlice::new(data3)];
-                writev(self.fd, &bufs)
+                writev(self.borrowed_fd(), &bufs)
                     .inspect(|x| self.buf.account_written(*x))
                     .map_err(|e| {
                         error! {"fail to write to fuse device fd {}: {}", self.fd, e};
@@ -603,7 +615,7 @@ mod async_io {
                         Ok(cnt)
                     } else {
                         // write to fd, can only happen once per instance
-                        nix::sys::uio::pwrite(self.fd, &self.buf.written()[..cnt], 0).map_err(|e| {
+                        pwrite(self.borrowed_fd(), &self.buf.written()[..cnt], 0).map_err(|e| {
                             error! {"fail to write to fuse device fd {}: {}", self.fd, e};
                             io::Error::other(format!("{}", e))
                         })
@@ -630,17 +642,17 @@ mod async_io {
 
             let res = match (self.buf.position(), o.len()) {
                 (0, 0) => Ok(0),
-                (0, _) => nix::sys::uio::pwrite(self.fd, o, 0).map_err(|e| {
+                (0, _) => pwrite(self.borrowed_fd(), o, 0).map_err(|e| {
                     error! {"fail to write to fuse device fd {}: {}", self.fd, e};
                     io::Error::other(format!("{}", e))
                 }),
-                (_, 0) => nix::sys::uio::pwrite(self.fd, self.buf.written(), 0).map_err(|e| {
+                (_, 0) => pwrite(self.borrowed_fd(), self.buf.written(), 0).map_err(|e| {
                     error! {"fail to write to fuse device fd {}: {}", self.fd, e};
                     io::Error::other(format!("{}", e))
                 }),
                 (_, _) => {
                     let bufs = [IoSlice::new(self.buf.written()), IoSlice::new(o)];
-                    writev(self.fd, &bufs).map_err(|e| {
+                    writev(self.borrowed_fd(), &bufs).map_err(|e| {
                         error! {"fail to write to fuse device fd {}: {}", self.fd, e};
                         io::Error::other(format!("{}", e))
                     })
@@ -685,6 +697,13 @@ mod tests {
 
         assert_eq!(reader.available_bytes(), 0);
         assert_eq!(reader.bytes_read(), 106);
+    }
+
+    #[test]
+    fn writer_rejects_negative_fd() {
+        let mut buf = [0u8; 16];
+        let res = FuseDevWriter::<()>::new(-1, &mut buf);
+        assert!(matches!(res, Err(Error::IoError(ref e)) if e.raw_os_error() == Some(libc::EBADF)));
     }
 
     #[test]

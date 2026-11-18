@@ -12,7 +12,7 @@ use std::fs::{File, OpenOptions};
 use std::io;
 use std::ops::Deref;
 use std::os::unix::fs::PermissionsExt;
-use std::os::unix::io::{AsRawFd, RawFd};
+use std::os::unix::io::{AsFd, AsRawFd, RawFd};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, PoisonError};
@@ -22,10 +22,12 @@ use fuse_backend_core::abi::fuse_abi::BackingMap;
 use mio::{Events, Poll, Token, Waker};
 use nix::errno::Errno;
 use nix::fcntl::{fcntl, FcntlArg, FdFlag, OFlag};
-use nix::mount::{mount, umount2, MntFlags, MsFlags};
-use nix::poll::{poll, PollFd, PollFlags};
-use nix::sys::epoll::{epoll_ctl, EpollEvent, EpollFlags, EpollOp};
+use nix::mount::{mount, umount2, MntFlags};
+use nix::poll::{poll, PollFd, PollFlags, PollTimeout};
 use nix::unistd::{getgid, getuid, read};
+
+/// The flags of [`FuseSession::set_mount_flags()`].
+pub use nix::mount::MsFlags;
 
 use super::{
     pagesize,
@@ -232,7 +234,7 @@ impl FuseSession {
             &self.fusermount,
         )?;
 
-        fcntl(file.as_raw_fd(), FcntlArg::F_SETFL(OFlag::O_NONBLOCK))
+        fcntl(&file, FcntlArg::F_SETFL(OFlag::O_NONBLOCK))
             .map_err(|e| SessionFailure(format!("set fd nonblocking: {e}")))?;
         self.file = Some(file);
         self.keep_alive = socket;
@@ -390,18 +392,23 @@ impl FuseChannel {
         // waiting channel per event instead. It requires level-triggered mode
         // (which we use) and kernel >= 4.5; older kernels reject the flag with
         // EINVAL, so fall back to a plain EPOLLIN registration there.
+        //
+        // nix's `Epoll` only wraps an epoll fd it owns, so register through libc.
         let epoll = poll.as_raw_fd();
         let fd = file.as_raw_fd();
-        let mut event = EpollEvent::new(
-            EpollFlags::EPOLLIN | EpollFlags::EPOLLEXCLUSIVE,
-            usize::from(FUSE_DEV_EVENT) as u64,
-        );
-        match epoll_ctl(epoll, EpollOp::EpollCtlAdd, fd, Some(&mut event)) {
+        let add = |events: libc::c_int| {
+            let mut event = libc::epoll_event {
+                events: events as u32,
+                u64: usize::from(FUSE_DEV_EVENT) as u64,
+            };
+            // SAFETY: both fds are open and `event` outlives the call.
+            Errno::result(unsafe { libc::epoll_ctl(epoll, libc::EPOLL_CTL_ADD, fd, &mut event) })
+        };
+        match add(libc::EPOLLIN | libc::EPOLLEXCLUSIVE) {
             Ok(_) => {}
             Err(Errno::EINVAL) => {
                 // Kernel < 4.5: EPOLLEXCLUSIVE is unsupported, retry without it.
-                event = EpollEvent::new(EpollFlags::EPOLLIN, usize::from(FUSE_DEV_EVENT) as u64);
-                epoll_ctl(epoll, EpollOp::EpollCtlAdd, fd, Some(&mut event))
+                add(libc::EPOLLIN)
                     .map_err(|e| SessionFailure(format!("epoll register channel fd: {e}")))?;
             }
             Err(e) => return Err(SessionFailure(format!("epoll register channel fd: {e}"))),
@@ -461,7 +468,7 @@ impl FuseChannel {
             }
             if fusereq_available {
                 let fd = self.file.as_raw_fd();
-                match read(fd, &mut self.buf) {
+                match read(&self.file, &mut self.buf) {
                     Ok(len) => {
                         // ###############################################
                         // Note: it's a heavy hack to reuse the same underlying data
@@ -552,7 +559,7 @@ impl BlockingFuseChannel {
     pub fn get_request(&mut self) -> Result<Option<(Reader<'_>, FuseDevWriter<'_>)>> {
         loop {
             let fd = self.file.as_raw_fd();
-            match read(fd, &mut self.buf) {
+            match read(&self.file, &mut self.buf) {
                 Ok(len) => {
                     // ###############################################
                     // Note: it's a heavy hack to reuse the same underlying data
@@ -764,7 +771,7 @@ fn fuse_fusermount_mount(
     // When its partner recv closes, fusermount will unmount.
     // Remove the close-on-exec flag from the socket, so we can pass it to
     // fusermount.
-    fcntl(send.as_raw_fd(), FcntlArg::F_SETFD(FdFlag::empty()))
+    fcntl(&send, FcntlArg::F_SETFD(FdFlag::empty()))
         .map_err(|e| SessionFailure(format!("Failed to remove close-on-exec flag: {e}")))?;
 
     // Old version of fusermount doesn't support long --options, yet.
@@ -811,8 +818,8 @@ fn fuse_fusermount_mount(
 /// Whether the file system is unmounted already, or its connection was aborted through
 /// /sys/fs/fuse/connections/NNN/abort. In both cases the fuse fd reports only POLLERR.
 fn is_torn_down(file: &File) -> bool {
-    let mut fds = [PollFd::new(file.as_raw_fd(), PollFlags::empty())];
-    poll(&mut fds, 0).is_ok() && fds[0].revents() == Some(PollFlags::POLLERR)
+    let mut fds = [PollFd::new(file.as_fd(), PollFlags::empty())];
+    poll(&mut fds, PollTimeout::ZERO).is_ok() && fds[0].revents() == Some(PollFlags::POLLERR)
 }
 
 /// Umount a fuse file system
@@ -932,7 +939,6 @@ pub fn fuse_backing_close(fuse_file: &File, backing_id: u32) -> io::Result<()> {
 mod tests {
     use super::*;
     use std::fs::File;
-    use std::os::unix::io::FromRawFd;
     use std::path::Path;
     use vmm_sys_util::tempdir::TempDir;
 
@@ -948,8 +954,7 @@ mod tests {
 
     #[test]
     fn test_new_channel() {
-        let fd = nix::unistd::dup(std::io::stdout().as_raw_fd()).unwrap();
-        let file = unsafe { File::from_raw_fd(fd) };
+        let file = File::from(nix::unistd::dup(std::io::stdout()).unwrap());
         let _ = FuseChannel::new(file, 3).unwrap();
     }
 
@@ -989,7 +994,7 @@ mod tests {
         let ch = se.new_blocking_channel().unwrap();
         // The cloned fd has its own file description, so it stays blocking
         // even though the session fd is O_NONBLOCK.
-        let flags = fcntl(ch.file.as_raw_fd(), FcntlArg::F_GETFL).unwrap();
+        let flags = fcntl(&ch.file, FcntlArg::F_GETFL).unwrap();
         assert_eq!(
             OFlag::from_bits_truncate(flags) & OFlag::O_NONBLOCK,
             OFlag::empty()
@@ -1038,7 +1043,7 @@ pub use asyncio::FuseDevTask;
 /// Task context to handle fuse request in asynchronous mode.
 mod asyncio {
     use std::cell::{Cell, RefCell};
-    use std::os::unix::io::{AsRawFd, RawFd};
+    use std::os::unix::io::{AsRawFd, OwnedFd, RawFd};
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
     use std::time::Duration;
@@ -1047,6 +1052,7 @@ mod asyncio {
     use nix::fcntl::{fcntl, FcntlArg, OFlag};
     use nix::sys::time::TimeSpec;
     use nix::sys::timerfd::{ClockId, Expiration, TimerFd, TimerFlags, TimerSetTimeFlags};
+    use nix::unistd::read;
     use tokio::io::unix::{AsyncFd, AsyncFdReadyGuard};
     use tokio::io::Interest;
 
@@ -1204,7 +1210,7 @@ mod asyncio {
             // Note: `O_NONBLOCK` is a property of the file description, so the
             // fd must not be shared with other consumers of the same file
             // description; the task takes ownership of `file` for this reason.
-            fcntl(file.as_raw_fd(), FcntlArg::F_SETFL(OFlag::O_NONBLOCK))
+            fcntl(&file, FcntlArg::F_SETFL(OFlag::O_NONBLOCK))
                 .expect("failed to set fuse device fd nonblocking");
 
             FuseDevTask {
@@ -1441,7 +1447,7 @@ mod asyncio {
     struct DeviceReadiness {
         device: AsyncFd<RawFd>,
         // Without a timer, an idle task checks `state` once a request arrives.
-        tick: Option<AsyncFd<TimerFd>>,
+        tick: Option<AsyncFd<OwnedFd>>,
     }
 
     impl DeviceReadiness {
@@ -1460,7 +1466,7 @@ mod asyncio {
         }
 
         /// A timer that becomes readable every `STATE_CHECK_INTERVAL`.
-        fn timer() -> std::io::Result<AsyncFd<TimerFd>> {
+        fn timer() -> std::io::Result<AsyncFd<OwnedFd>> {
             let timer = TimerFd::new(
                 ClockId::CLOCK_MONOTONIC,
                 TimerFlags::TFD_NONBLOCK | TimerFlags::TFD_CLOEXEC,
@@ -1471,7 +1477,9 @@ mod asyncio {
             )?;
             // SAFETY: the `AsyncFd` owns `timer`, so its fd stays open for as
             // long as the registration.
-            let tick = unsafe { AsyncFd::register_with_interest(timer, Interest::READABLE) }?;
+            let tick = unsafe {
+                AsyncFd::register_with_interest(OwnedFd::from(timer), Interest::READABLE)
+            }?;
             Ok(tick)
         }
 
@@ -1489,7 +1497,7 @@ mod asyncio {
                     let mut guard = ready?;
                     // Consume the expirations, so the next one makes the timer
                     // readable again. EAGAIN means there were none.
-                    let _ = tick.get_ref().wait();
+                    let _ = read(tick.get_ref(), &mut [0; 8]);
                     guard.clear_ready();
                     Ok(None)
                 }
