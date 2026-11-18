@@ -154,6 +154,54 @@ jobs:
         run: |
           make smoke-macos
 
+  Fuzz:
+    # The fuzz crates are a workspace of their own. Their tests check the
+    # seeds, replay the inputs that once broke the server and run a short
+    # mutation loop on stable. The fuzz targets need nightly, and run on pull
+    # requests only.
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+    - uses: actions/checkout@v3
+    - name: Cache cargo
+      uses: Swatinem/rust-cache@v2.2.0
+      with:
+        cache-on-failure: true
+        workspaces: fuzz
+    - name: Install Rust
+      uses: actions-rs/toolchain@v1
+      with:
+        profile: minimal
+        toolchain: stable
+        override: true
+        components: rustfmt, clippy
+    - name: Check and replay the fuzz inputs
+      working-directory: fuzz
+      run: |
+        cargo fmt --all -- --check
+        cargo clippy --all-targets -- -Dwarnings
+        cargo test -p common
+    - name: Fuzz
+      if: github.event_name == 'pull_request'
+      working-directory: fuzz
+      run: |
+        rustup toolchain install nightly --profile minimal
+        cargo install cargo-fuzz --version 0.13.2 --locked
+        cargo +nightly fuzz build
+        for target in server async_server; do
+          cargo +nightly fuzz run "$target" -- -max_total_time=300 -timeout=60 &
+        done
+        rc=0
+        for job in $(jobs -p); do wait "$job" || rc=1; done
+        exit $rc
+    - name: Keep the failing inputs
+      if: failure()
+      uses: actions/upload-artifact@v4
+      with:
+        name: fuzz-artifacts
+        path: fuzz/artifacts
+        if-no-files-found: ignore
+
   deny:
     name: Cargo Deny
     runs-on: ubuntu-latest
