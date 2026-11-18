@@ -12,9 +12,14 @@ extern crate log;
 
 use std::io::{self, IoSlice, Write};
 use std::marker::PhantomData;
-use std::os::fd::AsRawFd;
+use std::os::fd::{AsRawFd, BorrowedFd};
 use std::os::unix::io::RawFd;
 
+// nix 0.27+ takes I/O-safe `AsFd` arguments. The writers carry a raw fd
+// borrowed from the session's fuse device file (the descriptor outlives every
+// writer handed out for it), so each call re-borrows it for the duration of
+// the syscall. The old nix 0.24 wrappers performed the very same
+// `libc::write` on the same raw fd.
 use nix::sys::uio::writev;
 use nix::unistd::write;
 use vm_memory::bitmap::BitmapSlice;
@@ -183,13 +188,16 @@ impl<'a, S: BitmapSlice> FuseDevWriter<'a, S> {
         }
 
         let o = other.map(|w| w.buf.written()).unwrap_or(&[]);
+        // SAFETY: the fd belongs to the session's fuse device file, which
+        // outlives the writer.
+        let fd = unsafe { BorrowedFd::borrow_raw(self.fd) };
         let res = match (self.buf.position(), o.len()) {
             (0, 0) => Ok(0),
-            (0, _) => write(self.fd, o),
-            (_, 0) => write(self.fd, self.buf.written()),
+            (0, _) => write(fd, o),
+            (_, 0) => write(fd, self.buf.written()),
             (_, _) => {
                 let bufs = [IoSlice::new(self.buf.written()), IoSlice::new(o)];
-                writev(self.fd, &bufs)
+                writev(fd, &bufs)
             }
         };
 
@@ -293,8 +301,11 @@ impl<'a, S: BitmapSlice> FuseDevWriter<'a, S> {
     }
 
     fn do_write(fd: RawFd, data: &[u8]) -> io::Result<usize> {
+        // SAFETY: the fd belongs to the session's fuse device file, which
+        // outlives the writer.
+        let fd = unsafe { BorrowedFd::borrow_raw(fd) };
         write(fd, data).map_err(|e| {
-            error! {"fail to write to fuse device fd {}: {}, {:?}", fd, e, data};
+            error! {"fail to write to fuse device fd {}: {}, {:?}", fd.as_raw_fd(), e, data};
             io::Error::other(format!("{e}"))
         })
     }
@@ -328,7 +339,9 @@ impl<S: BitmapSlice> Write for FuseDevWriter<'_, S> {
             if bufs.is_empty() {
                 return Ok(0);
             }
-            writev(self.fd, bufs)
+            // SAFETY: the fd belongs to the session's fuse device file.
+            let fd = unsafe { BorrowedFd::borrow_raw(self.fd) };
+            writev(fd, bufs)
                 .inspect(|&x| {
                     self.buf.account_written(x);
                 })
@@ -498,7 +511,9 @@ mod async_io {
                 self.buf.extend_from_slice(data);
                 Ok(data.len())
             } else {
-                nix::sys::uio::pwrite(self.fd, data, 0)
+                // SAFETY: the fd belongs to the session's fuse device file.
+                let fd = unsafe { BorrowedFd::borrow_raw(self.fd) };
+                nix::sys::uio::pwrite(fd, data, 0)
                     .inspect(|x| self.buf.account_written(*x))
                     .map_err(|e| {
                         error! {"fail to write to fuse device fd {}: {}", self.fd, e};
@@ -521,7 +536,9 @@ mod async_io {
                 Ok(len)
             } else {
                 let bufs = [IoSlice::new(data), IoSlice::new(data2)];
-                writev(self.fd, &bufs)
+                // SAFETY: the fd belongs to the session's fuse device file.
+                let fd = unsafe { BorrowedFd::borrow_raw(self.fd) };
+                writev(fd, &bufs)
                     .inspect(|x| self.buf.account_written(*x))
                     .map_err(|e| {
                         error! {"fail to write to fuse device fd {}: {}", self.fd, e};
@@ -550,7 +567,9 @@ mod async_io {
                 Ok(len)
             } else {
                 let bufs = [IoSlice::new(data), IoSlice::new(data2), IoSlice::new(data3)];
-                writev(self.fd, &bufs)
+                // SAFETY: the fd belongs to the session's fuse device file.
+                let fd = unsafe { BorrowedFd::borrow_raw(self.fd) };
+                writev(fd, &bufs)
                     .inspect(|x| self.buf.account_written(*x))
                     .map_err(|e| {
                         error! {"fail to write to fuse device fd {}: {}", self.fd, e};
@@ -603,7 +622,10 @@ mod async_io {
                         Ok(cnt)
                     } else {
                         // write to fd, can only happen once per instance
-                        nix::sys::uio::pwrite(self.fd, &self.buf.written()[..cnt], 0).map_err(|e| {
+                        // SAFETY: the fd belongs to the session's fuse device
+                        // file, which outlives the writer.
+                        let fd = unsafe { BorrowedFd::borrow_raw(self.fd) };
+                        nix::sys::uio::pwrite(fd, &self.buf.written()[..cnt], 0).map_err(|e| {
                             error! {"fail to write to fuse device fd {}: {}", self.fd, e};
                             io::Error::other(format!("{}", e))
                         })
@@ -627,20 +649,22 @@ mod async_io {
             }
 
             let o = other.map(|w| w.buf.written()).unwrap_or(&[]);
+            // SAFETY: the fd belongs to the session's fuse device file.
+            let fd = unsafe { BorrowedFd::borrow_raw(self.fd) };
 
             let res = match (self.buf.position(), o.len()) {
                 (0, 0) => Ok(0),
-                (0, _) => nix::sys::uio::pwrite(self.fd, o, 0).map_err(|e| {
+                (0, _) => nix::sys::uio::pwrite(fd, o, 0).map_err(|e| {
                     error! {"fail to write to fuse device fd {}: {}", self.fd, e};
                     io::Error::other(format!("{}", e))
                 }),
-                (_, 0) => nix::sys::uio::pwrite(self.fd, self.buf.written(), 0).map_err(|e| {
+                (_, 0) => nix::sys::uio::pwrite(fd, self.buf.written(), 0).map_err(|e| {
                     error! {"fail to write to fuse device fd {}: {}", self.fd, e};
                     io::Error::other(format!("{}", e))
                 }),
                 (_, _) => {
                     let bufs = [IoSlice::new(self.buf.written()), IoSlice::new(o)];
-                    writev(self.fd, &bufs).map_err(|e| {
+                    writev(fd, &bufs).map_err(|e| {
                         error! {"fail to write to fuse device fd {}: {}", self.fd, e};
                         io::Error::other(format!("{}", e))
                     })

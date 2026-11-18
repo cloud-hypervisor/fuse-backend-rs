@@ -29,13 +29,29 @@ io-uring = { version = "0.5.8", optional = true }
 libc = "0.2.68"
 log = "0.4.6"
 mio = { version = "0.8", features = ["os-poll", "os-ext"] }
-nix = "0.24"
+# nix dropped its default features in 0.27, so the modules the sessions use
+# are listed explicitly. `time` covers the timerfd the async-serving tests
+# drive tokio's IO driver with; `event` provides epoll on Linux.
+nix = { version = "0.31", features = [
+    "event",
+    "fs",
+    "ioctl",
+    "mount",
+    "poll",
+    "process",
+    "signal",
+    "socket",
+    "time",
+    "uio",
+    "user",
+] }
 tokio = { version = "1.53.3", optional = true }
 vm-memory = { workspace = true }
 vmm-sys-util = { workspace = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 core-foundation-sys = ">=0.8"
+
 
 # The tests exercising a live session against a real filesystem driver use
 # `PassthroughFs`, which lives in its own crate.

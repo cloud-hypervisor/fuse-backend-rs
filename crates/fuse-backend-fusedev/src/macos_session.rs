@@ -22,7 +22,7 @@ use core_foundation_sys::string::{kCFStringEncodingUTF8, CFStringCreateWithBytes
 use core_foundation_sys::url::{kCFURLPOSIXPathStyle, CFURLCreateWithFileSystemPath, CFURLRef};
 use libc::{c_void, proc_pidpath, PROC_PIDPATHINFO_MAXSIZE};
 use nix::errno::Errno;
-use nix::fcntl::{fcntl, FdFlag, F_SETFD};
+use nix::fcntl::{fcntl, FcntlArg, FdFlag};
 use nix::sys::signal::{signal, SigHandler, Signal};
 use nix::sys::socket::{
     recvmsg, socketpair, AddressFamily, ControlMessageOwned, MsgFlags, RecvMsg, SockFlag, SockType,
@@ -237,7 +237,7 @@ impl FuseChannel {
     pub fn get_request(&mut self) -> Result<Option<(Reader<'_>, FuseDevWriter<'_>)>> {
         let fd = self.file.as_raw_fd();
         loop {
-            match read(fd, &mut self.buf) {
+            match read(&self.file, &mut self.buf) {
                 Ok(len) => {
                     // ###############################################
                     // Note: it's a heavy hack to reuse the same underlying data
@@ -295,7 +295,10 @@ fn receive_fd(sock_fd: RawFd) -> Result<RawFd> {
     let mut iov = [IoSliceMut::new(&mut buffer)];
     let r: RecvMsg<UnixAddr> =
         recvmsg(sock_fd, &mut iov, Some(&mut cmsgspace), MsgFlags::empty()).unwrap();
-    if let Some(msg) = r.cmsgs().next() {
+    let mut cmsgs = r
+        .cmsgs()
+        .map_err(|e| SessionFailure(format!("control message truncated: {e}")))?;
+    if let Some(msg) = cmsgs.next() {
         match msg {
             ControlMessageOwned::ScmRights(fds) => {
                 let fd = fds
@@ -327,13 +330,13 @@ fn fuse_kern_mount(mountpoint: &Path, fsname: &str, subtype: &str, rd_only: bool
             ForkResult::Parent { .. } => {
                 close(fd0)
                     .map_err(|e| SessionFailure(format!("parent close fd0 failed {:?}", e)))?;
-                let fd = receive_fd(fd1)?;
+                let fd = receive_fd(fd1.as_raw_fd())?;
                 File::from_raw_fd(fd)
             }
             ForkResult::Child => {
                 close(fd1)
                     .map_err(|e| SessionFailure(format!("child close fd1 failed {:?}", e)))?;
-                fcntl(fd0, F_SETFD(FdFlag::empty()))
+                fcntl(&fd0, FcntlArg::F_SETFD(FdFlag::empty()))
                     .map_err(|e| SessionFailure(format!("child fcntl fd0 failed {:?}", e)))?;
                 let mut daemon_path: Vec<u8> =
                     Vec::with_capacity(PROC_PIDPATHINFO_MAXSIZE as usize);
@@ -347,7 +350,7 @@ fn fuse_kern_mount(mountpoint: &Path, fsname: &str, subtype: &str, rd_only: bool
                         .map_err(|e| SessionFailure(format!("get pid path failed {:?}", e)))?;
                     std::env::set_var("_FUSE_DAEMON_PATH", daemon_path);
                 }
-                std::env::set_var("_FUSE_COMMFD", format!("{}", fd0));
+                std::env::set_var("_FUSE_COMMFD", format!("{}", fd0.as_raw_fd()));
                 std::env::set_var("_FUSE_COMMVERS", "2");
                 std::env::set_var("_FUSE_CALL_BY_LIB", "1");
 

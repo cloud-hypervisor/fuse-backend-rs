@@ -13,7 +13,7 @@ mod example;
 mod fusedev_tests {
     use std::ffi::CString;
     use std::io::Result;
-    use std::os::fd::AsRawFd;
+    use std::num::NonZeroUsize;
     use std::os::unix::ffi::OsStrExt;
     use std::os::unix::fs::MetadataExt;
     use std::os::unix::fs::OpenOptionsExt;
@@ -343,17 +343,17 @@ mod fusedev_tests {
         // SAFETY: a new read-only mapping of `file`, unmapped below.
         let addr = unsafe {
             mmap(
-                std::ptr::null_mut(),
-                data.len(),
+                None,
+                NonZeroUsize::new(data.len()).unwrap(),
                 ProtFlags::PROT_READ,
                 MapFlags::MAP_SHARED,
-                file.as_raw_fd(),
+                &file,
                 0,
             )
         }
         .expect("shared mmap of an O_DIRECT file");
         // SAFETY: the mapping covers `data.len()` readable bytes.
-        let mapped = unsafe { std::slice::from_raw_parts(addr as *const u8, data.len()) };
+        let mapped = unsafe { std::slice::from_raw_parts(addr.as_ptr() as *const u8, data.len()) };
         assert_eq!(mapped, &data[..]);
         // SAFETY: `addr` and the length are those of the mapping above.
         unsafe { munmap(addr, data.len()) }.unwrap();

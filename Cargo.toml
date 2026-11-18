@@ -56,7 +56,9 @@ fuse-backend-overlayfs = { path = "crates/fuse-backend-overlayfs", version = "0.
 async-trait = "0.1.42"
 libc = "0.2.68"
 log = "0.4.6"
-nix = "0.24"
+# The smoke tests mmap a fixture and name `MsFlags`; `mount` supplies the
+# type, `mman` the mmap/munmap wrappers.
+nix = { version = "0.31", features = ["mman", "mount"] }
 tempfile = "3"
 tokio = { version = "1", features = ["rt", "macros", "sync"] }
 vmm-sys-util = "0.15.0"
