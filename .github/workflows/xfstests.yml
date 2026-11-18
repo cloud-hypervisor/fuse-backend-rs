@@ -13,6 +13,11 @@ env:
 jobs:
   xfstests_on_passthrough:
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # See tests/scripts/xfstests_pathr.sh.
+        mode: [default, sync, async-tokio, async-tokio-uring, uring, no-writeback, kernel-passthrough]
     steps:
     - name: Checkout
       uses: actions/checkout@v4
@@ -26,10 +31,20 @@ jobs:
       run: |
         cargo build --release -p passthrough
         sudo install -t /usr/sbin/ -m 700 ./target/release/passthrough
+    # The runners' kernel has FUSE-over-io_uring built in but off by default.
+    - name: Enable FUSE-over-io_uring
+      if: matrix.mode == 'uring'
+      run: echo 1 | sudo tee /sys/module/fuse/parameters/enable_uring
     - name: Setup and run xfstest
       run: |
         cd $GITHUB_WORKSPACE
-        sudo ./tests/scripts/xfstests_pathr.sh
+        sudo ./tests/scripts/xfstests_pathr.sh ${{ matrix.mode }}
+    # The mount helper starts the daemon in the background, so only the log
+    # shows why a daemon failed to start. A job that fails before the first
+    # mount has no log.
+    - name: Show the daemon log
+      if: failure()
+      run: if [ -f /tmp/testpassthrough.log ]; then sudo tail -n 200 /tmp/testpassthrough.log; fi
 
   xfstests_on_overlayfs:
     runs-on: ubuntu-latest

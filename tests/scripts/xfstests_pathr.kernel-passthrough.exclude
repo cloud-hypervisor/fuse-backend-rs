@@ -1,0 +1,7 @@
+# Exclude list for tests that fail only with --kernel-passthrough
+#
+# A write through a passthrough mmap goes to the backing file and never reaches
+# the daemon, so stat() on the FUSE file shows the old mtime and ctime until
+# the attributes the kernel caches time out.
+generic/080
+generic/215
