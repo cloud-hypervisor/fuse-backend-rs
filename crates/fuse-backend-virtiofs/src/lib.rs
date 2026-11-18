@@ -311,7 +311,6 @@ impl<S: BitmapSlice> io::Write for VirtioFsWriter<'_, S> {
     }
 }
 
-#[cfg_attr(feature = "async-io", async_trait::async_trait(?Send))]
 impl<'a, S: BitmapSlice> Writer for VirtioFsWriter<'a, S> {
     // All methods forward to the inherent methods of the same name; the
     // explicit `VirtioFsWriter::` prefix keeps the forwarding unambiguous and
@@ -363,7 +362,7 @@ impl<'a, S: BitmapSlice> Writer for VirtioFsWriter<'a, S> {
     }
 
     #[cfg(feature = "async-io")]
-    async fn async_write_from_at<F: AsyncFileReadWriteVolatile>(
+    async fn async_write_from_at<F: AsyncFileReadWriteVolatile + ?Sized>(
         &mut self,
         src: &F,
         count: usize,
@@ -422,7 +421,7 @@ mod async_io {
 
         /// Writes data to the descriptor chain buffer from a File at offset `off`.
         /// Returns the number of bytes written to the descriptor chain buffer.
-        pub async fn async_write_from_at<F: AsyncFileReadWriteVolatile>(
+        pub async fn async_write_from_at<F: AsyncFileReadWriteVolatile + ?Sized>(
             &mut self,
             src: &F,
             count: usize,

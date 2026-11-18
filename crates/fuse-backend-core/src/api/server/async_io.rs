@@ -45,7 +45,7 @@ impl<'a, S: BitmapSlice> AsyncZeroCopyReader for AsyncZcReader<'a, S> {
         count: usize,
         off: u64,
     ) -> io::Result<usize> {
-        self.0.async_read_to_at(&f, count, off).await
+        self.0.async_read_to_at(&*f, count, off).await
     }
 }
 
@@ -81,7 +81,7 @@ impl<W: Writer> AsyncZeroCopyWriter for AsyncZcWriter<W> {
         count: usize,
         off: u64,
     ) -> io::Result<usize> {
-        self.0.async_write_from_at(&f, count, off).await
+        self.0.async_write_from_at(&*f, count, off).await
     }
 }
 

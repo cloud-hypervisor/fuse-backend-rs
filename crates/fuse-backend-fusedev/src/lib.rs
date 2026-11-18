@@ -365,7 +365,6 @@ impl<S: BitmapSlice> Write for FuseDevWriter<'_, S> {
     }
 }
 
-#[cfg_attr(feature = "async-io", async_trait::async_trait(?Send))]
 impl<'a, S: BitmapSlice> Writer for FuseDevWriter<'a, S> {
     // All methods forward to the inherent methods of the same name; the
     // explicit `FuseDevWriter::` prefix keeps the forwarding unambiguous and
@@ -417,7 +416,7 @@ impl<'a, S: BitmapSlice> Writer for FuseDevWriter<'a, S> {
     }
 
     #[cfg(feature = "async-io")]
-    async fn async_write_from_at<F: AsyncFileReadWriteVolatile>(
+    async fn async_write_from_at<F: AsyncFileReadWriteVolatile + ?Sized>(
         &mut self,
         src: &F,
         count: usize,
@@ -606,7 +605,7 @@ mod async_io {
         /// Write data from a File at offset `off` to the writer in asynchronous mode.
         ///
         /// Return the number of bytes written to the writer.
-        pub async fn async_write_from_at<F: AsyncFileReadWriteVolatile>(
+        pub async fn async_write_from_at<F: AsyncFileReadWriteVolatile + ?Sized>(
             &mut self,
             src: &F,
             count: usize,

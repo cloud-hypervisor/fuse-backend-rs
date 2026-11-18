@@ -104,7 +104,6 @@ impl io::Write for TestWriter<'_> {
     }
 }
 
-#[cfg_attr(feature = "async-io", async_trait::async_trait(?Send))]
 impl Writer for TestWriter<'_> {
     fn write_from_at<F: FileReadWriteVolatile>(
         &mut self,

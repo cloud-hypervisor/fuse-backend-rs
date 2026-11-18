@@ -22,13 +22,12 @@ documentation = "https://docs.rs/fuse-backend-virtiofs"
 # constructs the virtiofs-gated `buffer::Error` variants
 # (FindMemoryRegion/InvalidChain/GuestMemoryError).
 fuse-backend-core = { path = "../fuse-backend-core", version = "0.14.0", features = ["virtiofs"] }
-async-trait = { version = "0.1.42", optional = true }
 vm-memory = { workspace = true }
 virtio-queue = { workspace = true }
 
 [features]
 default = []
-async-io = ["async-trait", "fuse-backend-core/async-io"]
+async-io = ["fuse-backend-core/async-io"]
 
 [package.metadata.docs.rs]
 all-features = true
