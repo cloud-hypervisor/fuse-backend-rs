@@ -1,0 +1,11 @@
+# Exclude list for tests that fail or stall only with --kernel-passthrough
+#
+# A write through a passthrough mmap goes to the backing file and never reaches
+# the daemon, so stat() on the FUSE file shows the old mtime and ctime until
+# the attributes the kernel caches time out.
+generic/080
+generic/215
+# generic/323 runs 100 threads of O_DIRECT AIO reads. With passthrough they go
+# to the host disk without the daemon, and on the CI runners the test took 30
+# minutes instead of 2 or stalled the runner.
+generic/323
