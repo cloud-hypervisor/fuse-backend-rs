@@ -17,9 +17,6 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicPtr, Ordering};
 use std::sync::{Arc, Mutex};
 
-use core_foundation_sys::base::{CFAllocatorRef, CFIndex, CFRelease};
-use core_foundation_sys::string::{kCFStringEncodingUTF8, CFStringCreateWithBytes};
-use core_foundation_sys::url::{kCFURLPOSIXPathStyle, CFURLCreateWithFileSystemPath, CFURLRef};
 use libc::{c_void, proc_pidpath, PROC_PIDPATHINFO_MAXSIZE};
 use nix::errno::Errno;
 use nix::fcntl::{fcntl, FcntlArg, FdFlag};
@@ -51,6 +48,41 @@ type DADissenterRef = *const __DADissenter;
 #[repr(C)]
 struct __DASession(c_void);
 type DASessionRef = *const __DASession;
+
+// The handful of CoreFoundation declarations the DADisk unmount path below
+// needs, declared locally instead of through the core-foundation-sys crate:
+// the crate would sit unused in the fuse-t build, where this whole module
+// is compiled out.
+#[repr(C)]
+struct __CFString(c_void);
+type CFStringRef = *const __CFString;
+#[repr(C)]
+struct __CFURL(c_void);
+type CFURLRef = *const __CFURL;
+type CFAllocatorRef = *const c_void;
+type CFIndex = libc::c_long;
+type CFStringEncoding = u32;
+type Boolean = u8;
+
+const K_CF_STRING_ENCODING_UTF8: CFStringEncoding = 0x0800_0100;
+const K_CF_URL_POSIX_PATH_STYLE: isize = 0;
+
+extern "C" {
+    fn CFStringCreateWithBytes(
+        allocator: CFAllocatorRef,
+        bytes: *const u8,
+        num_bytes: CFIndex,
+        encoding: CFStringEncoding,
+        is_external_representation: Boolean,
+    ) -> CFStringRef;
+    fn CFURLCreateWithFileSystemPath(
+        allocator: CFAllocatorRef,
+        file_path: CFStringRef,
+        path_style: isize,
+        is_directory: Boolean,
+    ) -> CFURLRef;
+    fn CFRelease(cf: *const c_void);
+}
 
 type DADiskUnmountCallback =
     Option<unsafe extern "C" fn(disk: DADiskRef, dissenter: DADissenterRef, context: *mut c_void)>;
@@ -416,20 +448,18 @@ fn create_disk(mountpoint: &Path, dasession: DASessionRef) -> DADiskRef {
             std::ptr::null(),
             mountpoint,
             path_len as CFIndex,
-            kCFStringEncodingUTF8,
+            K_CF_STRING_ENCODING_UTF8,
             1u8,
         );
-        let url =
-            CFURLCreateWithFileSystemPath(std::ptr::null(), url_str, kCFURLPOSIXPathStyle, 1u8);
+        let url = CFURLCreateWithFileSystemPath(
+            std::ptr::null(),
+            url_str,
+            K_CF_URL_POSIX_PATH_STYLE,
+            1u8,
+        );
         let disk = DADiskCreateFromVolumePath(std::ptr::null(), dasession, url);
-        CFRelease(std::mem::transmute::<
-            *const core_foundation_sys::string::__CFString,
-            *const libc::c_void,
-        >(url_str));
-        CFRelease(std::mem::transmute::<
-            *const core_foundation_sys::url::__CFURL,
-            *const libc::c_void,
-        >(url));
+        CFRelease(url_str as *const c_void);
+        CFRelease(url as *const c_void);
         disk
     }
 }
