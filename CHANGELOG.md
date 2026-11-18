@@ -302,6 +302,15 @@
   and no code in the workspace relied on it.
 
 ### Fixed
+- [328](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/328): The servers answer a request that fails before it gets a reply. A malformed
+  request (a short body, a name without its NUL, a size that disagrees with the body) gets
+  `EINVAL`, and a failure of the server itself, such as remapping the ids, gets `EIO`. Most early
+  returns in the handlers dropped such a request, and FUSE has no request timeout, so the client
+  waited forever. `handle_message()` and `async_handle_message()` then return the size of the
+  reply, not the error, because transports treat an error as a request without a reply: the
+  io_uring worker replaced the reply with `EIO`, and a virtio-fs device may never return the
+  descriptor. FORGET, BATCH_FORGET, INTERRUPT and NOTIFY_REPLY get no reply, now also when they
+  are oversized.
 - [329](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/329): The servers no longer reply to NOTIFY_REPLY when `FileSystem::notify_reply()`
   fails, which the default implementation does. The kernel takes no reply to NOTIFY_REPLY, and
   sends it under the unique number that the server picked for NOTIFY_RETRIEVE, so the reply

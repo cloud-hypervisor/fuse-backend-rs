@@ -398,6 +398,9 @@ struct SrvContext<'a, F, S: BitmapSlice, W: Writer> {
     context: Context,
     r: Reader<'a, S>,
     w: W,
+    /// Set before a reply is written, so that `reply_on_error()` doesn't send a second reply
+    /// after a write that failed.
+    replied: bool,
     phantom: PhantomData<F>,
     phantom2: PhantomData<S>,
 }
@@ -411,6 +414,7 @@ impl<'a, F: FileSystem, S: BitmapSlice, W: Writer> SrvContext<'a, F, S, W> {
             context,
             r,
             w,
+            replied: false,
             phantom: PhantomData,
             phantom2: PhantomData,
         }
@@ -435,6 +439,46 @@ impl<'a, F: FileSystem, S: BitmapSlice, W: Writer> SrvContext<'a, F, S, W> {
 
         reader
     }
+
+    /// Returns the errno to answer the request with after its handler failed with `err`, and
+    /// logs `err`. Returns `None` if the request got a reply already or takes none.
+    fn fallback_errno(&self, err: &Error) -> Option<i32> {
+        if self.replied || !takes_reply(self.in_header.opcode) {
+            return None;
+        }
+        let errno = match err {
+            // The request is malformed: a short body, a name without its NUL, or a size that
+            // doesn't match the body.
+            Error::DecodeMessage(_)
+            | Error::InvalidCString(_)
+            | Error::InvalidHeaderLength
+            | Error::MissingParameter
+            | Error::InvalidXattrSize(_)
+            | Error::InvalidMessage(_) => libc::EINVAL,
+            // The server failed, not the request.
+            Error::EncodeMessage(_)
+            | Error::FailedToWrite(_)
+            | Error::FailedToSplitWriter(_)
+            | Error::FailedToRemapID(_) => libc::EIO,
+        };
+        warn!(
+            "fuse: failed to handle request {:?}, replying errno {}: {}",
+            self.in_header, errno, err
+        );
+        Some(errno)
+    }
+}
+
+/// Whether the kernel waits for a reply to a request with `opcode`.
+///
+/// FORGET and BATCH_FORGET take none. Neither does NOTIFY_REPLY, which carries the data for a
+/// NOTIFY_RETRIEVE under the unique number that the server picked. The kernel accepts only
+/// EAGAIN and ENOSYS for an INTERRUPT, and ENOSYS turns interrupts off. DESTROY takes a reply.
+fn takes_reply(opcode: u32) -> bool {
+    !matches!(
+        Opcode::from(opcode),
+        Opcode::Forget | Opcode::BatchForget | Opcode::Interrupt | Opcode::NotifyReply
+    )
 }
 
 #[cfg(test)]

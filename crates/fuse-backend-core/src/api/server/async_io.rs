@@ -23,8 +23,8 @@ use crate::api::filesystem::{
     ZeroCopyWriter,
 };
 use crate::api::server::{
-    decode_version, InitParams, MetricsHook, Server, ServerUtil, SrvContext, BUFFER_HEADER_SIZE,
-    MAX_BUFFER_SIZE,
+    decode_version, takes_reply, InitParams, MetricsHook, Server, ServerUtil, SrvContext,
+    BUFFER_HEADER_SIZE, MAX_BUFFER_SIZE,
 };
 use crate::buffer::{Reader, Writer};
 use crate::file_traits::{AsyncFileReadWriteVolatile, FileReadWriteVolatile};
@@ -130,7 +130,8 @@ impl<F: AsyncFileSystem + Sync> Server<F> {
     /// must ensure all data buffers managed by the `Reader` and `Writer` are valid until the
     /// `Future` object returned has completed. Other subsystems, such as the transport layer, rely
     /// on the invariant.
-    #[allow(unused_variables)]
+    ///
+    /// Returns like `handle_message()`.
     pub async unsafe fn async_handle_message<S: BitmapSlice, W: Writer>(
         &self,
         mut r: Reader<'_, S>,
@@ -140,10 +141,26 @@ impl<F: AsyncFileSystem + Sync> Server<F> {
     ) -> Result<usize> {
         let in_header = r.read_obj().map_err(Error::DecodeMessage)?;
         let mut ctx = SrvContext::<F, S, W>::new(in_header, r, w);
-        self.remap_ctx_ids(&mut ctx)?;
+        let res = self.async_dispatch(&mut ctx, vu_req, hook).await;
+        ctx.reply_on_error(res)
+    }
+
+    #[allow(unused_variables)]
+    async fn async_dispatch<S: BitmapSlice, W: Writer>(
+        &self,
+        ctx: &mut SrvContext<'_, F, S, W>,
+        vu_req: Option<&mut dyn FsCacheReqHandler>,
+        hook: Option<&dyn MetricsHook>,
+    ) -> Result<usize> {
+        self.remap_ctx_ids(ctx)?;
         if ctx.in_header.len > (MAX_BUFFER_SIZE + BUFFER_HEADER_SIZE)
             || ctx.w.available_bytes() < size_of::<OutHeader>()
         {
+            if !takes_reply(ctx.in_header.opcode) {
+                return Err(Error::InvalidMessage(io::Error::from_raw_os_error(
+                    libc::EOVERFLOW,
+                )));
+            }
             return ctx
                 .async_reply_error(io::Error::from_raw_os_error(libc::ENOMEM))
                 .await;
@@ -241,19 +258,13 @@ impl<F: AsyncFileSystem + Sync> Server<F> {
 
     async fn async_lookup<S: BitmapSlice, W: Writer>(
         &self,
-        mut ctx: SrvContext<'_, F, S, W>,
+        ctx: &mut SrvContext<'_, F, S, W>,
     ) -> Result<usize> {
         let buf = ServerUtil::get_message_body(&mut ctx.r, &ctx.in_header, 0)?;
-        let name = match bytes_to_cstr(buf.as_ref()) {
-            Ok(name) => name,
-            Err(e) => {
-                debug!("fuse: bytes to cstr error: {:?}, {:?}", buf, e);
-                let _ = ctx
-                    .async_reply_error(io::Error::from_raw_os_error(libc::EINVAL))
-                    .await;
-                return Err(e);
-            }
-        };
+        let name = bytes_to_cstr(buf.as_ref()).map_err(|e| {
+            debug!("fuse: bytes to cstr error: {:?}, {:?}", buf, e);
+            e
+        })?;
 
         let version = decode_version(self.vers.load(Ordering::Acquire));
         let result = self
@@ -280,7 +291,7 @@ impl<F: AsyncFileSystem + Sync> Server<F> {
 
     async fn async_getattr<S: BitmapSlice, W: Writer>(
         &self,
-        mut ctx: SrvContext<'_, F, S, W>,
+        ctx: &mut SrvContext<'_, F, S, W>,
     ) -> Result<usize> {
         let GetattrIn { flags, fh, .. } = ctx.r.read_obj().map_err(Error::DecodeMessage)?;
         let handle = if (flags & GETATTR_FH) != 0 {
@@ -298,7 +309,7 @@ impl<F: AsyncFileSystem + Sync> Server<F> {
 
     async fn async_setattr<S: BitmapSlice, W: Writer>(
         &self,
-        mut ctx: SrvContext<'_, F, S, W>,
+        ctx: &mut SrvContext<'_, F, S, W>,
     ) -> Result<usize> {
         let setattr_in: SetattrIn = ctx.r.read_obj().map_err(Error::DecodeMessage)?;
         let handle = if setattr_in.valid & FATTR_FH != 0 {
@@ -318,7 +329,7 @@ impl<F: AsyncFileSystem + Sync> Server<F> {
 
     async fn async_open<S: BitmapSlice, W: Writer>(
         &self,
-        mut ctx: SrvContext<'_, F, S, W>,
+        ctx: &mut SrvContext<'_, F, S, W>,
     ) -> Result<usize> {
         let OpenIn { flags, fuse_flags } = ctx.r.read_obj().map_err(Error::DecodeMessage)?;
         let result = self
@@ -342,7 +353,7 @@ impl<F: AsyncFileSystem + Sync> Server<F> {
 
     async fn async_read<S: BitmapSlice, W: Writer>(
         &self,
-        mut ctx: SrvContext<'_, F, S, W>,
+        ctx: &mut SrvContext<'_, F, S, W>,
     ) -> Result<usize> {
         let ReadIn {
             fh,
@@ -363,7 +374,7 @@ impl<F: AsyncFileSystem + Sync> Server<F> {
         // Split the writer into 2 pieces: one for the `OutHeader` and the rest for the data.
         let w2 = match ctx.w.split_at(size_of::<OutHeader>()) {
             Ok(v) => v,
-            Err(_e) => return Err(Error::InvalidHeaderLength),
+            Err(e) => return Err(Error::FailedToSplitWriter(e)),
         };
         let mut data_writer = AsyncZcWriter(w2);
         let result = self
@@ -388,7 +399,7 @@ impl<F: AsyncFileSystem + Sync> Server<F> {
 
     async fn async_write<S: BitmapSlice, W: Writer>(
         &self,
-        mut ctx: SrvContext<'_, F, S, W>,
+        ctx: &mut SrvContext<'_, F, S, W>,
     ) -> Result<usize> {
         let WriteIn {
             fh,
@@ -443,7 +454,7 @@ impl<F: AsyncFileSystem + Sync> Server<F> {
 
     async fn async_fsync<S: BitmapSlice, W: Writer>(
         &self,
-        mut ctx: SrvContext<'_, F, S, W>,
+        ctx: &mut SrvContext<'_, F, S, W>,
     ) -> Result<usize> {
         let FsyncIn {
             fh, fsync_flags, ..
@@ -462,7 +473,7 @@ impl<F: AsyncFileSystem + Sync> Server<F> {
 
     async fn async_opendir<S: BitmapSlice, W: Writer>(
         &self,
-        mut ctx: SrvContext<'_, F, S, W>,
+        ctx: &mut SrvContext<'_, F, S, W>,
     ) -> Result<usize> {
         let OpenIn { flags, .. } = ctx.r.read_obj().map_err(Error::DecodeMessage)?;
         let result = self
@@ -486,7 +497,7 @@ impl<F: AsyncFileSystem + Sync> Server<F> {
 
     async fn async_do_readdir<S: BitmapSlice, W: Writer>(
         &self,
-        mut ctx: SrvContext<'_, F, S, W>,
+        ctx: &mut SrvContext<'_, F, S, W>,
         plus: bool,
     ) -> Result<usize> {
         let ReadIn {
@@ -538,7 +549,7 @@ impl<F: AsyncFileSystem + Sync> Server<F> {
 
     async fn async_fsyncdir<S: BitmapSlice, W: Writer>(
         &self,
-        mut ctx: SrvContext<'_, F, S, W>,
+        ctx: &mut SrvContext<'_, F, S, W>,
     ) -> Result<usize> {
         let FsyncIn {
             fh, fsync_flags, ..
@@ -557,7 +568,7 @@ impl<F: AsyncFileSystem + Sync> Server<F> {
 
     async fn async_releasedir<S: BitmapSlice, W: Writer>(
         &self,
-        mut ctx: SrvContext<'_, F, S, W>,
+        ctx: &mut SrvContext<'_, F, S, W>,
     ) -> Result<usize> {
         let ReleaseIn { fh, flags, .. } = ctx.r.read_obj().map_err(Error::DecodeMessage)?;
         let result = self
@@ -573,33 +584,19 @@ impl<F: AsyncFileSystem + Sync> Server<F> {
 
     async fn async_create<S: BitmapSlice, W: Writer>(
         &self,
-        mut ctx: SrvContext<'_, F, S, W>,
+        ctx: &mut SrvContext<'_, F, S, W>,
     ) -> Result<usize> {
         let args: CreateIn = ctx.r.read_obj().map_err(Error::DecodeMessage)?;
         let buf = ServerUtil::get_message_body(&mut ctx.r, &ctx.in_header, size_of::<CreateIn>())?;
-        let name = match bytes_to_cstr(buf.as_ref()) {
-            Ok(name) => name,
-            Err(e) => {
-                debug!("fuse: bytes to cstr error: {:?}, {:?}", buf, e);
-                let _ = ctx
-                    .async_reply_error(io::Error::from_raw_os_error(libc::EINVAL))
-                    .await;
-                return Err(e);
-            }
-        };
+        let name = bytes_to_cstr(buf.as_ref()).map_err(|e| {
+            debug!("fuse: bytes to cstr error: {:?}, {:?}", buf, e);
+            e
+        })?;
 
-        let supp_gid = match parse_create_extensions(
+        let supp_gid = parse_create_extensions(
             &FsOptions::from_bits_truncate(self.options.load(Ordering::Acquire)),
             &buf[name.to_bytes_with_nul().len()..],
-        ) {
-            Ok(supp_gid) => supp_gid,
-            Err(e) => {
-                let _ = ctx
-                    .async_reply_error(io::Error::from_raw_os_error(libc::EINVAL))
-                    .await;
-                return Err(e);
-            }
-        };
+        )?;
         ctx.context.supp_gid = supp_gid;
 
         let result = self
@@ -634,7 +631,7 @@ impl<F: AsyncFileSystem + Sync> Server<F> {
 
     async fn async_fallocate<S: BitmapSlice, W: Writer>(
         &self,
-        mut ctx: SrvContext<'_, F, S, W>,
+        ctx: &mut SrvContext<'_, F, S, W>,
     ) -> Result<usize> {
         let FallocateIn {
             fh,
@@ -671,6 +668,7 @@ impl<'a, F: AsyncFileSystem, S: BitmapSlice, W: Writer> SrvContext<'a, F, S, W> 
         };
         trace!("fuse: new reply {:?}", header);
 
+        self.replied = true;
         let result = match (data2.len(), data3.len()) {
             (0, 0) => self.w.async_write(header.as_slice()).await,
             (0, _) => self.w.async_write2(header.as_slice(), data3).await,
@@ -693,6 +691,7 @@ impl<'a, F: AsyncFileSystem, S: BitmapSlice, W: Writer> SrvContext<'a, F, S, W> 
             unique: self.in_header.unique,
         };
 
+        self.replied = true;
         self.w
             .async_write_all(header.as_slice())
             .await
@@ -717,6 +716,7 @@ impl<'a, F: AsyncFileSystem, S: BitmapSlice, W: Writer> SrvContext<'a, F, S, W> 
         if internal_err {
             error!("fuse: reply error header {:?}, error {:?}", header, err);
         }
+        self.replied = true;
         self.w
             .async_write_all(header.as_slice())
             .await
@@ -767,7 +767,10 @@ mod tests {
     use std::ffi::CStr;
     use std::sync::atomic::AtomicUsize;
 
-    use super::super::test_util::TestWriter;
+    use super::super::test_util::{
+        check_malformed, check_oversized, oversized_request, request, request_bodies, MockFS,
+        NoDax, TestWriter, OVERSIZED_OPCODES,
+    };
     use super::*;
     use crate::abi::fuse_abi::{Dirent, InHeader};
     use crate::api::filesystem::{Context, FileSystem, OpenOptions};
@@ -1271,5 +1274,47 @@ mod tests {
         assert_eq!(out.fh, 4);
         assert_eq!(out.open_flags, OpenOptions::PASSTHROUGH.bits());
         assert_eq!(out.passthrough, BACKING_ID);
+    }
+
+    #[tokio::test]
+    async fn test_async_server_replies_to_malformed_bodies() {
+        let server = Server::new(MockFS);
+        for (opcode, body) in request_bodies() {
+            for len in 0..body.len() {
+                let mut req = request(opcode, &body[..len]);
+                let mut reply = [0u8; 4096];
+                let res = unsafe {
+                    server
+                        .async_handle_message(
+                            Reader::<()>::from_slice(&mut req),
+                            TestWriter::new(&mut reply),
+                            Some(&mut NoDax),
+                            None,
+                        )
+                        .await
+                };
+                check_malformed(opcode, len, res, &reply);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_async_server_rejects_oversized_requests() {
+        let server = Server::new(MockFS);
+        for opcode in OVERSIZED_OPCODES {
+            let mut req = oversized_request(opcode);
+            let mut reply = [0u8; 4096];
+            let res = unsafe {
+                server
+                    .async_handle_message(
+                        Reader::<()>::from_slice(&mut req),
+                        TestWriter::new(&mut reply),
+                        None,
+                        None,
+                    )
+                    .await
+            };
+            check_oversized(opcode, res, &reply);
+        }
     }
 }
