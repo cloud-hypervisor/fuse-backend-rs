@@ -12,6 +12,7 @@ mod example;
 #[cfg(all(feature = "fusedev", target_os = "linux"))]
 mod fusedev_tests {
     use std::ffi::CString;
+    use std::fs::File;
     use std::io::Result;
     use std::num::NonZeroUsize;
     use std::os::unix::ffi::OsStrExt;
@@ -21,7 +22,14 @@ mod fusedev_tests {
     use std::os::unix::process::CommandExt;
     use std::path::Path;
     use std::process::Command;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
 
+    use fuse_backend_rs::abi::fuse_abi::{InHeader, Opcode, OutHeader};
+    use fuse_backend_rs::api::server::{MetricsHook, Server};
+    use fuse_backend_rs::api::{Vfs, VfsOptions};
+    use fuse_backend_rs::passthrough::{Config, PassthroughFs};
+    use fuse_backend_rs::transport::FuseSession;
     use nix::mount::MsFlags;
     use nix::sys::mman::{mmap, munmap, MapFlags, ProtFlags};
     use vmm_sys_util::tempdir::TempDir;
@@ -359,6 +367,112 @@ mod fusedev_tests {
         unsafe { munmap(addr, data.len()) }.unwrap();
 
         daemon.umount().unwrap();
+        Ok(())
+    }
+
+    /// Counts the COPY_FILE_RANGE requests the server gets.
+    #[derive(Default)]
+    struct CopyRequests(AtomicUsize);
+
+    impl MetricsHook for CopyRequests {
+        fn collect(&self, ih: &InHeader) {
+            if ih.opcode == Opcode::CopyFileRange as u32 {
+                self.0.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+
+        fn release(&self, _oh: Option<&OutHeader>) {}
+    }
+
+    /// Copies `from` to a new file `to` with one copy_file_range() call.
+    fn copy_file(from: &Path, to: &Path) -> Result<usize> {
+        use nix::errno::Errno;
+        use std::os::fd::AsRawFd;
+
+        let src = File::open(from)?;
+        let dst = File::create(to)?;
+        let len = src.metadata()?.len() as usize;
+        // SAFETY: both fds are open, and null offsets use the file offsets.
+        let copied = Errno::result(unsafe {
+            libc::copy_file_range(
+                src.as_raw_fd(),
+                std::ptr::null_mut(),
+                dst.as_raw_fd(),
+                std::ptr::null_mut(),
+                len,
+                0,
+            )
+        })?;
+        Ok(copied as usize)
+    }
+
+    #[test]
+    #[ignore] // it depends on privileged mode to pass through /dev/fuse
+    fn integration_test_vfs_copy_file_range() -> Result<()> {
+        // A Vfs with two PassthroughFs mounts answers a copy between them with EXDEV, and the
+        // kernel copies the data itself. A copy within one mount goes to its PassthroughFs. Both
+        // copies reach the server, because the kernel stops sending COPY_FILE_RANGE only after
+        // ENOSYS.
+        if !running_as_root() {
+            eprintln!("skipping integration_test_vfs_copy_file_range: not running as root");
+            return Ok(());
+        }
+        if !kernel_at_least(5, 3) {
+            eprintln!(
+                "skipping integration_test_vfs_copy_file_range: kernel {} does not fall back on EXDEV from the server (needs >= 5.3)",
+                kernel_release()
+            );
+            return Ok(());
+        }
+
+        let src_a = TempDir::new().unwrap();
+        let src_b = TempDir::new().unwrap();
+        let mnt_dir = TempDir::new().unwrap();
+        let data: Vec<u8> = (0..8192u32).map(|i| i as u8).collect();
+        std::fs::write(src_a.as_path().join("file"), &data).unwrap();
+
+        let vfs = Vfs::new(VfsOptions {
+            no_open: false,
+            ..Default::default()
+        });
+        for (src, path) in [(&src_a, "/a"), (&src_b, "/b")] {
+            let fs = PassthroughFs::<()>::new(Config {
+                root_dir: src.as_path().to_str().unwrap().to_string(),
+                do_import: false,
+                ..Default::default()
+            })
+            .unwrap();
+            fs.import().unwrap();
+            vfs.mount(Box::new(fs), path).unwrap();
+        }
+        let server = Server::new(vfs);
+        let requests = Arc::new(CopyRequests::default());
+        let hook = requests.clone();
+
+        let mut se = FuseSession::new(mnt_dir.as_path(), "vfs_copy", "", false).unwrap();
+        se.mount().unwrap();
+        let mut ch = se.new_channel().unwrap();
+        let handle = std::thread::spawn(move || {
+            while let Ok(Some((reader, writer))) = ch.get_request() {
+                // Serve until the kernel ends the connection. A command that another test forks
+                // can inherit a file here and FLUSH it at exec, after this test is done.
+                if let Err(e) = server.handle_message(reader, writer, None, Some(&*hook)) {
+                    eprintln!("request failed: {e}");
+                }
+            }
+        });
+
+        let mnt = mnt_dir.as_path();
+        let across = copy_file(&mnt.join("a/file"), &mnt.join("b/copy"));
+        let within = copy_file(&mnt.join("a/file"), &mnt.join("a/copy"));
+        se.umount().unwrap();
+        handle.join().unwrap();
+
+        assert_eq!(across?, data.len());
+        assert_eq!(within?, data.len());
+        assert_eq!(std::fs::read(src_b.as_path().join("copy"))?, data);
+        assert_eq!(std::fs::read(src_a.as_path().join("copy"))?, data);
+        assert_eq!(requests.0.load(Ordering::Relaxed), 2);
         Ok(())
     }
 }
