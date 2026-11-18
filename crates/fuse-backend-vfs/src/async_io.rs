@@ -5,7 +5,7 @@ use std::io;
 
 use async_trait::async_trait;
 
-use super::sync_io::copy_file_range_error;
+use super::sync_io::{copy_file_range_error, syncfs_result};
 use super::*;
 
 #[async_trait]
@@ -455,6 +455,23 @@ impl AsyncFileSystem for Vfs {
         }
     }
 
+    // Like `syncfs()`, one backend after the other.
+    async fn async_syncfs(&self, ctx: &Context, inode: VfsInode) -> Result<()> {
+        if !inode.is_pseudo_fs() {
+            let fs = self.get_fs_by_idx(inode.fs_idx())?;
+            return fs.async_syncfs(ctx, inode.ino()).await;
+        }
+        let mounts = self.mountpoints.load_full();
+        let mut results = Vec::with_capacity(mounts.len());
+        for mnt in mounts.values() {
+            results.push(match self.get_fs_by_idx(mnt.fs_idx) {
+                Ok(fs) => fs.async_syncfs(ctx, mnt.ino).await,
+                Err(e) => Err(e),
+            });
+        }
+        syncfs_result(results)
+    }
+
     #[allow(clippy::too_many_arguments)]
     async fn async_release(
         &self,
@@ -770,6 +787,11 @@ mod tests {
             Ok(())
         }
 
+        async fn async_syncfs(&self, _ctx: &Context, _inode: u64) -> Result<()> {
+            tokio::task::yield_now().await;
+            Ok(())
+        }
+
         async fn async_copy_file_range(
             &self,
             _ctx: &Context,
@@ -970,6 +992,24 @@ mod tests {
         assert_eq!(errno(set), enosys);
         assert_eq!(errno(get), enosys);
         assert_eq!(errno(remove), enosys);
+    }
+
+    #[tokio::test]
+    async fn test_vfs_async_syncfs() {
+        let vfs = Vfs::new(VfsOptions::default());
+        vfs.mount(Box::new(AsyncDirFs), "/x").unwrap();
+        // FakeFileSystemOne answers ENOSYS.
+        let idx = vfs.mount(Box::new(FakeFileSystemOne {}), "/y").unwrap();
+        let ctx = Context::default();
+
+        // The root syncs both.
+        vfs.async_syncfs(&ctx, ROOT_ID.into()).await.unwrap();
+        vfs.async_syncfs(&ctx, MOUNT_ROOT.into()).await.unwrap();
+        let err = vfs
+            .async_syncfs(&ctx, VfsInode::new(idx, ROOT_ID))
+            .await
+            .unwrap_err();
+        assert_eq!(err.raw_os_error(), Some(libc::ENOSYS));
     }
 
     #[tokio::test]

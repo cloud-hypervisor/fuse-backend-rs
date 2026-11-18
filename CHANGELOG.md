@@ -44,6 +44,14 @@
   permission bits, owner and group of the directories `Vfs` serves itself: its root while no file
   system is mounted at `/`, and the directories on the path to each mount point. The defaults
   keep today's root-owned `0777` ([#148](https://github.com/cloud-hypervisor/fuse-backend-rs/issues/148)).
+- [344](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/344): Handle `FUSE_SYNCFS` (protocol 7.34), which virtiofs sends
+  when the guest syncs the file system. Since Linux 6.18 fuseblk mounts send it
+  too. The new `FileSystem::syncfs()` defaults to `ENOSYS`, after which the
+  kernel stops sending it. `AsyncFileSystem::async_syncfs()` calls `syncfs()`
+  by default. `Vfs` syncs every mounted backend when asked for its root, and
+  `PassthroughFs` calls `syncfs(2)` on the shared directory, from the async
+  thread pool when that is enabled.
+  `Opcode::MaxOpcode` moves to 51.
 - [304](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/304): Give FreeBSD a verification path. The Linux wire-format ABI
   body moves out of `fuse_abi_linux.rs` into a shared `fuse_abi_wire.rs`
   (each per-OS prelude re-exports the libc names the body uses), and a new
