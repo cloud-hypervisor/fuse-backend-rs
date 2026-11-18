@@ -1,7 +1,7 @@
 # Changelog
 ## [Unreleased]
 ### Changed
-- [NNN](link): Upgrade `fuse-backend-fusedev` (and the root dev-dependencies)
+- [305](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/305): Upgrade `fuse-backend-fusedev` (and the root dev-dependencies)
   from `nix` 0.24 to 0.31.4, the I/O-safety era of the crate: `read`/
   `write`/`pwrite`/`writev`/`fcntl` now take `AsFd`, so the raw fds the
   writers borrow from the session's fuse device file are re-borrowed per
