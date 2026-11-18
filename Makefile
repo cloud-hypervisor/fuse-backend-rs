@@ -170,17 +170,24 @@ smoke-macos: check-macos
 
 # FreeBSD coverage starts with the two crates that are FreeBSD-clean today:
 # core (through its FreeBSD ABI arm reusing the Linux wire protocol) and
-# vfs. fusedev cannot build there yet (nix 0.24 has no FreeBSD compile
-# support), so no umbrella row exists and the per-crate rows below are the
-# full coverage. Clippy is deliberately absent: no Linux CI row lints
-# core/vfs test code either (the umbrella rows lint the root package
-# only), so this row sticks to the verification the other platforms
-# actually guarantee: it compiles, and the unit tests pass.
+# vfs. The nix 0.31 upgrade makes the fusedev transport build there too,
+# though without a session module it is an empty shell — building it still
+# proves the dependency tree (nix, libc, vm-memory, ...) is FreeBSD-clean, so
+# the future session port starts from a compiling crate. tokio needs the
+# async-io feature to enter the build graph, and a FreeBSD session will want
+# async serving, so the second row pins that compile path down too. The
+# filesystem drivers (passthrough, overlayfs) remain FreeBSD-unbuildable. Clippy is
+# deliberately absent: no Linux CI row lints core/vfs test code either
+# (the umbrella rows lint the root package only), so this row sticks to
+# the verification the other platforms actually guarantee: it compiles,
+# and the unit tests pass.
 build-freebsd:
 	${CARGO} build -p fuse-backend-core --no-default-features
 	${CARGO} build -p fuse-backend-core
 	${CARGO} build -p fuse-backend-vfs --no-default-features
 	${CARGO} build -p fuse-backend-vfs
+	${CARGO} build -p fuse-backend-fusedev
+	${CARGO} build -p fuse-backend-fusedev --features async-io
 
 check-freebsd: build-freebsd
 	${CARGO} fmt --all -- --check

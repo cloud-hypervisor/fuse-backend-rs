@@ -1,5 +1,29 @@
 # Changelog
 ## [Unreleased]
+### Changed
+- [NNN](link): Upgrade `fuse-backend-fusedev` (and the root dev-dependencies)
+  from `nix` 0.24 to 0.31.4, the I/O-safety era of the crate: `read`/
+  `write`/`pwrite`/`writev`/`fcntl` now take `AsFd`, so the raw fds the
+  writers borrow from the session's fuse device file are re-borrowed per
+  call (`BorrowedFd::borrow_raw` with SAFETY comments); `socketpair`
+  returns owned fds; `SetSockOpt` setters take `AsFd`; `cmsgs()` returns a
+  `Result`; `poll` takes a `PollTimeout` and `PollFd::new` a `BorrowedFd`;
+  `F_SETFD`/`F_SETFL` moved into `FcntlArg`. The deprecated free
+  `epoll_ctl` is replaced with a direct `libc::epoll_ctl` on mio's epoll
+  instance (nix's owning `Epoll` type would steal the fd mio still owns),
+  and tokio's `AsyncFd` needs `AsRawFd`, which nix 0.31's `TimerFd` no
+  longer implements — a small wrapper exposes it again. The modules nix
+  0.27+ gates behind non-default features are listed explicitly
+  (`event`, `fs`, `ioctl`, `mount`, `poll`, `process`, `signal`, `socket`,
+  `time`, `uio`, `user`; `mman` for the root tests). The payoff: nix
+  0.31's FreeBSD support is Tier 1, and with it `fuse-backend-fusedev`
+  builds on FreeBSD again — an empty shell until a FreeBSD session module
+  arrives (`serving` is now gated to the OSes that have one, and the
+  Linux-only `mio`/`vmm-sys-util` deps are target-gated), proven by new
+  `cargo build -p fuse-backend-fusedev` rows (default and `async-io`) in
+  `make check-freebsd`. 0.32 is deliberately not taken (released days
+  earlier, its accept/accept4 fd-type breakage buys nothing here).
+
 ### Added
 - [304](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/304): Give FreeBSD a verification path. The Linux wire-format ABI
   body moves out of `fuse_abi_linux.rs` into a shared `fuse_abi_wire.rs`
