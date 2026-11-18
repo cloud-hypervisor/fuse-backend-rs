@@ -309,6 +309,9 @@
 - Turning O_DIRECT on or off for a READ or WRITE no longer puts O_APPEND back on a host file
   that the writeback cache opened without it. `PassthroughFs` passed the client's open flags to
   `fcntl()`, so later writes on that handle went to the end of the file instead of their offset.
+- [308](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/308): With `allow_direct_io` off, an O_DIRECT READ or WRITE no longer sets O_DIRECT on the
+  host file with `fcntl()` under `no_open` or on a handle opened without it, which made buffered
+  IO on that file fail with EINVAL.
 - Reading a request from the fuse device now returns `Ok(None)` on `ECONNABORTED` too, like
   `ENODEV`. The kernel returns `ECONNABORTED` instead of `ENODEV` when the connection is aborted
   while a request is being handed over to the reader, so `FuseChannel` and

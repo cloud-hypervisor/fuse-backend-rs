@@ -185,7 +185,7 @@ pub struct Config {
     pub use_host_ino: bool,
 
     /// Whether the file system should honor the O_DIRECT flag. If this option is disabled,
-    /// that flag is filtered out when opening or creating a host file.
+    /// host files never get that flag.
     ///
     /// The default is `true`.
     pub allow_direct_io: bool,
