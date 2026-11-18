@@ -44,6 +44,10 @@
   permission bits, owner and group of the directories `Vfs` serves itself: its root while no file
   system is mounted at `/`, and the directories on the path to each mount point. The defaults
   keep today's root-owned `0777` ([#148](https://github.com/cloud-hypervisor/fuse-backend-rs/issues/148)).
+- [343](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/343): `Server::set_request_timeout()` asks Linux 6.14 and later to
+  abort the connection when a request stays unanswered for longer than the
+  given number of seconds, through `FsOptions::REQUEST_TIMEOUT` and the new
+  `InitOut::request_timeout`.
 - [304](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/304): Give FreeBSD a verification path. The Linux wire-format ABI
   body moves out of `fuse_abi_linux.rs` into a shared `fuse_abi_wire.rs`
   (each per-OS prelude re-exports the libc names the body uses), and a new
@@ -224,6 +228,8 @@
   took.
 
 ### Changed
+- [343](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/343): `InitOut::unused` is now `[u16; 11]`, because the new
+  `request_timeout` takes its first two bytes.
 - [325](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/325): The `fuse-backend-fusedev` `uring` transport uses io-uring 0.6 instead of 0.5,
   and depends on it only on Linux.
 - [324](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/324): `fuse-backend-core` uses bitflags 2 instead of 1. The flag types (`FsOptions`,

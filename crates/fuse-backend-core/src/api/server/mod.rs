@@ -22,6 +22,8 @@ use std::marker::PhantomData;
 use std::mem::size_of;
 #[cfg(all(target_os = "linux", feature = "fusedev-uring"))]
 use std::sync::atomic::AtomicBool;
+#[cfg(target_os = "linux")]
+use std::sync::atomic::AtomicU16;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use crate::abi::fuse_abi::*;
@@ -76,6 +78,9 @@ pub struct Server<F: FileSystem + Sync> {
     /// `max_pages` of the INIT reply, 0 if it doesn't set `FUSE_MAX_PAGES`.
     #[cfg(all(target_os = "linux", feature = "fusedev-uring"))]
     init_max_pages: AtomicU32,
+    /// Request timeout in seconds sent in the INIT reply, 0 for none.
+    #[cfg(target_os = "linux")]
+    request_timeout: AtomicU16,
 }
 
 impl<F: FileSystem + Sync> Server<F> {
@@ -96,6 +101,8 @@ impl<F: FileSystem + Sync> Server<F> {
             init_max_write: AtomicU32::new(0),
             #[cfg(all(target_os = "linux", feature = "fusedev-uring"))]
             init_max_pages: AtomicU32::new(0),
+            #[cfg(target_os = "linux")]
+            request_timeout: AtomicU16::new(0),
         }
     }
 
@@ -116,6 +123,19 @@ impl<F: FileSystem + Sync> Server<F> {
         }
         self.max_stack_depth.store(depth, Ordering::Relaxed);
         Ok(())
+    }
+
+    /// Ask the kernel to abort the connection, as `umount -f` does, when a request stays
+    /// unanswered for longer than `secs` seconds. Call it before the server handles the INIT
+    /// request.
+    ///
+    /// The kernel needs `FsOptions::REQUEST_TIMEOUT` (Linux 6.14). It checks the requests every
+    /// 15 seconds, so it raises a shorter timeout to 15 seconds and aborts between `secs` and
+    /// `secs` + 15 seconds after the request. The `fs.fuse.max_request_timeout` sysctl caps the
+    /// timeout. 0, the default, leaves it to the `fs.fuse.default_request_timeout` sysctl.
+    #[cfg(target_os = "linux")]
+    pub fn set_request_timeout(&self, secs: u16) {
+        self.request_timeout.store(secs, Ordering::Relaxed);
     }
 
     /// Get the protocol version and the options enabled at INIT, for `restore_init()`. Before
@@ -221,6 +241,19 @@ impl<F: FileSystem + Sync> Server<F> {
         self.init_max_write.store(max_write, Ordering::Release);
         self.init_max_pages
             .store(u32::from(max_pages), Ordering::Release);
+    }
+
+    /// Enable `FsOptions::REQUEST_TIMEOUT` if a timeout is set and the kernel offers it, and
+    /// return the timeout for the INIT reply, or 0. Without a timeout, drop the flag even when
+    /// the filesystem asked for it.
+    #[cfg(target_os = "linux")]
+    fn apply_request_timeout(&self, capable: FsOptions, enabled: FsOptions) -> (FsOptions, u16) {
+        let secs = self.request_timeout.load(Ordering::Relaxed);
+        if secs != 0 && capable.contains(FsOptions::REQUEST_TIMEOUT) {
+            (enabled | FsOptions::REQUEST_TIMEOUT, secs)
+        } else {
+            (enabled - FsOptions::REQUEST_TIMEOUT, 0)
+        }
     }
 
     /// OR the extra INIT flags requested through `set_uring()` into the
