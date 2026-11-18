@@ -36,7 +36,7 @@ use arc_swap::ArcSwap;
 use fuse_backend_core::abi::fuse_abi::*;
 use fuse_backend_core::api::filesystem::*;
 
-use crate::pseudo_fs::PseudoFs;
+use crate::pseudo_fs::{PseudoFs, PSEUDOFS_DEFAULT_DIR_MODE};
 
 #[cfg(feature = "async-io")]
 mod async_io;
@@ -216,6 +216,16 @@ pub struct VfsOptions {
     /// to remove security.capability xattr and setuid/setgid bits. See details in
     /// comments for HANDLE_KILLPRIV_V2
     pub killpriv_v2: bool,
+
+    /// Permission bits of the directories `Vfs` makes up itself: its root while no file
+    /// system is mounted at `/`, and the directories on the path to each mount point. `Vfs`
+    /// ignores bits outside `0o7777`. It doesn't check the mode itself: the kernel does,
+    /// under `default_permissions`. The default is `0o777`.
+    pub pseudo_dir_mode: u32,
+    /// Owner of those directories. The default is 0.
+    pub pseudo_dir_uid: u32,
+    /// Group of those directories. The default is 0.
+    pub pseudo_dir_gid: u32,
 }
 
 impl VfsOptions {
@@ -267,6 +277,9 @@ impl Default for VfsOptions {
             in_opts: FsOptions::empty(),
             out_opts,
             id_mapping: (0, 0, 0),
+            pseudo_dir_mode: PSEUDOFS_DEFAULT_DIR_MODE,
+            pseudo_dir_uid: 0,
+            pseudo_dir_gid: 0,
         }
     }
 }
@@ -307,7 +320,11 @@ impl Vfs {
             mountpoints: ArcSwap::new(Arc::new(HashMap::new())),
             superblocks: ArcSwap::new(Arc::new(vec![None; MAX_VFS_INDEX])),
             mount_id_mappings: ArcSwap::new(Arc::new(vec![None; MAX_VFS_INDEX])),
-            root: PseudoFs::new(),
+            root: PseudoFs::with_dir_attr(
+                opts.pseudo_dir_mode,
+                opts.pseudo_dir_uid,
+                opts.pseudo_dir_gid,
+            ),
             opts: ArcSwap::new(Arc::new(opts)),
             lock: Mutex::new(()),
             generations: (0..MAX_VFS_INDEX).map(|_| AtomicU32::new(0)).collect(),
@@ -954,7 +971,9 @@ pub mod persist {
             }
         }
 
-        fn restore(state: &VfsOptionsState) -> VfsResult<VfsOptions> {
+        // The snapshot doesn't hold the pseudo directory attributes. Keep those of `current`,
+        // which the pseudo fs was built with.
+        fn restore(state: &VfsOptionsState, current: &VfsOptions) -> VfsResult<VfsOptions> {
             Ok(VfsOptions {
                 in_opts: FsOptions::from_bits(state.in_opts).ok_or(VfsError::Persist(
                     "Failed to restore VfsOptions.in_opts".to_owned(),
@@ -974,6 +993,9 @@ pub mod persist {
                 no_opendir: state.no_opendir,
                 no_writeback: state.no_writeback,
                 killpriv_v2: state.killpriv_v2,
+                pseudo_dir_mode: current.pseudo_dir_mode,
+                pseudo_dir_uid: current.pseudo_dir_uid,
+                pseudo_dir_gid: current.pseudo_dir_gid,
             })
         }
     }
@@ -1124,7 +1146,7 @@ pub mod persist {
                         VfsError::Persist(format!("Failed to load Vfs using snapshot: {:?}", e))
                     })?
                     .0;
-            let opts = VfsOptions::restore(&state.options)?;
+            let opts = VfsOptions::restore(&state.options, &self.opts.load())?;
             self.initialized
                 .store(!opts.in_opts.is_empty(), Ordering::Release);
             self.opts.store(Arc::new(opts));
@@ -1177,6 +1199,28 @@ pub mod persist {
             let vfs = &Vfs::new(VfsOptions::default());
             vfs.restore_from_bytes(&mut buf).unwrap();
             assert_eq!(vfs.next_super.load(std::sync::atomic::Ordering::SeqCst), 1);
+        }
+
+        // The snapshot leaves the pseudo directory attributes out, so a restored Vfs keeps
+        // the ones it was created with.
+        #[test]
+        fn test_vfs_save_restore_keeps_pseudo_dir_attr() {
+            use crate::{Vfs, VfsOptions};
+
+            let vfs = &Vfs::new(VfsOptions {
+                pseudo_dir_mode: 0o700,
+                ..Default::default()
+            });
+            let mut buf = vfs.save_to_bytes().unwrap();
+
+            let restored_vfs = &Vfs::new(VfsOptions {
+                pseudo_dir_mode: 0o750,
+                pseudo_dir_uid: 1000,
+                ..Default::default()
+            });
+            restored_vfs.restore_from_bytes(&mut buf).unwrap();
+            let opts = restored_vfs.options();
+            assert_eq!((opts.pseudo_dir_mode, opts.pseudo_dir_uid), (0o750, 1000));
         }
 
         // Note: the save/restore tests with real `PassthroughFs` backends
@@ -1715,6 +1759,36 @@ mod tests {
             )
             .unwrap();
         assert_eq!(vfs.get_effective_id_mapping(idx2), Some((0, 300000, 65536)));
+    }
+
+    // The root and the directories on the path to a mount point take their mode, uid and gid
+    // from VfsOptions. Only the permission bits of the mode count.
+    #[test]
+    fn test_vfs_pseudo_dir_attr() {
+        let ctx = Context::new();
+        let attr = |st: stat64| {
+            let attr = Attr::from(st);
+            (attr.mode, attr.uid, attr.gid)
+        };
+
+        let vfs = Vfs::new(VfsOptions::default());
+        let (st, _) = vfs.getattr(&ctx, ROOT_ID.into(), None).unwrap();
+        assert_eq!(attr(st), (S_IFDIR | 0o777, 0, 0));
+
+        let vfs = Vfs::new(VfsOptions {
+            pseudo_dir_mode: S_IFCHR | 0o2750,
+            pseudo_dir_uid: 1000,
+            pseudo_dir_gid: 100,
+            ..Default::default()
+        });
+        vfs.mount(Box::new(FakeFileSystemOne {}), "/x/y").unwrap();
+        let expected = (S_IFDIR | 0o2750, 1000, 100);
+        let (st, _) = vfs.getattr(&ctx, ROOT_ID.into(), None).unwrap();
+        assert_eq!(attr(st), expected);
+        let x = vfs
+            .lookup(&ctx, ROOT_ID.into(), CString::new("x").unwrap().as_c_str())
+            .unwrap();
+        assert_eq!(attr(x.attr), expected);
     }
 
     #[test]

@@ -26,6 +26,7 @@ use fuse_backend_core::api::filesystem::*;
 const PSEUDOFS_NEXT_INODE: u64 = 2;
 const PSEUDOFS_DEFAULT_ATTR_TIMEOUT: u64 = 1 << 32;
 const PSEUDOFS_DEFAULT_ENTRY_TIMEOUT: u64 = PSEUDOFS_DEFAULT_ATTR_TIMEOUT;
+pub(crate) const PSEUDOFS_DEFAULT_DIR_MODE: u32 = S_IRWXU | S_IRWXG | S_IRWXO;
 
 type Inode = u64;
 type Handle = u64;
@@ -74,16 +75,31 @@ pub struct PseudoFs {
     root_inode: Arc<PseudoInode>,
     inodes: ArcSwap<HashMap<u64, Arc<PseudoInode>>>,
     lock: Mutex<()>, // Write protect PseudoFs.inodes and PseudoInode.children
+    // Mode, owner and block size of every directory.
+    dir_attr: Attr,
 }
 
 impl PseudoFs {
     pub fn new() -> Self {
+        Self::with_dir_attr(PSEUDOFS_DEFAULT_DIR_MODE, 0, 0)
+    }
+
+    /// A pseudo fs whose directories have the permission bits of `mode` and belong to
+    /// `uid`:`gid`.
+    pub fn with_dir_attr(mode: u32, uid: u32, gid: u32) -> Self {
         let root_inode = Arc::new(PseudoInode::new(ROOT_ID, ROOT_ID, String::from("/")));
         let fs = PseudoFs {
             next_inode: AtomicU64::new(PSEUDOFS_NEXT_INODE),
             root_inode: root_inode.clone(),
             inodes: ArcSwap::new(Arc::new(HashMap::new())),
             lock: Mutex::new(()),
+            dir_attr: Attr {
+                mode: S_IFDIR | (mode & 0o7777),
+                uid,
+                gid,
+                blksize: 4096,
+                ..Default::default()
+            },
         };
 
         // Create the root inode. We have just created the lock, so it should be safe to unwrap().
@@ -260,11 +276,8 @@ impl PseudoFs {
     }
 
     fn get_entry(&self, ino: u64) -> Entry {
-        let mut attr = Attr {
-            ..Default::default()
-        };
+        let mut attr = self.dir_attr;
         attr.ino = ino;
-        attr.mode = S_IFDIR | S_IRWXU | S_IRWXG | S_IRWXO;
         let now = SystemTime::now();
         attr.ctime = now
             .duration_since(SystemTime::UNIX_EPOCH)
@@ -272,7 +285,6 @@ impl PseudoFs {
             .as_secs();
         attr.mtime = attr.ctime;
         attr.atime = attr.ctime;
-        attr.blksize = 4096;
         Entry {
             inode: ino,
             generation: 0,
