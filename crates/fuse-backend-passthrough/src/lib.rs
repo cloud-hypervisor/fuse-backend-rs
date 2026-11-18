@@ -209,6 +209,10 @@ struct HandleData {
     inode: Inode,
     file: File,
     open_flags: RwLock<u32>,
+    /// Whether the file rejected a non-blocking buffered read with EOPNOTSUPP, see
+    /// `PassthroughFs::read_nowait()`.
+    #[cfg(all(feature = "async-io", target_os = "linux"))]
+    no_nowait_read: AtomicBool,
     /// Whether the file rejected a non-blocking buffered write with EOPNOTSUPP, see
     /// `PassthroughFs::write_nowait()`.
     #[cfg(all(feature = "async-io", target_os = "linux"))]
@@ -223,6 +227,8 @@ impl HandleData {
             inode,
             file,
             open_flags: RwLock::new(flags),
+            #[cfg(all(feature = "async-io", target_os = "linux"))]
+            no_nowait_read: AtomicBool::new(false),
             #[cfg(all(feature = "async-io", target_os = "linux"))]
             no_nowait_write: AtomicBool::new(false),
             has_backing_id,
