@@ -178,6 +178,8 @@
   systems.
 
 ### Changed
+- [325](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/325): The `fuse-backend-fusedev` `uring` transport uses io-uring 0.6 instead of 0.5,
+  and depends on it only on Linux.
 - [294](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/294): `PassthroughFs` negotiates
   `FsOptions::DIRECT_IO_ALLOW_MMAP` under the `Never` and `Metadata` cache policies only when the
   new `Config::allow_mmap` opts in (default off), so shared mmaps keep failing with `ENODEV` there
