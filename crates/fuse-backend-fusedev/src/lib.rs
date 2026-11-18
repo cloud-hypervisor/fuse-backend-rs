@@ -62,7 +62,13 @@ pub use fuse_t_session::*;
 
 // The unified serving layer over the session modules above; the async and
 // io_uring serving implementations live with their transports.
+//
+// The serving layer drives a session, so it only exists where a session
+// module does (Linux and macOS for now; a FreeBSD session module is future
+// work on top of the nix 0.31 upgrade).
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 mod serving;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 pub use serving::*;
 
 #[cfg(all(target_os = "linux", feature = "uring"))]
