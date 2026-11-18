@@ -54,6 +54,15 @@ pub(super) fn copy_file_range_error(e: Error) -> Error {
     }
 }
 
+/// The error for a TMPFILE that the file system failed with `e`. ENOSYS becomes EOPNOTSUPP,
+/// because an ENOSYS reply would turn O_TMPFILE off for every mount on the connection.
+pub(super) fn tmpfile_error(e: Error) -> Error {
+    match e.raw_os_error() {
+        Some(libc::ENOSYS) => Error::from_raw_os_error(libc::EOPNOTSUPP),
+        _ => e,
+    }
+}
+
 impl FileSystem for Vfs {
     type Inode = VfsInode;
     type Handle = VfsHandle;
@@ -375,6 +384,25 @@ impl FileSystem for Vfs {
                     })
             }
         }
+    }
+
+    fn tmpfile(
+        &self,
+        ctx: &Context,
+        parent: VfsInode,
+        args: CreateIn,
+    ) -> Result<(Entry, Option<u64>, OpenOptions, Option<u32>)> {
+        let ctx = self.ctx_for_mount(ctx, parent.fs_idx());
+
+        match self.get_real_rootfs(parent)? {
+            (Left(fs), idata) => fs.tmpfile(&ctx, idata.ino(), args),
+            (Right(fs), idata) => fs
+                .tmpfile(&ctx, idata.ino(), args)
+                .and_then(|(a, b, c, d)| {
+                    self.convert_backend_entry(idata, a).map(|a| (a, b, c, d))
+                }),
+        }
+        .map_err(tmpfile_error)
     }
 
     fn read(
