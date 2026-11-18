@@ -565,7 +565,10 @@ impl<S: BitmapSlice> io::Read for Reader<'_, S> {
 /// layer is generic over the transport instead of depending on a closed set of
 /// transports. It is re-exported from `transport`, so the historical
 /// `transport::Writer` import path keeps resolving.
-#[cfg_attr(feature = "async-io", async_trait::async_trait(?Send))]
+///
+/// The futures of the async methods have no `Send` bound, like the server's
+/// futures that await them.
+#[allow(async_fn_in_trait)]
 pub trait Writer: io::Write + Sized {
     /// Write data to the reply buffer from a File at offset `off`.
     ///
@@ -645,7 +648,7 @@ pub trait Writer: io::Write + Sized {
     /// without asynchronous IO support may rely on the default implementation,
     /// which fails with `EINVAL`.
     #[cfg(feature = "async-io")]
-    async fn async_write_from_at<F: AsyncFileReadWriteVolatile>(
+    async fn async_write_from_at<F: AsyncFileReadWriteVolatile + ?Sized>(
         &mut self,
         _src: &F,
         _count: usize,
@@ -673,7 +676,7 @@ mod async_io {
         ///
         /// Return the number of bytes read from the data buffer. The number of bytes read can
         /// be less than `count` if there isn't enough data in the buffer.
-        pub async fn async_read_to_at<F: AsyncFileReadWriteVolatile>(
+        pub async fn async_read_to_at<F: AsyncFileReadWriteVolatile + ?Sized>(
             &mut self,
             dst: &F,
             count: usize,

@@ -592,7 +592,6 @@ mod tests {
         }
     }
 
-    #[async_trait(?Send)]
     impl Writer for NullWriter {
         fn write_from_at<F: FileReadWriteVolatile>(
             &mut self,

@@ -203,6 +203,13 @@
   `O_DIRECT` opens. A standalone `OverlayFs` mount under `CachePolicy::Never` gains the same
   `Config::allow_mmap` knob. Behind a `Vfs` the flag is connection-wide in `VfsOptions::out_opts`,
   where a strict deployment removes it like any other capability bit.
+- [315](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/315): The async methods of `transport::Writer` are native `async fn`s instead of `async_trait`
+  methods, so the `async_write*()` and `async_commit()` calls of a reply no longer box a future.
+  Implementations drop their `#[async_trait(?Send)]` attribute. `Writer::async_write_from_at()`
+  and `Reader::async_read_to_at()` take an unsized file type, so the server passes
+  `&dyn AsyncFileReadWriteVolatile` instead of going through the `Arc` forwarding impl, which
+  boxed one more future per READ and WRITE. Overrides of `async_write_from_at()` add `+ ?Sized`
+  to `F`. A 4 KiB READ through `Server::async_handle_message()` takes 25-35 ns (3-5%) less.
 - Bump the declared minimum supported Rust version (MSRV) from 1.80 to 1.86.
   Trait-object upcasting (stabilized in Rust 1.86) is required by the default
   `AsyncFileSystem` read/write handlers and by the passthrough O_DIRECT relay,
