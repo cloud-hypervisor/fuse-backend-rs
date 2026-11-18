@@ -1,6 +1,10 @@
 # Changelog
 ## [Unreleased]
 ### Added
+- [NNN](link): `VfsOptions::pseudo_dir_mode`, `pseudo_dir_uid` and `pseudo_dir_gid` set the
+  permission bits, owner and group of the directories `Vfs` serves itself: its root while no file
+  system is mounted at `/`, and the directories on the path to each mount point. The defaults
+  keep today's root-owned `0777` ([#148](https://github.com/cloud-hypervisor/fuse-backend-rs/issues/148)).
 - [NNN](link): Give FreeBSD a verification path. The Linux wire-format ABI
   body moves out of `fuse_abi_linux.rs` into a shared `fuse_abi_wire.rs`
   (each per-OS prelude re-exports the libc names the body uses), and a new
