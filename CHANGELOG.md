@@ -288,6 +288,9 @@
   new `FsOptions::DIRECT_IO_ALLOW_MMAP` when the kernel offers it, so the kernel maps such a file
   through the page cache. This also allows shared mmap with the `Never` and `Metadata` cache
   policies, which open every file with `DIRECT_IO`.
+- Turning O_DIRECT on or off for a READ or WRITE no longer puts O_APPEND back on a host file
+  that the writeback cache opened without it. `PassthroughFs` passed the client's open flags to
+  `fcntl()`, so later writes on that handle went to the end of the file instead of their offset.
 - Reading a request from the fuse device now returns `Ok(None)` on `ECONNABORTED` too, like
   `ENODEV`. The kernel returns `ECONNABORTED` instead of `ENODEV` when the connection is aborted
   while a request is being handed over to the reader, so `FuseChannel` and
