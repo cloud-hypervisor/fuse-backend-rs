@@ -102,11 +102,14 @@ impl Daemon {
         Ok(())
     }
 
-    /// Umounts and destroies a fusedev daemon
+    /// Lazily umounts a fusedev daemon. The service threads serve until the kernel tears the
+    /// connection down and their reads fail with ENODEV.
     pub fn umount(&mut self) -> Result<()> {
         if let Some(mut se) = self.session.take() {
+            // Don't wake the threads. A child that another test forked while a file here was open
+            // holds the /dev/fuse fds and flushes the file on exec, and an unserved FLUSH would
+            // hang it.
             se.umount().unwrap();
-            se.wake().unwrap();
         }
         Ok(())
     }
@@ -123,7 +126,6 @@ impl Drop for Daemon {
             if let Err(e) = se.umount() {
                 eprintln!("e2e daemon: umount during drop failed: {}", e);
             }
-            let _ = se.wake();
         }
     }
 }
