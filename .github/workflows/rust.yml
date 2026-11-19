@@ -136,6 +136,15 @@ jobs:
           wget https://github.com/macos-fuse-t/fuse-t/releases/download/1.2.9/fuse-t-macos-installer-1.2.9.pkg
           sudo installer -pkg fuse-t-macos-installer-1.2.9.pkg -target /
       - uses: actions/checkout@v3
+      - name: Cache cargo
+        # Same action and settings as the Linux CI rows. The workspace's
+        # Cargo.lock is gitignored, so without a cache every run re-resolves
+        # and re-downloads the whole dependency tree from crates.io — a
+        # network path the cached Linux rows never take.
+        uses: Swatinem/rust-cache@v2.2.0
+        with:
+          cache-on-failure: true
+          key: ${{ runner.os }}-cargo
       - name: build and check
         run: |
           make smoke-macos
