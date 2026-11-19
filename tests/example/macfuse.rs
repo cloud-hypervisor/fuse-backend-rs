@@ -25,6 +25,12 @@ impl FileSystem for HelloFileSystem {
     type Handle = u64;
     #[allow(unused_variables)]
     fn lookup(&self, _: &Context, parent: Self::Inode, name: &CStr) -> Result<Entry> {
+        // Only "/hello" exists. macOS looks up AppleDouble names such as
+        // "._." on fuse-t mounts, and answering them with hello's inode
+        // broke later opens of hello.
+        if parent != 1 || name.to_bytes() != b"hello" {
+            return Err(std::io::Error::from_raw_os_error(libc::ENOENT));
+        }
         let content = "hello, fuse".as_bytes();
         let now = SystemTime::now();
         let time = now
@@ -123,12 +129,15 @@ impl FileSystem for HelloFileSystem {
         let offset = offset as usize;
         let content = "hello, fuse".as_bytes();
         let mut buf = Vec::<u8>::with_capacity(size as usize);
-        let can_read_size = content.len() - offset;
+        let can_read_size = content.len().saturating_sub(offset);
         let read_size = if can_read_size < size as usize {
             can_read_size
         } else {
             size as usize
         };
+        if read_size == 0 {
+            return Ok(0);
+        }
         let read_end = offset + read_size;
         buf.extend_from_slice(&content[offset..read_end]);
         w.write_all(buf.as_slice())?;
@@ -199,7 +208,7 @@ impl FileSystem for HelloFileSystem {
                         | libc::S_IROTH
                         | libc::S_IXOTH),
                     st_nlink: 1,
-                    st_ino: 1,
+                    st_ino: 2,
                     st_uid: 0,
                     st_gid: 0,
                     st_rdev: 0,
