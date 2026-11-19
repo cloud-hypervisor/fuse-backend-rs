@@ -12,13 +12,7 @@ sudo apt-get install acl attr automake bc dbench dump e2fsprogs fio gawk \
 
 # clone xfstests and install.
 cd /tmp/
-# The deprecated git:// protocol (port 9418) is intermittently unreachable
-# from CI runners; clone over HTTPS instead, with a bounded retry.
-for i in 1 2 3; do
-    git clone -b v2026.10.15 https://git.kernel.org/pub/scm/fs/xfs/xfstests-dev.git && break
-    [ "$i" = 3 ] && exit 1
-    sleep 10
-done
+"$current_dir"/xfstests_clone.sh || exit 1
 cd xfstests-dev
 # Keep building with the long-standing gnu17 dialect: runners ship a GCC whose
 # default is C23, where an empty parameter list means (void), and the ltp-derived
