@@ -14,6 +14,11 @@ env:
 jobs:
   CI:
     runs-on: ubuntu-latest
+    # The smoke step mounts real FUSE filesystems; a hung request through
+    # them never returns, and cargo's "over 60 seconds" notice does not abort
+    # the test. Bound the job so a hang fails loudly instead of sitting for
+    # GitHub's 360-minute default (a full run takes ~7 minutes).
+    timeout-minutes: 30
     strategy:
       matrix:
         arch: [amd64, arm64, ppc64le, riscv64, s390x]
