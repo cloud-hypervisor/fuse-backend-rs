@@ -44,6 +44,10 @@
   permission bits, owner and group of the directories `Vfs` serves itself: its root while no file
   system is mounted at `/`, and the directories on the path to each mount point. The defaults
   keep today's root-owned `0777` ([#148](https://github.com/cloud-hypervisor/fuse-backend-rs/issues/148)).
+- [367](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/367): `Vfs` marks the root of each mounted file system with `ATTR_SUBMOUNT`
+  when `FsOptions::SUBMOUNTS` is in `VfsOptions::out_opts` and the kernel offers
+  it, as virtio-fs does since Linux 5.10, so each mount gets its own `st_dev`.
+  Otherwise `Vfs` clears `ATTR_SUBMOUNT` from the entries of its file systems.
 - [304](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/304): Give FreeBSD a verification path. The Linux wire-format ABI
   body moves out of `fuse_abi_linux.rs` into a shared `fuse_abi_wire.rs`
   (each per-OS prelude re-exports the libc names the body uses), and a new
