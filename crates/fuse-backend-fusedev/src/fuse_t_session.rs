@@ -18,6 +18,7 @@ use std::process::Command;
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
+use fuse_backend_core::abi::fuse_abi::InHeader;
 use libc::{proc_pidpath, PROC_PIDPATHINFO_MAXSIZE};
 use nix::errno::Errno;
 use nix::sys::signal::{signal, SigHandler, Signal};
@@ -503,5 +504,3 @@ mod tests {
         assert!(ch.is_ok());
     }
 }
-
-use fuse_backend_core::abi::fuse_abi::InHeader;

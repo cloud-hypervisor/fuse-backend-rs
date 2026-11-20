@@ -1069,7 +1069,7 @@ mod tests {
 
         assert_eq!(bitmap1.len(), 8);
         for i in 0..8 {
-            assert_eq!(bitmap1.is_bit_set(i), false);
+            assert!(!bitmap1.is_bit_set(i));
         }
 
         let mut buf2 = vec![0x0u8; 16];
@@ -1107,7 +1107,7 @@ mod tests {
         assert_eq!(buffers.bytes_consumed(), 8);
 
         for i in 0..8 {
-            assert_eq!(bitmap1.is_bit_set(i), false);
+            assert!(!bitmap1.is_bit_set(i));
         }
 
         assert_eq!(
@@ -1120,17 +1120,17 @@ mod tests {
         assert_eq!(buffers.bytes_consumed(), 24);
         for i in 0..8 {
             if i >= 4 {
-                assert_eq!(bitmap1.is_bit_set(i), true);
+                assert!(bitmap1.is_bit_set(i));
                 continue;
             } else {
-                assert_eq!(bitmap1.is_bit_set(i), false);
+                assert!(!bitmap1.is_bit_set(i));
             }
         }
         for i in 0..8 {
             if i < 4 {
-                assert_eq!(bitmap2.is_bit_set(i), true);
+                assert!(bitmap2.is_bit_set(i));
             } else {
-                assert_eq!(bitmap2.is_bit_set(i), false);
+                assert!(!bitmap2.is_bit_set(i));
             }
         }
     }
