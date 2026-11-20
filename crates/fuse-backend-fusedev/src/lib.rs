@@ -41,6 +41,11 @@ mod bytes_cursor;
 use crate::bytes_cursor::BytesCursor;
 
 #[cfg(target_os = "linux")]
+mod splice;
+#[cfg(target_os = "linux")]
+use crate::splice::SplicePipes;
+
+#[cfg(target_os = "linux")]
 mod linux_session;
 #[cfg(target_os = "linux")]
 pub use linux_session::*;
@@ -149,6 +154,12 @@ pub struct FuseDevWriter<'a, S: BitmapSlice = ()> {
     fd: RawFd,
     buffered: bool,
     buf: BytesCursor<'a>,
+    /// The channel's pipes, if it splices READ replies. After a split only
+    /// the second writer has them, because the data goes after the header.
+    #[cfg(target_os = "linux")]
+    splice: Option<&'a SplicePipes>,
+    /// Bytes of data in the data pipe of `splice`, which follow `buf`.
+    spliced: usize,
     bitmapslice: S,
     phantom: PhantomData<&'a mut [S]>,
 }
@@ -161,9 +172,19 @@ impl<'a, S: BitmapSlice + Default> FuseDevWriter<'a, S> {
             fd,
             buffered: false,
             buf,
+            #[cfg(target_os = "linux")]
+            splice: None,
+            spliced: 0,
             bitmapslice: S::default(),
             phantom: PhantomData,
         })
+    }
+
+    /// Let the writer splice READ data through `pipes`, see `write_from_at()`.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn with_splice(mut self, pipes: Option<&'a SplicePipes>) -> Self {
+        self.splice = pipes;
+        self
     }
 }
 
@@ -174,6 +195,8 @@ impl<'a, S: BitmapSlice> FuseDevWriter<'a, S> {
     /// `Writer` can write up to `available_bytes() - offset` bytes.  Returns an error if
     /// `offset > self.available_bytes()`.
     pub fn split_at(&mut self, offset: usize) -> Result<FuseDevWriter<'a, S>> {
+        #[cfg(target_os = "linux")]
+        self.unsplice().map_err(Error::IoError)?;
         let buf2 = self.buf.split_at(offset)?;
 
         self.buffered = true;
@@ -182,6 +205,9 @@ impl<'a, S: BitmapSlice> FuseDevWriter<'a, S> {
             fd: self.fd,
             buffered: true,
             buf: buf2,
+            #[cfg(target_os = "linux")]
+            splice: self.splice.take(),
+            spliced: 0,
             bitmapslice: self.bitmapslice.clone(),
             phantom: PhantomData,
         })
@@ -191,6 +217,10 @@ impl<'a, S: BitmapSlice> FuseDevWriter<'a, S> {
     pub fn commit(&mut self, other: Option<&FuseDevWriter<'a, S>>) -> io::Result<usize> {
         if !self.buffered {
             return Ok(0);
+        }
+        #[cfg(target_os = "linux")]
+        if let Some(n) = self.commit_spliced(other)? {
+            return Ok(n);
         }
 
         let o = other.map(|w| w.buf.written()).unwrap_or(&[]);
@@ -212,12 +242,12 @@ impl<'a, S: BitmapSlice> FuseDevWriter<'a, S> {
 
     /// Return number of bytes already written to the internal buffer.
     pub fn bytes_written(&self) -> usize {
-        self.buf.position()
+        self.buf.position() + self.spliced
     }
 
     /// Return number of bytes available for writing.
     pub fn available_bytes(&self) -> usize {
-        self.buf.available_bytes()
+        self.buf.available_bytes() - self.spliced
     }
 
     /// Write an object to the writer.
@@ -251,12 +281,21 @@ impl<'a, S: BitmapSlice> FuseDevWriter<'a, S> {
 
     /// Write data to the writer from a File at offset `off`.
     /// Return the number of bytes written to the writer.
+    ///
+    /// On Linux, if the writer comes from a channel of a session with
+    /// `FuseSession::set_splice_write()` and `src` has a file descriptor, this
+    /// splices the data into a pipe, and `commit()` splices it from there into
+    /// `/dev/fuse`.
     pub fn write_from_at<F: FileReadWriteVolatile>(
         &mut self,
         mut src: F,
         count: usize,
         off: u64,
     ) -> io::Result<usize> {
+        #[cfg(target_os = "linux")]
+        if let Some(n) = self.splice_from_at(&src, count, off) {
+            return Ok(n);
+        }
         self.check_available_space(count)?;
 
         let cnt = src.read_vectored_at_volatile(
@@ -301,9 +340,65 @@ impl<'a, S: BitmapSlice> FuseDevWriter<'a, S> {
         Ok(())
     }
 
-    fn check_available_space(&self, sz: usize) -> io::Result<()> {
+    fn check_available_space(&mut self, sz: usize) -> io::Result<()> {
         assert!(self.buffered || self.buf.position() == 0);
+        // Data written now goes after the spliced data, so move that into the buffer.
+        #[cfg(target_os = "linux")]
+        self.unsplice()?;
         self.buf.check_available_space(sz)
+    }
+
+    /// Splice the data of a READ reply into the data pipe, see `write_from_at()`.
+    /// Returns `None` if it has to be copied instead.
+    #[cfg(target_os = "linux")]
+    fn splice_from_at<F: FileReadWriteVolatile>(
+        &mut self,
+        src: &F,
+        count: usize,
+        off: u64,
+    ) -> Option<usize> {
+        // A writer splices once, and only if it was split off from the header.
+        if !self.buffered || self.spliced > 0 || count > self.buf.available_bytes() {
+            return None;
+        }
+        let pipes = self.splice.filter(|p| p.enabled())?;
+        let n = pipes.splice_in(src.raw_fd()?, off, count)?;
+        self.spliced = n;
+        Some(n)
+    }
+
+    /// Move the spliced data from the data pipe into the buffer.
+    #[cfg(target_os = "linux")]
+    fn unsplice(&mut self) -> io::Result<()> {
+        let n = std::mem::take(&mut self.spliced);
+        if let Some(pipes) = self.splice.filter(|_| n > 0) {
+            pipes.take_data(&mut self.buf.available_slice()[..n])?;
+            self.buf.account_written(n);
+        }
+        Ok(())
+    }
+
+    /// Send the buffers of `self` and `other` and the data that `other`
+    /// spliced. Returns `None` if `other` spliced nothing.
+    #[cfg(target_os = "linux")]
+    fn commit_spliced(
+        &mut self,
+        other: Option<&FuseDevWriter<'a, S>>,
+    ) -> io::Result<Option<usize>> {
+        self.unsplice()?;
+        let Some((other, pipes)) =
+            other.and_then(|w| w.splice.filter(|_| w.spliced > 0).map(|p| (w, p)))
+        else {
+            return Ok(None);
+        };
+        // SAFETY: the fd belongs to the session's fuse device file, which
+        // outlives the writer.
+        let fd = unsafe { BorrowedFd::borrow_raw(self.fd) };
+        let head = [
+            IoSlice::new(self.buf.written()),
+            IoSlice::new(other.buf.written()),
+        ];
+        pipes.send(fd, &head, other.spliced).map(Some)
     }
 
     fn do_write(fd: RawFd, data: &[u8]) -> io::Result<usize> {
@@ -651,6 +746,10 @@ mod async_io {
                 // In non-buffered mode, all data has been written to the fuse device
                 // synchronously by the write methods, so there's nothing to commit.
                 return Ok(0);
+            }
+            #[cfg(target_os = "linux")]
+            if let Some(n) = self.commit_spliced(other)? {
+                return Ok(n);
             }
 
             let o = other.map(|w| w.buf.written()).unwrap_or(&[]);
@@ -1102,6 +1201,221 @@ mod tests {
         writer.write_from_at(&mut file, 40, 16).unwrap_err();
         assert_eq!(writer.available_bytes(), 8);
         assert_eq!(writer.bytes_written(), 40);
+    }
+
+    #[cfg(target_os = "linux")]
+    mod splice {
+        use std::cell::Cell;
+        use std::fs::File;
+        use std::os::unix::net::UnixStream;
+
+        use super::*;
+        use crate::splice::SplicePipes;
+
+        const HEADER: [u8; 16] = [0xa5; 16];
+
+        /// A temporary file with `len` bytes of a pattern that doesn't repeat
+        /// every page.
+        fn source(len: usize) -> (File, Vec<u8>) {
+            let data: Vec<u8> = (0..len).map(|i| (i % 251) as u8).collect();
+            let mut file = TempFile::new().unwrap().into_file();
+            file.write_all(&data).unwrap();
+            (file, data)
+        }
+
+        /// A writer for the header of a reply to `fd`, and one for the data
+        /// that splices with `pipes`.
+        fn writers<'a>(
+            fd: &impl AsRawFd,
+            buf: &'a mut [u8],
+            pipes: &'a SplicePipes,
+        ) -> (FuseDevWriter<'a>, FuseDevWriter<'a>) {
+            let mut w = FuseDevWriter::new(fd.as_raw_fd(), buf)
+                .unwrap()
+                .with_splice(Some(pipes));
+            let data = w.split_at(HEADER.len()).unwrap();
+            (w, data)
+        }
+
+        /// Send a READ reply with `count` bytes of `src` from `off` through a
+        /// writer that splices with `pipes`, to the file `dev`. Returns what
+        /// `write_from_at()` returned, and whether the data went through
+        /// the reply buffer.
+        fn reply<F: FileReadWriteVolatile>(
+            dev: &TempFile,
+            pipes: &SplicePipes,
+            src: F,
+            count: usize,
+            off: u64,
+        ) -> (usize, bool) {
+            let mut buf = vec![0u8; 0x20000];
+            let (mut w, mut data) = writers(dev.as_file(), &mut buf, pipes);
+            let n = data.write_from_at(src, count, off).unwrap();
+            assert_eq!(data.bytes_written(), n);
+            assert_eq!(data.available_bytes(), 0x20000 - HEADER.len() - n);
+            w.write_all(&HEADER).unwrap();
+            assert_eq!(w.commit(Some(&data)).unwrap(), HEADER.len() + n);
+            (n, buf[HEADER.len()..].iter().any(|&b| b != 0))
+        }
+
+        /// Read what the replies wrote to `dev` since the last call.
+        fn sent(dev: &TempFile) -> Vec<u8> {
+            let mut out = Vec::new();
+            let mut f = dev.as_file();
+            f.seek(SeekFrom::Start(0)).unwrap();
+            f.read_to_end(&mut out).unwrap();
+            dev.as_file().set_len(0).unwrap();
+            f.seek(SeekFrom::Start(0)).unwrap();
+            out
+        }
+
+        #[test]
+        fn writer_splices_read_reply() {
+            let dev = TempFile::new().unwrap();
+            let (mut src, data) = source(0x9000);
+            let pipes = SplicePipes::new().unwrap();
+
+            // A range that starts and ends in the middle of a page.
+            let (n, copied) = reply(&dev, &pipes, &mut src, 0x5000, 123);
+            assert_eq!(n, 0x5000);
+            assert!(!copied);
+            assert_eq!(sent(&dev), [&HEADER[..], &data[123..123 + 0x5000]].concat());
+
+            // A short read at the end of the file, and a read past it.
+            let (n, copied) = reply(&dev, &pipes, &mut src, 0x5000, 0x8000);
+            assert_eq!((n, copied), (0x1000, false));
+            assert_eq!(sent(&dev), [&HEADER[..], &data[0x8000..]].concat());
+            assert_eq!(reply(&dev, &pipes, &mut src, 0x1000, 0x9000), (0, false));
+            assert_eq!(sent(&dev), HEADER);
+        }
+
+        #[test]
+        fn writer_splices_after_written_data() {
+            let dev = TempFile::new().unwrap();
+            let (mut src, data) = source(0x3000);
+            let pipes = SplicePipes::new().unwrap();
+
+            // Data written before the spliced data goes into the pipe with the
+            // header, and data written after it moves the spliced data into the
+            // buffer.
+            for post in [&b""[..], b"post"] {
+                let mut buf = vec![0u8; 0x10000];
+                let (mut w, mut d) = writers(dev.as_file(), &mut buf, &pipes);
+                d.write_all(b"pre").unwrap();
+                assert_eq!(d.write_from_at(&mut src, 0x2000, 7).unwrap(), 0x2000);
+                d.write_all(post).unwrap();
+                assert_eq!(d.bytes_written(), 0x2003 + post.len());
+                w.write_all(&HEADER).unwrap();
+                w.commit(Some(&d)).unwrap();
+                assert_eq!(buf[19..].iter().any(|&b| b != 0), !post.is_empty());
+                let want = [&HEADER[..], b"pre", &data[7..0x2007], post].concat();
+                assert_eq!(sent(&dev), want);
+            }
+        }
+
+        #[test]
+        fn writer_drops_unsent_spliced_data() {
+            let dev = TempFile::new().unwrap();
+            let (mut src, data) = source(0x3000);
+            let pipes = SplicePipes::new().unwrap();
+
+            // A reply that fails after the data was spliced sends only its header.
+            let mut buf = vec![0u8; 0x10000];
+            let (mut w, mut d) = writers(dev.as_file(), &mut buf, &pipes);
+            d.write_from_at(&mut src, 0x2000, 0).unwrap();
+            w.write_all(&HEADER).unwrap();
+            w.commit(None).unwrap();
+            assert_eq!(sent(&dev), HEADER);
+
+            // The next reply doesn't send the data left in the pipe.
+            assert_eq!(
+                reply(&dev, &pipes, &mut src, 0x1000, 0x2000),
+                (0x1000, false)
+            );
+            assert_eq!(sent(&dev), [&HEADER[..], &data[0x2000..]].concat());
+        }
+
+        #[test]
+        fn writer_writes_reply_that_splice_cant_send() {
+            let dev = TempFile::new().unwrap();
+            // splice() refuses O_APPEND files before it takes the reply from the pipe.
+            let append = std::fs::OpenOptions::new()
+                .append(true)
+                .open(dev.as_path())
+                .unwrap();
+            let (mut src, data) = source(0x3000);
+            let pipes = SplicePipes::new().unwrap();
+
+            let mut buf = vec![0u8; 0x10000];
+            let (mut w, mut d) = writers(&append, &mut buf, &pipes);
+            assert_eq!(d.write_from_at(&mut src, 0x2000, 3).unwrap(), 0x2000);
+            w.write_all(&HEADER).unwrap();
+            assert_eq!(w.commit(Some(&d)).unwrap(), HEADER.len() + 0x2000);
+            assert_eq!(sent(&dev), [&HEADER[..], &data[3..0x2003]].concat());
+            assert!(!pipes.enabled());
+        }
+
+        /// A file whose descriptor is a socket, which can't splice from an
+        /// offset.
+        struct Unspliceable {
+            file: File,
+            sock: UnixStream,
+            fd_calls: Cell<usize>,
+        }
+
+        impl FileReadWriteVolatile for Unspliceable {
+            fn raw_fd(&self) -> Option<RawFd> {
+                self.fd_calls.set(self.fd_calls.get() + 1);
+                Some(self.sock.as_raw_fd())
+            }
+
+            fn read_volatile(&mut self, slice: FileVolatileSlice) -> io::Result<usize> {
+                self.file.read_volatile(slice)
+            }
+
+            fn write_volatile(&mut self, slice: FileVolatileSlice) -> io::Result<usize> {
+                self.file.write_volatile(slice)
+            }
+
+            fn read_at_volatile(
+                &mut self,
+                slice: FileVolatileSlice,
+                off: u64,
+            ) -> io::Result<usize> {
+                self.file.read_at_volatile(slice, off)
+            }
+
+            fn write_at_volatile(
+                &mut self,
+                slice: FileVolatileSlice,
+                off: u64,
+            ) -> io::Result<usize> {
+                self.file.write_at_volatile(slice, off)
+            }
+        }
+
+        #[test]
+        fn writer_copies_when_splice_fails() {
+            let dev = TempFile::new().unwrap();
+            let (mut src, data) = source(0x3000);
+            let pipes = SplicePipes::new().unwrap();
+            let mut file = Unspliceable {
+                file: src.try_clone().unwrap(),
+                sock: UnixStream::pair().unwrap().0,
+                fd_calls: Cell::new(0),
+            };
+
+            // splice() fails with EINVAL, so the writer copies the data.
+            assert_eq!(reply(&dev, &pipes, &mut file, 0x2000, 5), (0x2000, true));
+            assert_eq!(sent(&dev), [&HEADER[..], &data[5..0x2005]].concat());
+            assert_eq!(file.fd_calls.get(), 1);
+
+            // Splicing stays off, and the next reply doesn't ask for the fd.
+            assert_eq!(reply(&dev, &pipes, &mut file, 0x1000, 0), (0x1000, true));
+            assert_eq!(sent(&dev), [&HEADER[..], &data[..0x1000]].concat());
+            assert_eq!(file.fd_calls.get(), 1);
+            assert_eq!(reply(&dev, &pipes, &mut src, 0x1000, 0), (0x1000, true));
+        }
     }
 
     #[cfg(feature = "async-io")]
