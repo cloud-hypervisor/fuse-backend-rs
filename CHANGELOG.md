@@ -176,6 +176,10 @@
   READDIR, READDIRPLUS and RELEASEDIR with them, so a file system that implements them can
   list a directory without blocking the worker. `Vfs` passes them on to the mounted file
   systems.
+- [337](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/337): The passthrough test daemon takes `--serving sync|async|uring`, `--runtime
+  tokio|uring`, `--no-writeback` and `--kernel-passthrough`. CI also runs xfstests with
+  `SyncFuseServing`, with `AsyncFuseServing` on tokio and on tokio-uring, with
+  `UringFuseServing`, without the writeback cache and with kernel passthrough.
 
 ### Changed
 - [325](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/325): The `fuse-backend-fusedev` `uring` transport uses io-uring 0.6 instead of 0.5,
