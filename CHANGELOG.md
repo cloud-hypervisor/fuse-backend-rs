@@ -335,6 +335,10 @@
   and no code in the workspace relied on it.
 
 ### Fixed
+- [367](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/367): `Vfs` applies the id mapping to the root entry of a mounted file
+  system once. LOOKUP applied it a second time, so with a mapping whose ranges
+  overlap, such as (0, 1, 65536), LOOKUP and READDIRPLUS disagreed about the
+  owner of the mount root.
 - [367](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/367): CREATE replies carry the `attr_flags` of the file system's `Entry`, like
   the other replies with an entry. Both servers sent 0, so a file created on a
   virtio-fs mount with per-file DAX got DAX only after the kernel evicted its
