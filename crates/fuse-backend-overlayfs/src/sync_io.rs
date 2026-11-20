@@ -85,6 +85,15 @@ impl FileSystem for OverlayFs {
         self.do_statvfs(ctx, inode)
     }
 
+    fn syncfs(&self, ctx: &Context, inode: Inode) -> Result<()> {
+        trace!("SYNCFS: inode: {}\n", inode);
+        // Only the upper layer takes writes. Without one there is nothing to sync.
+        match self.upper_layer.as_ref() {
+            Some(upper) => upper.syncfs(ctx, upper.root_inode()),
+            None => Ok(()),
+        }
+    }
+
     fn lookup(&self, ctx: &Context, parent: Inode, name: &CStr) -> Result<Entry> {
         let tmp = name.to_string_lossy().to_string();
         trace!("LOOKUP: parent: {}, name: {}\n", parent, tmp);

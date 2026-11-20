@@ -44,6 +44,8 @@
   permission bits, owner and group of the directories `Vfs` serves itself: its root while no file
   system is mounted at `/`, and the directories on the path to each mount point. The defaults
   keep today's root-owned `0777` ([#148](https://github.com/cloud-hypervisor/fuse-backend-rs/issues/148)).
+- [370](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/370): `OverlayFs` handles `FUSE_SYNCFS` by syncing its upper layer, the
+  only one it writes to. Without an upper layer it answers success.
 - [344](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/344): Handle `FUSE_SYNCFS` (protocol 7.34), which virtiofs sends
   when the guest syncs the file system. Since Linux 6.18 fuseblk mounts send it
   too. The new `FileSystem::syncfs()` defaults to `ENOSYS`, after which the
