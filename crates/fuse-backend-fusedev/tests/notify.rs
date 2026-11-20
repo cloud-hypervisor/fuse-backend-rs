@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! These tests send notifications to a mount that `SyncFuseServing` serves and check what the
-//! kernel does with them. Mounting needs root or fusermount3, and the tests skip without either.
+//! These tests send notifications to a mount that `SyncFuseServing` or `AsyncFuseServing` serves
+//! and check what the kernel does with them. Mounting needs root or fusermount3, and the tests
+//! skip without either.
 
 #[cfg(target_os = "linux")]
 mod notify {
@@ -17,11 +18,17 @@ mod notify {
     use std::time::Duration;
 
     use fuse_backend_core::abi::fuse_abi::{stat64, FsOptions, ROOT_ID};
+    #[cfg(feature = "async-io")]
+    use fuse_backend_core::api::filesystem::AsyncFileSystem;
     use fuse_backend_core::api::filesystem::{
         Context, Entry, FileSystem, ZeroCopyReader, ZeroCopyWriter,
     };
     use fuse_backend_core::api::server::Server;
+    #[cfg(feature = "async-io")]
+    use fuse_backend_core::async_runtime;
     use fuse_backend_core::{Error, Result};
+    #[cfg(feature = "async-io")]
+    use fuse_backend_fusedev::{AsyncFuseServing, AsyncServingConfig};
     use fuse_backend_fusedev::{
         FuseDevWriter, FuseServing, FuseSession, SyncFuseServing, SyncServingConfig,
     };
@@ -136,6 +143,9 @@ mod notify {
         }
     }
 
+    #[cfg(feature = "async-io")]
+    impl AsyncFileSystem for TestFs {}
+
     /// A mounted `TestFs` and the layer that serves it.
     struct Mount {
         fs: Arc<TestFs>,
@@ -187,6 +197,16 @@ mod notify {
         }
     }
 
+    #[cfg(feature = "async-io")]
+    fn async_serving(
+        se: FuseSession,
+        server: Arc<Server<Arc<TestFs>>>,
+    ) -> Option<Box<dyn FuseServing>> {
+        let se = mount(se)?;
+        let serving = AsyncFuseServing::new(se, server, AsyncServingConfig::default()).unwrap();
+        Some(Box::new(serving))
+    }
+
     impl Mount {
         /// Mount a `TestFs` that `SyncFuseServing` serves, or return `None` if mounting fails.
         fn new() -> Option<Mount> {
@@ -233,6 +253,15 @@ mod notify {
             let mut buf = vec![0u8; 2 * SIZE];
             let fd = self.serving.session().get_fuse_file().unwrap().as_raw_fd();
             send(&self.server, FuseDevWriter::new(fd, &mut buf).unwrap())
+        }
+
+        /// Like `notify()`, but run `send` on an async runtime.
+        #[cfg(feature = "async-io")]
+        fn async_notify(
+            &self,
+            send: impl AsyncFnOnce(&Server<Arc<TestFs>>, FuseDevWriter<'_>) -> Result<usize>,
+        ) -> Result<usize> {
+            self.notify(|s, w| async_runtime::block_on(send(s, w)))
         }
     }
 
@@ -298,6 +327,38 @@ mod notify {
 
         // The kernel has no inode 99.
         let result = m.notify(|s, w| s.notify_store(w, 99, 0, b"x"));
+        assert_eq!(errno(&result), Some(libc::ENOENT));
+    }
+
+    /// `store_and_retrieve()` with the async helpers, on a mount that `AsyncFuseServing` serves.
+    #[cfg(feature = "async-io")]
+    #[test]
+    fn test_async_notify_store_and_retrieve() {
+        let Some(m) = Mount::with(async_serving) else {
+            return;
+        };
+        let file = File::open(m.path("file")).unwrap();
+        let data: Vec<u8> = (0..SIZE).map(|i| (i % 251) as u8).collect();
+
+        m.async_notify(async |s, w| s.async_notify_store(w, FILE, 0, &data).await)
+            .unwrap();
+        let mut read = vec![0u8; SIZE];
+        file.read_exact_at(&mut read, 0).unwrap();
+        assert_eq!(read, data);
+        assert_eq!(m.fs.reads.load(Ordering::Relaxed), 0);
+
+        m.async_notify(async |s, w| s.async_notify_retrieve(w, 42, FILE, 0, SIZE as u32).await)
+            .unwrap();
+        let (inode, unique, offset, retrieved) =
+            m.retrieved.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!((inode, unique, offset), (FILE, 42, 0));
+        assert!(
+            retrieved == data,
+            "retrieved {} other bytes",
+            retrieved.len()
+        );
+
+        let result = m.async_notify(async |s, w| s.async_notify_store(w, 99, 0, b"x").await);
         assert_eq!(errno(&result), Some(libc::ENOENT));
     }
 

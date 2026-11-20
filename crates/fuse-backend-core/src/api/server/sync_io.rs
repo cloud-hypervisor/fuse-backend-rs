@@ -183,20 +183,26 @@ impl XattrReply {
 }
 
 impl<F: FileSystem + Sync> Server<F> {
-    /// Send the notification `code` with the body `parts` through `w`.
+    /// The header of the notification `code` with the body `parts`.
     #[cfg(feature = "fusedev")]
-    fn notify<W: Writer>(mut w: W, code: NotifyOpcode, parts: &[&[u8]]) -> Result<usize> {
+    pub(super) fn notify_header(code: NotifyOpcode, parts: &[&[u8]]) -> Result<OutHeader> {
         let len = size_of::<OutHeader>() + parts.iter().map(|part| part.len()).sum::<usize>();
         if len > u32::MAX as usize {
             return Err(Error::EncodeMessage(io::Error::from_raw_os_error(
                 libc::EINVAL,
             )));
         }
-        let header = OutHeader {
+        Ok(OutHeader {
             len: len as u32,
             unique: 0,
             error: code as i32,
-        };
+        })
+    }
+
+    /// Send the notification `code` with the body `parts` through `w`.
+    #[cfg(feature = "fusedev")]
+    fn notify<W: Writer>(mut w: W, code: NotifyOpcode, parts: &[&[u8]]) -> Result<usize> {
+        let header = Self::notify_header(code, parts)?;
         let mut buffer_writer = w.split_at(0).map_err(Error::FailedToSplitWriter)?;
         buffer_writer
             .write_obj(header)
@@ -240,13 +246,20 @@ impl<F: FileSystem + Sync> Server<F> {
     /// as in `notify_inval_entry()`.
     #[cfg(all(feature = "fusedev", target_os = "linux"))]
     pub fn notify_expire_entry<W: Writer>(&self, w: W, parent: u64, name: &CStr) -> Result<usize> {
+        self.check_expire_only()?;
+        Self::notify_entry(w, parent, name, EXPIRE_ONLY)
+    }
+
+    /// Fail with `ENOSYS` unless the file system enabled `FsOptions::HAS_EXPIRE_ONLY` at INIT.
+    #[cfg(all(feature = "fusedev", target_os = "linux"))]
+    pub(super) fn check_expire_only(&self) -> Result<()> {
         let options = FsOptions::from_bits_truncate(self.options.load(Ordering::Acquire));
         if !options.contains(FsOptions::HAS_EXPIRE_ONLY) {
             return Err(Error::EncodeMessage(io::Error::from_raw_os_error(
                 libc::ENOSYS,
             )));
         }
-        Self::notify_entry(w, parent, name, EXPIRE_ONLY)
+        Ok(())
     }
 
     /// Tell the kernel that `name` in `parent`, the inode `child`, was deleted.

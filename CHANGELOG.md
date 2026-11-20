@@ -44,6 +44,9 @@
   permission bits, owner and group of the directories `Vfs` serves itself: its root while no file
   system is mounted at `/`, and the directories on the path to each mount point. The defaults
   keep today's root-owned `0777` ([#148](https://github.com/cloud-hypervisor/fuse-backend-rs/issues/148)).
+- [369](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/369): With `async-io`, `Server` has async variants of the notification helpers, such as
+  `async_notify_store()`, which write through the async methods of the writer.
+  `FuseDevWriter::async_commit()` now calls `commit()`, so it fails with the errno of the write.
 - [330](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/330): `Server` sends the other FUSE notifications: `notify_delete()`,
   `notify_store()`, `notify_retrieve()`, `notify_expire_entry()` (Linux 6.2, needs
   `FsOptions::HAS_EXPIRE_ONLY`, which `Vfs` now negotiates), `notify_increment_epoch()` (Linux
