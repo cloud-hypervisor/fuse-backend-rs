@@ -42,8 +42,8 @@ impl Daemon {
         let cfg = Config {
             root_dir: src.to_string(),
             do_import: false,
-            // The macOS e2e test exercises the xattr family through the
-            // mount; on Linux the config stays at the historical default.
+            // For the xattr steps of the macOS e2e test, skipped on fuse-t.
+            // On Linux the config stays at the historical default.
             xattr: cfg!(target_os = "macos"),
             ..Default::default()
         };
