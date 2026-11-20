@@ -345,6 +345,9 @@
   splice copy. A copy between two mounts now gets EXDEV, and a backend's ENOSYS turns into
   EOPNOTSUPP. On both, Linux falls back for that call only. FreeBSD falls back only on
   ENOSYS, so there both stay ENOSYS. The pseudo fs directories answer EISDIR.
+- [362](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/362): `Vfs` answers a rename or a hard link between two of its mounts with EXDEV
+  instead of EINVAL, as rename(2) and link(2) do between two file systems. `mv` copies the
+  file only on EXDEV. On EINVAL it failed with "cannot move to a subdirectory of itself".
 - [303](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/303): The sync server answers a SETXATTR request it received in full
   but cannot decode — no NUL separator in the attribute name, or a value size
   that disagrees with the body — with `EINVAL` instead of dropping it. FUSE
