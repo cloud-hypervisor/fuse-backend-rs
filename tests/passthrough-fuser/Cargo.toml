@@ -1,0 +1,16 @@
+[package]
+name = "passthrough-fuser"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# fuser >= 0.17: &self Filesystem methods (Send + Sync), Config::n_threads
+# and Config::clone_fd for multi-threaded event loops. The abi-7-x feature
+# flags were removed in 0.18 (ABI negotiation moved to runtime, so the old
+# protocol-7.8 4k-write-splitting trap no longer exists).
+fuser = "0.18"
+libc = "0.2"
+log = "0.4"
+simple_logger = "4"
+signal-hook = "0.3"
+clap = { version = "4", features = ["derive"] }
