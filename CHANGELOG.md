@@ -185,6 +185,11 @@
 - [281](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/281): `abi::fuse_uring` has the commands, INIT flag and fields of protocol 7.46 for buffer pools.
   `Server::uring_bufpool_supported()` tells whether the kernel offered them at INIT, and
   `Server::uring_payload_size()` returns the size of the kernel's payload buffers.
+- [NNN](link): On Linux 5.2 and later, `FuseSession::mount()` mounts through `fsopen()`,
+  `fsmount()` and `move_mount()`, with the options `mount(2)` gets. If that fails, it mounts with
+  `mount(2)` or fusermount as before. With `set_target_mntns()`, a helper thread mounts and
+  unmounts in that namespace, so root no longer needs nsenter and fusermount there.
+  `auto_unmount` still takes fusermount.
 
 ### Changed
 - [325](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/325): The `fuse-backend-fusedev` `uring` transport uses io-uring 0.6 instead of 0.5,
