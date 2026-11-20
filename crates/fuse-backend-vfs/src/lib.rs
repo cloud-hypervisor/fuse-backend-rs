@@ -193,6 +193,10 @@ pub struct VfsOptions {
     /// Add `FsOptions::PASSTHROUGH` for kernel passthrough. If the kernel offers it, init()
     /// sets `no_writeback` and clears `no_open` for all mounts, because passthrough needs open
     /// requests and no writeback cache.
+    ///
+    /// Add `FsOptions::SUBMOUNTS` to mark the root of each mounted file system with
+    /// `ATTR_SUBMOUNT`, so the kernel mounts it as a submount with its own `st_dev`. Only
+    /// virtio-fs offers it, since Linux 5.10.
     pub out_opts: FsOptions,
     /// Declaration of ID mapping, in the format (internal ID, external ID, range).
     /// For example, (0, 1, 65536) represents mapping the external UID/GID range of `1~65536`
@@ -593,13 +597,40 @@ impl Vfs {
                 entry.attr.st_uid = remap_id(entry.attr.st_uid, internal_id, external_id, range);
                 entry.attr.st_gid = remap_id(entry.attr.st_gid, internal_id, external_id, range);
             }
+            self.submount_entry(entry);
             *entry
         })
     }
 
-    /// The root entry of the file system mounted at `mnt`, converted for a reply.
+    /// Clears `ATTR_SUBMOUNT` from `entry` unless the kernel negotiated `FsOptions::SUBMOUNTS`.
+    /// The kernel acts on the flag whenever it offers `FsOptions::SUBMOUNTS`, even if the INIT
+    /// reply didn't take it.
+    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+    fn submount_entry(&self, entry: &mut Entry) {
+        if entry.attr_flags & ATTR_SUBMOUNT == 0 {
+            return;
+        }
+        if self.opts.load().out_opts.contains(FsOptions::SUBMOUNTS) {
+            // fuse_iget() gives an automount point generation 0, and the kernel drops its dentry
+            // when a reply carries another one.
+            entry.generation = 0;
+        } else {
+            entry.attr_flags &= !ATTR_SUBMOUNT;
+        }
+    }
+
+    /// macFUSE has no submounts, and its `fuse_attr.flags` holds chflags(2) flags.
+    #[cfg(target_os = "macos")]
+    fn submount_entry(&self, _entry: &mut Entry) {}
+
+    /// The root entry of the file system mounted at `mnt`, marked as a submount and converted
+    /// for a reply.
     fn mount_root_entry(&self, mnt: &MountPointData) -> Result<Entry> {
         let mut entry = mnt.root_entry;
+        #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+        {
+            entry.attr_flags |= ATTR_SUBMOUNT;
+        }
         self.convert_entry(mnt.fs_idx, mnt.ino, &mut entry)
     }
 
@@ -1754,6 +1785,49 @@ mod tests {
             .getattr(&ctx, VfsInode(0x100_0000_0000_0001), None)
             .unwrap();
         assert_eq!(stat.st_ino, 0x100_0000_0000_0001);
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+    #[test]
+    fn test_submounts() {
+        let ctx = Context::new();
+        let x = CString::new("x").unwrap();
+        let (sub, none) = (FsOptions::SUBMOUNTS, FsOptions::empty());
+        // What out_opts asks for, what the kernel offers, and whether the root of the mount at
+        // /x gets ATTR_SUBMOUNT.
+        for (wanted, offered, marked) in [(sub, sub, true), (sub, none, false), (none, sub, false)]
+        {
+            let mut opts = VfsOptions::default();
+            opts.out_opts.insert(wanted);
+            let vfs = Vfs::new(opts);
+            let idx = vfs.mount(Box::new(FakeFileSystemOne {}), "/x").unwrap();
+            vfs.init(offered).unwrap();
+
+            // A marked root has generation 0, like the automount point the kernel makes for it.
+            let root = vfs.lookup(&ctx, ROOT_ID.into(), &x).unwrap();
+            let expected = if marked {
+                (ATTR_SUBMOUNT, 0)
+            } else {
+                (0, vfs.generation(idx))
+            };
+            assert_eq!((root.attr_flags, root.generation), expected);
+            let mut listed = Vec::new();
+            vfs.readdirplus(&ctx, ROOT_ID.into(), 0, 4096, 0, &mut |_, entry| {
+                listed.push((entry.inode, entry.attr_flags, entry.generation));
+                Ok(1)
+            })
+            .unwrap();
+            assert_eq!(listed, [(root.inode, expected.0, expected.1)]);
+
+            // Below the mount root, a file system's own ATTR_SUBMOUNT needs the same
+            // negotiation.
+            let mut entry = Entry {
+                attr_flags: ATTR_SUBMOUNT,
+                ..Default::default()
+            };
+            vfs.convert_entry(idx, 2, &mut entry).unwrap();
+            assert_eq!((entry.attr_flags, entry.generation), expected);
+        }
     }
 
     #[test]
