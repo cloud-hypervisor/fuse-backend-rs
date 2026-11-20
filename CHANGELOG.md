@@ -32,6 +32,14 @@
   directly by the fusedev build script.
 
 ### Added
+- [371](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/371): `FuseSession::set_splice_write()` makes the Linux
+  channels send READ replies with `splice(2)` when the file system serves the
+  data from a file through `ZeroCopyWriter::write_from()`, as `PassthroughFs`
+  does, so the data goes from the page cache into the FUSE request without a
+  copy through the server. `FileReadWriteVolatile::raw_fd()` gives the
+  transport the file descriptor. A channel falls back to copying when the
+  kernel can't splice. It's off by default, because the pipes count against
+  the user's `pipe-user-pages-soft`.
 - [304](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/304): Give FreeBSD a verification path. The Linux wire-format ABI
   body moves out of `fuse_abi_linux.rs` into a shared `fuse_abi_wire.rs`
   (each per-OS prelude re-exports the libc names the body uses), and a new
