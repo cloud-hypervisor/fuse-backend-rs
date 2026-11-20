@@ -33,7 +33,7 @@ use std::time::{Duration, Instant};
 use io_uring::{cqueue, opcode, squeue, types, IoUring};
 use vm_memory::ByteValued;
 
-use fuse_backend_core::abi::fuse_abi::{InHeader, OutHeader};
+use fuse_backend_core::abi::fuse_abi::{InHeader, Opcode, OutHeader};
 use fuse_backend_core::abi::fuse_uring::{
     FuseUringBufpool, FuseUringCmdReq, FuseUringEntInOut, FuseUringReqHeader,
     FUSE_IO_URING_CMD_ADD_BUFPOOL, FUSE_IO_URING_CMD_ADD_QUEUE, FUSE_IO_URING_CMD_COMMIT_AND_FETCH,
@@ -179,54 +179,59 @@ fn possible_cpu_count() -> Result<usize> {
 /// buffer pool, the kernel lends no buffer to a request without a payload
 /// and without out arguments. `None` marks opcodes this table doesn't know.
 fn op_args(opcode: u32) -> Option<(usize, bool)> {
-    let args = match opcode {
-        1 => (0, true),         // LOOKUP: name only
-        2 => (8, false),        // FORGET: ForgetIn
-        3 => (16, true),        // GETATTR: GetattrIn
-        4 => (88, true),        // SETATTR: SetattrIn
-        5 => (0, true),         // READLINK: no arguments
-        6 => (0, true),         // SYMLINK: name + linkname
-        8 => (16, true),        // MKNOD: MknodIn
-        9 => (8, true),         // MKDIR: MkdirIn
-        10 | 11 => (0, false),  // UNLINK/RMDIR: name only
-        12 => (8, false),       // RENAME: RenameIn
-        13 => (8, true),        // LINK: LinkIn
-        14 => (8, true),        // OPEN: OpenIn
-        15 => (40, true),       // READ: ReadIn
-        16 => (40, true),       // WRITE: WriteIn
-        17 => (0, true),        // STATFS: no arguments
-        18 => (24, false),      // RELEASE: ReleaseIn
-        20 => (16, false),      // FSYNC: FsyncIn
-        21 => (8, false),       // SETXATTR: SetxattrIn
-        22 => (8, true),        // GETXATTR: GetxattrIn
-        23 => (8, true),        // LISTXATTR: GetxattrIn
-        24 => (0, false),       // REMOVEXATTR: name only
-        25 => (24, false),      // FLUSH: FlushIn
-        26 => (16, true),       // INIT: InitIn
-        27 => (8, true),        // OPENDIR: OpenIn
-        28 | 44 => (40, true),  // READDIR/READDIRPLUS: ReadIn
-        29 => (24, false),      // RELEASEDIR: ReleaseIn
-        30 => (16, false),      // FSYNCDIR: FsyncIn
-        31 => (48, true),       // GETLK: LkIn
-        32 | 33 => (48, false), // SETLK/SETLKW: LkIn
-        34 => (8, false),       // ACCESS: AccessIn
-        35 => (16, true),       // CREATE: CreateIn
-        36 => (8, false),       // INTERRUPT: InterruptIn
-        37 => (16, true),       // BMAP: BmapIn
-        38 => (0, false),       // DESTROY: no arguments
-        39 => (32, true),       // IOCTL: IoctlIn
-        40 => (24, true),       // POLL: PollIn
-        41 => (0, false),       // NOTIFY_REPLY: payload only
-        42 => (8, false),       // BATCH_FORGET: BatchForgetIn
-        43 => (32, false),      // FALLOCATE: FallocateIn
-        45 => (16, false),      // RENAME2: Rename2In
-        46 => (24, true),       // LSEEK: LseekIn
-        47 => (56, true),       // COPY_FILE_RANGE: CopyFileRangeIn
+    // No wildcard arm, so that a new Opcode doesn't build without an entry.
+    let args = match Opcode::from(opcode) {
+        Opcode::Lookup => (0, true),                         // name only
+        Opcode::Forget => (8, false),                        // ForgetIn
+        Opcode::Getattr => (16, true),                       // GetattrIn
+        Opcode::Setattr => (88, true),                       // SetattrIn
+        Opcode::Readlink => (0, true),                       // no arguments
+        Opcode::Symlink => (0, true),                        // name + linkname
+        Opcode::Mknod => (16, true),                         // MknodIn
+        Opcode::Mkdir => (8, true),                          // MkdirIn
+        Opcode::Unlink | Opcode::Rmdir => (0, false),        // name only
+        Opcode::Rename => (8, false),                        // RenameIn
+        Opcode::Link => (8, true),                           // LinkIn
+        Opcode::Open => (8, true),                           // OpenIn
+        Opcode::Read => (40, true),                          // ReadIn
+        Opcode::Write => (40, true),                         // WriteIn
+        Opcode::Statfs => (0, true),                         // no arguments
+        Opcode::Release => (24, false),                      // ReleaseIn
+        Opcode::Fsync => (16, false),                        // FsyncIn
+        Opcode::Setxattr => (8, false),                      // SetxattrIn
+        Opcode::Getxattr => (8, true),                       // GetxattrIn
+        Opcode::Listxattr => (8, true),                      // GetxattrIn
+        Opcode::Removexattr => (0, false),                   // name only
+        Opcode::Flush => (24, false),                        // FlushIn
+        Opcode::Init => (16, true),                          // InitIn
+        Opcode::Opendir => (8, true),                        // OpenIn
+        Opcode::Readdir | Opcode::Readdirplus => (40, true), // ReadIn
+        Opcode::Releasedir => (24, false),                   // ReleaseIn
+        Opcode::Fsyncdir => (16, false),                     // FsyncIn
+        Opcode::Getlk => (48, true),                         // LkIn
+        Opcode::Setlk | Opcode::Setlkw => (48, false),       // LkIn
+        Opcode::Access => (8, false),                        // AccessIn
+        Opcode::Create => (16, true),                        // CreateIn
+        Opcode::Interrupt => (8, false),                     // InterruptIn
+        Opcode::Bmap => (16, true),                          // BmapIn
+        Opcode::Destroy => (0, false),                       // no arguments
+        Opcode::Ioctl => (32, true),                         // IoctlIn
+        Opcode::Poll => (24, true),                          // PollIn
+        Opcode::NotifyReply => (0, false),                   // payload only
+        Opcode::BatchForget => (8, false),                   // BatchForgetIn
+        Opcode::Fallocate => (32, false),                    // FallocateIn
+        Opcode::Rename2 => (16, false),                      // Rename2In
+        Opcode::Lseek => (24, true),                         // LseekIn
+        Opcode::CopyFileRange => (56, true),                 // CopyFileRangeIn
         // SETUPMAPPING/REMOVEMAPPING only exist on the virtiofs DAX window
-        // path and are never delivered through /dev/fuse, opcodes 0, 7 and
-        // 19 are undefined, and request() answers the rest, such as
-        // SYNCFS, TMPFILE and STATX, with ENOSYS.
-        _ => return None,
+        // path, never on /dev/fuse. Opcode::from() maps the numbers without
+        // a variant to MaxOpcode and never returns the byte-swapped INIT
+        // opcodes.
+        Opcode::SetupMapping
+        | Opcode::RemoveMapping
+        | Opcode::MaxOpcode
+        | Opcode::CuseInitBswapReserved
+        | Opcode::InitBswapReserved => return None,
     };
     Some(args)
 }
