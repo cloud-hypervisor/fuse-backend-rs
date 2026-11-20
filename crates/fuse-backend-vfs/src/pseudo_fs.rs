@@ -19,7 +19,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
-use fuse_backend_core::abi::fuse_abi::{stat64, Attr, S_IFDIR, S_IRWXG, S_IRWXO, S_IRWXU};
+use fuse_backend_core::abi::fuse_abi::{
+    stat64, Attr, CreateIn, OpenOptions, S_IFDIR, S_IRWXG, S_IRWXO, S_IRWXU,
+};
 use fuse_backend_core::api::filesystem::*;
 
 // ID 0 is reserved for invalid entry, and ID 1 is used for ROOT_ID.
@@ -403,6 +405,18 @@ impl FileSystem for PseudoFs {
 
     fn access(&self, _ctx: &Context, _inode: u64, _mask: u32) -> Result<()> {
         Ok(())
+    }
+
+    // EACCES is what Linux answers for a directory without a create operation. ENOSYS would make
+    // the kernel use MKNOD and OPEN instead of CREATE from then on, for every mount of a Vfs.
+    fn create(
+        &self,
+        _ctx: &Context,
+        _parent: u64,
+        _name: &CStr,
+        _args: CreateIn,
+    ) -> Result<(Entry, Option<u64>, OpenOptions, Option<u32>)> {
+        Err(Error::from_raw_os_error(libc::EACCES))
     }
 }
 

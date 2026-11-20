@@ -131,6 +131,31 @@ fn remap_id(value: u32, from_base: u32, to_base: u32, range: u32) -> u32 {
     }
 }
 
+// On ENOSYS the kernel stops sending some requests on the connection, so one mount without an
+// operation would turn it off for every mount. For those requests Vfs gives the answer the
+// kernel would give the caller after ENOSYS.
+
+/// EOPNOTSUPP on Linux and FreeBSD, whose kernels answer it after ENOSYS from FALLOCATE and the
+/// xattr requests. On macOS ENOTSUP is the errno for unsupported xattrs.
+const UNSUPPORTED: i32 = libc::ENOTSUP;
+
+/// Turns ENOSYS into `errno`.
+fn errno_for_enosys<T>(result: Result<T>, errno: i32) -> Result<T> {
+    match result {
+        Err(e) if e.raw_os_error() == Some(libc::ENOSYS) => Err(Error::from_raw_os_error(errno)),
+        result => result,
+    }
+}
+
+/// Turns ENOSYS into success. The kernel takes ENOSYS from FLUSH, FSYNC, FSYNCDIR and ACCESS
+/// for success.
+fn ok_for_enosys(result: Result<()>) -> Result<()> {
+    match result {
+        Err(e) if e.raw_os_error() == Some(libc::ENOSYS) => Ok(()),
+        result => result,
+    }
+}
+
 impl VfsInode {
     fn new(fs_idx: VfsIndex, ino: u64) -> Self {
         assert_eq!(ino & !VFS_MAX_INO, 0);
