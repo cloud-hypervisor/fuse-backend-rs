@@ -27,8 +27,10 @@ vm-memory = { workspace = true, features = ["backend-mmap"] }
 
 # io_uring only exists on Linux, so `async-io` uses tokio elsewhere.
 [target.'cfg(target_os = "linux")'.dependencies]
-io-uring = { version = "0.5.8", optional = true }
-tokio-uring = { version = "0.4.0", optional = true }
+# Only the runtime probe uses io-uring. Keep it on tokio-uring's version, so
+# `async-io` builds without fusedev's `uring` compile one copy.
+io-uring = { version = "0.6", optional = true }
+tokio-uring = { version = "0.5", optional = true }
 
 [dev-dependencies]
 tempfile = "3"

@@ -113,15 +113,10 @@ impl File {
             }
             #[cfg(target_os = "linux")]
             File::Uring(f) => f.read_at(buf, offset).await,
-            File::Borrowed { fd, .. } => {
+            File::Borrowed { fd, _guard, .. } => {
                 #[cfg(target_os = "linux")]
                 if self.uses_io_uring() {
-                    // Safe because `fd` is valid for the lifetime of this
-                    // object, and the wrapper is forgotten on drop (including
-                    // cancellation of the IO) so it never closes the
-                    // borrowed descriptor.
-                    let file = unsafe { tokio_uring::fs::File::from_raw_fd(*fd) };
-                    return ForgetOnDrop::new(file).read_at(buf, offset).await;
+                    return uring_borrowed::read_at(*fd, _guard, buf, offset).await;
                 }
                 let mut bufs = [buf];
                 let res = preadv(*fd, &mut bufs, offset);
@@ -145,15 +140,10 @@ impl File {
             }
             #[cfg(target_os = "linux")]
             File::Uring(f) => f.readv_at(bufs, offset).await,
-            File::Borrowed { fd, .. } => {
+            File::Borrowed { fd, _guard, .. } => {
                 #[cfg(target_os = "linux")]
                 if self.uses_io_uring() {
-                    // Safe because `fd` is valid for the lifetime of this
-                    // object, and the wrapper is forgotten on drop (including
-                    // cancellation of the IO) so it never closes the
-                    // borrowed descriptor.
-                    let file = unsafe { tokio_uring::fs::File::from_raw_fd(*fd) };
-                    return ForgetOnDrop::new(file).readv_at(bufs, offset).await;
+                    return uring_borrowed::readv_at(*fd, _guard, bufs, offset).await;
                 }
                 let res = preadv(*fd, &mut bufs, offset);
                 (res, bufs)
@@ -176,16 +166,11 @@ impl File {
                 (res, bufs[0])
             }
             #[cfg(target_os = "linux")]
-            File::Uring(f) => f.write_at(buf, offset).await,
-            File::Borrowed { fd, .. } => {
+            File::Uring(f) => f.write_at(buf, offset).submit().await,
+            File::Borrowed { fd, _guard, .. } => {
                 #[cfg(target_os = "linux")]
                 if self.uses_io_uring() {
-                    // Safe because `fd` is valid for the lifetime of this
-                    // object, and the wrapper is forgotten on drop (including
-                    // cancellation of the IO) so it never closes the
-                    // borrowed descriptor.
-                    let file = unsafe { tokio_uring::fs::File::from_raw_fd(*fd) };
-                    return ForgetOnDrop::new(file).write_at(buf, offset).await;
+                    return uring_borrowed::write_at(*fd, _guard, buf, offset).await;
                 }
                 let bufs = [buf];
                 let res = pwritev(*fd, &bufs, offset);
@@ -209,15 +194,10 @@ impl File {
             }
             #[cfg(target_os = "linux")]
             File::Uring(f) => f.writev_at(bufs, offset).await,
-            File::Borrowed { fd, .. } => {
+            File::Borrowed { fd, _guard, .. } => {
                 #[cfg(target_os = "linux")]
                 if self.uses_io_uring() {
-                    // Safe because `fd` is valid for the lifetime of this
-                    // object, and the wrapper is forgotten on drop (including
-                    // cancellation of the IO) so it never closes the
-                    // borrowed descriptor.
-                    let file = unsafe { tokio_uring::fs::File::from_raw_fd(*fd) };
-                    return ForgetOnDrop::new(file).writev_at(bufs, offset).await;
+                    return uring_borrowed::writev_at(*fd, _guard, bufs, offset).await;
                 }
                 let res = pwritev(*fd, &bufs, offset);
                 (res, bufs)
@@ -295,36 +275,147 @@ impl Debug for File {
     }
 }
 
-/// A wrapper which forgets its content instead of dropping it.
+/// io_uring reads and writes on a borrowed descriptor.
 ///
-/// Used to wrap file objects created from borrowed descriptors, so that the
-/// descriptor is never closed, even when the asynchronous IO is cancelled
-/// and the future dropped in flight.
+/// A `tokio_uring::fs::File` would close the descriptor when dropped, and
+/// forgetting it instead leaks the `Rc` it allocates, so these submit the
+/// operations to tokio-uring directly. Each operation keeps its buffers, its
+/// iovecs and the descriptor's guard until the kernel completes it, even if
+/// its future is dropped first.
 #[cfg(target_os = "linux")]
-struct ForgetOnDrop<T>(Option<T>);
+mod uring_borrowed {
+    use std::any::Any;
+    use std::io;
+    use std::marker::PhantomData;
+    use std::os::unix::io::RawFd;
+    use std::sync::Arc;
 
-#[cfg(target_os = "linux")]
-impl<T> ForgetOnDrop<T> {
-    fn new(value: T) -> Self {
-        ForgetOnDrop(Some(value))
+    use io_uring::{cqueue, opcode, squeue, types};
+    use tokio_uring::buf::{IoBuf, IoBufMut};
+    use tokio_uring::{OneshotOutputTransform, UnsubmittedOneshot};
+
+    use super::mark_filled;
+    use crate::file_buf::FileVolatileBuf;
+
+    /// What an operation keeps alive until it completes.
+    struct Data<B> {
+        bufs: B,
+        _iovecs: Vec<libc::iovec>,
+        _guard: Arc<dyn Any>,
     }
-}
 
-#[cfg(target_os = "linux")]
-impl<T> std::ops::Deref for ForgetOnDrop<T> {
-    type Target = T;
+    /// Gives the buffers back with the result.
+    struct Complete<B>(PhantomData<B>);
 
-    fn deref(&self) -> &T {
-        self.0.as_ref().expect("value already consumed")
-    }
-}
+    impl<B> OneshotOutputTransform for Complete<B> {
+        type Output = (io::Result<usize>, B);
+        type StoredData = Data<B>;
 
-#[cfg(target_os = "linux")]
-impl<T> Drop for ForgetOnDrop<T> {
-    fn drop(&mut self) {
-        if let Some(value) = self.0.take() {
-            std::mem::forget(value);
+        fn transform_oneshot_output(self, data: Data<B>, cqe: cqueue::Entry) -> Self::Output {
+            let res = cqe.result();
+            if res < 0 {
+                (Err(io::Error::from_raw_os_error(-res)), data.bufs)
+            } else {
+                (Ok(res as usize), data.bufs)
+            }
         }
+    }
+
+    async fn submit<B: Unpin + 'static>(
+        sqe: squeue::Entry,
+        bufs: B,
+        iovecs: Vec<libc::iovec>,
+        guard: &Arc<dyn Any>,
+    ) -> (io::Result<usize>, B) {
+        let data = Data {
+            bufs,
+            _iovecs: iovecs,
+            _guard: guard.clone(),
+        };
+        UnsubmittedOneshot::new(data, Complete(PhantomData), sqe)
+            .submit()
+            .await
+    }
+
+    pub(super) async fn read_at(
+        fd: RawFd,
+        guard: &Arc<dyn Any>,
+        mut buf: FileVolatileBuf,
+        offset: u64,
+    ) -> (io::Result<usize>, FileVolatileBuf) {
+        let sqe = opcode::Read::new(
+            types::Fd(fd),
+            buf.stable_mut_ptr(),
+            buf.bytes_total() as u32,
+        )
+        .offset(offset)
+        .build();
+        let (res, mut buf) = submit(sqe, buf, Vec::new(), guard).await;
+        if let Ok(n) = res {
+            // Safe because the kernel wrote `n` bytes from the start of the buffer.
+            unsafe { buf.set_init(n) };
+        }
+        (res, buf)
+    }
+
+    pub(super) async fn readv_at(
+        fd: RawFd,
+        guard: &Arc<dyn Any>,
+        bufs: Vec<FileVolatileBuf>,
+        offset: u64,
+    ) -> (io::Result<usize>, Vec<FileVolatileBuf>) {
+        let iovecs: Vec<libc::iovec> = bufs
+            .iter()
+            .map(|b| {
+                let slice = b.io_slice_mut();
+                libc::iovec {
+                    iov_base: slice.as_ptr() as *mut libc::c_void,
+                    iov_len: slice.len(),
+                }
+            })
+            .collect();
+        let sqe = opcode::Readv::new(types::Fd(fd), iovecs.as_ptr(), iovecs.len() as u32)
+            .offset(offset)
+            .build();
+        let (res, mut bufs) = submit(sqe, bufs, iovecs, guard).await;
+        if let Ok(n) = res {
+            mark_filled(&mut bufs, n);
+        }
+        (res, bufs)
+    }
+
+    pub(super) async fn write_at(
+        fd: RawFd,
+        guard: &Arc<dyn Any>,
+        buf: FileVolatileBuf,
+        offset: u64,
+    ) -> (io::Result<usize>, FileVolatileBuf) {
+        let sqe = opcode::Write::new(types::Fd(fd), buf.stable_ptr(), buf.bytes_init() as u32)
+            .offset(offset)
+            .build();
+        submit(sqe, buf, Vec::new(), guard).await
+    }
+
+    pub(super) async fn writev_at(
+        fd: RawFd,
+        guard: &Arc<dyn Any>,
+        bufs: Vec<FileVolatileBuf>,
+        offset: u64,
+    ) -> (io::Result<usize>, Vec<FileVolatileBuf>) {
+        let iovecs: Vec<libc::iovec> = bufs
+            .iter()
+            .map(|b| {
+                let slice = b.io_slice();
+                libc::iovec {
+                    iov_base: slice.as_ptr() as *mut libc::c_void,
+                    iov_len: slice.len(),
+                }
+            })
+            .collect();
+        let sqe = opcode::Writev::new(types::Fd(fd), iovecs.as_ptr(), iovecs.len() as u32)
+            .offset(offset)
+            .build();
+        submit(sqe, bufs, iovecs, guard).await
     }
 }
 
@@ -380,6 +471,19 @@ pub fn preadv(fd: RawFd, bufs: &mut [FileVolatileBuf], offset: u64) -> std::io::
     })
 }
 
+/// Mark the `count` bytes a vectored read put into `bufs`, buffer by buffer.
+fn mark_filled(bufs: &mut [FileVolatileBuf], mut count: usize) {
+    for buf in bufs.iter_mut() {
+        let cnt = std::cmp::min(count, buf.cap() - buf.len());
+        unsafe { buf.set_size(buf.len() + cnt) };
+        count -= cnt;
+        if count == 0 {
+            break;
+        }
+    }
+    assert_eq!(count, 0);
+}
+
 fn preadv_once(fd: RawFd, bufs: &mut [FileVolatileBuf], offset: u64) -> std::io::Result<usize> {
     let iov: Vec<IoSliceMut> = bufs.iter().map(|v| v.io_slice_mut()).collect();
 
@@ -395,16 +499,7 @@ fn preadv_once(fd: RawFd, bufs: &mut [FileVolatileBuf], offset: u64) -> std::io:
         };
 
         if res >= 0 {
-            let mut count = res as usize;
-            for buf in bufs.iter_mut() {
-                let cnt = std::cmp::min(count, buf.cap() - buf.len());
-                unsafe { buf.set_size(buf.len() + cnt) };
-                count -= cnt;
-                if count == 0 {
-                    break;
-                }
-            }
-            assert_eq!(count, 0);
+            mark_filled(bufs, res as usize);
             return Ok(res as usize);
         } else {
             let e = std::io::Error::last_os_error();
@@ -649,6 +744,49 @@ mod tests {
         let mut buffer = [0u8; 4];
         assert_eq!(std::io::Read::read(&mut owner, &mut buffer).unwrap(), 4);
         assert_eq!(&buffer, b"test");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_borrowed_fd_uring_read_keeps_guard_after_drop() {
+        use std::future::Future;
+        use std::task::Poll;
+
+        let mut fds = [0; 2];
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        let rd = unsafe { std::fs::File::from_raw_fd(fds[0]) };
+        let wr = unsafe { std::fs::File::from_raw_fd(fds[1]) };
+        let guard = Arc::new(());
+        let file = File::borrow_fd(rd.as_raw_fd(), guard.clone());
+        let writer = File::borrow_fd(wr.as_raw_fd(), Arc::new(()));
+        if !file.uses_io_uring() {
+            return;
+        }
+        let mut mem = [0u8; 4];
+
+        block_on(async {
+            // The pipe is empty, so the read stays in flight.
+            let mut read =
+                Box::pin(file.async_read_at(unsafe { FileVolatileBuf::new(&mut mem) }, 0));
+            let pending =
+                std::future::poll_fn(|cx| Poll::Ready(read.as_mut().poll(cx).is_pending()));
+            assert!(pending.await);
+            drop(read);
+            assert_eq!(Arc::strong_count(&guard), 3);
+
+            // Once the kernel completes the read, the runtime drops the guard. The
+            // runtime reaps completions while it waits for the writes.
+            for _ in 0..1000 {
+                let mut data = *b"test";
+                let buf = unsafe { FileVolatileBuf::new_with_data(&mut data, 4) };
+                assert_eq!(writer.async_write_at(buf, 0).await.0.unwrap(), 4);
+                if Arc::strong_count(&guard) == 2 {
+                    break;
+                }
+            }
+            assert_eq!(Arc::strong_count(&guard), 2);
+        });
+        assert_eq!(&mem, b"test");
     }
 
     #[test]
