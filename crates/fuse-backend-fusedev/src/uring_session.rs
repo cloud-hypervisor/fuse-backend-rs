@@ -25,6 +25,8 @@ use std::io::{self, IoSlice, Write};
 use std::mem::ManuallyDrop;
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::ptr::NonNull;
+#[cfg(test)]
+use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Sender};
 use std::sync::{Arc, Condvar, Mutex};
@@ -1290,6 +1292,9 @@ struct UringWorker<F: FileSystem + Send + Sync + 'static> {
     server: Arc<Server<F>>,
     /// Ends the connection when the worker fails.
     abort: Arc<ConnectionAbort>,
+    /// Counts the entries that release_entries() leaked.
+    #[cfg(test)]
+    leaked: Arc<AtomicUsize>,
 }
 
 /// Lets the workers register their entries in rounds, see
@@ -1642,7 +1647,10 @@ impl<F: FileSystem + Send + Sync + 'static> UringWorker<F> {
         if failed_while_connected(&result, &exit) {
             self.abort.abort();
         }
-        release_entries(ring, entries, completions.armed);
+        #[cfg_attr(not(test), allow(unused_variables))]
+        let leaked = release_entries(ring, entries, completions.armed);
+        #[cfg(test)]
+        self.leaked.fetch_add(leaked, Ordering::Relaxed);
         if let Some(payload) = panic {
             error!("uring worker: a request handler panicked");
             std::panic::resume_unwind(payload);
@@ -1897,8 +1905,9 @@ const RELEASE_TIMEOUT: Duration = Duration::from_secs(1);
 /// from a workqueue. So wait for the `armed` outstanding completions first,
 /// which arrive quickly once the connection is torn down. If they don't
 /// arrive within `RELEASE_TIMEOUT`, leak the entries instead of freeing
-/// memory the kernel may still write to.
-fn release_entries(mut ring: FuseRing, entries: Vec<UringEntry>, mut armed: usize) {
+/// memory the kernel may still write to. Returns how many entries the
+/// kernel still held.
+fn release_entries(mut ring: FuseRing, entries: Vec<UringEntry>, mut armed: usize) -> usize {
     let deadline = Instant::now() + RELEASE_TIMEOUT;
     while armed > 0 {
         let left = deadline.saturating_duration_since(Instant::now());
@@ -1935,6 +1944,7 @@ fn release_entries(mut ring: FuseRing, entries: Vec<UringEntry>, mut armed: usiz
         std::mem::forget(entries);
     }
     drop(ring);
+    armed
 }
 
 /// Serve FUSE requests over io_uring (experimental).
@@ -1950,6 +1960,9 @@ pub struct UringFuseServing<F: FileSystem + Send + Sync + 'static> {
     /// Whether the queues have zero-copy.
     #[cfg(test)]
     zero_copy: bool,
+    /// How many ring entries the workers leaked when they stopped.
+    #[cfg(test)]
+    leaked: Arc<AtomicUsize>,
     _fs: std::marker::PhantomData<F>,
 }
 
@@ -2048,6 +2061,8 @@ impl<F: FileSystem + Send + Sync + 'static> UringFuseServing<F> {
         let abort = Arc::new(ConnectionAbort::new(session.mountpoint()));
         let nr_rounds = spread.iter().flatten().map(|&(_, round)| round + 1).max();
         let rounds = Arc::new(RegisterRounds::new(workers, nr_rounds.unwrap_or(1)));
+        #[cfg(test)]
+        let leaked = Arc::new(AtomicUsize::new(0));
         let mut worker_list = Vec::with_capacity(workers);
         for entries in spread {
             worker_list.push(UringWorker {
@@ -2067,6 +2082,8 @@ impl<F: FileSystem + Send + Sync + 'static> UringFuseServing<F> {
                 rounds: rounds.clone(),
                 server: server.clone(),
                 abort: abort.clone(),
+                #[cfg(test)]
+                leaked: leaked.clone(),
             });
         }
 
@@ -2146,6 +2163,8 @@ impl<F: FileSystem + Send + Sync + 'static> UringFuseServing<F> {
             pooled: pools.is_some(),
             #[cfg(test)]
             zero_copy,
+            #[cfg(test)]
+            leaked,
             _fs: std::marker::PhantomData,
         })
     }
@@ -2656,6 +2675,7 @@ mod tests {
                 path: None,
                 done: AtomicBool::new(false),
             }),
+            leaked: Arc::new(AtomicUsize::new(0)),
         };
         (worker, source)
     }
@@ -3169,11 +3189,12 @@ mod tests {
         }
 
         // Tearing the connection down completes the commands of all armed
-        // entries, so the workers get their entries back well within
-        // RELEASE_TIMEOUT instead of waiting it out and leaking them.
-        let start = Instant::now();
+        // entries, so the workers get their entries back instead of waiting
+        // out RELEASE_TIMEOUT and leaking them. Count the leaks rather than
+        // time the drop, which also waits for the unmount and the threads.
+        let leaked = serving.leaked.clone();
         drop(serving);
-        assert!(start.elapsed() < RELEASE_TIMEOUT);
+        assert_eq!(leaked.load(Ordering::Relaxed), 0);
         assert!(std::fs::read(mnt.as_path().join("hello")).is_err());
     }
 
@@ -3298,6 +3319,7 @@ mod tests {
         });
         rx.recv_timeout(Duration::from_secs(5))
             .expect("the worker didn't end the connection after the panic");
+        assert_eq!(serving.leaked.load(Ordering::Relaxed), 0);
     }
 
     /// Ending the connection, as a failed worker does, stops every worker,
@@ -3350,6 +3372,7 @@ mod tests {
         });
         rx.recv_timeout(Duration::from_secs(5))
             .expect("the workers didn't stop after the connection ended");
+        assert_eq!(serving.leaked.load(Ordering::Relaxed), 0);
         assert!(std::fs::read_dir(mnt.as_path()).is_err());
     }
 }
