@@ -56,28 +56,6 @@ use crate::{FuseBuf, FuseChannel, FuseDevReaderExt, FuseSession, FUSE_HEADER_SIZ
 const IN_HEADER_SIZE: usize = 40;
 const OUT_HEADER_SIZE: usize = 16;
 
-/// Field-for-field mirror of `struct io_uring_sqe`, used to reach the
-/// `addr`/`len` fields of an SQE128 which the io-uring crate does not
-/// expose for `IORING_OP_URING_CMD` entries.
-#[allow(dead_code)]
-#[repr(C)]
-struct SqeMirror {
-    opcode: u8,
-    flags: u8,
-    ioprio: u16,
-    fd: i32,
-    off: u64,
-    addr: u64,
-    len: u32,
-    op_flags: u32,
-    user_data: u64,
-    buf_index: u16,
-    personality: u16,
-    splice_fd_in: i32,
-    addr3: u64,
-    pad2: u64,
-}
-
 /// Configuration of the io_uring serving transport.
 #[derive(Clone, Copy, Debug)]
 pub struct UringConfig {
@@ -778,31 +756,30 @@ fn cmd_sqe(
     let mut bytes = [0u8; 80];
     bytes[..std::mem::size_of::<FuseUringCmdReq>()].copy_from_slice(req.as_slice());
 
-    let sqe = opcode::UringCmd80::new(types::Fd(fd), cmd_op)
+    let mut sqe = opcode::UringCmd80::new(types::Fd(fd), cmd_op)
         .cmd(bytes)
         .build();
     let Some(iovecs) = iovecs else {
         return sqe;
     };
-    // sqe->addr points to the iovec array and sqe->len to the segment
-    // count, as required by fuse_uring_get_iovec_from_sqe(). The crate
-    // exposes no accessor for them on URING_CMD entries, so patch them
-    // through a layout mirror of the SQE.
-    //
-    // Safe because SqeMirror mirrors the kernel ABI layout of
-    // io_uring_sqe and Entry128 is an SQE plus a 64-byte command area;
-    // the sizes are asserted below and only addr/len are overwritten.
+    // fuse_uring_get_iovec_from_sqe() wants the iovec array in sqe->addr
+    // and the segment count in sqe->len. The crate has no setter for them
+    // on URING_CMD entries, so write them at their offsets in struct
+    // io_uring_sqe (include/uapi/linux/io_uring.h).
+    const SQE_ADDR: usize = 16;
+    const SQE_LEN: usize = 24;
+    // Safe because Entry128 is a repr(C) SQE128 that starts with struct
+    // io_uring_sqe, so both writes stay inside it.
     unsafe {
-        assert_eq!(
-            std::mem::size_of::<(SqeMirror, [u8; 64])>(),
-            std::mem::size_of::<squeue::Entry128>()
-        );
-        let (mut inner, cmd_area) =
-            std::mem::transmute::<squeue::Entry128, (SqeMirror, [u8; 64])>(sqe);
-        inner.addr = iovecs.as_ptr() as u64;
-        inner.len = FUSE_URING_IOV_SEGS as u32;
-        std::mem::transmute::<(SqeMirror, [u8; 64]), squeue::Entry128>((inner, cmd_area))
+        let raw = (&raw mut sqe).cast::<u8>();
+        raw.add(SQE_ADDR)
+            .cast::<u64>()
+            .write_unaligned(iovecs.as_ptr() as u64);
+        raw.add(SQE_LEN)
+            .cast::<u32>()
+            .write_unaligned(FUSE_URING_IOV_SEGS as u32);
     }
+    sqe
 }
 
 /// A FUSE ring. `IORING_OP_URING_CMD` with the FUSE command payload needs
@@ -2191,45 +2168,69 @@ mod tests {
         assert_eq!(entry.header().ring_ent_in_out.payload_sz, 0);
     }
 
+    /// The SQE128 of a uring command, built field by field at the offsets of
+    /// `struct io_uring_sqe` in include/uapi/linux/io_uring.h, with the
+    /// 80-byte command area at offset 48.
+    fn uapi_cmd_sqe(
+        fd: i32,
+        cmd_op: u32,
+        flags: u8,
+        addr: u64,
+        len: u32,
+        user_data: u64,
+        req: &FuseUringCmdReq,
+    ) -> [u8; 128] {
+        let mut sqe = [0u8; 128];
+        sqe[0] = 46; // IORING_OP_URING_CMD
+        sqe[1] = flags;
+        sqe[4..8].copy_from_slice(&fd.to_ne_bytes());
+        sqe[8..12].copy_from_slice(&cmd_op.to_ne_bytes());
+        sqe[16..24].copy_from_slice(&addr.to_ne_bytes());
+        sqe[24..28].copy_from_slice(&len.to_ne_bytes());
+        sqe[32..40].copy_from_slice(&user_data.to_ne_bytes());
+        sqe[48..48 + std::mem::size_of::<FuseUringCmdReq>()].copy_from_slice(req.as_slice());
+        sqe
+    }
+
     #[test]
     fn test_cmd_sqe() {
-        let entry = UringEntry::new(7, Payload::Own(64));
-        let sqe = entry.cmd_sqe(42, FUSE_IO_URING_CMD_REGISTER, 0xdead_beef, 5);
+        // Safe because Entry128 is a repr(C) SQE128 of integers, without
+        // padding, and io-uring builds it zeroed, so all 128 bytes are
+        // initialized.
+        let bytes = |sqe: squeue::Entry128| unsafe {
+            std::mem::transmute::<squeue::Entry128, [u8; 128]>(sqe)
+        };
+        let fd = 42;
 
-        assert_eq!(
-            std::mem::size_of::<(SqeMirror, [u8; 64])>(),
-            std::mem::size_of::<squeue::Entry128>()
-        );
-        // Safe because of the size assertion above.
-        let (inner, extra): (SqeMirror, [u8; 64]) = unsafe { std::mem::transmute(sqe) };
-
-        // IORING_OP_URING_CMD as of kernel ABI 6.14.
-        assert_eq!(inner.opcode, 46);
-        assert_eq!(inner.fd, 42);
-        assert_eq!(inner.addr, entry.iovecs.as_ptr() as u64);
-        assert_eq!(inner.len, FUSE_URING_IOV_SEGS as u32);
-        assert_eq!(inner.user_data, 5);
-
-        // The io-uring crate splits the 80-byte command payload of an
-        // SQE128: the first 16 bytes are placed in the sqe cmd union
-        // (the addr3/__pad2 slots), the remaining 64 bytes in the extra
-        // area, so the payload is contiguous at sqe offsets 48..128 and
-        // io_uring_sqe128_cmd() reads it in one piece.
-        let mut cmd_bytes = [0u8; 80];
-        cmd_bytes[0..8].copy_from_slice(&inner.addr3.to_le_bytes());
-        cmd_bytes[8..16].copy_from_slice(&inner.pad2.to_le_bytes());
-        cmd_bytes[16..80].copy_from_slice(&extra);
-
-        // The command payload must carry the queue id and commit id.
-        let cmd = FuseUringCmdReq {
-            qid: 7,
-            commit_id: 0xdead_beef,
+        // A setup command, as add_bufpools() builds it.
+        let add_queue = FuseUringCmdReq {
+            qid: 3,
             ..Default::default()
         };
-        assert_eq!(
-            cmd_bytes[..std::mem::size_of::<FuseUringCmdReq>()],
-            *cmd.as_slice()
-        );
+        let sqe = cmd_sqe(fd, FUSE_IO_URING_CMD_ADD_QUEUE, &add_queue, None)
+            .flags(squeue::Flags::IO_LINK)
+            .user_data(3);
+        let link = squeue::Flags::IO_LINK.bits();
+        let expected = uapi_cmd_sqe(fd, FUSE_IO_URING_CMD_ADD_QUEUE, link, 0, 0, 3, &add_queue);
+        assert_eq!(bytes(sqe), expected);
+
+        // The entry commands, which also carry the entry's iovec array.
+        let entry = UringEntry::new(7, Payload::Own(64));
+        let iovecs = entry.iovecs.as_ptr() as u64;
+        let segs = FUSE_URING_IOV_SEGS as u32;
+        for (cmd_op, commit_id, user_data) in [
+            (FUSE_IO_URING_CMD_REGISTER, 0, 5),
+            (FUSE_IO_URING_CMD_COMMIT_AND_FETCH, 0xdead_beef, 6),
+        ] {
+            let sqe = entry.cmd_sqe(fd, cmd_op, commit_id, user_data);
+            let req = FuseUringCmdReq {
+                qid: 7,
+                commit_id,
+                ..Default::default()
+            };
+            let expected = uapi_cmd_sqe(fd, cmd_op, 0, iovecs, segs, user_data, &req);
+            assert_eq!(bytes(sqe), expected, "cmd_op {cmd_op}");
+        }
     }
 
     #[test]
