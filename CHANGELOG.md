@@ -32,6 +32,12 @@
   directly by the fusedev build script.
 
 ### Added
+- [356](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/356): Negotiate `FUSE_HAS_SYNCFS` (protocol 7.47, Linux 7.4), with which
+  a `/dev/fuse` server asks for `FUSE_SYNCFS` on `syncfs(2)` and `sync(2)` of the
+  mount. The kernel offers it only to a server that opened `/dev/fuse` with
+  `CAP_SYS_ADMIN`. A file system asks for it by returning `FsOptions::HAS_SYNCFS`
+  from `init()`, `Vfs` through `VfsOptions::out_opts`, and `PassthroughFs`
+  through the new `Config::syncfs`. None of them asks by default.
 - [344](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/344): Handle `FUSE_SYNCFS` (protocol 7.34), which virtiofs sends
   when the guest syncs the file system. Since Linux 6.18 fuseblk mounts send it
   too. The new `FileSystem::syncfs()` defaults to `ENOSYS`, after which the

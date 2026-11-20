@@ -229,6 +229,10 @@ const DIRECT_IO_ALLOW_MMAP: u64 = 1_u64 << 36;
 /// backing files (added in Linux 6.9; macFUSE never offers it).
 const PASSTHROUGH: u64 = 1_u64 << 37;
 
+/// The server asks for SYNCFS on syncfs(2) and sync(2) (added in Linux 7.4;
+/// macFUSE has no SYNCFS).
+const HAS_SYNCFS: u64 = 1_u64 << 44;
+
 /**
  *
  * fuse_attr flags
@@ -317,6 +321,7 @@ bitflags! {
         /// to backing files; requires the kernel to also offer
         /// `FsOptions::PASSTHROUGH` (macFUSE never offers it).
         const PASSTHROUGH = PASSTHROUGH;
+        const HAS_SYNCFS = HAS_SYNCFS;
     }
 }
 

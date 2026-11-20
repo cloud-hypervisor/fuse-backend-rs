@@ -193,6 +193,9 @@ pub struct VfsOptions {
     /// Add `FsOptions::PASSTHROUGH` for kernel passthrough. If the kernel offers it, init()
     /// sets `no_writeback` and clears `no_open` for all mounts, because passthrough needs open
     /// requests and no writeback cache.
+    ///
+    /// The default set leaves out `FsOptions::HAS_SYNCFS`, because once it is negotiated every
+    /// `sync(2)` on the system waits for the server. Add it to have `syncfs(2)` reach the mounts.
     pub out_opts: FsOptions,
     /// Declaration of ID mapping, in the format (internal ID, external ID, range).
     /// For example, (0, 1, 65536) represents mapping the external UID/GID range of `1~65536`
@@ -1491,6 +1494,8 @@ mod tests {
 
         let opts = vfs.opts.load();
         let out_opts = opts.out_opts;
+        // SYNCFS makes every sync(2) wait for the server, so it is opt-in.
+        assert!(!out_opts.contains(FsOptions::HAS_SYNCFS));
 
         assert!(opts.no_open);
         assert!(opts.no_opendir);
