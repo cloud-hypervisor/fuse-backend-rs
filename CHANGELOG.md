@@ -210,6 +210,11 @@
   only READDIR and READDIRPLUS still run on the runtime thread. A MKDIR, MKNOD, SYMLINK, LINK or
   OPENDIR that is dropped while a pool thread serves it gives back the lookup count or handle it
   took.
+- [365](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/365): On Linux 5.2 and later, `FuseSession::mount()` mounts through `fsopen()`,
+  `fsmount()` and `move_mount()`, with the options `mount(2)` gets. If that fails, it mounts with
+  `mount(2)` or fusermount as before. With `set_target_mntns()`, a helper thread mounts and
+  unmounts in that namespace, so root no longer needs nsenter and fusermount there.
+  `auto_unmount` still takes fusermount.
 
 ### Changed
 - [325](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/325): The `fuse-backend-fusedev` `uring` transport uses io-uring 0.6 instead of 0.5,
