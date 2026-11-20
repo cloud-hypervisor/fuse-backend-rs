@@ -48,8 +48,7 @@
   lets the FUSE mount be idmapped with `mount_setattr(MOUNT_ATTR_IDMAP)`.
   `PassthroughFs` negotiates it on its own when the new
   `Config::allow_idmap` is set; behind a `Vfs`, add it to
-  `VfsOptions::out_opts`. `OverlayFs` isn't ready for it: it copies files
-  up with the ids of the request, which are then invalid.
+  `VfsOptions::out_opts`. `OverlayFs` has its own `Config::allow_idmap`.
 
 - [304](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/304): Give FreeBSD a verification path. The Linux wire-format ABI
   body moves out of `fuse_abi_linux.rs` into a shared `fuse_abi_wire.rs`
@@ -371,6 +370,13 @@
   splice copy. A copy between two mounts now gets EXDEV, and a backend's ENOSYS turns into
   EOPNOTSUPP. On both, Linux falls back for that call only. FreeBSD falls back only on
   ENOSYS, so there both stay ENOSYS. The pseudo fs directories answer EISDIR.
+- [364](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/364): `OverlayFs` copies files up as the daemon and gives each copy the
+  owner and mode of the lower file. It used to create the copy with the ids of
+  the request that wrote to the file, so the copy could get the caller as its
+  owner, or fail with `EACCES` where the caller can't write to the upper
+  directory. With `FsOptions::ALLOW_IDMAP` those ids are `FUSE_INVALID_UIDGID`,
+  and the new `Config::allow_idmap` now lets `OverlayFs` offer the flag.
+  `OverlayFs` creates whiteouts as the daemon too.
 - [303](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/303): The sync server answers a SETXATTR request it received in full
   but cannot decode — no NUL separator in the attribute name, or a value size
   that disagrees with the body — with `EINVAL` instead of dropping it. FUSE

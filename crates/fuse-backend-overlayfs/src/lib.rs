@@ -19,7 +19,9 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock, Weak};
 
 use fuse_backend_core::abi::fuse_abi::{stat64, statvfs64, CreateIn, ROOT_ID as FUSE_ROOT_ID};
-use fuse_backend_core::api::filesystem::{Context, DirEntry, Entry, Layer, OpenOptions};
+use fuse_backend_core::api::filesystem::{
+    Context, DirEntry, Entry, Layer, OpenOptions, SetattrValid,
+};
 #[cfg(not(feature = "async-io"))]
 use fuse_backend_core::api::BackendFileSystem;
 use fuse_backend_core::api::{SLASH_ASCII, VFS_MAX_INO};
@@ -347,15 +349,16 @@ impl RealInode {
         Ok(child_real_inodes)
     }
 
-    fn create_whiteout(&self, ctx: &Context, name: &str) -> Result<RealInode> {
+    // Whiteouts belong to the overlay, so the daemon creates them, as it does copy-ups.
+    fn create_whiteout(&self, name: &str) -> Result<RealInode> {
         if !self.in_upper_layer {
             return Err(Error::from_raw_os_error(libc::EROFS));
         }
 
         let cname = utils::to_cstring(name)?;
-        let entry = self
-            .layer
-            .create_whiteout(ctx, self.inode, cname.as_c_str())?;
+        let entry =
+            self.layer
+                .create_whiteout(&Context::default(), self.inode, cname.as_c_str())?;
 
         // Wrap whiteout to RealInode.
         Ok(RealInode {
@@ -491,6 +494,37 @@ impl RealInode {
             opaque: false,
             stat: Some(entry.attr),
         })
+    }
+
+    // Give this copy-up, `name` in the upper directory `parent`, the owner and mode of the lower
+    // inode `lower`. chown() clears the setuid and setgid bits, so the mode goes last. On
+    // failure, remove the copy so that the next copy-up starts over.
+    fn finish_copy_up(&self, parent: u64, name: &str, lower: &stat64) -> Result<()> {
+        let ctx = Context::default();
+        let set_attr = |valid| self.layer.setattr(&ctx, self.inode, *lower, None, valid);
+        // Filling the copy as the daemon changes neither its owner nor its mode.
+        let res = self
+            .stat
+            .map_or_else(|| self.stat64(&ctx), Ok)
+            .and_then(|mut st| {
+                if (st.st_uid, st.st_gid) != (lower.st_uid, lower.st_gid) {
+                    st = set_attr(SetattrValid::UID | SetattrValid::GID)?.0;
+                }
+                if st.st_mode != lower.st_mode && !utils::is_symlink(*lower) {
+                    set_attr(SetattrValid::MODE)?;
+                }
+                Ok(())
+            });
+        if res.is_err() {
+            if let Ok(name) = utils::to_cstring(name) {
+                let _ = if utils::is_dir(*lower) {
+                    self.layer.rmdir(&ctx, parent, &name)
+                } else {
+                    self.layer.unlink(&ctx, parent, &name)
+                };
+            }
+        }
+        res
     }
 }
 
@@ -730,13 +764,10 @@ impl OverlayInode {
         Ok(childrens)
     }
 
-    // Create a new directory in upper layer for node, node must be directory.
-    pub fn create_upper_dir(
-        self: &Arc<Self>,
-        ctx: &Context,
-        mode_umask: Option<(u32, u32)>,
-    ) -> Result<()> {
-        let st = self.stat64(ctx)?;
+    // Copy the directory up to the upper layer, after its parents. See OverlayFs::copy_node_up().
+    pub fn create_upper_dir(self: &Arc<Self>) -> Result<()> {
+        let ctx = Context::default();
+        let st = self.stat64(&ctx)?;
         if !utils::is_dir(st) {
             return Err(Error::from_raw_os_error(libc::ENOTDIR));
         }
@@ -754,19 +785,14 @@ impl OverlayInode {
         };
 
         if !pnode.in_upper_layer() {
-            pnode.create_upper_dir(ctx, None)?; // recursive call
+            pnode.create_upper_dir()?; // recursive call
         }
         let mut child = None;
         pnode.handle_upper_inode_locked(&mut |parent_upper_inode| -> Result<bool> {
             match parent_upper_inode {
                 Some(parent_ri) => {
-                    let ri = match mode_umask {
-                        Some((mode, umask)) => {
-                            parent_ri.mkdir(ctx, self.name.as_str(), mode, umask)?
-                        }
-                        None => parent_ri.mkdir(ctx, self.name.as_str(), st.st_mode, 0)?,
-                    };
-                    // create directory here
+                    let ri = parent_ri.mkdir(&ctx, self.name.as_str(), st.st_mode, 0)?;
+                    ri.finish_copy_up(parent_ri.inode, self.name.as_str(), &st)?;
                     child.replace(ri);
                 }
                 None => {
@@ -1552,7 +1578,7 @@ impl OverlayFs {
         }
 
         // Copy parent node up if necessary.
-        let pnode = self.copy_node_up(ctx, Arc::clone(parent_node))?;
+        let pnode = self.copy_node_up(Arc::clone(parent_node))?;
 
         let mut new_node = None;
         let path = format!("{}/{}", pnode.path, name);
@@ -1631,7 +1657,7 @@ impl OverlayFs {
                 }
 
                 // Copy parent node up if necessary.
-                let pnode = self.copy_node_up(ctx, Arc::clone(parent_node))?;
+                let pnode = self.copy_node_up(Arc::clone(parent_node))?;
                 pnode.handle_upper_inode_locked(&mut |parent_real_inode| -> Result<bool> {
                     let parent_real_inode = match parent_real_inode {
                         Some(inode) => inode,
@@ -1661,7 +1687,7 @@ impl OverlayFs {
             }
             None => {
                 // Copy parent node up if necessary.
-                let pnode = self.copy_node_up(ctx, Arc::clone(parent_node))?;
+                let pnode = self.copy_node_up(Arc::clone(parent_node))?;
                 let mut new_node = None;
                 let path = format!("{}/{}", pnode.path, name);
                 pnode.handle_upper_inode_locked(&mut |parent_real_inode| -> Result<bool> {
@@ -1723,7 +1749,7 @@ impl OverlayFs {
                 }
 
                 // Copy parent node up if necessary.
-                let pnode = self.copy_node_up(ctx, Arc::clone(parent_node))?;
+                let pnode = self.copy_node_up(Arc::clone(parent_node))?;
                 pnode.handle_upper_inode_locked(&mut |parent_real_inode| -> Result<bool> {
                     let parent_real_inode = match parent_real_inode {
                         Some(inode) => inode,
@@ -1756,7 +1782,7 @@ impl OverlayFs {
             }
             None => {
                 // Copy parent node up if necessary.
-                let pnode = self.copy_node_up(ctx, Arc::clone(parent_node))?;
+                let pnode = self.copy_node_up(Arc::clone(parent_node))?;
                 let mut new_node = None;
                 let path = format!("{}/{}", pnode.path, name);
                 pnode.handle_upper_inode_locked(&mut |parent_real_inode| -> Result<bool> {
@@ -1840,8 +1866,8 @@ impl OverlayFs {
             return Err(Error::from_raw_os_error(libc::EPERM));
         }
 
-        let src_node = self.copy_node_up(ctx, Arc::clone(src_node))?;
-        let new_parent = self.copy_node_up(ctx, Arc::clone(new_parent))?;
+        let src_node = self.copy_node_up(Arc::clone(src_node))?;
+        let new_parent = self.copy_node_up(Arc::clone(new_parent))?;
         let src_ino = src_node.first_layer_inode().2;
 
         match self.lookup_node_ignore_enoent(ctx, new_parent.inode, name)? {
@@ -1943,7 +1969,7 @@ impl OverlayFs {
                 }
 
                 // Copy parent node up if necessary.
-                let pnode = self.copy_node_up(ctx, Arc::clone(parent_node))?;
+                let pnode = self.copy_node_up(Arc::clone(parent_node))?;
                 pnode.handle_upper_inode_locked(&mut |parent_real_inode| -> Result<bool> {
                     let parent_real_inode = match parent_real_inode {
                         Some(inode) => inode,
@@ -1973,7 +1999,7 @@ impl OverlayFs {
             }
             None => {
                 // Copy parent node up if necessary.
-                let pnode = self.copy_node_up(ctx, Arc::clone(parent_node))?;
+                let pnode = self.copy_node_up(Arc::clone(parent_node))?;
                 let mut new_node = None;
                 let path = format!("{}/{}", pnode.path, name);
                 pnode.handle_upper_inode_locked(&mut |parent_real_inode| -> Result<bool> {
@@ -2007,7 +2033,7 @@ impl OverlayFs {
         Ok(())
     }
 
-    fn copy_symlink_up(&self, ctx: &Context, node: Arc<OverlayInode>) -> Result<Arc<OverlayInode>> {
+    fn copy_symlink_up(&self, node: Arc<OverlayInode>, st: stat64) -> Result<Arc<OverlayInode>> {
         if node.in_upper_layer() {
             return Ok(node);
         }
@@ -2030,10 +2056,11 @@ impl OverlayFs {
             None => return Err(Error::other("no parent?")),
         };
 
+        let ctx = &Context::default();
         let (self_layer, _, self_inode) = node.first_layer_inode();
 
         if !parent_node.in_upper_layer() {
-            parent_node.create_upper_dir(ctx, None)?;
+            parent_node.create_upper_dir()?;
         }
 
         // Read the linkname from lower layer.
@@ -2047,7 +2074,9 @@ impl OverlayFs {
             // We already create upper dir for parent_node above.
             let parent_real_inode =
                 parent_upper_inode.ok_or_else(|| Error::from_raw_os_error(libc::EROFS))?;
-            new_upper_real.replace(parent_real_inode.symlink(ctx, path, name.as_str())?);
+            let real_inode = parent_real_inode.symlink(ctx, path, name.as_str())?;
+            real_inode.finish_copy_up(parent_real_inode.inode, name.as_str(), &st)?;
+            new_upper_real.replace(real_inode);
             Ok(false)
         })?;
 
@@ -2070,7 +2099,7 @@ impl OverlayFs {
 
     // Copy regular file from lower layer to upper layer.
     // Caller must ensure node doesn't have upper layer.
-    fn copy_regfile_up(&self, ctx: &Context, node: Arc<OverlayInode>) -> Result<Arc<OverlayInode>> {
+    fn copy_regfile_up(&self, node: Arc<OverlayInode>, st: stat64) -> Result<Arc<OverlayInode>> {
         if node.in_upper_layer() {
             return Ok(node);
         }
@@ -2093,22 +2122,24 @@ impl OverlayFs {
             None => return Err(Error::other("no parent?")),
         };
 
-        let st = node.stat64(ctx)?;
+        let ctx = &Context::default();
         let (lower_layer, _, lower_inode) = node.first_layer_inode();
 
         if !parent_node.in_upper_layer() {
-            parent_node.create_upper_dir(ctx, None)?;
+            parent_node.create_upper_dir()?;
         }
 
         // create the file in upper layer using information from lower layer
         let args = CreateIn {
             flags: libc::O_WRONLY as u32,
-            mode: st.st_mode,
+            // The copy is the daemon's until finish_copy_up(), which adds these bits.
+            mode: st.st_mode & !(libc::S_ISUID | libc::S_ISGID),
             umask: 0,
             fuse_flags: 0,
         };
 
         let mut upper_handle = 0u64;
+        let mut upper_parent = 0;
         let mut upper_real_inode = None;
         parent_node.handle_upper_inode_locked(&mut |parent_upper_inode| -> Result<bool> {
             // We already create upper dir for parent_node.
@@ -2118,6 +2149,7 @@ impl OverlayFs {
             })?;
             let (inode, h) = parent_real_inode.create(ctx, name.as_str(), args)?;
             upper_handle = h.unwrap_or(0);
+            upper_parent = parent_real_inode.inode;
             upper_real_inode.replace(inode);
             Ok(false)
         })?;
@@ -2191,6 +2223,7 @@ impl OverlayFs {
                     return Err(e);
                 }
             }
+            ri.finish_copy_up(upper_parent, name.as_str(), &st)?;
 
             // update upper_inode and first_inode()
             node.add_upper_inode(ri, true);
@@ -2208,25 +2241,29 @@ impl OverlayFs {
         Ok(Arc::clone(&node))
     }
 
-    fn copy_node_up(&self, ctx: &Context, node: Arc<OverlayInode>) -> Result<Arc<OverlayInode>> {
+    // Copy-up runs as the daemon, like the kernel's overlayfs with the mounter's credentials, and
+    // gives the copy the owner and mode of the lower inode. The ids of the request that triggers
+    // it are FUSE_INVALID_UIDGID with FsOptions::ALLOW_IDMAP, and otherwise belong to a caller
+    // who may own neither the file nor the upper directory.
+    fn copy_node_up(&self, node: Arc<OverlayInode>) -> Result<Arc<OverlayInode>> {
         if node.in_upper_layer() {
             return Ok(node);
         }
 
-        let st = node.stat64(ctx)?;
+        let st = node.stat64(&Context::default())?;
         // directory
         if utils::is_dir(st) {
-            node.create_upper_dir(ctx, None)?;
+            node.create_upper_dir()?;
             return Ok(Arc::clone(&node));
         }
 
         // For symlink.
-        if st.st_mode & libc::S_IFMT == libc::S_IFLNK {
-            return self.copy_symlink_up(ctx, Arc::clone(&node));
+        if utils::is_symlink(st) {
+            return self.copy_symlink_up(Arc::clone(&node), st);
         }
 
         // For regular file.
-        self.copy_regfile_up(ctx, Arc::clone(&node))
+        self.copy_regfile_up(Arc::clone(&node), st)
     }
 
     // Location of the directory entry `name` in the upper layer under
@@ -2348,7 +2385,7 @@ impl OverlayFs {
                 .ok_or_else(|| Error::from_raw_os_error(libc::EINVAL))?
         };
         for (p, n) in missing {
-            let p = self.copy_node_up(ctx, p)?;
+            let p = self.copy_node_up(p)?;
             p.handle_upper_inode_locked(&mut |parent_real_inode| -> Result<bool> {
                 let parent_real_inode = match parent_real_inode {
                     Some(inode) => inode,
@@ -2434,7 +2471,7 @@ impl OverlayFs {
             true
         };
 
-        let pnode = self.copy_node_up(ctx, Arc::clone(&pnode))?;
+        let pnode = self.copy_node_up(Arc::clone(&pnode))?;
 
         // With one overlay inode shared by all hard links of a file, the
         // directory entry being removed may live in a different layer
@@ -2552,7 +2589,7 @@ impl OverlayFs {
                     Error::from_raw_os_error(libc::EINVAL)
                 })?;
 
-                let child_ri = parent_real_inode.create_whiteout(ctx, sname.as_str())?;
+                let child_ri = parent_real_inode.create_whiteout(sname.as_str())?;
                 let path = format!("{}/{}", pnode.path, sname);
                 let ino = self.alloc_inode(&path)?;
                 let mut new_ovi =
@@ -2777,7 +2814,7 @@ impl OverlayFs {
                     .cloned()
                     .ok_or_else(|| Error::from_raw_os_error(libc::EROFS))?;
                 // copy up to upper layer
-                self.copy_node_up(ctx, Arc::clone(&node))?;
+                self.copy_node_up(Arc::clone(&node))?;
             }
 
             let (layer, in_upper_layer, inode) = node.first_layer_inode();
@@ -2845,18 +2882,10 @@ mod tests {
         assert!(is_multi_link_file(stat_with(libc::S_IFLNK | 0o777, 2)));
     }
 
-    /// An overlay of an empty upper layer over a lower layer with a
-    /// directory "d" of four files.
-    fn readdirplus_fs() -> (OverlayFs, TempDir, TempDir) {
+    /// An overlay of PassthroughFs layers on `upper` and `lower`.
+    fn overlay_fs(upper: &TempDir, lower: &TempDir) -> OverlayFs {
         use fuse_backend_passthrough::{Config as PassthroughConfig, PassthroughFs};
 
-        let lower = TempDir::new().unwrap();
-        let upper = TempDir::new().unwrap();
-        let dir = lower.as_path().join("d");
-        std::fs::create_dir(&dir).unwrap();
-        for i in 0..4 {
-            std::fs::File::create(dir.join(format!("f{}", i))).unwrap();
-        }
         let layer = |root: &TempDir| -> Arc<BoxedLayer> {
             let fs = PassthroughFs::<()>::new(PassthroughConfig {
                 root_dir: root.as_path().to_str().unwrap().to_string(),
@@ -2868,8 +2897,8 @@ mod tests {
             Arc::new(Box::new(fs))
         };
         let fs = OverlayFs::new(
-            Some(layer(&upper)),
-            vec![layer(&lower)],
+            Some(layer(upper)),
+            vec![layer(lower)],
             Config {
                 do_import: true,
                 ..Default::default()
@@ -2877,7 +2906,20 @@ mod tests {
         )
         .unwrap();
         fs.import().unwrap();
-        (fs, lower, upper)
+        fs
+    }
+
+    /// An overlay of an empty upper layer over a lower layer with a
+    /// directory "d" of four files.
+    fn readdirplus_fs() -> (OverlayFs, TempDir, TempDir) {
+        let lower = TempDir::new().unwrap();
+        let upper = TempDir::new().unwrap();
+        let dir = lower.as_path().join("d");
+        std::fs::create_dir(&dir).unwrap();
+        for i in 0..4 {
+            std::fs::File::create(dir.join(format!("f{}", i))).unwrap();
+        }
+        (overlay_fs(&upper, &lower), lower, upper)
     }
 
     /// The lookup counts of the root, of `dir` and of its children.
@@ -2945,5 +2987,89 @@ mod tests {
         assert_eq!(lookup_counts(&fs, dir), expected);
 
         fs.releasedir(&ctx, dir, 0, handle).unwrap();
+    }
+
+    // Copy-up gives the copies the owner and mode of the lower inodes, whatever the ids of the
+    // request: FUSE_INVALID_UIDGID with ALLOW_IDMAP, or the owner of the file, who can't create
+    // anything in the root-owned upper directory. Whiteouts belong to the daemon.
+    #[test]
+    fn test_copy_up_keeps_lower_owner() {
+        use fuse_backend_core::abi::fuse_abi::FUSE_INVALID_UIDGID;
+        use std::os::unix::fs::{lchown, symlink, FileTypeExt, MetadataExt, PermissionsExt};
+
+        let ids = |id| Context {
+            uid: id,
+            gid: id,
+            ..Default::default()
+        };
+        for ctx in [ids(FUSE_INVALID_UIDGID), ids(1000)] {
+            let lower = TempDir::new().unwrap();
+            let upper = TempDir::new().unwrap();
+            let path = |name| lower.as_path().join(name);
+            std::fs::create_dir(path("d")).unwrap();
+            std::fs::write(path("d/f"), b"data").unwrap();
+            std::fs::write(path("d/g"), b"").unwrap();
+            symlink("f", path("d/l")).unwrap();
+            for name in ["d", "d/f", "d/g", "d/l"] {
+                if let Err(e) = lchown(path(name), Some(1000), Some(1000)) {
+                    eprintln!("skipping test_copy_up_keeps_lower_owner: chown: {}", e);
+                    return;
+                }
+            }
+            // After the chown, which clears the setuid and setgid bits of files.
+            for (name, mode) in [("d", 0o2750), ("d/f", 0o4754)] {
+                std::fs::set_permissions(path(name), std::fs::Permissions::from_mode(mode))
+                    .unwrap();
+            }
+
+            let fs = overlay_fs(&upper, &lower);
+            let cname = |name| CString::new(name).unwrap();
+            let d = fs.lookup(&ctx, FUSE_ROOT_ID, &cname("d")).unwrap().inode;
+            let f = fs.lookup(&ctx, d, &cname("f")).unwrap().inode;
+            let l = fs.lookup(&ctx, d, &cname("l")).unwrap().inode;
+            // Opening f for writing copies d and f up, and linking l copies it up.
+            let handle = fs
+                .open(&ctx, f, libc::O_WRONLY as u32, 0)
+                .unwrap()
+                .0
+                .unwrap();
+            fs.release(&ctx, f, 0, handle, false, false, None).unwrap();
+            fs.link(&ctx, l, d, &cname("l2")).unwrap();
+            fs.unlink(&ctx, d, &cname("g")).unwrap();
+
+            let path = |name| upper.as_path().join(name);
+            for (name, mode) in [
+                ("d", libc::S_IFDIR | 0o2750),
+                ("d/f", libc::S_IFREG | 0o4754),
+                ("d/l", libc::S_IFLNK | 0o777),
+            ] {
+                let md = std::fs::symlink_metadata(path(name)).unwrap();
+                assert_eq!(
+                    (md.uid(), md.gid(), md.mode()),
+                    (1000, 1000, mode),
+                    "{}",
+                    name
+                );
+            }
+            assert_eq!(std::fs::read(path("d/f")).unwrap(), b"data");
+            let md = std::fs::symlink_metadata(path("d/g")).unwrap();
+            assert!(md.file_type().is_char_device() && md.rdev() == 0);
+            assert_eq!(md.uid(), 0);
+        }
+    }
+
+    #[test]
+    fn test_init_allow_idmap() {
+        use fuse_backend_core::api::filesystem::FsOptions;
+
+        for allow_idmap in [false, true] {
+            let config = Config {
+                allow_idmap,
+                ..Default::default()
+            };
+            let fs = OverlayFs::new(None, vec![], config).unwrap();
+            let opts = fs.init(FsOptions::ALLOW_IDMAP).unwrap();
+            assert_eq!(opts.contains(FsOptions::ALLOW_IDMAP), allow_idmap);
+        }
     }
 }
