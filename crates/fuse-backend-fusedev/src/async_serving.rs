@@ -57,7 +57,9 @@ impl Default for AsyncServingConfig {
 /// Serve FUSE requests with multiple asynchronous workers.
 ///
 /// The serving layer takes ownership of the mounted session: dropping it
-/// unmounts the filesystem and joins all serving threads.
+/// unmounts the filesystem and joins all serving threads. A connection
+/// that open files keep up after the unmount ends once the workers have
+/// replied to the requests they took, see [`FuseServing`].
 pub struct AsyncFuseServing<F: AsyncFileSystem + Send + Sync + 'static> {
     session: FuseSession,
     workers: WorkerSet,
@@ -99,6 +101,7 @@ impl<F: AsyncFileSystem + Send + Sync + 'static> AsyncFuseServing<F> {
         }
 
         let mut set = WorkerSet::new();
+        set.end_connection_on_stop(&session);
         let exit = set.exit_flag();
         let tracker = set.tracker();
         let (ready_tx, ready_rx) = channel::<bool>();
@@ -112,8 +115,9 @@ impl<F: AsyncFileSystem + Send + Sync + 'static> AsyncFuseServing<F> {
                     let ready_tx = ready_tx.clone();
                     move || {
                         // Report the thread exit to the serving layer's
-                        // wait().
-                        let _exited = tracker.exit_guard();
+                        // wait(), and the requests the task serves to its
+                        // stop.
+                        let exited = tracker.exit_guard();
                         // Runtime and task creation may panic (io_uring
                         // ring allocation, fd setup); the guard turns that
                         // into a constructor error below.
@@ -128,6 +132,7 @@ impl<F: AsyncFileSystem + Send + Sync + 'static> AsyncFuseServing<F> {
                                 FuseDevTask::new_with_max_inflight(buf_size, file, server, exit, n)
                             }
                         };
+                        task.report_activity(exited.activity().clone());
                         guard.ready();
                         runtime.block_on(task.poll_handler());
                     }
@@ -167,9 +172,10 @@ impl<F: AsyncFileSystem + Send + Sync + 'static> Drop for AsyncFuseServing<F> {
     fn drop(&mut self) {
         // Pending reads on the workers' cloned file descriptions cannot be
         // woken with FuseSession::wake(), which only reaches epoll-based
-        // channels: tearing the connection down completes them with ENODEV
-        // instead, which ends poll_handler(). Requests already in flight
-        // are still served and replied before a worker exits.
+        // channels: tearing the connection down, by the unmount or by
+        // stop() through fusectl, completes them with ENODEV instead, which
+        // ends poll_handler(). Requests already in flight are still served
+        // and replied before a worker exits.
         self.workers.stop(&mut self.session, false);
     }
 }
@@ -312,6 +318,27 @@ mod tests {
             .expect("the workers didn't stop after detach()");
         waiter.join().unwrap();
         assert!(std::fs::read(mnt.as_path().join("hello")).is_err());
+    }
+
+    fn async_serving<F: AsyncFileSystem + Send + Sync + 'static>(
+        se: FuseSession,
+        server: Arc<Server<F>>,
+    ) -> AsyncFuseServing<F> {
+        let cfg = AsyncServingConfig {
+            workers: 2,
+            max_inflight: 0,
+        };
+        AsyncFuseServing::new(se, server, cfg).unwrap()
+    }
+
+    #[test]
+    fn test_async_serving_stop_with_child_in_exec() {
+        crate::serving::tests::linux::stop_with_child_in_exec(async_serving);
+    }
+
+    #[test]
+    fn test_async_serving_stop_with_request_in_flight() {
+        crate::serving::tests::linux::stop_with_request_in_flight(async_serving);
     }
 
     mod gated_dir {
