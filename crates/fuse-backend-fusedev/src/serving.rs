@@ -129,7 +129,8 @@ pub struct SyncServingConfig {
     ///
     /// Blocking channels cannot be woken by [`FuseSession::wake()`]; they
     /// exit when the connection is torn down. On macOS, where reception is
-    /// inherently blocking, the knob is ignored.
+    /// inherently blocking, the knob is ignored. FreeBSD ignores it too,
+    /// because its channels always wait in poll(2).
     pub blocking: bool,
 }
 
@@ -154,8 +155,9 @@ impl Default for SyncServingConfig {
 /// On Linux every worker owns a channel created by
 /// [`FuseSession::new_channel()`] — or, with
 /// [`SyncServingConfig::blocking`], a blocking channel from
-/// `FuseSession::new_blocking_channel()`. On macOS the session exposes a
-/// single channel whose reception is inherently blocking, so the
+/// `FuseSession::new_blocking_channel()`. On FreeBSD every worker owns a
+/// channel from [`FuseSession::new_channel()`]. On macOS the session exposes
+/// a single channel whose reception is inherently blocking, so the
 /// configuration is validated accordingly.
 pub struct SyncFuseServing<F: FileSystem + Send + Sync + 'static> {
     session: FuseSession,
@@ -196,6 +198,15 @@ impl<F: FileSystem + Send + Sync + 'static> SyncFuseServing<F> {
                 );
             }
         }
+        #[cfg(target_os = "freebsd")]
+        {
+            if cfg.blocking {
+                warn!(
+                    "sync serving: FreeBSD channels always poll, \
+                     ignoring the `blocking` configuration"
+                );
+            }
+        }
 
         #[cfg(target_os = "linux")]
         {
@@ -205,10 +216,10 @@ impl<F: FileSystem + Send + Sync + 'static> SyncFuseServing<F> {
                 spawn_workers(session, server, workers, FuseSession::new_channel)
             }
         }
-        #[cfg(target_os = "macos")]
+        // macOS has a single channel, checked above, and every FreeBSD
+        // worker polls a channel of its own.
+        #[cfg(not(target_os = "linux"))]
         {
-            // macFUSE reception is a plain blocking read on the single
-            // session channel; the configuration was validated above.
             spawn_workers(session, server, workers, FuseSession::new_channel)
         }
     }
@@ -226,10 +237,9 @@ impl<F: FileSystem + Send + Sync + 'static> FuseServing for SyncFuseServing<F> {
 
 impl<F: FileSystem + Send + Sync + 'static> Drop for SyncFuseServing<F> {
     fn drop(&mut self) {
-        // Waking the session is a no-op unless epoll-based channels are
-        // registered with it, so it is unconditional: blocking channels
-        // exit through the ENODEV that tearing the connection down
-        // produces.
+        // Waking the session only stops the channels that wait on its
+        // waker, so it is unconditional: blocking channels exit through
+        // the ENODEV that tearing the connection down produces.
         self.workers.stop(&mut self.session, true);
     }
 }
@@ -362,10 +372,10 @@ impl WorkerSet {
 
     /// Signal all workers to stop, tear the session down and join them.
     ///
-    /// `wake` wakes the epoll-based channels registered with the session,
-    /// which snaps their `epoll_wait` out immediately; blocking channels
-    /// and io_uring workers instead exit through the `ENODEV`/ring-error
-    /// completion that tearing the connection down produces. In-flight
+    /// `wake` wakes the epoll- and poll-based channels of the session, which
+    /// snaps their wait out immediately; blocking channels and io_uring
+    /// workers instead exit through the `ENODEV`/ring-error completion that
+    /// tearing the connection down produces. In-flight
     /// requests are still served and replied before a worker exits.
     pub(crate) fn stop(&mut self, session: &mut FuseSession, wake: bool) {
         self.exit.store(true, Ordering::Release);
@@ -478,6 +488,159 @@ mod tests {
         let mut session = FuseSession::new(dir.as_path(), "test", "", false).unwrap();
         set.wait();
         set.stop(&mut session, true);
+    }
+
+    #[cfg(target_os = "freebsd")]
+    mod freebsd {
+        use super::*;
+
+        use std::ffi::CStr;
+        use std::io;
+        use std::path::Path;
+        use std::time::Duration;
+
+        use fuse_backend_core::abi::fuse_abi::{stat64, ROOT_ID};
+        use fuse_backend_core::api::filesystem::{Context, DirEntry, Entry, ZeroCopyWriter};
+
+        /// A read-only file system with a single file, `/hello`.
+        struct HelloFs;
+
+        const HELLO: u64 = 2;
+        const HELLO_DATA: &[u8] = b"hello, fuse\n";
+
+        fn attr(inode: u64) -> stat64 {
+            let mut st: stat64 = unsafe { std::mem::zeroed() };
+            st.st_ino = inode;
+            if inode == ROOT_ID {
+                st.st_mode = libc::S_IFDIR | 0o755;
+                st.st_nlink = 2;
+            } else {
+                st.st_mode = libc::S_IFREG | 0o444;
+                st.st_nlink = 1;
+                st.st_size = HELLO_DATA.len() as i64;
+            }
+            st
+        }
+
+        impl FileSystem for HelloFs {
+            type Inode = u64;
+            type Handle = u64;
+
+            fn lookup(&self, _: &Context, parent: u64, name: &CStr) -> io::Result<Entry> {
+                if parent != ROOT_ID || name.to_bytes() != b"hello" {
+                    return Err(io::Error::from_raw_os_error(libc::ENOENT));
+                }
+                Ok(Entry {
+                    inode: HELLO,
+                    generation: 0,
+                    attr: attr(HELLO),
+                    attr_flags: 0,
+                    attr_timeout: Duration::from_secs(1),
+                    entry_timeout: Duration::from_secs(1),
+                })
+            }
+
+            fn getattr(
+                &self,
+                _: &Context,
+                inode: u64,
+                _: Option<u64>,
+            ) -> io::Result<(stat64, Duration)> {
+                Ok((attr(inode), Duration::from_secs(1)))
+            }
+
+            fn read(
+                &self,
+                _: &Context,
+                _: u64,
+                _: u64,
+                w: &mut dyn ZeroCopyWriter,
+                size: u32,
+                offset: u64,
+                _: Option<u64>,
+                _: u32,
+            ) -> io::Result<usize> {
+                let start = HELLO_DATA.len().min(offset as usize);
+                let end = HELLO_DATA.len().min(start + size as usize);
+                w.write(&HELLO_DATA[start..end])
+            }
+
+            fn readdir(
+                &self,
+                _: &Context,
+                _: u64,
+                _: u64,
+                _: u32,
+                offset: u64,
+                add_entry: &mut dyn FnMut(DirEntry) -> io::Result<usize>,
+            ) -> io::Result<()> {
+                if offset == 0 {
+                    add_entry(DirEntry {
+                        ino: HELLO,
+                        offset: 1,
+                        type_: libc::DT_REG as u32,
+                        name: b"hello",
+                    })?;
+                }
+                Ok(())
+            }
+        }
+
+        /// Mount `HelloFs` with two workers, or `None` when not running as root with fusefs
+        /// loaded.
+        fn mount_hello(mnt: &TempDir) -> Option<SyncFuseServing<HelloFs>> {
+            if !nix::unistd::geteuid().is_root() || !Path::new("/dev/fuse").exists() {
+                eprintln!("mounting needs root and the fusefs module, skipping");
+                return None;
+            }
+            let mut se = FuseSession::new(mnt.as_path(), "hellofs", "test", true).unwrap();
+            se.mount().unwrap();
+            let cfg = SyncServingConfig {
+                workers: 2,
+                ..Default::default()
+            };
+            Some(SyncFuseServing::new(se, Arc::new(Server::new(HelloFs)), cfg).unwrap())
+        }
+
+        #[test]
+        fn test_sync_serving_freebsd_mount() {
+            let mnt = TempDir::new().unwrap();
+            let Some(serving) = mount_hello(&mnt) else {
+                return;
+            };
+
+            let st = nix::sys::statfs::statfs(mnt.as_path()).unwrap();
+            assert_eq!(st.filesystem_type_name(), "fusefs.test");
+            let names: Vec<_> = std::fs::read_dir(mnt.as_path())
+                .unwrap()
+                .map(|e| e.unwrap().file_name())
+                .collect();
+            assert_eq!(names, ["hello"]);
+            let hello = mnt.as_path().join("hello");
+            assert_eq!(std::fs::read(&hello).unwrap(), HELLO_DATA);
+            assert!(std::fs::write(&hello, b"read-only").is_err());
+
+            // Dropping the serving layer unmounts the session and joins the workers.
+            drop(serving);
+            assert!(std::fs::read(&hello).is_err());
+        }
+
+        /// An unmount from outside, like umount(8), stops every worker, not just the one the
+        /// kernel wakes.
+        #[test]
+        fn test_sync_serving_freebsd_external_unmount() {
+            let mnt = TempDir::new().unwrap();
+            let Some(serving) = mount_hello(&mnt) else {
+                return;
+            };
+            assert_eq!(
+                std::fs::read(mnt.as_path().join("hello")).unwrap(),
+                HELLO_DATA
+            );
+
+            nix::mount::unmount(mnt.as_path(), nix::mount::MntFlags::empty()).unwrap();
+            serving.wait();
+        }
     }
 
     #[cfg(target_os = "linux")]
