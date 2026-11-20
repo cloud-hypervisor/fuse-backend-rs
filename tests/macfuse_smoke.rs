@@ -118,19 +118,28 @@ mod macfuse_tests {
         assert_eq!(content.trim(), "written");
 
         // xattr: set, list, and read through the mount land on the backing
-        // file.
-        exec(format!("xattr -w user.e2e v {}/hello", mnt).as_str()).unwrap();
-        let xattrs = exec(format!("xattr -l {}/hello", mnt).as_str()).unwrap();
-        assert!(xattrs.find("user.e2e").is_some(), "xattrs: {}", xattrs);
-        let value = exec(format!("xattr -p user.e2e {}/hello", mnt).as_str()).unwrap();
-        assert!(value.trim().eq("v"), "value: {}", value);
-        // Reading a missing attribute through the mount must fail — the only
-        // success path would be serving data for an attribute the daemon
-        // answered ENOATTR for. The error text also records which errno the
-        // transport forwarded, the one part the shim tests cannot observe.
-        let e = try_exec(format!("xattr -p user.e2e.missing {}/hello", mnt).as_str())
-            .expect_err("missing-attribute read through the mount must fail");
-        println!("enoattr through mount: {}", e);
+        // file. fuse-t 1.2.9 doesn't send xattrs to the daemon. macOS keeps
+        // them in an AppleDouble `._hello` file instead and reports any
+        // failure there as EPERM, so on fuse-t these steps test macOS, not
+        // PassthroughFs. They stay for a macFUSE build of this test, though
+        // the test builds only with fuse-t today.
+        if cfg!(feature = "fuse-t") {
+            println!("xattr: skipped, fuse-t doesn't send xattrs to the daemon");
+        } else {
+            exec(format!("xattr -w user.e2e v {}/hello", mnt).as_str()).unwrap();
+            let xattrs = exec(format!("xattr -l {}/hello", mnt).as_str()).unwrap();
+            assert!(xattrs.find("user.e2e").is_some(), "xattrs: {}", xattrs);
+            let value = exec(format!("xattr -p user.e2e {}/hello", mnt).as_str()).unwrap();
+            assert!(value.trim().eq("v"), "value: {}", value);
+            // Reading a missing attribute through the mount must fail. The
+            // only success path would be serving data for an attribute the
+            // daemon answered ENOATTR for. The error text also records which
+            // errno the transport forwarded, the one part the shim tests
+            // cannot observe.
+            let e = try_exec(format!("xattr -p user.e2e.missing {}/hello", mnt).as_str())
+                .expect_err("missing-attribute read through the mount must fail");
+            println!("enoattr through mount: {}", e);
+        }
 
         // link-by-fd: a hard link through the mount shares the backing inode.
         exec(format!("ln {}/hello {}/hello.lnk", mnt, mnt).as_str()).unwrap();
