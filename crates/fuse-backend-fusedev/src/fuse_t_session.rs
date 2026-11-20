@@ -16,14 +16,18 @@ use std::os::unix::prelude::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Arc, Mutex};
-use std::thread::JoinHandle;
+use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant};
 
 use libc::{proc_pidpath, PROC_PIDPATHINFO_MAXSIZE};
 use nix::errno::Errno;
-use nix::sys::signal::{signal, SigHandler, Signal};
+use nix::sys::signal::{kill, signal, SigHandler, Signal};
+use nix::sys::socket::sockopt::ReceiveTimeout;
 use nix::sys::socket::{recv, send, setsockopt, SetSockOpt};
 use nix::sys::socket::{socketpair, AddressFamily, MsgFlags, SockFlag, SockType};
-use nix::unistd::{close, fork, getpid, read, ForkResult};
+use nix::sys::time::{TimeVal, TimeValLike};
+use nix::sys::wait::{waitpid, WaitPidFlag, WaitStatus};
+use nix::unistd::{close, fork, getpid, read, ForkResult, Pid};
 use vm_memory::ByteValued;
 
 use super::{
@@ -37,6 +41,19 @@ use crate::{FuseChannelExt, FuseDevReaderExt};
 const FS_SND_SIZE: usize = 4 * 1024 * 1024;
 
 const FUSE_NFSSRV_PATH: &str = "/usr/local/bin/go-nfsv4";
+
+// After umount sends the "unmount" command, the go-nfsv4 server tears its
+// NFS mount and listen port down asynchronously. A server that is still
+// running when the next session mounts interferes with it: go-nfsv4
+// instances pick their listen port from the same default first, and
+// upstream fuse-t tracks more interference between concurrent sessions as
+// #116 and #124. So umount waits for the server to be gone. It waits up to
+// FUSE_UMOUNT_TIMEOUT_MS for the server to acknowledge the command by
+// exiting, then kills it, and FUSE_REAP_TIMEOUT_MS more to reap the
+// (possibly killed) server. Both bounds sit far above a healthy unmount,
+// which is immediate; both only guard against a wedged server.
+const FUSE_UMOUNT_TIMEOUT_MS: i64 = 10_000;
+const FUSE_REAP_TIMEOUT_MS: u64 = 5_000;
 
 #[derive(Clone, Debug)]
 pub struct RcvBuf;
@@ -90,6 +107,10 @@ pub struct FuseSession {
     bufsize: usize,
     readonly: bool,
     monitor_file: Option<File>,
+    // The go-nfsv4 server forked by mount(), for umount to wait for and
+    // reap. It is None before mount() and on the set_fuse_file() path,
+    // which passes the connection in from outside and owns no server.
+    server_pid: Option<Pid>,
     wait_handle: Option<JoinHandle<Result<()>>>,
 }
 
@@ -118,6 +139,7 @@ impl FuseSession {
             file_lock: Arc::new(Mutex::new(())),
             bufsize: FUSE_KERN_BUF_PAGES * pagesize() + FUSE_HEADER_SIZE,
             monitor_file: None,
+            server_pid: None,
             wait_handle: None,
             readonly,
         })
@@ -155,9 +177,11 @@ impl FuseSession {
 
     /// Mount the fuse mountpoint, building connection with the in kernel fuse driver.
     pub fn mount(&mut self) -> Result<()> {
-        let files = fuse_kern_mount(&self.mountpoint, &self.fsname, &self.subtype, self.readonly)?;
-        self.file = Some(files.0);
-        self.monitor_file = Some(files.1);
+        let (file, mon, server) =
+            fuse_kern_mount(&self.mountpoint, &self.fsname, &self.subtype, self.readonly)?;
+        self.file = Some(file);
+        self.monitor_file = Some(mon);
+        self.server_pid = Some(server);
         self.wait_handle = Some(self.send_mount_command()?);
 
         Ok(())
@@ -167,7 +191,7 @@ impl FuseSession {
     pub fn umount(&mut self) -> Result<()> {
         if let Some(file) = self.monitor_file.take() {
             if self.mountpoint.to_str().is_some() {
-                fuse_kern_umount(file)
+                fuse_kern_umount(file, self.server_pid.take())
             } else {
                 Err(SessionFailure("invalid mountpoint".to_string()))
             }
@@ -372,7 +396,7 @@ fn fuse_kern_mount(
     fsname: &str,
     subtype: &str,
     rd_only: bool,
-) -> Result<(File, File)> {
+) -> Result<(File, File, Pid)> {
     unsafe { signal(Signal::SIGCHLD, SigHandler::SigDfl) }
         .map_err(|e| SessionFailure(format!("fail to reset SIGCHLD handler{:?}", e)))?;
 
@@ -407,11 +431,11 @@ fn fuse_kern_mount(
     }
 
     match res {
-        ForkResult::Parent { .. } => {
+        ForkResult::Parent { child } => {
             close(fd0).map_err(|e| SessionFailure(format!("parent close fd0 failed {:?}", e)))?;
             close(mon_fd0)
                 .map_err(|e| SessionFailure(format!("parent close mon fd0 failed {:?}", e)))?;
-            Ok((File::from(fd1), File::from(mon_fd1)))
+            Ok((File::from(fd1), File::from(mon_fd1), child))
         }
         ForkResult::Child => {
             close(fd1).map_err(|e| SessionFailure(format!("child close fd1 failed {:?}", e)))?;
@@ -469,14 +493,77 @@ fn fuse_kern_mount(
     }
 }
 /// Umount a fuse file system
-fn fuse_kern_umount(file: File) -> Result<()> {
+fn fuse_kern_umount(file: File, server: Option<Pid>) -> Result<()> {
     let msg = b"unmount";
     send(file.as_raw_fd(), msg, MsgFlags::empty())
         .map_err(|e| SessionFailure(format!("send unmount failed {:?}", e)))?;
 
+    // The server exits asynchronously, so wait for it: its NFS state and
+    // listen port are gone for sure only then, and a still-running server
+    // of this mount interferes with the next one. Reap it too, so a daemon
+    // that mounts repeatedly does not leak a zombie server per mount. Both
+    // waits are bounded (see the constants above); umount must stay
+    // best-effort, as the session's `Drop` also calls it.
+    let exited = wait_server_exit(&file, TimeVal::milliseconds(FUSE_UMOUNT_TIMEOUT_MS));
+    if let Some(pid) = server {
+        reap_server(pid, exited);
+    }
+
     drop(file);
 
     Ok(())
+}
+
+/// Wait for the go-nfsv4 server to close its end of the monitor socket,
+/// which it does when it exits. Returns whether it did, i.e. whether it
+/// acknowledged the unmount command.
+fn wait_server_exit<F: AsFd + AsRawFd>(mon: &F, timeout: TimeVal) -> bool {
+    if setsockopt(mon, ReceiveTimeout, &timeout).is_err() {
+        // Without a bound the wait could block forever on a wedged server.
+        // Skip the wait rather than kill a possibly healthy server for
+        // lack of the wait's outcome.
+        warn!("failed to bound the fuse-t monitor socket wait");
+        return true;
+    }
+
+    let mut status = [0u8; 4];
+    loop {
+        match recv(mon.as_raw_fd(), &mut status, MsgFlags::empty()) {
+            // EOF: the server closed its end, normally by exiting.
+            Ok(0) => return true,
+            // Drain whatever the server reports before closing.
+            Ok(_size) => continue,
+            Err(Errno::EINTR) => continue,
+            // The receive timeout expired: the server ignored the command.
+            Err(Errno::EAGAIN) => return false,
+            // A reset and the like: the peer is gone either way.
+            Err(_) => return true,
+        }
+    }
+}
+
+/// Reap the go-nfsv4 server, killing it first if it ignored the unmount
+/// command: a wedged server keeps the mount's NFS state and listen port
+/// until the daemon process itself exits. A server that still has not
+/// exited after FUSE_REAP_TIMEOUT_MS is left behind with a warning
+/// instead of hanging umount, which the session's `Drop` also calls.
+fn reap_server(pid: Pid, exited: bool) {
+    if !exited {
+        let _ = kill(pid, Signal::SIGKILL);
+    }
+
+    let deadline = Instant::now() + Duration::from_millis(FUSE_REAP_TIMEOUT_MS);
+    while Instant::now() < deadline {
+        match waitpid(pid, Some(WaitPidFlag::WNOHANG)) {
+            Ok(WaitStatus::Exited(..)) | Ok(WaitStatus::Signaled(..)) => return,
+            Ok(WaitStatus::StillAlive) => {}
+            // ECHILD: reaped elsewhere already, and no other outcome
+            // fixes itself by retrying.
+            Err(_) | Ok(_) => return,
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+    warn!("fuse-t server {} did not exit in time", pid);
 }
 
 #[cfg(test)]
@@ -501,6 +588,67 @@ mod tests {
     fn test_new_channel() {
         let ch = FuseChannel::new(unsafe { File::from_raw_fd(0) }, Arc::new(Mutex::new(())), 3);
         assert!(ch.is_ok());
+    }
+
+    // A server that acknowledges the unmount closes its end of the monitor
+    // socket: the wait sees the EOF without needing its timeout.
+    #[test]
+    fn test_wait_server_exit_eof() {
+        let (mon, srv) = socketpair(
+            AddressFamily::Unix,
+            SockType::Stream,
+            None,
+            SockFlag::empty(),
+        )
+        .unwrap();
+        drop(srv);
+        assert!(wait_server_exit(&mon, TimeVal::milliseconds(1_000)));
+    }
+
+    // A server that hangs keeps its end open: the wait gives up when its
+    // receive timeout expires.
+    #[test]
+    fn test_wait_server_exit_timeout() {
+        let (mon, _srv) = socketpair(
+            AddressFamily::Unix,
+            SockType::Stream,
+            None,
+            SockFlag::empty(),
+        )
+        .unwrap();
+        let start = Instant::now();
+        assert!(!wait_server_exit(&mon, TimeVal::milliseconds(100)));
+        assert!(start.elapsed() < Duration::from_secs(5));
+    }
+
+    // A server that ignored the unmount command is killed and reaped.
+    // reap_server reaps through waitpid, which std's Child::wait cannot
+    // observe, so silence the never-waited warning on the spawned child.
+    #[allow(clippy::zombie_processes)]
+    #[test]
+    fn test_reap_server_kills_wedged_server() {
+        let child = Command::new("sleep").arg("1000").spawn().unwrap();
+        let pid = Pid::from_raw(child.id() as i32);
+        let start = Instant::now();
+        reap_server(pid, false);
+        assert!(start.elapsed() < Duration::from_secs(5));
+        assert_eq!(
+            waitpid(pid, Some(WaitPidFlag::WNOHANG)).unwrap_err(),
+            Errno::ECHILD
+        );
+    }
+
+    // A server that acknowledged the unmount is reaped without a kill.
+    #[allow(clippy::zombie_processes)]
+    #[test]
+    fn test_reap_server_reaps_exited_server() {
+        let child = Command::new("true").spawn().unwrap();
+        let pid = Pid::from_raw(child.id() as i32);
+        reap_server(pid, true);
+        assert_eq!(
+            waitpid(pid, Some(WaitPidFlag::WNOHANG)).unwrap_err(),
+            Errno::ECHILD
+        );
     }
 }
 

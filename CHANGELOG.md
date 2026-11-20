@@ -269,6 +269,12 @@
   and no code in the workspace relied on it.
 
 ### Fixed
+- [NNN](link): The fuse-t session's umount waits for the go-nfsv4 server to exit before
+  returning, and kills and reaps a server that ignores the unmount command for ten
+  seconds. The server releases its NFS mount and listen port asynchronously, and a server
+  still running when the next session mounted interfered with it — observed in CI as a
+  flaky `EPERM` answering the new session's first xattr operation. Each mount also no
+  longer leaks the server as a zombie.
 - [NNN](link): With `allow_direct_io` off, a create with O_DIRECT no longer opens the new host
   file with O_DIRECT, which made buffered IO on it fail with EINVAL. `PassthroughFs::create()`
   now builds the host open flags with the same helper as `open_inode()`.
