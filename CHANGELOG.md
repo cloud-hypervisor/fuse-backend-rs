@@ -198,6 +198,11 @@
   and serves without it otherwise. `UringConfig` has a new field.
 
 ### Changed
+- [360](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/360): With `allow_direct_io` off, the async handlers of `PassthroughFs` serve O_DIRECT
+  READ and WRITE requests like buffered ones, since the host file never has O_DIRECT then. They
+  used to take the synchronous path, which with the thread pool costs a copy and a handoff to a
+  pool thread per request. Without the pool on tokio-uring, such a WRITE now goes through
+  io_uring instead of a `pwritev()` on the runtime thread.
 - [325](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/325): The `fuse-backend-fusedev` `uring` transport uses io-uring 0.6 instead of 0.5,
   and depends on it only on Linux.
 - [324](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/324): `fuse-backend-core` uses bitflags 2 instead of 1. The flag types (`FsOptions`,
