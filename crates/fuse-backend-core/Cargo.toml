@@ -23,7 +23,7 @@ bitflags = "1.1"
 libc = "0.2.68"
 log = "0.4.6"
 tokio = { version = "1", optional = true }
-vm-memory = { workspace = true, features = ["backend-mmap"] }
+vm-memory = { workspace = true }
 
 # io_uring only exists on Linux, so `async-io` uses tokio elsewhere.
 [target.'cfg(target_os = "linux")'.dependencies]
@@ -32,7 +32,7 @@ tokio-uring = { version = "0.4.0", optional = true }
 
 [dev-dependencies]
 tempfile = "3"
-vm-memory = { version = "=0.17.1", features = ["backend-mmap", "backend-bitmap"] }
+vm-memory = { workspace = true, features = ["backend-bitmap"] }
 
 [features]
 default = []

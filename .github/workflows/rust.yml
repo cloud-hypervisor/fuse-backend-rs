@@ -149,6 +149,29 @@ jobs:
         run: |
           make smoke-macos
 
+  FreeBSD-CI:
+    # GitHub has no FreeBSD runner, so this runs in a FreeBSD VM.
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: build and check
+        uses: vmactions/freebsd-vm@v1.6.0
+        with:
+          release: "14.5"
+          envs: CARGO_TERM_COLOR RUST_BACKTRACE
+          copyback: false
+          prepare: |
+            # rustup.sh needs curl.
+            pkg install -y curl gmake
+            # rustup keeps the VM on the latest stable toolchain, like the
+            # Linux rows, instead of the quarterly pkg snapshot.
+            fetch https://sh.rustup.rs -o /tmp/rustup.sh
+            sh /tmp/rustup.sh -y --profile minimal --component rustfmt
+          run: |
+            . $HOME/.cargo/env
+            gmake check-freebsd
+
   deny:
     name: Cargo Deny
     runs-on: ubuntu-latest
