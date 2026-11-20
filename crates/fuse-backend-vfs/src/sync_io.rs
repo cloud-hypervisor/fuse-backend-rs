@@ -44,6 +44,17 @@ impl Vfs {
         }
         Ok((fs, idata_in, idata_out))
     }
+
+    /// The answer to a FLUSH that the backend answered with `result`.
+    pub(super) fn flush_result(&self, result: Result<()>) -> Result<()> {
+        // With no_open, no mount has open files, and a file system answers ENOSYS so that the
+        // kernel stops sending FLUSH on every close. That's right for every mount.
+        if self.opts.load().no_open {
+            result
+        } else {
+            ok_for_enosys(result)
+        }
+    }
 }
 
 /// The error for a COPY_FILE_RANGE that the backend failed with `e`.
@@ -52,6 +63,38 @@ pub(super) fn copy_file_range_error(e: Error) -> Error {
         Some(libc::ENOSYS) => Error::from_raw_os_error(COPY_UNSUPPORTED),
         _ => e,
     }
+}
+
+/// The answer to a RENAME or RENAME2 with `flags` that the backend answered with `result`.
+pub(super) fn rename_result(result: Result<()>, flags: u32) -> Result<()> {
+    // Linux sends RENAME2 only with flags, and answers its ENOSYS with EINVAL.
+    if flags != 0 && cfg!(target_os = "linux") {
+        errno_for_enosys(result, libc::EINVAL)
+    } else {
+        result
+    }
+}
+
+/// The answer to a LINK that the backend answered with `result`.
+pub(super) fn link_result(result: Result<Entry>) -> Result<Entry> {
+    // Since 6.15 Linux answers LINK's ENOSYS with EPERM.
+    if cfg!(target_os = "linux") {
+        errno_for_enosys(result, libc::EPERM)
+    } else {
+        result
+    }
+}
+
+/// The answer to a GETXATTR of `name` that the backend answered with `result`.
+#[cfg_attr(not(target_os = "linux"), allow(unused_variables))]
+pub(super) fn getxattr_result(result: Result<GetxattrReply>, name: &CStr) -> Result<GetxattrReply> {
+    // Linux reads POSIX ACLs with GETXATTR. It takes ENODATA for no ACL, and EOPNOTSUPP
+    // for an error that fails permission checks, unless ENOSYS came first.
+    #[cfg(target_os = "linux")]
+    if let b"system.posix_acl_access" | b"system.posix_acl_default" = name.to_bytes() {
+        return errno_for_enosys(result, libc::ENODATA);
+    }
+    errno_for_enosys(result, UNSUPPORTED)
 }
 
 impl FileSystem for Vfs {
@@ -300,7 +343,7 @@ impl FileSystem for Vfs {
 
         let (root, idata_old, idata_new) = self.get_real_rootfs_pair(olddir, newdir)?;
 
-        match root {
+        let result = match root {
             Left(fs) => fs.rename(
                 ctx,
                 idata_old.ino(),
@@ -317,7 +360,8 @@ impl FileSystem for Vfs {
                 newname,
                 flags,
             ),
-        }
+        };
+        rename_result(result, flags)
     }
 
     fn link(
@@ -331,12 +375,13 @@ impl FileSystem for Vfs {
 
         let (root, idata_old, idata_new) = self.get_real_rootfs_pair(inode, newparent)?;
 
-        match root {
+        let result = match root {
             Left(fs) => fs.link(ctx, idata_old.ino(), idata_new.ino(), newname),
             Right(fs) => fs
                 .link(ctx, idata_old.ino(), idata_new.ino(), newname)
                 .and_then(|e| self.convert_backend_entry(idata_new, e)),
-        }
+        };
+        link_result(result)
     }
 
     fn open(
@@ -440,17 +485,18 @@ impl FileSystem for Vfs {
     }
 
     fn flush(&self, ctx: &Context, inode: VfsInode, handle: u64, lock_owner: u64) -> Result<()> {
-        match self.get_real_rootfs(inode)? {
+        let result = match self.get_real_rootfs(inode)? {
             (Left(fs), idata) => fs.flush(ctx, idata.ino(), handle, lock_owner),
             (Right(fs), idata) => fs.flush(ctx, idata.ino(), handle, lock_owner),
-        }
+        };
+        self.flush_result(result)
     }
 
     fn fsync(&self, ctx: &Context, inode: VfsInode, datasync: bool, handle: u64) -> Result<()> {
-        match self.get_real_rootfs(inode)? {
+        ok_for_enosys(match self.get_real_rootfs(inode)? {
             (Left(fs), idata) => fs.fsync(ctx, idata.ino(), datasync, handle),
             (Right(fs), idata) => fs.fsync(ctx, idata.ino(), datasync, handle),
-        }
+        })
     }
 
     fn fallocate(
@@ -462,10 +508,11 @@ impl FileSystem for Vfs {
         offset: u64,
         length: u64,
     ) -> Result<()> {
-        match self.get_real_rootfs(inode)? {
+        let result = match self.get_real_rootfs(inode)? {
             (Left(fs), idata) => fs.fallocate(ctx, idata.ino(), handle, mode, offset, length),
             (Right(fs), idata) => fs.fallocate(ctx, idata.ino(), handle, mode, offset, length),
-        }
+        };
+        errno_for_enosys(result, UNSUPPORTED)
     }
 
     fn release(
@@ -515,10 +562,11 @@ impl FileSystem for Vfs {
         value: &[u8],
         flags: u32,
     ) -> Result<()> {
-        match self.get_real_rootfs(inode)? {
+        let result = match self.get_real_rootfs(inode)? {
             (Left(fs), idata) => fs.setxattr(ctx, idata.ino(), name, value, flags),
             (Right(fs), idata) => fs.setxattr(ctx, idata.ino(), name, value, flags),
-        }
+        };
+        errno_for_enosys(result, UNSUPPORTED)
     }
 
     fn getxattr(
@@ -528,24 +576,27 @@ impl FileSystem for Vfs {
         name: &CStr,
         size: u32,
     ) -> Result<GetxattrReply> {
-        match self.get_real_rootfs(inode)? {
+        let result = match self.get_real_rootfs(inode)? {
             (Left(fs), idata) => fs.getxattr(ctx, idata.ino(), name, size),
             (Right(fs), idata) => fs.getxattr(ctx, idata.ino(), name, size),
-        }
+        };
+        getxattr_result(result, name)
     }
 
     fn listxattr(&self, ctx: &Context, inode: VfsInode, size: u32) -> Result<ListxattrReply> {
-        match self.get_real_rootfs(inode)? {
+        let result = match self.get_real_rootfs(inode)? {
             (Left(fs), idata) => fs.listxattr(ctx, idata.ino(), size),
             (Right(fs), idata) => fs.listxattr(ctx, idata.ino(), size),
-        }
+        };
+        errno_for_enosys(result, UNSUPPORTED)
     }
 
     fn removexattr(&self, ctx: &Context, inode: VfsInode, name: &CStr) -> Result<()> {
-        match self.get_real_rootfs(inode)? {
+        let result = match self.get_real_rootfs(inode)? {
             (Left(fs), idata) => fs.removexattr(ctx, idata.ino(), name),
             (Right(fs), idata) => fs.removexattr(ctx, idata.ino(), name),
-        }
+        };
+        errno_for_enosys(result, UNSUPPORTED)
     }
 
     fn opendir(
@@ -622,10 +673,10 @@ impl FileSystem for Vfs {
     }
 
     fn fsyncdir(&self, ctx: &Context, inode: VfsInode, datasync: bool, handle: u64) -> Result<()> {
-        match self.get_real_rootfs(inode)? {
+        ok_for_enosys(match self.get_real_rootfs(inode)? {
             (Left(fs), idata) => fs.fsyncdir(ctx, idata.ino(), datasync, handle),
             (Right(fs), idata) => fs.fsyncdir(ctx, idata.ino(), datasync, handle),
-        }
+        })
     }
 
     fn releasedir(&self, ctx: &Context, inode: VfsInode, flags: u32, handle: u64) -> Result<()> {
@@ -636,10 +687,10 @@ impl FileSystem for Vfs {
     }
 
     fn access(&self, ctx: &Context, inode: VfsInode, mask: u32) -> Result<()> {
-        match self.get_real_rootfs(inode)? {
+        ok_for_enosys(match self.get_real_rootfs(inode)? {
             (Left(fs), idata) => fs.access(ctx, idata.ino(), mask),
             (Right(fs), idata) => fs.access(ctx, idata.ino(), mask),
-        }
+        })
     }
 
     fn copy_file_range(
@@ -998,12 +1049,12 @@ mod tests {
         assert_eq!(ctx.supplementary_groups, None);
     }
 
+    fn raw_errno<T>(result: Result<T>) -> Option<i32> {
+        result.err().and_then(|e| e.raw_os_error())
+    }
+
     #[test]
     fn test_xattr_name_with_slash() {
-        fn errno<T>(res: Result<T>) -> Option<i32> {
-            res.err().and_then(|e| e.raw_os_error())
-        }
-
         let vfs = Vfs::new(VfsOptions::default());
         vfs.mount(Box::new(FakeFileSystemOne {}), "/x").unwrap();
         let ctx = Context::new();
@@ -1011,11 +1062,83 @@ mod tests {
         let inode = x.unwrap().inode.into();
 
         // Linux allows '/' in xattr names, so the requests reach the file system, whose
-        // default handlers answer ENOSYS.
+        // default handlers answer ENOSYS. Vfs turns that into ENOTSUP.
         let name = CString::new("user.a/b").unwrap();
-        let enosys = Some(libc::ENOSYS);
-        assert_eq!(errno(vfs.setxattr(&ctx, inode, &name, b"v", 0)), enosys);
-        assert_eq!(errno(vfs.getxattr(&ctx, inode, &name, 0)), enosys);
-        assert_eq!(errno(vfs.removexattr(&ctx, inode, &name)), enosys);
+        let unsupported = Some(UNSUPPORTED);
+        assert_eq!(
+            raw_errno(vfs.setxattr(&ctx, inode, &name, b"v", 0)),
+            unsupported
+        );
+        assert_eq!(raw_errno(vfs.getxattr(&ctx, inode, &name, 0)), unsupported);
+        assert_eq!(raw_errno(vfs.removexattr(&ctx, inode, &name)), unsupported);
+    }
+
+    #[test]
+    fn test_enosys_per_mount() {
+        let vfs = Vfs::new(VfsOptions {
+            no_open: false,
+            ..Default::default()
+        });
+        let idx = vfs.mount(Box::new(FakeFileSystemOne {}), "/x/y").unwrap();
+        let ctx = Context::new();
+        let (a, b) = (CString::new("a").unwrap(), CString::new("b").unwrap());
+        #[cfg(target_os = "linux")]
+        let acl = CString::new("system.posix_acl_access").unwrap();
+
+        // FakeFileSystemOne and the pseudo fs answer these with the trait's ENOSYS, on which
+        // the kernel would stop sending them for every mount. The pseudo fs has the root and
+        // /x, inode 2.
+        for inode in [VfsInode::new(idx, 5), ROOT_ID.into(), 2.into()] {
+            let errnos = [
+                raw_errno(vfs.fallocate(&ctx, inode, 0, 0, 0, 4096)),
+                raw_errno(vfs.setxattr(&ctx, inode, &a, b"v", 0)),
+                raw_errno(vfs.getxattr(&ctx, inode, &a, 0)),
+                raw_errno(vfs.listxattr(&ctx, inode, 0)),
+                raw_errno(vfs.removexattr(&ctx, inode, &a)),
+            ];
+            assert_eq!(errnos, [Some(UNSUPPORTED); 5]);
+            #[cfg(target_os = "linux")]
+            assert_eq!(
+                raw_errno(vfs.getxattr(&ctx, inode, &acl, 0)),
+                Some(libc::ENODATA)
+            );
+
+            vfs.flush(&ctx, inode, 0, 0).unwrap();
+            vfs.fsync(&ctx, inode, false, 0).unwrap();
+            vfs.fsyncdir(&ctx, inode, false, 0).unwrap();
+            vfs.access(&ctx, inode, libc::R_OK as u32).unwrap();
+
+            // Only Linux turns LINK and RENAME2 off.
+            let (eperm, einval) = if cfg!(target_os = "linux") {
+                (libc::EPERM, libc::EINVAL)
+            } else {
+                (libc::ENOSYS, libc::ENOSYS)
+            };
+            let link = vfs.link(&ctx, inode, inode, &b);
+            assert_eq!(raw_errno(link), Some(eperm));
+            let rename = vfs.rename(&ctx, inode, &a, inode, &b, RENAME_NOREPLACE);
+            assert_eq!(raw_errno(rename), Some(einval));
+            // The kernel turns nothing off for a RENAME without flags.
+            let rename = vfs.rename(&ctx, inode, &a, inode, &b, 0);
+            assert_eq!(raw_errno(rename), Some(libc::ENOSYS));
+        }
+
+        // The pseudo fs can't create files. A file system's ENOSYS still goes to the kernel,
+        // which then uses MKNOD and OPEN.
+        let args = CreateIn::default();
+        let create = vfs.create(&ctx, ROOT_ID.into(), &a, args);
+        assert_eq!(raw_errno(create), Some(libc::EACCES));
+        let create = vfs.create(&ctx, VfsInode::new(idx, 1), &a, args);
+        assert_eq!(raw_errno(create), Some(libc::ENOSYS));
+    }
+
+    #[test]
+    fn test_flush_enosys_with_no_open() {
+        // With no_open, FLUSH's ENOSYS goes to the kernel, which then stops sending it.
+        let vfs = Vfs::default();
+        let idx = vfs.mount(Box::new(FakeFileSystemOne {}), "/x").unwrap();
+
+        let flush = vfs.flush(&Context::new(), VfsInode::new(idx, 5), 0, 0);
+        assert_eq!(raw_errno(flush), Some(libc::ENOSYS));
     }
 }
