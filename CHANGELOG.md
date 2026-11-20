@@ -335,6 +335,10 @@
   and no code in the workspace relied on it.
 
 ### Fixed
+- [367](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/367): CREATE replies carry the `attr_flags` of the file system's `Entry`, like
+  the other replies with an entry. Both servers sent 0, so a file created on a
+  virtio-fs mount with per-file DAX got DAX only after the kernel evicted its
+  inode and looked it up again.
 - [NNN](link): A `FuseDevTask` that keeps finding requests lets its runtime run. On tokio,
   `AsyncFd::ready()` takes none of the task's budget, and the read of a readable fuse fd doesn't
   wait, so a task that kept finding requests never returned to its runtime. The timers, IO and
