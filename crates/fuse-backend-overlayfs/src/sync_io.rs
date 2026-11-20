@@ -75,6 +75,10 @@ impl FileSystem for OverlayFs {
             opts |= FsOptions::DIRECT_IO_ALLOW_MMAP;
         }
 
+        if self.config.allow_idmap {
+            opts |= capable & FsOptions::ALLOW_IDMAP;
+        }
+
         Ok(opts)
     }
 
@@ -292,7 +296,7 @@ impl FileSystem for OverlayFs {
 
         if !readonly {
             // copy up to upper layer
-            self.copy_node_up(ctx, Arc::clone(&node))?;
+            self.copy_node_up(Arc::clone(&node))?;
         }
 
         // assign a handle in overlayfs and open it
@@ -590,7 +594,7 @@ impl FileSystem for OverlayFs {
         let mut node = self.lookup_node(ctx, inode, "")?;
 
         if !node.in_upper_layer() {
-            node = self.copy_node_up(ctx, Arc::clone(&node))?
+            node = self.copy_node_up(Arc::clone(&node))?
         }
 
         let (layer, _, real_inode) = node.first_layer_inode();
@@ -779,7 +783,7 @@ impl FileSystem for OverlayFs {
 
         if !node.in_upper_layer() {
             // Copy node up.
-            self.copy_node_up(ctx, Arc::clone(&node))?;
+            self.copy_node_up(Arc::clone(&node))?;
         }
 
         let (layer, _, real_inode) = node.first_layer_inode();
@@ -840,7 +844,7 @@ impl FileSystem for OverlayFs {
 
         if !node.in_upper_layer() {
             // copy node into upper layer
-            self.copy_node_up(ctx, Arc::clone(&node))?;
+            self.copy_node_up(Arc::clone(&node))?;
         }
 
         let (layer, _, ino) = node.first_layer_inode();

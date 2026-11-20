@@ -319,52 +319,33 @@ mod fusedev_tests {
         Ok(())
     }
 
-    #[test]
-    #[ignore] // it depends on privileged mode to pass through /dev/fuse
-    fn integration_test_idmapped_mount() -> Result<()> {
-        use fuse_backend_rs::api::server::Server;
-        use fuse_backend_rs::passthrough::{Config, PassthroughFs};
-        use fuse_backend_rs::transport::{FuseSession, SyncFuseServing, SyncServingConfig};
-        use nix::errno::Errno;
-        use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
-        use std::sync::Arc;
-
-        // Root creates a file through an idmapped mount of the FUSE mount, and the backing
-        // file gets the owner that the idmapping gives root.
+    /// Whether the idmapped mount test `name` can run here.
+    fn can_test_idmapped_mount(name: &str) -> bool {
         if !running_as_root() {
-            eprintln!("skipping integration_test_idmapped_mount: not running as root");
-            return Ok(());
+            eprintln!("skipping {}: not running as root", name);
+            return false;
         }
         if !kernel_at_least(6, 12) {
             eprintln!(
-                "skipping integration_test_idmapped_mount: kernel {} can't idmap FUSE mounts",
+                "skipping {}: kernel {} can't idmap FUSE mounts",
+                name,
                 kernel_release()
             );
-            return Ok(());
+            return false;
         }
+        true
+    }
 
-        let src_dir = TempDir::new().unwrap();
-        let mnt_dir = TempDir::new().unwrap();
-        let idmapped_dir = TempDir::new().unwrap();
-        // The kernel lets nobody write to a directory whose owner the idmapping doesn't map.
-        std::os::unix::fs::chown(src_dir.as_path(), Some(1000), Some(1000))?;
+    /// Attaches an idmapped clone of the FUSE mount `mnt` at `target`. The idmapping comes from
+    /// a user namespace whose uid and gid 1000 are 0 outside it: through the clone, what uid
+    /// 1000 owns shows as owned by root, and what root creates gets uid 1000.
+    fn idmap_mount(mnt: &Path, target: &Path) -> Result<()> {
+        use nix::errno::Errno;
+        use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 
-        let fs = PassthroughFs::<()>::new(Config {
-            root_dir: src_dir.as_path().to_str().unwrap().to_string(),
-            allow_idmap: true,
-            ..Default::default()
-        })
-        .unwrap();
-        let mut se = FuseSession::new(mnt_dir.as_path(), "idmap", "", false).unwrap();
-        se.mount().unwrap();
-        let server = Arc::new(Server::new(fs));
-        let serving = SyncFuseServing::new(se, server, SyncServingConfig::default()).unwrap();
         // Idmapping fails until the INIT reply, and opening the root waits for it.
-        std::fs::read_dir(mnt_dir.as_path())?;
+        std::fs::read_dir(mnt)?;
 
-        // A user namespace whose uid and gid 1000 are 0 outside it. Through a mount idmapped
-        // with it, what uid 1000 owns shows as owned by root, and what root creates gets uid
-        // 1000.
         let mut cmd = Command::new("sleep");
         cmd.arg("60");
         // SAFETY: the closure only calls unshare(), which is async-signal-safe.
@@ -378,8 +359,8 @@ mod fusedev_tests {
         let pid = child.id();
 
         let empty = CString::default();
-        let mnt = CString::new(mnt_dir.as_path().as_os_str().as_bytes()).unwrap();
-        let idmapped = CString::new(idmapped_dir.as_path().as_os_str().as_bytes()).unwrap();
+        let mnt = CString::new(mnt.as_os_str().as_bytes()).unwrap();
+        let target = CString::new(target.as_os_str().as_bytes()).unwrap();
         // Map the child's user namespace, then clone the FUSE mount, idmap the clone with that
         // namespace and attach it. The child is killed after this whether or not it fails.
         let idmap = || -> Result<()> {
@@ -421,7 +402,7 @@ mod fusedev_tests {
                     tree.as_raw_fd(),
                     empty.as_ptr(),
                     libc::AT_FDCWD,
-                    idmapped.as_ptr(),
+                    target.as_ptr(),
                     libc::MOVE_MOUNT_F_EMPTY_PATH,
                 )
             })?;
@@ -430,9 +411,43 @@ mod fusedev_tests {
         let res = idmap();
         let _ = child.kill();
         let _ = child.wait();
+        res
+    }
+
+    #[test]
+    #[ignore] // it depends on privileged mode to pass through /dev/fuse
+    fn integration_test_idmapped_mount() -> Result<()> {
+        use fuse_backend_rs::api::server::Server;
+        use fuse_backend_rs::passthrough::{Config, PassthroughFs};
+        use fuse_backend_rs::transport::{FuseSession, SyncFuseServing, SyncServingConfig};
+        use std::sync::Arc;
+
+        // Root creates a file through an idmapped mount of the FUSE mount, and the backing
+        // file gets the owner that the idmapping gives root.
+        if !can_test_idmapped_mount("integration_test_idmapped_mount") {
+            return Ok(());
+        }
+
+        let src_dir = TempDir::new().unwrap();
+        let mnt_dir = TempDir::new().unwrap();
+        let idmapped_dir = TempDir::new().unwrap();
+        // The kernel lets nobody write to a directory whose owner the idmapping doesn't map.
+        std::os::unix::fs::chown(src_dir.as_path(), Some(1000), Some(1000))?;
+
+        let fs = PassthroughFs::<()>::new(Config {
+            root_dir: src_dir.as_path().to_str().unwrap().to_string(),
+            allow_idmap: true,
+            ..Default::default()
+        })
+        .unwrap();
+        let mut se = FuseSession::new(mnt_dir.as_path(), "idmap", "", false).unwrap();
+        se.mount().unwrap();
+        let server = Arc::new(Server::new(fs));
+        let serving = SyncFuseServing::new(se, server, SyncServingConfig::default()).unwrap();
+
         // Writing and reading send requests with FUSE_INVALID_UIDGID.
         let path = idmapped_dir.as_path().join("file");
-        let created = res.and_then(|()| {
+        let created = idmap_mount(mnt_dir.as_path(), idmapped_dir.as_path()).and_then(|()| {
             std::fs::write(&path, b"data")?;
             Ok((std::fs::read(&path)?, std::fs::metadata(&path)?))
         });
@@ -443,6 +458,78 @@ mod fusedev_tests {
         assert_eq!((data.as_slice(), md.uid()), (&b"data"[..], 0));
         let md = std::fs::metadata(src_dir.as_path().join("file"))?;
         assert_eq!((md.uid(), md.gid()), (1000, 1000));
+        Ok(())
+    }
+
+    #[test]
+    #[ignore] // it depends on privileged mode to pass through /dev/fuse
+    fn integration_test_idmapped_overlay_copy_up() -> Result<()> {
+        use fuse_backend_rs::api::server::Server;
+        use fuse_backend_rs::overlayfs::{self, BoxedLayer, OverlayFs};
+        use fuse_backend_rs::passthrough::{self, PassthroughFs};
+        use fuse_backend_rs::transport::{FuseSession, SyncFuseServing, SyncServingConfig};
+        use std::io::Write;
+        use std::sync::Arc;
+
+        // Root writes a lower file of uid 1000 through an idmapped mount of an OverlayFs. The
+        // request carries FUSE_INVALID_UIDGID, and the copy-up keeps the owner of the file and
+        // of its directory.
+        if !can_test_idmapped_mount("integration_test_idmapped_overlay_copy_up") {
+            return Ok(());
+        }
+
+        let upper_dir = TempDir::new().unwrap();
+        let lower_dir = TempDir::new().unwrap();
+        let mnt_dir = TempDir::new().unwrap();
+        let idmapped_dir = TempDir::new().unwrap();
+        let lower = lower_dir.as_path();
+        std::fs::create_dir(lower.join("dir"))?;
+        std::fs::write(lower.join("dir/file"), b"lower")?;
+        for path in [
+            upper_dir.as_path(),
+            &lower.join("dir"),
+            &lower.join("dir/file"),
+        ] {
+            std::os::unix::fs::chown(path, Some(1000), Some(1000))?;
+        }
+
+        let layer = |dir: &TempDir| -> Result<Arc<BoxedLayer>> {
+            let fs = PassthroughFs::<()>::new(passthrough::Config {
+                root_dir: dir.as_path().to_str().unwrap().to_string(),
+                xattr: true,
+                ..Default::default()
+            })?;
+            fs.import()?;
+            Ok(Arc::new(Box::new(fs)))
+        };
+        let config = overlayfs::config::Config {
+            do_import: true,
+            allow_idmap: true,
+            ..Default::default()
+        };
+        let fs = OverlayFs::new(Some(layer(&upper_dir)?), vec![layer(&lower_dir)?], config)?;
+        let mut se = FuseSession::new(mnt_dir.as_path(), "idmap-overlay", "", false).unwrap();
+        se.mount().unwrap();
+        let server = Arc::new(Server::new(fs));
+        let serving = SyncFuseServing::new(se, server, SyncServingConfig::default()).unwrap();
+
+        let path = idmapped_dir.as_path().join("dir/file");
+        let written = idmap_mount(mnt_dir.as_path(), idmapped_dir.as_path()).and_then(|()| {
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(&path)?
+                .write_all(b"upper")?;
+            Ok((std::fs::read(&path)?, std::fs::metadata(&path)?))
+        });
+        let _ = nix::mount::umount2(idmapped_dir.as_path(), nix::mount::MntFlags::MNT_DETACH);
+        drop(serving);
+
+        let (data, md) = written?;
+        assert_eq!((data.as_slice(), md.uid()), (&b"upper"[..], 0));
+        for name in ["dir", "dir/file"] {
+            let md = std::fs::metadata(upper_dir.as_path().join(name))?;
+            assert_eq!((md.uid(), md.gid()), (1000, 1000), "{}", name);
+        }
         Ok(())
     }
 
