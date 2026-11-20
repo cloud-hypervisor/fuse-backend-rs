@@ -340,7 +340,7 @@ impl Vfs {
     fn insert_mount_locked(
         &self,
         fs: BackFileSystem,
-        mut entry: Entry,
+        entry: Entry,
         fs_idx: VfsIndex,
         path: &str,
     ) -> Result<()> {
@@ -351,8 +351,9 @@ impl Vfs {
         let mut mountpoints = self.mountpoints.load().deref().deref().clone();
         let inode = self.root.mount(path)?;
         let real_root_ino = entry.inode;
-
-        self.convert_entry(fs_idx, entry.inode, &mut entry)?;
+        // Store the entry as the file system returned it, and only check that its inode fits.
+        // mount_root_entry() converts it for each reply.
+        self.convert_inode(fs_idx, real_root_ino)?;
 
         // Over mount would invalidate previous superblock inodes.
         if let Some(mnt) = mountpoints.get(&inode) {
@@ -406,8 +407,8 @@ impl Vfs {
             })?;
         }
         let index = self.allocate_fs_idx().map_err(VfsError::FsIndex)?;
-        // Store per-mount id_mapping before insert_mount_locked so that
-        // convert_entry during insertion can use it.
+        // Store the per-mount id_mapping before insert_mount_locked() publishes the
+        // mount, so that no reply about it goes out unmapped.
         if id_mapping.is_some() {
             let mut mappings = self.mount_id_mappings.load().deref().deref().clone();
             mappings[index as usize] = id_mapping;
@@ -596,6 +597,12 @@ impl Vfs {
         })
     }
 
+    /// The root entry of the file system mounted at `mnt`, converted for a reply.
+    fn mount_root_entry(&self, mnt: &MountPointData) -> Result<Entry> {
+        let mut entry = mnt.root_entry;
+        self.convert_entry(mnt.fs_idx, mnt.ino, &mut entry)
+    }
+
     /// If id_mapping is enabled, remap the uid/gid in attributes.
     ///
     /// If `map_internal_to_external` is true, the IDs inside VFS will be mapped
@@ -746,8 +753,7 @@ impl Vfs {
         match self.mountpoints.load().get(&entry.inode) {
             Some(mnt) => {
                 // cross mountpoint, return mount root entry
-                entry = mnt.root_entry;
-                self.convert_entry(mnt.fs_idx, mnt.ino, &mut entry)?;
+                entry = self.mount_root_entry(mnt)?;
                 trace!(
                     "vfs lookup cross mountpoint, return new mount fs_idx {} inode 0x{:x} fuse inode 0x{:x}, attr inode 0x{:x}",
                     mnt.fs_idx,
@@ -817,8 +823,8 @@ impl Vfs {
                 match self.mountpoints.load().get(&dir_entry.ino) {
                     Some(mnt) => {
                         // cross mountpoint, return mount root entry
-                        dir_entry.ino = self.convert_inode(mnt.fs_idx, mnt.ino)?;
-                        entry = mnt.root_entry;
+                        entry = self.mount_root_entry(mnt)?;
+                        dir_entry.ino = entry.inode;
                     }
                     None => {
                         dir_entry.ino = self.convert_inode(idata.fs_idx(), dir_entry.ino)?;
@@ -1623,6 +1629,24 @@ mod tests {
         vfs.convert_entry(0, 1, &mut entry).unwrap();
         assert_eq!(entry.attr.st_uid, 65536);
         assert_eq!(entry.attr.st_gid, 65536);
+    }
+
+    #[test]
+    fn test_mount_root_is_remapped_once() {
+        // With overlapping ranges, a second remap would turn uid 1 into 2.
+        let vfs = Vfs::new(VfsOptions::default());
+        vfs.mount_with_id_mapping(Box::new(FakeFileSystemOne {}), "/x", Some((0, 1, 65536)))
+            .unwrap();
+        let ctx = Context::new();
+        let x = CString::new("x").unwrap();
+        assert_eq!(vfs.lookup(&ctx, ROOT_ID.into(), &x).unwrap().attr.st_uid, 1);
+        let mut uids = Vec::new();
+        vfs.readdirplus(&ctx, ROOT_ID.into(), 0, 4096, 0, &mut |_, entry| {
+            uids.push(entry.attr.st_uid);
+            Ok(1)
+        })
+        .unwrap();
+        assert_eq!(uids, [1]);
     }
 
     #[test]
