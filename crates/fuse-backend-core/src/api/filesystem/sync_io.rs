@@ -538,7 +538,8 @@ pub trait FileSystem {
     /// Write the file system that contains `inode` to stable storage, like `syncfs(2)`.
     ///
     /// virtiofs sends this with the root inode when the guest syncs the file system. Since
-    /// Linux 6.18 fuseblk mounts send it too.
+    /// Linux 6.18 fuseblk mounts send it too, and since Linux 7.4 any mount that negotiated
+    /// `FsOptions::HAS_SYNCFS`.
     /// If this method returns `ENOSYS`, the kernel stops sending it.
     fn syncfs(&self, ctx: &Context, inode: Self::Inode) -> io::Result<()> {
         Err(io::Error::from_raw_os_error(libc::ENOSYS))

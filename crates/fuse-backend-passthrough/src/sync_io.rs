@@ -753,6 +753,10 @@ impl<S: BitmapSlice + Send + Sync> FileSystem for PassthroughFs<S> {
             opts |= capable & FsOptions::DIRECT_IO_ALLOW_MMAP;
         }
 
+        if self.cfg.syncfs {
+            opts |= capable & FsOptions::HAS_SYNCFS;
+        }
+
         if capable.contains(FsOptions::PERFILE_DAX) {
             opts |= FsOptions::PERFILE_DAX;
             self.perfile_dax.store(true, Ordering::Relaxed);
