@@ -291,6 +291,10 @@
   and no code in the workspace relied on it.
 
 ### Fixed
+- [NNN](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/NNN): CREATE replies carry the `attr_flags` of the file system's `Entry`, like
+  the other replies with an entry. Both servers sent 0, so a file created on a
+  virtio-fs mount with per-file DAX got DAX only after the kernel evicted its
+  inode and looked it up again.
 - [329](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/329): The servers no longer reply to NOTIFY_REPLY when `FileSystem::notify_reply()`
   fails, which the default implementation does. The kernel takes no reply to NOTIFY_REPLY, and
   sends it under the unique number that the server picked for NOTIFY_RETRIEVE, so the reply
