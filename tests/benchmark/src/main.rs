@@ -42,8 +42,9 @@
 //! `--no-writeback` turns the writeback cache off without enabling kernel
 //! passthrough, to tell the effects of the two apart.
 //!
-//! `--splice` makes the sync mode send READ replies with `splice(2)`, see
-//! `FuseSession::set_splice_write()`.
+//! `--splice` makes the sync and async modes send READ replies with
+//! `splice(2)`, see `FuseSession::set_splice_write()`. The async mode still
+//! copies the READs it serves with io_uring or with an inline page-cache read.
 
 #[cfg(target_os = "linux")]
 mod daemon {
@@ -169,8 +170,8 @@ mod daemon {
             help();
             return Err(Error::from_raw_os_error(libc::EINVAL));
         }
-        // The blocking and splice knobs only configure the sync transport.
-        if (res.sync_blocking || res.splice) && (res.as_async || res.as_uring) {
+        // Blocking only applies to the sync transport, and splice to the sync and async ones.
+        if (res.sync_blocking && (res.as_async || res.as_uring)) || (res.splice && res.as_uring) {
             help();
             return Err(Error::from_raw_os_error(libc::EINVAL));
         }
