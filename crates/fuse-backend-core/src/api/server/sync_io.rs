@@ -2134,8 +2134,14 @@ mod tests {
         assert!(options.contains(FsOptions::CREATE_SUPP_GROUP | FsOptions::INIT_EXT));
 
         let new = Server::new(SuppGroupFs);
-        assert!(new.init_state().1.is_empty());
-        new.restore_init(version.clone(), options);
+        let fresh = new.init_state();
+        assert!(fresh.1.is_empty());
+        // The state of a connection that serves over io_uring can't be restored.
+        let uring = FsOptions::from_bits_retain(options.bits() | super::super::FUSE_OVER_IO_URING);
+        let err = new.restore_init(version.clone(), uring).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::Unsupported);
+        assert_eq!(new.init_state(), fresh);
+        new.restore_init(version.clone(), options).unwrap();
         assert_eq!(new.init_state(), (version, options));
     }
 

@@ -1,6 +1,9 @@
 # Changelog
 ## [Unreleased]
 ### Changed
+- [374](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/374): `Server::restore_init()` fails with `ErrorKind::Unsupported` for the INIT state of a
+  connection that negotiated `FUSE_OVER_IO_URING`, whose requests never reach `/dev/fuse`, instead
+  of letting the new server wait for them forever. It returns an `io::Result` for that.
 - [305](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/305): Upgrade `fuse-backend-fusedev` (and the root dev-dependencies)
   from `nix` 0.24 to 0.31.4, the I/O-safety era of the crate: `read`/
   `write`/`pwrite`/`writev`/`fcntl` now take `AsFd`, so the raw fds the
