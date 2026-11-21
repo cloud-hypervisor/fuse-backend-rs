@@ -291,7 +291,7 @@
   and no code in the workspace relied on it.
 
 ### Fixed
-- [NNN](link): `Vfs` answers the lookups of "." and ".." that the kernel sends with
+- [376](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/376): `Vfs` answers the lookups of "." and ".." that the kernel sends with
   `FsOptions::EXPORT_SUPPORT` with the node ids it already has. The root of a file system
   mounted at "/" comes back as `ROOT_ID` with generation 0 instead of under a second node id,
   and ".." of the root of a file system mounted elsewhere is the parent of its mountpoint, not
