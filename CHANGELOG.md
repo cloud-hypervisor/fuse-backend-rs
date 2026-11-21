@@ -196,6 +196,20 @@
   writes of opens that ask for it with zero-copy. It moves the data between the client's pages
   and the file with io_uring fixed-buffer operations. It needs buffer pools and CAP_SYS_ADMIN,
   and serves without it otherwise. `UringConfig` has a new field.
+- [313](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/313): `AsyncFileSystem` has async versions of 18 more handlers: `async_readlink()`,
+  `async_symlink()`, `async_mknod()`, `async_mkdir()`, `async_unlink()`, `async_rmdir()`,
+  `async_rename()`, `async_link()`, `async_statfs()`, `async_release()`, `async_setxattr()`,
+  `async_getxattr()`, `async_listxattr()`, `async_removexattr()`, `async_flush()`,
+  `async_access()`, `async_lseek()` and `async_copy_file_range()`. They default to the sync
+  handlers, and the async server serves their requests with them. `Vfs` passes all but
+  `async_lseek()` on to the mounted file systems, like its sync handlers do. The async server
+  now sends only INIT, DESTROY, NOTIFY_REPLY, locks, `ioctl`, `poll`, `bmap`, forgets and DAX
+  mappings to the sync handlers.
+- [313](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/313): With `enable_async_thread_pool()`, `PassthroughFs` also serves those 18 handlers,
+  `async_opendir()` and `async_releasedir()` on the blocking thread pool. Of its async handlers,
+  only READDIR and READDIRPLUS still run on the runtime thread. A MKDIR, MKNOD, SYMLINK, LINK or
+  OPENDIR that is dropped while a pool thread serves it gives back the lookup count or handle it
+  took.
 
 ### Changed
 - [325](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/325): The `fuse-backend-fusedev` `uring` transport uses io-uring 0.6 instead of 0.5,

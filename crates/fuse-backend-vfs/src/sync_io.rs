@@ -15,13 +15,44 @@ use fuse_backend_core::api::filesystem::FsCacheReqHandler;
 // but stops sending COPY_FILE_RANGE for every mount in this Vfs. FreeBSD falls back only on
 // ENOSYS and returns other errors to the caller.
 #[cfg(not(target_os = "freebsd"))]
-const COPY_CROSS_MOUNT: i32 = libc::EXDEV;
+pub(super) const COPY_CROSS_MOUNT: i32 = libc::EXDEV;
 #[cfg(not(target_os = "freebsd"))]
-const COPY_UNSUPPORTED: i32 = libc::EOPNOTSUPP;
+pub(super) const COPY_UNSUPPORTED: i32 = libc::EOPNOTSUPP;
 #[cfg(target_os = "freebsd")]
-const COPY_CROSS_MOUNT: i32 = libc::ENOSYS;
+pub(super) const COPY_CROSS_MOUNT: i32 = libc::ENOSYS;
 #[cfg(target_os = "freebsd")]
-const COPY_UNSUPPORTED: i32 = libc::ENOSYS;
+pub(super) const COPY_UNSUPPORTED: i32 = libc::ENOSYS;
+
+impl Vfs {
+    /// The backend that serves a COPY_FILE_RANGE from `inode_in` to `inode_out`, with their
+    /// inodes in it.
+    pub(super) fn copy_file_range_fs(
+        &self,
+        inode_in: VfsInode,
+        inode_out: VfsInode,
+    ) -> Result<(ArcBackFs, VfsInode, VfsInode)> {
+        // The pseudo fs has only directories, and the kernel never copies those.
+        let (Right(fs), idata_in) = self.get_real_rootfs(inode_in)? else {
+            return Err(Error::from_raw_os_error(libc::EISDIR));
+        };
+        let (Right(_), idata_out) = self.get_real_rootfs(inode_out)? else {
+            return Err(Error::from_raw_os_error(libc::EISDIR));
+        };
+
+        if idata_in.fs_idx() != idata_out.fs_idx() {
+            return Err(Error::from_raw_os_error(COPY_CROSS_MOUNT));
+        }
+        Ok((fs, idata_in, idata_out))
+    }
+}
+
+/// The error for a COPY_FILE_RANGE that the backend failed with `e`.
+pub(super) fn copy_file_range_error(e: Error) -> Error {
+    match e.raw_os_error() {
+        Some(libc::ENOSYS) => Error::from_raw_os_error(COPY_UNSUPPORTED),
+        _ => e,
+    }
+}
 
 impl FileSystem for Vfs {
     type Inode = VfsInode;
@@ -186,10 +217,7 @@ impl FileSystem for Vfs {
     ) -> Result<Entry> {
         validate_path_component(name)?;
 
-        // The supp gid is parsed after the request-wide id remap, so
-        // translate it here, where the target mount is known.
-        let mut ctx = ctx.clone();
-        self.remap_ctx_supp_gid(&mut ctx, parent.fs_idx());
+        let ctx = self.ctx_for_mount(ctx, parent.fs_idx());
 
         match self.get_real_rootfs(parent)? {
             (Left(fs), idata) => fs.symlink(&ctx, linkname, idata.ino(), name),
@@ -210,10 +238,7 @@ impl FileSystem for Vfs {
     ) -> Result<Entry> {
         validate_path_component(name)?;
 
-        // The supp gid is parsed after the request-wide id remap, so
-        // translate it here, where the target mount is known.
-        let mut ctx = ctx.clone();
-        self.remap_ctx_supp_gid(&mut ctx, inode.fs_idx());
+        let ctx = self.ctx_for_mount(ctx, inode.fs_idx());
 
         match self.get_real_rootfs(inode)? {
             (Left(fs), idata) => fs.mknod(&ctx, idata.ino(), name, mode, rdev, umask),
@@ -233,10 +258,7 @@ impl FileSystem for Vfs {
     ) -> Result<Entry> {
         validate_path_component(name)?;
 
-        // The supp gid is parsed after the request-wide id remap, so
-        // translate it here, where the target mount is known.
-        let mut ctx = ctx.clone();
-        self.remap_ctx_supp_gid(&mut ctx, parent.fs_idx());
+        let ctx = self.ctx_for_mount(ctx, parent.fs_idx());
 
         match self.get_real_rootfs(parent)? {
             (Left(fs), idata) => fs.mkdir(&ctx, idata.ino(), name, mode, umask),
@@ -276,12 +298,7 @@ impl FileSystem for Vfs {
         validate_path_component(oldname)?;
         validate_path_component(newname)?;
 
-        let (root, idata_old) = self.get_real_rootfs(olddir)?;
-        let (_, idata_new) = self.get_real_rootfs(newdir)?;
-
-        if idata_old.fs_idx() != idata_new.fs_idx() {
-            return Err(Error::from_raw_os_error(libc::EINVAL));
-        }
+        let (root, idata_old, idata_new) = self.get_real_rootfs_pair(olddir, newdir)?;
 
         match root {
             Left(fs) => fs.rename(
@@ -312,12 +329,7 @@ impl FileSystem for Vfs {
     ) -> Result<Entry> {
         validate_path_component(newname)?;
 
-        let (root, idata_old) = self.get_real_rootfs(inode)?;
-        let (_, idata_new) = self.get_real_rootfs(newparent)?;
-
-        if idata_old.fs_idx() != idata_new.fs_idx() {
-            return Err(Error::from_raw_os_error(libc::EINVAL));
-        }
+        let (root, idata_old, idata_new) = self.get_real_rootfs_pair(inode, newparent)?;
 
         match root {
             Left(fs) => fs.link(ctx, idata_old.ino(), idata_new.ino(), newname),
@@ -352,10 +364,7 @@ impl FileSystem for Vfs {
     ) -> Result<(Entry, Option<u64>, OpenOptions, Option<u32>)> {
         validate_path_component(name)?;
 
-        // The supp gid is parsed after the request-wide id remap, so
-        // translate it here, where the target mount is known.
-        let mut ctx = ctx.clone();
-        self.remap_ctx_supp_gid(&mut ctx, parent.fs_idx());
+        let ctx = self.ctx_for_mount(ctx, parent.fs_idx());
 
         match self.get_real_rootfs(parent)? {
             (Left(fs), idata) => fs.create(&ctx, idata.ino(), name, args),
@@ -645,17 +654,7 @@ impl FileSystem for Vfs {
         len: u64,
         flags: u64,
     ) -> Result<u32> {
-        // The pseudo fs has only directories, and the kernel never copies those.
-        let (Right(fs), idata_in) = self.get_real_rootfs(inode_in)? else {
-            return Err(Error::from_raw_os_error(libc::EISDIR));
-        };
-        let (Right(_), idata_out) = self.get_real_rootfs(inode_out)? else {
-            return Err(Error::from_raw_os_error(libc::EISDIR));
-        };
-
-        if idata_in.fs_idx() != idata_out.fs_idx() {
-            return Err(Error::from_raw_os_error(COPY_CROSS_MOUNT));
-        }
+        let (fs, idata_in, idata_out) = self.copy_file_range_fs(inode_in, inode_out)?;
         fs.copy_file_range(
             ctx,
             idata_in.ino(),
@@ -667,10 +666,7 @@ impl FileSystem for Vfs {
             len,
             flags,
         )
-        .map_err(|e| match e.raw_os_error() {
-            Some(libc::ENOSYS) => Error::from_raw_os_error(COPY_UNSUPPORTED),
-            _ => e,
-        })
+        .map_err(copy_file_range_error)
     }
 
     #[inline]

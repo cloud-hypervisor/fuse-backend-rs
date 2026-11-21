@@ -676,6 +676,15 @@ impl Vfs {
         }
     }
 
+    /// A copy of `ctx` for a request that creates a node on the file system `fs_idx`, with its
+    /// supplementary group remapped by `remap_ctx_supp_gid()`. The server parses the group after
+    /// the request-wide id remap, so the create handlers remap it for their mount.
+    fn ctx_for_mount(&self, ctx: &Context, fs_idx: VfsIndex) -> Context {
+        let mut ctx = ctx.clone();
+        self.remap_ctx_supp_gid(&mut ctx, fs_idx);
+        ctx
+    }
+
     fn allocate_fs_idx(&self) -> Result<VfsIndex> {
         let superblocks = self.superblocks.load().deref().deref().clone();
         let start = self.next_super.load(Ordering::SeqCst);
@@ -731,6 +740,22 @@ impl Vfs {
             let fs = self.get_fs_by_idx(inode.fs_idx())?;
             Ok((Right(fs), inode))
         }
+    }
+
+    /// Like `get_real_rootfs()` for two inodes of one request, which have to be on the same file
+    /// system. Fails with EINVAL if they aren't.
+    fn get_real_rootfs_pair(
+        &self,
+        a: VfsInode,
+        b: VfsInode,
+    ) -> Result<(VfsEitherFs<'_>, VfsInode, VfsInode)> {
+        let (root, idata_a) = self.get_real_rootfs(a)?;
+        let (_, idata_b) = self.get_real_rootfs(b)?;
+
+        if idata_a.fs_idx() != idata_b.fs_idx() {
+            return Err(Error::from_raw_os_error(libc::EINVAL));
+        }
+        Ok((root, idata_a, idata_b))
     }
 
     fn lookup_pseudo(
