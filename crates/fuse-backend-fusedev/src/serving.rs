@@ -7,18 +7,23 @@
 //! A *serving layer* owns a mounted [`FuseSession`], drives it with worker
 //! threads and turns [`Drop`] into teardown: stop accepting new requests,
 //! let in-flight requests finish, unmount the session and join all
-//! workers. Three implementations share that shape:
+//! workers. These implementations share that shape:
 //!
 //! | implementation       | handler model        | transport            |
 //! |----------------------|----------------------|----------------------|
 //! | [`SyncFuseServing`]  | `F: FileSystem`      | classic `/dev/fuse`  |
 //! | `AsyncFuseServing`   | `F: AsyncFileSystem` | classic `/dev/fuse`  |
 //! | `UringFuseServing`   | `F: FileSystem`      | FUSE-over-io_uring   |
+//! | (`new_async()`)      | `F: AsyncFileSystem` | FUSE-over-io_uring   |
 //!
-//! The axes a serving layer owns are the *transport* and the *handler
-//! model* — both fixed at the type level — plus the *worker count*, a
-//! field of every serving configuration. Two knobs that look like serving
-//! concerns deliberately are not:
+//! `UringFuseServing::new_async()` waits at most 10 seconds for in-flight
+//! requests, and leaks the ones that don't finish with their ring entries.
+//!
+//! A serving layer owns the *transport* and the *handler model*, which its
+//! type fixes, and the *worker count*, a field of every serving
+//! configuration. `UringFuseServing` picks its handler model with the
+//! constructor instead. Two knobs that look like serving concerns
+//! deliberately are not:
 //!
 //! - *blocking vs non-blocking reception* is a configuration of the
 //!   classic transport ([`SyncServingConfig::blocking`]): both reception
@@ -39,18 +44,18 @@
 //!   classic transport is the choice.
 //! - **Workload**: on a uring-capable kernel, metadata-heavy workloads
 //!   gain the most (3.7x file creation at 8 threads), while large
-//!   sequential IO currently regresses on uring — a known upstream
-//!   limitation analyzed in `docs/fuse-uring-performance.md` in the
-//!   repository — so classic multi-worker serving stays the throughput
-//!   choice there.
+//!   sequential IO is still slower on uring, see
+//!   `docs/fuse-uring-performance.md` in the repository, so classic
+//!   multi-worker serving stays the throughput choice there.
 //! - **Backing storage**: with local storage, synchronous handlers
 //!   (`FileSystem`) saturate with one worker per CPU. When every request
 //!   hides a network round trip, asynchronous handlers
 //!   (`AsyncFileSystem`) decouple the request concurrency from the
 //!   worker count.
 //!
-//! `AsyncFuseServing` needs the `async-io` feature and `UringFuseServing`
-//! the `uring` feature; [`SyncFuseServing`] is always available.
+//! `AsyncFuseServing` needs the `async-io` feature, `UringFuseServing` the
+//! `uring` feature, and `UringFuseServing::new_async()` both;
+//! [`SyncFuseServing`] is always available.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
@@ -59,6 +64,8 @@ use std::thread::{self, JoinHandle};
 use fuse_backend_core::api::filesystem::FileSystem;
 use fuse_backend_core::api::server::Server;
 
+#[cfg(all(target_os = "linux", any(feature = "async-io", feature = "uring")))]
+use crate::StopSignal;
 use crate::{Error, FuseChannelExt, FuseSession, Result};
 
 /// A running serving layer that owns a mounted [`FuseSession`].
@@ -326,6 +333,9 @@ fn svc_loop<F: FileSystem + Send + Sync + 'static, C: FuseChannelExt>(
 /// of [`WorkerSet::stop`].
 pub(crate) struct WorkerSet {
     exit: Arc<AtomicBool>,
+    // Wakes the `FuseDevTask` and io_uring workers when `stop()` sets `exit`.
+    #[cfg(all(target_os = "linux", any(feature = "async-io", feature = "uring")))]
+    signal: Option<StopSignal>,
     tracker: Arc<WorkerExitTracker>,
     handles: Vec<JoinHandle<()>>,
 }
@@ -334,21 +344,31 @@ impl WorkerSet {
     pub(crate) fn new() -> Self {
         WorkerSet {
             exit: Arc::new(AtomicBool::new(false)),
+            #[cfg(all(target_os = "linux", any(feature = "async-io", feature = "uring")))]
+            signal: None,
             tracker: Arc::new(WorkerExitTracker::default()),
             handles: Vec::new(),
         }
     }
 
     /// The exit flag shared with every worker.
-    // Only the async and uring serving layers hand the flag to their
-    // workers, so the accessor only exists in configurations that compile
-    // one of them.
-    #[cfg(any(
-        all(target_os = "linux", feature = "async-io"),
-        all(target_os = "linux", feature = "uring")
-    ))]
+    // Only the `/dev/fuse` thread of the uring serving layer takes the bare
+    // flag, so the accessor only exists in configurations that compile it.
+    #[cfg(all(target_os = "linux", feature = "uring"))]
     pub(crate) fn exit_flag(&self) -> Arc<AtomicBool> {
         self.exit.clone()
+    }
+
+    /// A stop signal for `FuseDevTask` and io_uring workers, which sets the
+    /// exit flag and wakes them when the set stops.
+    #[cfg(all(target_os = "linux", any(feature = "async-io", feature = "uring")))]
+    pub(crate) fn stop_signal(&mut self) -> Result<StopSignal> {
+        if let Some(signal) = &self.signal {
+            return Ok(signal.clone());
+        }
+        let signal = StopSignal::new(self.exit.clone())
+            .map_err(|e| Error::SessionFailure(format!("create the stop signal: {e}")))?;
+        Ok(self.signal.insert(signal).clone())
     }
 
     /// The exit tracker, for arming a guard at the top of a worker thread.
@@ -363,16 +383,25 @@ impl WorkerSet {
     /// Signal all workers to stop, tear the session down and join them.
     ///
     /// `wake` wakes the epoll-based channels registered with the session,
-    /// which snaps their `epoll_wait` out immediately; blocking channels
-    /// and io_uring workers instead exit through the `ENODEV`/ring-error
-    /// completion that tearing the connection down produces. In-flight
-    /// requests are still served and replied before a worker exits.
+    /// which snaps their `epoll_wait` out immediately. The stop signal
+    /// wakes `FuseDevTask` and io_uring workers after the unmount. Blocking
+    /// channels exit through the `ENODEV` that tearing the connection down
+    /// produces. In-flight requests are still served and replied before a
+    /// worker exits.
     pub(crate) fn stop(&mut self, session: &mut FuseSession, wake: bool) {
         self.exit.store(true, Ordering::Release);
         if wake {
             let _ = session.wake();
         }
         let _ = session.umount();
+        // Stop the signal after the unmount. A stopped io_uring worker ends a
+        // connection that is still up, and umount() leaves the mount of an
+        // ended connection in place. With auto_unmount, fusermount unmounts
+        // later, dead mount or not.
+        #[cfg(all(target_os = "linux", any(feature = "async-io", feature = "uring")))]
+        if let Some(signal) = &self.signal {
+            signal.stop();
+        }
         let handles = std::mem::take(&mut self.handles);
         for handle in handles {
             let _ = handle.join();

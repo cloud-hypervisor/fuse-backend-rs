@@ -60,10 +60,12 @@ its own `/dev/fuse` file description and async runtime, tokio-uring when
 io_uring is available), pool mode (the async mode with
 `PassthroughFs::enable_async_thread_pool()`), uring mode (the experimental
 FUSE-over-io_uring transport, requires kernel 6.14+ and is skipped
-otherwise), nowriteback mode (the sync daemon with the FUSE writeback
-cache turned off) and passthrough mode (the sync daemon with kernel
-passthrough, requires kernel 6.9+ with `CONFIG_FUSE_PASSTHROUGH` and is
-skipped on kernels known to lack it) — and runs identical fio workloads:
+otherwise), uring_async mode (the same transport with the asynchronous
+handlers, `UringFuseServing::new_async()`), nowriteback mode (the sync
+daemon with the FUSE writeback cache turned off) and passthrough mode (the
+sync daemon with kernel passthrough, requires kernel 6.9+ with
+`CONFIG_FUSE_PASSTHROUGH` and is skipped on kernels known to lack it) — and
+runs identical fio workloads:
 
 - sequential read/write with 1MB requests
 - random read/write with 4KB requests
@@ -90,9 +92,20 @@ The fio results are written in JSON format to a temporary results directory
 (printed at the start, `<dir>/<mode>-<workload>.json`), and a side-by-side
 summary is printed at the end. The default execution order is sync then
 async; the second mode benefits from a warmer page cache, so cross-check
-with `BENCH_MODES="async sync"`. The uring mode is included with
-`BENCH_MODES="sync async uring"`, and the kernel passthrough arms with
-`BENCH_MODES="sync nowriteback passthrough"`.
+with `BENCH_MODES="async sync"`. The uring modes are included with
+`BENCH_MODES="sync async uring uring_async"`, and the kernel passthrough arms
+with `BENCH_MODES="sync nowriteback passthrough"`.
+
+`BENCH_DAEMON_ARGS` passes extra arguments to the daemon in every mode. With
+`BENCH_DAEMON_ARGS="--delay-us 1000"`, every LOOKUP and READ waits 1 ms before
+it is served, as if the file system fetched from a remote store. The
+synchronous handlers block their worker for that time, while the
+asynchronous ones keep serving other requests. The difference shows once
+more reads are in flight than the daemon has workers, for example with
+`BENCH_THREADS=8 BENCH_DAEMON_ARGS="--delay-us 1000 --threads 2"`, since the
+daemon takes the last `--threads`. Reads that the page cache serves never
+reach the daemon, and with `--kernel-passthrough` no READ does, so only
+LOOKUPs wait.
 
 To quantify the difference between the transports, collect each mode's
 results and compare the collected files — `bench_compare.py` is
