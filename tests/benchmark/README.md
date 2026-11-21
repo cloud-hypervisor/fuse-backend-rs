@@ -105,7 +105,9 @@ more reads are in flight than the daemon has workers, for example with
 `BENCH_THREADS=8 BENCH_DAEMON_ARGS="--delay-us 1000 --threads 2"`, since the
 daemon takes the last `--threads`. Reads that the page cache serves never
 reach the daemon, and with `--kernel-passthrough` no READ does, so only
-LOOKUPs wait.
+LOOKUPs wait. With `--delay-prefix P` as well, only the files whose names
+start with `P` wait, so a fio job on other files measures how the fast
+requests of a mount fare next to slow ones.
 
 To quantify the difference between the transports, collect each mode's
 results and compare the collected files — `bench_compare.py` is

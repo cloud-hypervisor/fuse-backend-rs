@@ -6,16 +6,19 @@
 //! each LOOKUP and READ, to stand in for a backend that waits on a remote
 //! store. The synchronous handlers block their thread for the delay, and
 //! the asynchronous ones sleep without blocking it, so a transport that
-//! keeps several requests in flight overlaps the waits.
+//! keeps several requests in flight overlaps the waits. With a name
+//! prefix, only the files whose names start with it wait, like the misses
+//! of a backend that serves the other files from a cache.
 //!
 //! It forwards the requests the benchmark workloads send. The other
 //! synchronous handlers keep the `ENOSYS` defaults, and the other
 //! asynchronous ones call the synchronous handlers.
 
+use std::collections::HashSet;
 use std::ffi::CStr;
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -34,11 +37,38 @@ use fuse_backend_rs::api::Vfs;
 pub struct DelayFs {
     inner: Arc<Vfs>,
     delay: Duration,
+    /// Only names with this prefix wait, if set.
+    prefix: Option<Vec<u8>>,
+    /// The inodes that names with `prefix` led to, whose READs wait.
+    slow: RwLock<HashSet<Inode>>,
 }
 
 impl DelayFs {
-    pub fn new(inner: Arc<Vfs>, delay: Duration) -> Self {
-        DelayFs { inner, delay }
+    pub fn new(inner: Arc<Vfs>, delay: Duration, prefix: Option<String>) -> Self {
+        DelayFs {
+            inner,
+            delay,
+            prefix: prefix.map(String::into_bytes),
+            slow: RwLock::new(HashSet::new()),
+        }
+    }
+
+    /// Whether a LOOKUP of `name` waits.
+    fn slow_name(&self, name: &[u8]) -> bool {
+        self.prefix.as_ref().is_none_or(|p| name.starts_with(p))
+    }
+
+    /// Whether a READ of `inode` waits.
+    fn slow_inode(&self, inode: Inode) -> bool {
+        self.prefix.is_none() || self.slow.read().unwrap().contains(&inode)
+    }
+
+    /// Make the READs of the inode in `entry` wait if `name` does. The
+    /// kernel learns of files from READDIRPLUS too, and then sends no LOOKUP.
+    fn found(&self, name: &[u8], entry: &Entry) {
+        if self.prefix.as_ref().is_some_and(|p| name.starts_with(p)) {
+            self.slow.write().unwrap().insert(entry.inode.into());
+        }
     }
 
     fn wait(&self) {
@@ -108,8 +138,12 @@ impl FileSystem for DelayFs {
     }
 
     fn lookup(&self, ctx: &Context, parent: Inode, name: &CStr) -> io::Result<Entry> {
-        self.wait();
-        self.inner.lookup(ctx, parent, name)
+        if self.slow_name(name.to_bytes()) {
+            self.wait();
+        }
+        let entry = self.inner.lookup(ctx, parent, name)?;
+        self.found(name.to_bytes(), &entry);
+        Ok(entry)
     }
 
     fn forget(&self, ctx: &Context, inode: Inode, count: u64) {
@@ -172,7 +206,9 @@ impl FileSystem for DelayFs {
         name: &CStr,
         args: CreateIn,
     ) -> io::Result<(Entry, Option<Handle>, OpenOptions, Option<u32>)> {
-        self.inner.create(ctx, parent, name, args)
+        let created = self.inner.create(ctx, parent, name, args)?;
+        self.found(name.to_bytes(), &created.0);
+        Ok(created)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -187,7 +223,9 @@ impl FileSystem for DelayFs {
         lock_owner: Option<u64>,
         flags: u32,
     ) -> io::Result<usize> {
-        self.wait();
+        if self.slow_inode(inode) {
+            self.wait();
+        }
         self.inner
             .read(ctx, inode, handle, w, size, offset, lock_owner, flags)
     }
@@ -290,8 +328,12 @@ impl FileSystem for DelayFs {
         offset: u64,
         add_entry: &mut dyn FnMut(DirEntry, Entry) -> io::Result<usize>,
     ) -> io::Result<()> {
+        let mut add = |dir: DirEntry, entry: Entry| {
+            self.found(dir.name, &entry);
+            add_entry(dir, entry)
+        };
         self.inner
-            .readdirplus(ctx, inode, handle, size, offset, add_entry)
+            .readdirplus(ctx, inode, handle, size, offset, &mut add)
     }
 
     fn releasedir(
@@ -308,8 +350,12 @@ impl FileSystem for DelayFs {
 #[async_trait]
 impl AsyncFileSystem for DelayFs {
     async fn async_lookup(&self, ctx: &Context, parent: Inode, name: &CStr) -> io::Result<Entry> {
-        self.async_wait().await;
-        self.inner.async_lookup(ctx, parent, name).await
+        if self.slow_name(name.to_bytes()) {
+            self.async_wait().await;
+        }
+        let entry = self.inner.async_lookup(ctx, parent, name).await?;
+        self.found(name.to_bytes(), &entry);
+        Ok(entry)
     }
 
     async fn async_getattr(
@@ -351,7 +397,9 @@ impl AsyncFileSystem for DelayFs {
         name: &CStr,
         args: CreateIn,
     ) -> io::Result<(Entry, Option<Handle>, OpenOptions, Option<u32>)> {
-        self.inner.async_create(ctx, parent, name, args).await
+        let created = self.inner.async_create(ctx, parent, name, args).await?;
+        self.found(name.to_bytes(), &created.0);
+        Ok(created)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -366,7 +414,9 @@ impl AsyncFileSystem for DelayFs {
         lock_owner: Option<u64>,
         flags: u32,
     ) -> io::Result<usize> {
-        self.async_wait().await;
+        if self.slow_inode(inode) {
+            self.async_wait().await;
+        }
         self.inner
             .async_read(ctx, inode, handle, w, size, offset, lock_owner, flags)
             .await
@@ -458,8 +508,12 @@ impl AsyncFileSystem for DelayFs {
         offset: u64,
         add_entry: &mut (dyn FnMut(DirEntry, Entry) -> io::Result<usize> + Send),
     ) -> io::Result<()> {
+        let mut add = |dir: DirEntry, entry: Entry| {
+            self.found(dir.name, &entry);
+            add_entry(dir, entry)
+        };
         self.inner
-            .async_readdirplus(ctx, inode, handle, size, offset, add_entry)
+            .async_readdirplus(ctx, inode, handle, size, offset, &mut add)
             .await
     }
 
