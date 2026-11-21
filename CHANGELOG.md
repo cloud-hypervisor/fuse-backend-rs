@@ -179,9 +179,10 @@
 - [281](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/281): On Linux 7.3 and later, `UringFuseServing` gives each kernel queue a buffer pool of
   `UringConfig::bufs_per_queue` payload buffers. The kernel lends them to the queue's ring entries
   while they serve a request, so with fewer buffers than entries a mount needs less memory.
-  `bufs_per_queue` defaults to 4, the default number of entries, and counts as at most
-  `entries_per_queue`. 0 keeps a buffer per entry, as on older kernels. `UringConfig` has a new
-  field, so struct literals need `..Default::default()`.
+  `bufs_per_queue`, an `Option<usize>`, counts as at most `entries_per_queue`, and `Some(0)`
+  keeps a buffer per entry, as on older kernels. `None`, the default, gives
+  `UringFuseServing::new()` 4 buffers. `UringConfig` has a new field, so struct literals need
+  `..Default::default()`.
 - [281](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/281): `abi::fuse_uring` has the commands, INIT flag and fields of protocol 7.46 for buffer pools.
   `Server::uring_bufpool_supported()` tells whether the kernel offered them at INIT, and
   `Server::uring_payload_size()` returns the size of the kernel's payload buffers.
@@ -201,7 +202,7 @@
 - [317](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/317): `UringFuseServing::new_async()` serves FUSE-over-io_uring with the `AsyncFileSystem` handlers.
   Each worker runs an async runtime and keeps up to one request per ring entry in flight, so
   handlers that wait don't hold up the worker's other requests.
-  Its queues get `entries_per_queue` pool buffers, because a request keeps its buffer
+  By default its queues get a pool buffer per entry, because a request keeps its buffer
   while its handler waits.
 - [318](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/318): `UringFuseServing::new_async()` serves zero-copy too. `ZeroCopySource::async_write_to_file()`
   and `AsyncFileReadWriteVolatile::raw_fd()` let `Reader::async_read_to_at()` move zero-copy
@@ -212,6 +213,9 @@
   still works and makes an idle task check the flag every 100ms. `AsyncFuseServing` and the
   `/dev/fuse` thread of `UringFuseServing::new_async()` stop with a signal, so their idle tasks
   no longer wake 10 times a second.
+- [NNN](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/NNN): `UringFuseServing::new_async()` takes a `bufs_per_queue` smaller than
+  `entries_per_queue` as it is, which caps the memory of its pools. Requests that need a buffer
+  then wait while the handlers of others wait.
 
 ### Changed
 - [325](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/325): The `fuse-backend-fusedev` `uring` transport uses io-uring 0.6 instead of 0.5,

@@ -27,7 +27,8 @@
 //!   sets `UringConfig::entries_per_queue`, 16 by default. `--uring-bufs N`
 //!   sets `UringConfig::bufs_per_queue`, the number of buffers in each
 //!   queue's buffer pool on kernels with buffer pools. `0` gives every ring
-//!   entry a buffer of its own. `--uring-zero-copy` serves reads and writes
+//!   entry a buffer of its own. Without it, a pool has 4 buffers, or one
+//!   per entry with `--async`. `--uring-zero-copy` serves reads and writes
 //!   with zero-copy (`UringConfig::zero_copy` and
 //!   `Config::uring_zero_copy`), which needs CAP_SYS_ADMIN.
 //! - `--uring --async` mode: requests are served through FUSE-over-io_uring
@@ -96,7 +97,7 @@ mod daemon {
         no_writeback: bool,
         thread_cnt: u32,
         uring_entries: usize,
-        uring_bufs: usize,
+        uring_bufs: Option<usize>,
         uring_zero_copy: bool,
         backing_direct_io: bool,
         delay: Duration,
@@ -164,7 +165,7 @@ mod daemon {
             no_writeback: false,
             thread_cnt: 4,
             uring_entries: 16,
-            uring_bufs: UringConfig::default().bufs_per_queue,
+            uring_bufs: None,
             uring_zero_copy: false,
             backing_direct_io: true,
             delay: Duration::ZERO,
@@ -199,7 +200,7 @@ mod daemon {
                 }
                 "--uring-bufs" => {
                     idx += 1;
-                    res.uring_bufs = option_value(&args, idx)?;
+                    res.uring_bufs = Some(option_value(&args, idx)?);
                 }
                 _ => {
                     help();
