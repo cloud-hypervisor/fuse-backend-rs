@@ -185,6 +185,17 @@
 - [281](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/281): `abi::fuse_uring` has the commands, INIT flag and fields of protocol 7.46 for buffer pools.
   `Server::uring_bufpool_supported()` tells whether the kernel offered them at INIT, and
   `Server::uring_payload_size()` returns the size of the kernel's payload buffers.
+- [282](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/282): `OpenOptions::IO_URING_ZERO_COPY` and the zero-copy flags of protocol 7.46 in
+  `abi::fuse_uring` let a file system ask for FUSE-over-io_uring zero-copy on an open.
+  `Reader::with_zero_copy()` attaches request data that only the transport can move, through a
+  `ZeroCopySource`, and `Reader::read_to_at()` hands it over. `FileReadWriteVolatile::raw_fd()`
+  gives the transport the file descriptor to move it to. Other reads get a copy through memory.
+- [282](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/282): `passthrough::Config::uring_zero_copy` asks for FUSE-over-io_uring zero-copy on the files that
+  `PassthroughFs` opens, except files it opens with O_DIRECT.
+- [282](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/282): With `UringConfig::zero_copy` on Linux 7.3 and later, `UringFuseServing` serves the reads and
+  writes of opens that ask for it with zero-copy. It moves the data between the client's pages
+  and the file with io_uring fixed-buffer operations. It needs buffer pools and CAP_SYS_ADMIN,
+  and serves without it otherwise. `UringConfig` has a new field.
 
 ### Changed
 - [325](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/325): The `fuse-backend-fusedev` `uring` transport uses io-uring 0.6 instead of 0.5,
@@ -297,6 +308,15 @@
   and ".." of the root of a file system mounted elsewhere is the parent of its mountpoint, not
   the root itself. So `open_by_handle_at()` of a directory whose dentry has left the cache
   connects to the mount root instead of failing with ESTALE.
+- [328](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/328): The servers answer a request that fails before it gets a reply. A malformed
+  request (a short body, a name without its NUL, a size that disagrees with the body) gets
+  `EINVAL`, and a failure of the server itself, such as remapping the ids, gets `EIO`. Most early
+  returns in the handlers dropped such a request, and FUSE has no request timeout, so the client
+  waited forever. `handle_message()` and `async_handle_message()` then return the size of the
+  reply, not the error, because transports treat an error as a request without a reply: the
+  io_uring worker replaced the reply with `EIO`, and a virtio-fs device may never return the
+  descriptor. FORGET, BATCH_FORGET, INTERRUPT and NOTIFY_REPLY get no reply, now also when they
+  are oversized.
 - [329](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/329): The servers no longer reply to NOTIFY_REPLY when `FileSystem::notify_reply()`
   fails, which the default implementation does. The kernel takes no reply to NOTIFY_REPLY, and
   sends it under the unique number that the server picked for NOTIFY_RETRIEVE, so the reply
@@ -304,6 +324,12 @@
 - [NNN](link): With `allow_direct_io` off, a create with O_DIRECT no longer opens the new host
   file with O_DIRECT, which made buffered IO on it fail with EINVAL. `PassthroughFs::create()`
   now builds the host open flags with the same helper as `open_inode()`.
+- [347](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/347): `Vfs` forwards COPY_FILE_RANGE to the mounted file system that holds both
+  files, so a `PassthroughFs` behind a `Vfs` copies on the host. `Vfs` answered ENOSYS, on
+  which the kernel stops sending COPY_FILE_RANGE on the connection and falls back to a
+  splice copy. A copy between two mounts now gets EXDEV, and a backend's ENOSYS turns into
+  EOPNOTSUPP. On both, Linux falls back for that call only. FreeBSD falls back only on
+  ENOSYS, so there both stay ENOSYS. The pseudo fs directories answer EISDIR.
 - [303](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/303): The sync server answers a SETXATTR request it received in full
   but cannot decode — no NUL separator in the attribute name, or a value size
   that disagrees with the body — with `EINVAL` instead of dropping it. FUSE

@@ -10,6 +10,19 @@ use fuse_backend_core::abi::virtio_fs;
 #[cfg(feature = "virtiofs")]
 use fuse_backend_core::api::filesystem::FsCacheReqHandler;
 
+// The errnos `Vfs::copy_file_range()` answers when the kernel should copy the data itself.
+// Linux falls back on EXDEV and EOPNOTSUPP for that call only. On ENOSYS it falls back too,
+// but stops sending COPY_FILE_RANGE for every mount in this Vfs. FreeBSD falls back only on
+// ENOSYS and returns other errors to the caller.
+#[cfg(not(target_os = "freebsd"))]
+const COPY_CROSS_MOUNT: i32 = libc::EXDEV;
+#[cfg(not(target_os = "freebsd"))]
+const COPY_UNSUPPORTED: i32 = libc::EOPNOTSUPP;
+#[cfg(target_os = "freebsd")]
+const COPY_CROSS_MOUNT: i32 = libc::ENOSYS;
+#[cfg(target_os = "freebsd")]
+const COPY_UNSUPPORTED: i32 = libc::ENOSYS;
+
 impl FileSystem for Vfs {
     type Inode = VfsInode;
     type Handle = VfsHandle;
@@ -623,6 +636,46 @@ impl FileSystem for Vfs {
         }
     }
 
+    fn copy_file_range(
+        &self,
+        ctx: &Context,
+        inode_in: VfsInode,
+        fh_in: VfsHandle,
+        offset_in: u64,
+        inode_out: VfsInode,
+        fh_out: VfsHandle,
+        offset_out: u64,
+        len: u64,
+        flags: u64,
+    ) -> Result<u32> {
+        // The pseudo fs has only directories, and the kernel never copies those.
+        let (Right(fs), idata_in) = self.get_real_rootfs(inode_in)? else {
+            return Err(Error::from_raw_os_error(libc::EISDIR));
+        };
+        let (Right(_), idata_out) = self.get_real_rootfs(inode_out)? else {
+            return Err(Error::from_raw_os_error(libc::EISDIR));
+        };
+
+        if idata_in.fs_idx() != idata_out.fs_idx() {
+            return Err(Error::from_raw_os_error(COPY_CROSS_MOUNT));
+        }
+        fs.copy_file_range(
+            ctx,
+            idata_in.ino(),
+            fh_in,
+            offset_in,
+            idata_out.ino(),
+            fh_out,
+            offset_out,
+            len,
+            flags,
+        )
+        .map_err(|e| match e.raw_os_error() {
+            Some(libc::ENOSYS) => Error::from_raw_os_error(COPY_UNSUPPORTED),
+            _ => e,
+        })
+    }
+
     #[inline]
     fn id_remap(&self, ctx: &mut Context) -> Result<()> {
         // Without an inode there is no way to identify the target mount, so
@@ -677,9 +730,130 @@ impl FileSystem for Vfs {
 
 #[cfg(test)]
 mod tests {
+    use std::any::Any;
+
     use super::*;
     use crate::tests::FakeFileSystemOne;
     use std::ffi::CString;
+
+    /// A backend that records its `copy_file_range()` calls. It fails them with `errno`, or
+    /// copies `len` bytes when `errno` is 0.
+    struct CopyFs {
+        errno: i32,
+        calls: Arc<Mutex<Vec<[u64; 8]>>>,
+    }
+
+    impl FileSystem for CopyFs {
+        type Inode = u64;
+        type Handle = u64;
+
+        fn copy_file_range(
+            &self,
+            _ctx: &Context,
+            inode_in: u64,
+            fh_in: u64,
+            offset_in: u64,
+            inode_out: u64,
+            fh_out: u64,
+            offset_out: u64,
+            len: u64,
+            flags: u64,
+        ) -> Result<u32> {
+            let args = [
+                inode_in, fh_in, offset_in, inode_out, fh_out, offset_out, len, flags,
+            ];
+            self.calls.lock().unwrap().push(args);
+            match self.errno {
+                0 => Ok(len as u32),
+                errno => Err(Error::from_raw_os_error(errno)),
+            }
+        }
+    }
+
+    #[cfg(feature = "async-io")]
+    impl AsyncFileSystem for CopyFs {}
+
+    impl BackendFileSystem for CopyFs {
+        fn mount(&self) -> Result<(Entry, u64)> {
+            let root = Entry {
+                inode: 1,
+                ..Default::default()
+            };
+            Ok((root, 0))
+        }
+
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+    }
+
+    /// Mounts a `CopyFs` at `path`, and returns its index and the calls it gets.
+    fn mount_copy_fs(vfs: &Vfs, path: &str, errno: i32) -> (VfsIndex, Arc<Mutex<Vec<[u64; 8]>>>) {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let fs = CopyFs {
+            errno,
+            calls: calls.clone(),
+        };
+        (vfs.mount(Box::new(fs), path).unwrap(), calls)
+    }
+
+    /// Copies 4096 bytes from handle 10 at offset 100 to handle 20 at offset 200.
+    fn copy(vfs: &Vfs, inode_in: VfsInode, inode_out: VfsInode) -> Result<u32> {
+        let ctx = Context::default();
+        vfs.copy_file_range(&ctx, inode_in, 10, 100, inode_out, 20, 200, 4096, 0)
+    }
+
+    fn errno(result: Result<u32>) -> Option<i32> {
+        result.unwrap_err().raw_os_error()
+    }
+
+    #[test]
+    fn test_copy_file_range_within_a_mount() {
+        let vfs = Vfs::default();
+        mount_copy_fs(&vfs, "/a", 0);
+        let (b, calls) = mount_copy_fs(&vfs, "/b", 0);
+
+        let copied = copy(&vfs, VfsInode::new(b, 5), VfsInode::new(b, 6)).unwrap();
+        assert_eq!(copied, 4096);
+        assert_eq!(*calls.lock().unwrap(), [[5, 10, 100, 6, 20, 200, 4096, 0]]);
+    }
+
+    #[test]
+    fn test_copy_file_range_across_mounts() {
+        let vfs = Vfs::default();
+        let (a, _) = mount_copy_fs(&vfs, "/a", 0);
+        let (b, _) = mount_copy_fs(&vfs, "/b", 0);
+
+        let result = copy(&vfs, VfsInode::new(a, 5), VfsInode::new(b, 5));
+        assert_eq!(errno(result), Some(COPY_CROSS_MOUNT));
+    }
+
+    #[test]
+    fn test_copy_file_range_backend_errors() {
+        let vfs = Vfs::default();
+        let (a, _) = mount_copy_fs(&vfs, "/a", libc::ENOSYS);
+        let (b, _) = mount_copy_fs(&vfs, "/b", libc::EBADF);
+
+        let result = copy(&vfs, VfsInode::new(a, 5), VfsInode::new(a, 6));
+        assert_eq!(errno(result), Some(COPY_UNSUPPORTED));
+        let result = copy(&vfs, VfsInode::new(b, 5), VfsInode::new(b, 6));
+        assert_eq!(errno(result), Some(libc::EBADF));
+    }
+
+    #[test]
+    fn test_copy_file_range_pseudo_dirs() {
+        let vfs = Vfs::default();
+        let (idx, _) = mount_copy_fs(&vfs, "/x/y", 0);
+        let file = VfsInode::new(idx, 5);
+
+        // The root and /x, inode 2, are pseudo fs directories.
+        for dir in [ROOT_ID, 2].map(VfsInode::from) {
+            for (inode_in, inode_out) in [(dir, file), (file, dir), (dir, dir)] {
+                let result = copy(&vfs, inode_in, inode_out);
+                assert_eq!(errno(result), Some(libc::EISDIR));
+            }
+        }
+    }
 
     #[test]
     fn test_id_remap_reverse_direction_without_underflow() {

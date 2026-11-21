@@ -16,7 +16,7 @@
 
 use std::fs::File;
 use std::io::{Error, ErrorKind, Result};
-use std::os::unix::io::AsRawFd;
+use std::os::unix::io::{AsRawFd, RawFd};
 
 use libc::{c_int, c_void, read, readv, size_t, write, writev};
 
@@ -42,6 +42,13 @@ impl FileSetLen for File {
 
 /// A trait similar to `Read` and `Write`, but uses [FileVolatileSlice] objects as data buffers.
 pub trait FileReadWriteVolatile {
+    /// The file descriptor behind this file, if it has one. A transport
+    /// uses it to move data between the file and memory the server can't
+    /// map, such as the client pages of FUSE-over-io_uring zero-copy.
+    fn raw_fd(&self) -> Option<RawFd> {
+        None
+    }
+
     /// Read bytes from this file into the given slice, returning the number of bytes read on
     /// success.
     fn read_volatile(&mut self, slice: FileVolatileSlice) -> Result<usize>;
@@ -194,6 +201,10 @@ pub trait FileReadWriteVolatile {
 }
 
 impl<T: FileReadWriteVolatile + ?Sized> FileReadWriteVolatile for &mut T {
+    fn raw_fd(&self) -> Option<RawFd> {
+        (**self).raw_fd()
+    }
+
     fn read_volatile(&mut self, slice: FileVolatileSlice) -> Result<usize> {
         (**self).read_volatile(slice)
     }
@@ -254,6 +265,10 @@ impl<T: FileReadWriteVolatile + ?Sized> FileReadWriteVolatile for &mut T {
 macro_rules! volatile_impl {
     ($ty:ty) => {
         impl FileReadWriteVolatile for $ty {
+            fn raw_fd(&self) -> Option<RawFd> {
+                Some(self.as_raw_fd())
+            }
+
             fn read_volatile(&mut self, slice: FileVolatileSlice) -> Result<usize> {
                 // Safe because only bytes inside the slice are accessed and the kernel is expected
                 // to handle arbitrary memory for I/O.
@@ -1199,8 +1214,7 @@ mod tests {
         file.seek(SeekFrom::Start(0)).unwrap();
 
         let mut buf2 = [0x0u8; 32];
-        let slice =
-            unsafe { FileVolatileSlice::from_raw_ptr(buf2.as_mut_ptr() as *mut u8, buf2.len()) };
+        let slice = unsafe { FileVolatileSlice::from_raw_ptr(buf2.as_mut_ptr(), buf2.len()) };
         assert_eq!(file.read_volatile(slice).unwrap(), 32);
         assert_eq!(buf, buf2);
 
@@ -1218,8 +1232,8 @@ mod tests {
         let mut buf2 = [0x0u8; 32];
         let slices = unsafe {
             [
-                FileVolatileSlice::from_raw_ptr(buf2.as_mut_ptr() as *mut u8, 16),
-                FileVolatileSlice::from_raw_ptr((buf2.as_mut_ptr() as *mut u8).add(16), 16),
+                FileVolatileSlice::from_raw_ptr(buf2.as_mut_ptr(), 16),
+                FileVolatileSlice::from_raw_ptr(buf2.as_mut_ptr().add(16), 16),
             ]
         };
         assert_eq!(file.read_vectored_volatile(&slices).unwrap(), 32);
@@ -1237,8 +1251,7 @@ mod tests {
         file.seek(SeekFrom::Start(0)).unwrap();
 
         let mut buf2 = [0x0u8; 31];
-        let slice =
-            unsafe { FileVolatileSlice::from_raw_ptr(buf2.as_mut_ptr() as *mut u8, buf2.len()) };
+        let slice = unsafe { FileVolatileSlice::from_raw_ptr(buf2.as_mut_ptr(), buf2.len()) };
         file.read_exact_volatile(slice).unwrap();
         assert_eq!(buf[..31], buf2);
 
@@ -1253,8 +1266,7 @@ mod tests {
         file.write_all(&buf).unwrap();
 
         let mut buf2 = [0x0u8; 32];
-        let slice =
-            unsafe { FileVolatileSlice::from_raw_ptr(buf2.as_mut_ptr() as *mut u8, buf2.len()) };
+        let slice = unsafe { FileVolatileSlice::from_raw_ptr(buf2.as_mut_ptr(), buf2.len()) };
         assert_eq!(file.read_at_volatile(slice, 0).unwrap(), 32);
         assert_eq!(buf, buf2);
 
@@ -1272,8 +1284,8 @@ mod tests {
         let mut buf2 = [0x0u8; 32];
         let slices = unsafe {
             [
-                FileVolatileSlice::from_raw_ptr(buf2.as_mut_ptr() as *mut u8, 16),
-                FileVolatileSlice::from_raw_ptr((buf2.as_mut_ptr() as *mut u8).add(16), 16),
+                FileVolatileSlice::from_raw_ptr(buf2.as_mut_ptr(), 16),
+                FileVolatileSlice::from_raw_ptr(buf2.as_mut_ptr().add(16), 16),
             ]
         };
         assert_eq!(file.read_vectored_at_volatile(&slices, 0).unwrap(), 32);
@@ -1291,8 +1303,7 @@ mod tests {
         file.write_all(&buf).unwrap();
 
         let mut buf2 = [0x0u8; 32];
-        let slice =
-            unsafe { FileVolatileSlice::from_raw_ptr(buf2.as_mut_ptr() as *mut u8, buf2.len()) };
+        let slice = unsafe { FileVolatileSlice::from_raw_ptr(buf2.as_mut_ptr(), buf2.len()) };
         file.read_exact_at_volatile(slice, 0).unwrap();
         assert_eq!(buf, buf2);
 
@@ -1305,14 +1316,12 @@ mod tests {
         let mut file = tempfile::tempfile().unwrap();
 
         let mut buf = [0xfu8; 32];
-        let slice1 =
-            unsafe { FileVolatileSlice::from_raw_ptr(buf.as_mut_ptr() as *mut u8, buf.len()) };
+        let slice1 = unsafe { FileVolatileSlice::from_raw_ptr(buf.as_mut_ptr(), buf.len()) };
         file.write_volatile(slice1).unwrap();
         file.seek(SeekFrom::Start(0)).unwrap();
 
         let mut buf2 = [0x0u8; 32];
-        let slice =
-            unsafe { FileVolatileSlice::from_raw_ptr(buf2.as_mut_ptr() as *mut u8, buf2.len()) };
+        let slice = unsafe { FileVolatileSlice::from_raw_ptr(buf2.as_mut_ptr(), buf2.len()) };
         assert_eq!(file.read_volatile(slice).unwrap(), 32);
         assert_eq!(buf, buf2);
 
@@ -1326,8 +1335,8 @@ mod tests {
         let mut buf = [0xfu8; 32];
         let slices1 = unsafe {
             [
-                FileVolatileSlice::from_raw_ptr(buf.as_mut_ptr() as *mut u8, 16),
-                FileVolatileSlice::from_raw_ptr((buf.as_mut_ptr() as *mut u8).add(16), 16),
+                FileVolatileSlice::from_raw_ptr(buf.as_mut_ptr(), 16),
+                FileVolatileSlice::from_raw_ptr(buf.as_mut_ptr().add(16), 16),
             ]
         };
         file.write_vectored_volatile(&slices1).unwrap();
@@ -1336,8 +1345,8 @@ mod tests {
         let mut buf2 = [0x0u8; 32];
         let slices = unsafe {
             [
-                FileVolatileSlice::from_raw_ptr(buf2.as_mut_ptr() as *mut u8, 16),
-                FileVolatileSlice::from_raw_ptr((buf2.as_mut_ptr() as *mut u8).add(16), 16),
+                FileVolatileSlice::from_raw_ptr(buf2.as_mut_ptr(), 16),
+                FileVolatileSlice::from_raw_ptr(buf2.as_mut_ptr().add(16), 16),
             ]
         };
         assert_eq!(file.read_vectored_volatile(&slices).unwrap(), 32);
@@ -1351,14 +1360,12 @@ mod tests {
         let mut file = tempfile::tempfile().unwrap();
 
         let mut buf = [0xfu8; 32];
-        let slice1 =
-            unsafe { FileVolatileSlice::from_raw_ptr(buf.as_mut_ptr() as *mut u8, buf.len()) };
+        let slice1 = unsafe { FileVolatileSlice::from_raw_ptr(buf.as_mut_ptr(), buf.len()) };
         file.write_all_volatile(slice1).unwrap();
         file.seek(SeekFrom::Start(0)).unwrap();
 
         let mut buf2 = [0x0u8; 32];
-        let slice =
-            unsafe { FileVolatileSlice::from_raw_ptr(buf2.as_mut_ptr() as *mut u8, buf2.len()) };
+        let slice = unsafe { FileVolatileSlice::from_raw_ptr(buf2.as_mut_ptr(), buf2.len()) };
         file.read_exact_volatile(slice).unwrap();
         assert_eq!(buf, buf2);
 
@@ -1370,14 +1377,12 @@ mod tests {
         let mut file = tempfile::tempfile().unwrap();
 
         let mut buf = [0xfu8; 32];
-        let slice1 =
-            unsafe { FileVolatileSlice::from_raw_ptr(buf.as_mut_ptr() as *mut u8, buf.len()) };
+        let slice1 = unsafe { FileVolatileSlice::from_raw_ptr(buf.as_mut_ptr(), buf.len()) };
         file.write_volatile(slice1).unwrap();
         file.seek(SeekFrom::Start(0)).unwrap();
 
         let mut buf2 = [0x0u8; 32];
-        let slice =
-            unsafe { FileVolatileSlice::from_raw_ptr(buf2.as_mut_ptr() as *mut u8, buf2.len()) };
+        let slice = unsafe { FileVolatileSlice::from_raw_ptr(buf2.as_mut_ptr(), buf2.len()) };
         assert_eq!(file.read_at_volatile(slice, 0).unwrap(), 32);
         assert_eq!(buf, buf2);
 
@@ -1392,8 +1397,8 @@ mod tests {
         let mut buf = [0xfu8; 32];
         let slices1 = unsafe {
             [
-                FileVolatileSlice::from_raw_ptr(buf.as_mut_ptr() as *mut u8, 16),
-                FileVolatileSlice::from_raw_ptr((buf.as_mut_ptr() as *mut u8).add(16), 16),
+                FileVolatileSlice::from_raw_ptr(buf.as_mut_ptr(), 16),
+                FileVolatileSlice::from_raw_ptr(buf.as_mut_ptr().add(16), 16),
             ]
         };
         file.write_vectored_volatile(&slices1).unwrap();
@@ -1402,8 +1407,8 @@ mod tests {
         let mut buf2 = [0x0u8; 32];
         let slices = unsafe {
             [
-                FileVolatileSlice::from_raw_ptr(buf2.as_mut_ptr() as *mut u8, 16),
-                FileVolatileSlice::from_raw_ptr((buf2.as_mut_ptr() as *mut u8).add(16), 16),
+                FileVolatileSlice::from_raw_ptr(buf2.as_mut_ptr(), 16),
+                FileVolatileSlice::from_raw_ptr(buf2.as_mut_ptr().add(16), 16),
             ]
         };
         assert_eq!(file.read_vectored_at_volatile(&slices, 0).unwrap(), 32);
@@ -1418,14 +1423,12 @@ mod tests {
         let mut file = tempfile::tempfile().unwrap();
 
         let mut buf = [0xfu8; 32];
-        let slice1 =
-            unsafe { FileVolatileSlice::from_raw_ptr(buf.as_mut_ptr() as *mut u8, buf.len()) };
+        let slice1 = unsafe { FileVolatileSlice::from_raw_ptr(buf.as_mut_ptr(), buf.len()) };
         file.write_all_volatile(slice1).unwrap();
         file.seek(SeekFrom::Start(0)).unwrap();
 
         let mut buf2 = [0x0u8; 32];
-        let slice =
-            unsafe { FileVolatileSlice::from_raw_ptr(buf2.as_mut_ptr() as *mut u8, buf2.len()) };
+        let slice = unsafe { FileVolatileSlice::from_raw_ptr(buf2.as_mut_ptr(), buf2.len()) };
         file.read_exact_at_volatile(slice, 0).unwrap();
         assert_eq!(buf, buf2);
 
