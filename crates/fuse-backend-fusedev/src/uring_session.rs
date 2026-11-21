@@ -230,7 +230,7 @@ fn op_args(opcode: u32) -> Option<(usize, bool)> {
         Opcode::Destroy => (0, false),                       // no arguments
         Opcode::Ioctl => (32, true),                         // IoctlIn
         Opcode::Poll => (24, true),                          // PollIn
-        Opcode::NotifyReply => (0, false),                   // payload only
+        Opcode::NotifyReply => (0, false),                   // NotifyRetrieveIn in the payload
         Opcode::BatchForget => (8, false),                   // BatchForgetIn
         Opcode::Fallocate => (32, false),                    // FallocateIn
         Opcode::Rename2 => (16, false),                      // Rename2In
