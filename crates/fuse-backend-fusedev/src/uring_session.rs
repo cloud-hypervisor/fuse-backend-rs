@@ -116,6 +116,31 @@ pub struct UringConfig {
     /// `AsyncFileReadWriteVolatile`). Other files take a slower copy through
     /// memory.
     pub zero_copy: bool,
+    /// Create the rings of the `UringFuseServing::new()` workers with
+    /// `IORING_SETUP_SINGLE_ISSUER` and `IORING_SETUP_DEFER_TASKRUN`, so the
+    /// kernel copies a request into its entry when the worker waits for the
+    /// next one instead of interrupting its handler. That made requests that
+    /// a client sends one at a time faster, see
+    /// `docs/fuse-uring-performance.md`. A kernel that refuses the flags
+    /// gets rings without them.
+    ///
+    /// Only the worker may enter such a ring, so zero-copy IO must run on the
+    /// thread that serves the request. On another thread, such as a scoped
+    /// thread of a handler, it fails with EEXIST.
+    ///
+    /// It is off by default, because on Linux 7.2.0 to 7.2.13, 7.3.0 and
+    /// 7.3.1 a thread that waits on such a ring can miss its wake-up, and
+    /// the worker then sleeps with a request until a signal interrupts it.
+    /// Commit 8257f6ec45ee ("io_uring: don't lose the DEFER_TASKRUN wake
+    /// up") fixed that in 7.4-rc1, 7.3.2 and 7.2.14. Kernels before 7.2
+    /// don't have the bug.
+    ///
+    /// `UringFuseServing::new_async()` ignores it. Its workers wait for
+    /// completions in epoll, and from Linux 6.3 on, the kernel doesn't wake
+    /// epoll for deferred task work until commit b88902d8745a ("io_uring:
+    /// wake ring pollers for local task_work"), in 7.4-rc1, 7.3.2, 7.2.14
+    /// and 6.18.60.
+    pub defer_taskrun: bool,
 }
 
 impl Default for UringConfig {
@@ -125,6 +150,7 @@ impl Default for UringConfig {
             entries_per_queue: 4,
             bufs_per_queue: 4,
             zero_copy: false,
+            defer_taskrun: false,
         }
     }
 }
@@ -1013,6 +1039,53 @@ fn cmd_sqe(
 /// 128-byte SQEs.
 type FuseRing = IoUring<squeue::Entry128, cqueue::Entry>;
 
+/// The setup flags of a worker ring.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RingFlags {
+    /// No setup flags. The kernel copies a request into its entry in task
+    /// work of the worker, which interrupts the worker, also in a handler.
+    Default,
+    /// `IORING_SETUP_SINGLE_ISSUER` and `IORING_SETUP_DEFER_TASKRUN`, since
+    /// Linux 6.1. The task work waits until the worker waits for completions
+    /// in `io_uring_enter()`. Only the thread that created the ring may
+    /// submit to it. See `UringConfig::defer_taskrun` for the kernels that
+    /// miss wake-ups with it.
+    DeferTaskrun,
+}
+
+impl RingFlags {
+    /// Build a ring with these flags and `entries` submission queue
+    /// entries.
+    fn build(self, entries: u32) -> io::Result<FuseRing> {
+        let mut builder = FuseRing::builder();
+        if self == RingFlags::DeferTaskrun {
+            builder.setup_single_issuer().setup_defer_taskrun();
+        }
+        builder.build(entries)
+    }
+
+    /// Run `build` with these flags, and again without flags if it fails
+    /// with EINVAL, which is how a kernel refuses flags it doesn't know.
+    fn build_or_default<T>(
+        self,
+        mut build: impl FnMut(RingFlags) -> io::Result<T>,
+    ) -> io::Result<T> {
+        match build(self) {
+            Err(e) if self != RingFlags::Default && e.raw_os_error() == Some(libc::EINVAL) => {
+                let res = build(RingFlags::Default);
+                // Every worker tries, so warn once, and only if the flags
+                // were what the kernel refused.
+                static WARNED: AtomicBool = AtomicBool::new(false);
+                if res.is_ok() && !WARNED.swap(true, Ordering::Relaxed) {
+                    warn!("uring: the kernel refused a ring with {self:?} ({e}), using no flags");
+                }
+                res
+            }
+            res => res,
+        }
+    }
+}
+
 /// The number of zero-copy requests served, for the tests.
 #[cfg(test)]
 static ZERO_COPY_REQUESTS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
@@ -1040,16 +1113,29 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 struct RingState {
     ring: FuseRing,
     completions: Completions,
+    /// The thread of the worker, which alone may enter a ring with
+    /// `IORING_SETUP_SINGLE_ISSUER`.
+    worker: thread::ThreadId,
 }
 
 impl RingState {
-    /// The state of `ring`, while the kernel holds all `nr_entries`
-    /// entries, behind the lock its users share.
+    /// The state of `ring`, for the calling worker thread, while the kernel
+    /// holds all `nr_entries` entries, behind the lock its users share.
     fn new(ring: FuseRing, nr_entries: usize) -> Mutex<RingState> {
         Mutex::new(RingState {
             ring,
             completions: Completions::new(nr_entries),
+            worker: thread::current().id(),
         })
+    }
+
+    /// Whether the calling thread may enter the ring. With
+    /// `IORING_SETUP_SINGLE_ISSUER`, only the worker may. The kernel fails a
+    /// submit from another thread with EEXIST, but only after the ring
+    /// published the queued entries, which then go out with the worker's
+    /// next submit.
+    fn enterable(&self) -> bool {
+        !self.ring.params().is_setup_single_issuer() || thread::current().id() == self.worker
     }
 
     /// Take all completions off the ring, see `Completions::receive()`.
@@ -1232,7 +1318,12 @@ impl BounceBuf {
 
 impl ZeroCopyIo<'_> {
     /// Queue `sqe` on the ring as the next operation of the entry.
+    /// Other threads get EEXIST on a ring with deferred task work, and the
+    /// ring stays as it is.
     fn start(&self, state: &mut RingState, sqe: squeue::Entry) -> io::Result<()> {
+        if !state.enterable() {
+            return Err(io::Error::from_raw_os_error(libc::EEXIST));
+        }
         let op = &mut state.completions.ops[self.idx];
         op.started = op.started.wrapping_add(1) & 0x7fff_ffff;
         op.result = None;
@@ -1841,6 +1932,11 @@ struct UringWorker<F: FileSystem + Send + Sync + 'static> {
     abort: Arc<ConnectionAbort>,
     /// Lets the workers end the connection once all have stopped.
     barrier: Arc<StopBarrier>,
+    /// The setup flags of the worker's ring.
+    ring_flags: RingFlags,
+    /// Counts the worker rings that got deferred task work.
+    #[cfg(test)]
+    deferred_rings: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 /// Lets the workers register their entries in rounds, see
@@ -2163,10 +2259,19 @@ impl<F: FileSystem + Send + Sync + 'static> UringWorker<F> {
         }
     }
 
-    /// The worker's ring, with a sparse buffer table of a slot per entry if
-    /// the queues have zero-copy.
+    /// The worker's ring, with its flags if the kernel takes them, and a
+    /// sparse buffer table of a slot per entry if the queues have zero-copy.
     fn create_ring(&self) -> io::Result<FuseRing> {
-        let ring = FuseRing::builder().build((self.entries.len() * 2) as u32)?;
+        let entries = (self.entries.len() * 2) as u32;
+        let ring = self
+            .ring_flags
+            .build_or_default(|flags| flags.build(entries))?;
+        // The flags come together, and io-uring has no getter for
+        // IORING_SETUP_DEFER_TASKRUN.
+        #[cfg(test)]
+        if ring.params().is_setup_single_issuer() {
+            self.deferred_rings.fetch_add(1, Ordering::Relaxed);
+        }
         if self.bounce.is_some() {
             register_sparse_buffers(&ring, self.entries.len()).map_err(|e| {
                 io::Error::other(format!(
@@ -2389,6 +2494,8 @@ impl<F: AsyncFileSystem + Send + Sync + 'static> UringWorker<F> {
         // ready channel open and the constructor would never see this
         // thread exit.
         let barrier = self.barrier_guard();
+        // serve_async() waits in epoll, see UringConfig::defer_taskrun.
+        debug_assert_eq!(self.ring_flags, RingFlags::Default);
         let (ring, entries, (runtime, ring_ready)) = self.setup(&exit, &ready_tx, |ring| {
             let runtime = std::panic::catch_unwind(Runtime::new)
                 .map_err(|_| io::Error::other("failed to create the async runtime"))?;
@@ -2762,6 +2869,9 @@ pub struct UringFuseServing<F: FileSystem + Send + Sync + 'static> {
     /// Whether the queues have zero-copy.
     #[cfg(test)]
     zero_copy: bool,
+    /// The number of worker rings with deferred task work.
+    #[cfg(test)]
+    deferred_rings: usize,
     _fs: std::marker::PhantomData<F>,
 }
 
@@ -2872,6 +2982,8 @@ impl<F: FileSystem + Send + Sync + 'static> UringFuseServing<F> {
         let barrier = Arc::new(StopBarrier::new(workers));
         let nr_rounds = spread.iter().flatten().map(|&(_, round)| round + 1).max();
         let rounds = Arc::new(RegisterRounds::new(workers, nr_rounds.unwrap_or(1)));
+        #[cfg(test)]
+        let deferred_rings = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let mut worker_list = Vec::with_capacity(workers);
         for entries in spread {
             worker_list.push(UringWorker {
@@ -2896,6 +3008,13 @@ impl<F: FileSystem + Send + Sync + 'static> UringFuseServing<F> {
                 server: server.clone(),
                 abort: abort.clone(),
                 barrier: barrier.clone(),
+                ring_flags: if cfg.defer_taskrun {
+                    RingFlags::DeferTaskrun
+                } else {
+                    RingFlags::Default
+                },
+                #[cfg(test)]
+                deferred_rings: deferred_rings.clone(),
             });
         }
 
@@ -2990,6 +3109,9 @@ impl<F: FileSystem + Send + Sync + 'static> UringFuseServing<F> {
             pool_bufs: if pools.is_some() { bufs_per_queue } else { 0 },
             #[cfg(test)]
             zero_copy,
+            // The workers created their rings before they reported ready.
+            #[cfg(test)]
+            deferred_rings: deferred_rings.load(Ordering::Relaxed),
             _fs: std::marker::PhantomData,
         })
     }
@@ -3064,6 +3186,8 @@ impl<F: AsyncFileSystem + Send + Sync + 'static> UringFuseServing<F> {
     /// non-zero `bufs_per_queue` says. `docs/fuse-uring-performance.md` has
     /// the numbers. A `bufs_per_queue` of 0 still gives every entry a buffer
     /// of its own.
+    ///
+    /// The workers ignore `defer_taskrun`, see there.
     pub fn new_async(
         session: FuseSession,
         server: Arc<Server<F>>,
@@ -3073,6 +3197,7 @@ impl<F: AsyncFileSystem + Send + Sync + 'static> UringFuseServing<F> {
             // start() counts 0 entries as 1.
             cfg.bufs_per_queue = cfg.entries_per_queue.max(1);
         }
+        cfg.defer_taskrun = false;
         Self::start(
             session,
             server,
@@ -3155,6 +3280,7 @@ mod tests {
             entries_per_queue: 1,
             bufs_per_queue: 0,
             zero_copy: false,
+            ..Default::default()
         };
         let r = UringFuseServing::new(se, server, cfg);
         if uring_available() {
@@ -3456,6 +3582,87 @@ mod tests {
             let expected = uapi_cmd_sqe(fd, cmd_op, 0, iovecs, segs, user_data, &req);
             assert_eq!(bytes(sqe), expected, "cmd_op {cmd_op}");
         }
+    }
+
+    #[test]
+    fn test_ring_flags_fallback() {
+        use RingFlags::*;
+        // Build with `flags`, failing the first attempt with `errno`.
+        let attempts = |flags: RingFlags, errno| {
+            let mut tried = Vec::new();
+            let built = flags.build_or_default(|f| {
+                tried.push(f);
+                match tried.len() {
+                    1 => Err(io::Error::from_raw_os_error(errno)),
+                    _ => Ok(()),
+                }
+            });
+            (built.map_err(|e| e.raw_os_error()), tried)
+        };
+        // A kernel that refuses the flags with EINVAL gets a ring without them.
+        assert_eq!(
+            attempts(DeferTaskrun, libc::EINVAL),
+            (Ok(()), vec![DeferTaskrun, Default])
+        );
+        // Other errors don't fall back, nor does a ring without flags.
+        assert_eq!(
+            attempts(DeferTaskrun, libc::ENOMEM),
+            (Err(Some(libc::ENOMEM)), vec![DeferTaskrun])
+        );
+        assert_eq!(
+            attempts(Default, libc::EINVAL),
+            (Err(Some(libc::EINVAL)), vec![Default])
+        );
+
+        // Kernels since 6.1 take the flags.
+        match DeferTaskrun.build(8) {
+            Ok(ring) => assert!(ring.params().is_setup_single_issuer()),
+            Err(e) => eprintln!("can't create a ring ({e}), skipping"),
+        }
+    }
+
+    /// A ring with `flags` and the state and memory file of zero-copy IO
+    /// for one entry on it, or None if the kernel can't create the ring.
+    fn zero_copy_state(flags: RingFlags) -> Option<(Mutex<RingState>, Mutex<BounceBuf>)> {
+        match flags.build(8) {
+            Ok(ring) => Some((
+                RingState::new(ring, 1),
+                Mutex::new(BounceBuf::new(4096).unwrap()),
+            )),
+            Err(e) => {
+                eprintln!("can't create a ring with {flags:?} ({e}), skipping");
+                None
+            }
+        }
+    }
+
+    /// The zero-copy IO of entry 0 in `state`.
+    fn zero_copy_io<'r>(
+        state: &'r Mutex<RingState>,
+        bounce: &'r Mutex<BounceBuf>,
+    ) -> ZeroCopyIo<'r> {
+        ZeroCopyIo {
+            state,
+            idx: 0,
+            slot: 0,
+            bounce,
+        }
+    }
+
+    /// On a ring with deferred task work, zero-copy IO from another thread
+    /// than the worker fails, and queues nothing that the worker's next
+    /// submit would send after the request is done.
+    #[test]
+    fn test_zero_copy_off_the_worker_queues_nothing() {
+        let Some((state, bounce)) = zero_copy_state(RingFlags::DeferTaskrun) else {
+            return;
+        };
+        let io = zero_copy_io(&state, &bounce);
+        let nop = || opcode::Nop::new().build();
+        let off_worker = thread::scope(|s| s.spawn(|| io.run(nop())).join().unwrap());
+        assert_eq!(off_worker.unwrap_err().raw_os_error(), Some(libc::EEXIST));
+        assert!(lock(&state).ring.submission().is_empty());
+        assert_eq!(io.run(nop()).unwrap(), 0);
     }
 
     #[test]
@@ -3896,6 +4103,8 @@ mod tests {
                 done: AtomicBool::new(false),
             }),
             barrier: Arc::new(StopBarrier::new(1)),
+            ring_flags: RingFlags::Default,
+            deferred_rings: Arc::default(),
         };
         (worker, source)
     }
@@ -4320,18 +4529,21 @@ mod tests {
     }
 
     /// Serve a PassthroughFs over io_uring with `start`, `workers` workers,
-    /// 2 entries and `bufs_per_queue` buffers per queue, and zero-copy if
-    /// `zero_copy`. Check that a kernel with buffer pools gives each queue
-    /// `pool_bufs` buffers, read and write through the mount, then check
-    /// that dropping the serving layer gets the ring entries back from the
-    /// kernel and unmounts.
+    /// 2 entries and `bufs_per_queue` buffers per queue, zero-copy if
+    /// `zero_copy`, and deferred task work if `defer_taskrun`. Check that a
+    /// kernel with buffer pools gives each queue `pool_bufs` buffers, read
+    /// and write through the mount, then check that dropping the serving
+    /// layer gets the ring entries back from the kernel and unmounts.
+    /// Returns the number of worker rings with deferred task work, or None
+    /// if the kernel refused FUSE-over-io_uring.
     fn check_passthrough_mount(
         start: StartFn<PassthroughFs<()>>,
         workers: usize,
         bufs_per_queue: usize,
         zero_copy: bool,
+        defer_taskrun: bool,
         pool_bufs: usize,
-    ) {
+    ) -> Option<usize> {
         let src = TempDir::new().unwrap();
         std::fs::write(src.as_path().join("hello"), b"over io_uring").unwrap();
         let mnt = TempDir::new().unwrap();
@@ -4341,10 +4553,9 @@ mod tests {
             entries_per_queue: 2,
             bufs_per_queue,
             zero_copy,
+            defer_taskrun,
         };
-        let Some(serving) = mount_uring(server.clone(), mnt.as_path(), cfg, start) else {
-            return;
-        };
+        let serving = mount_uring(server.clone(), mnt.as_path(), cfg, start)?;
         // Kernels with buffer pools must get them when the config asks, and
         // zero-copy too when the test runs as root.
         let pooled = server.uring_bufpool_supported();
@@ -4353,7 +4564,8 @@ mod tests {
             assert!(serving.zero_copy);
         }
         eprintln!(
-            "uring mount: {workers} workers, {bufs_per_queue} buffers per queue, zero-copy {}",
+            "uring mount: {workers} workers, {bufs_per_queue} buffers per queue, zero-copy {}, \
+             deferred task work {defer_taskrun}",
             serving.zero_copy
         );
 
@@ -4396,26 +4608,34 @@ mod tests {
         // Tearing the connection down completes the commands of all armed
         // entries, so the workers get their entries back well within
         // RELEASE_TIMEOUT instead of waiting it out and leaking them.
+        let deferred_rings = serving.deferred_rings;
         let start = Instant::now();
         drop(serving);
         assert!(start.elapsed() < RELEASE_TIMEOUT);
         assert!(std::fs::read(mnt.as_path().join("hello")).is_err());
+        Some(deferred_rings)
     }
 
     #[test]
     fn test_uring_serving_mount() {
-        for (bufs_per_queue, zero_copy) in
-            [(0, false), (1, false), (4, false), (1, true), (4, true)]
-        {
-            // A pool holds at most as many buffers as the queue has entries.
-            let pool_bufs = bufs_per_queue.min(2);
-            check_passthrough_mount(
-                UringFuseServing::new,
-                2,
-                bufs_per_queue,
-                zero_copy,
-                pool_bufs,
-            );
+        for defer_taskrun in [false, true] {
+            for (bufs_per_queue, zero_copy) in
+                [(0, false), (1, false), (4, false), (1, true), (4, true)]
+            {
+                // A pool holds at most as many buffers as the queue has entries.
+                let pool_bufs = bufs_per_queue.min(2);
+                let deferred = check_passthrough_mount(
+                    UringFuseServing::new,
+                    2,
+                    bufs_per_queue,
+                    zero_copy,
+                    defer_taskrun,
+                    pool_bufs,
+                );
+                if let Some(deferred) = deferred {
+                    assert_eq!(deferred, if defer_taskrun { 2 } else { 0 });
+                }
+            }
         }
     }
 
@@ -4423,9 +4643,12 @@ mod tests {
     #[test]
     fn test_uring_async_serving_mount() {
         // A pool gets a buffer per entry, even when the config asks for 1.
-        check_passthrough_mount(UringFuseServing::new_async, 2, 0, false, 0);
-        check_passthrough_mount(UringFuseServing::new_async, 2, 1, false, 2);
-        check_passthrough_mount(UringFuseServing::new_async, 2, 1, true, 2);
+        check_passthrough_mount(UringFuseServing::new_async, 2, 0, false, false, 0);
+        // The workers ignore defer_taskrun. On Linux 7.3.1, a worker that
+        // took it never answered the first request.
+        let deferred = check_passthrough_mount(UringFuseServing::new_async, 2, 1, false, true, 2);
+        assert_eq!(deferred.unwrap_or(0), 0);
+        check_passthrough_mount(UringFuseServing::new_async, 2, 1, true, false, 2);
     }
 
     /// With more workers than queues, every queue's entries are spread over
@@ -4436,6 +4659,7 @@ mod tests {
             UringFuseServing::new,
             possible_cpu_count().unwrap() + 1,
             0,
+            false,
             false,
             0,
         );
@@ -4525,6 +4749,7 @@ mod tests {
             entries_per_queue: 1,
             bufs_per_queue: 0,
             zero_copy: false,
+            ..Default::default()
         };
         let serving = match start(se, server, cfg) {
             Ok(serving) => Arc::new(serving),
@@ -4574,6 +4799,7 @@ mod tests {
             entries_per_queue: 2,
             bufs_per_queue: 0,
             zero_copy: false,
+            ..Default::default()
         };
         let serving = mount_uring(server, mnt, cfg, start)?;
         if ConnectionAbort::new(serving.session.mountpoint())
@@ -4735,6 +4961,7 @@ mod tests {
             entries_per_queue: 2,
             bufs_per_queue: 0,
             zero_copy: false,
+            ..Default::default()
         };
         let serving = match UringFuseServing::new(se, server, cfg) {
             Ok(serving) => Arc::new(serving),
