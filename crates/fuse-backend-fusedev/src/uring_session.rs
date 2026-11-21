@@ -49,6 +49,7 @@ use fuse_backend_core::file_traits::FileReadWriteVolatile;
 use vm_memory::bitmap::BitmapSlice;
 use vm_memory::mmap::MmapRegion;
 
+use crate::linux_session::open_abort_file;
 use crate::serving::{FuseServing, WorkerSet};
 use crate::{FuseBuf, FuseChannel, FuseDevReaderExt, FuseSession, FUSE_HEADER_SIZE};
 
@@ -1243,52 +1244,18 @@ struct UringWorker<F: FileSystem + Send + Sync + 'static> {
 /// Ending the connection fails those requests and the other workers'
 /// commands instead, so every worker stops and `wait()` returns.
 struct ConnectionAbort {
-    /// `/sys/fs/fuse/connections/<minor>/abort`, if fusectl is mounted.
-    path: Option<std::path::PathBuf>,
+    /// The fusectl `abort` file of the connection, or why it can't be opened.
+    file: std::io::Result<File>,
     /// Whether a worker ended the connection already.
     done: AtomicBool,
 }
 
-/// The minor device number of the last mount at `mountpoint`, an
-/// absolute path, in `mountinfo`, the format of /proc/self/mountinfo.
-fn mount_minor(mountinfo: &str, mountpoint: &std::path::Path) -> Option<u32> {
-    // mountinfo writes space, tab, newline and backslash as octal escapes.
-    let mountpoint: String = mountpoint
-        .to_str()?
-        .chars()
-        .map(|c| match c {
-            ' ' | '\t' | '\n' | '\\' => format!("\\{:03o}", c as u32),
-            c => c.to_string(),
-        })
-        .collect();
-    mountinfo.lines().rev().find_map(|line| {
-        // ID, parent ID, major:minor, root, mount point, ...
-        let mut fields = line.split(' ');
-        let dev = fields.nth(2)?;
-        let point = fields.nth(1)?;
-        if point != mountpoint {
-            return None;
-        }
-        dev.split_once(':')?.1.parse().ok()
-    })
-}
-
 impl ConnectionAbort {
-    /// The abort file of the connection mounted at `mountpoint`. fusectl
-    /// names connections after the minor number of the mount's device,
-    /// which comes from /proc/self/mountinfo, because a stat() of the
-    /// mountpoint would wait for a FUSE request that nobody serves yet.
-    /// `FuseSession` keeps the mountpoint canonical, as mountinfo has it.
-    fn new(mountpoint: &std::path::Path) -> ConnectionAbort {
-        let path = std::fs::read_to_string("/proc/self/mountinfo")
-            .ok()
-            .and_then(|info| mount_minor(&info, mountpoint))
-            .map(|minor| {
-                std::path::PathBuf::from(format!("/sys/fs/fuse/connections/{minor}/abort"))
-            })
-            .filter(|path| path.exists());
+    /// The abort file of the connection of `session`, see
+    /// [`open_abort_file`].
+    fn new(session: &FuseSession) -> ConnectionAbort {
         ConnectionAbort {
-            path,
+            file: open_abort_file(session),
             done: AtomicBool::new(false),
         }
     }
@@ -1298,11 +1265,17 @@ impl ConnectionAbort {
         if self.done.swap(true, Ordering::AcqRel) {
             return;
         }
-        let Some(path) = &self.path else {
-            error!("uring: can't end the FUSE connection without fusectl, unmount it by hand");
-            return;
+        let mut file = match self.file.as_ref() {
+            Ok(file) => file,
+            Err(e) => {
+                error!(
+                    "uring: can't end the FUSE connection without fusectl ({e}), unmount \
+                     it by hand"
+                );
+                return;
+            }
         };
-        if let Err(e) = std::fs::write(path, b"1") {
+        if let Err(e) = file.write_all(b"1") {
             error!("uring: can't end the FUSE connection, unmount it by hand: {e}");
         }
     }
@@ -1858,7 +1831,7 @@ impl<F: FileSystem + Send + Sync + 'static> UringFuseServing<F> {
 
         // Build one worker per queue set, cloning the fuse fd up front so
         // cloning failures are reported before any thread is spawned.
-        let abort = Arc::new(ConnectionAbort::new(session.mountpoint()));
+        let abort = Arc::new(ConnectionAbort::new(&session));
         let mut worker_list = Vec::with_capacity(workers);
         for ids in queue_ids {
             worker_list.push(UringWorker {
@@ -2345,7 +2318,7 @@ mod tests {
             bounce: None,
             server: Arc::new(Server::new(Arc::new(fs))),
             abort: Arc::new(ConnectionAbort {
-                path: None,
+                file: Err(std::io::ErrorKind::NotFound.into()),
                 done: AtomicBool::new(false),
             }),
         };
@@ -2880,19 +2853,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_mount_minor() {
-        let info = "22 1 0:21 / /proc rw - proc proc rw\n\
-                    95 30 0:84 / /tmp/a rw - fuse.x x rw\n\
-                    96 30 0:86 / /tmp/a rw - fuse.x x rw\n";
-        // The last mount at a path is the one in effect.
-        assert_eq!(mount_minor(info, "/tmp/a".as_ref()), Some(86));
-        assert_eq!(mount_minor(info, "/tmp/b".as_ref()), None);
-        // Special characters are octal escapes.
-        let info = "97 30 0:88 / /tmp/a\\040b rw - fuse.x x rw\n";
-        assert_eq!(mount_minor(info, "/tmp/a b".as_ref()), Some(88));
-    }
-
     /// A file system whose LOOKUP panics.
     struct PanicFs;
 
@@ -2933,7 +2893,7 @@ mod tests {
         server.set_uring(true);
         let mut se = FuseSession::new(mnt.as_path(), "uring_panic_test", "", false).unwrap();
         se.mount().unwrap();
-        if ConnectionAbort::new(se.mountpoint()).path.is_none() {
+        if ConnectionAbort::new(&se).file.is_err() {
             eprintln!("fusectl isn't mounted, skipping");
             return;
         }
@@ -2988,8 +2948,8 @@ mod tests {
         server.set_uring(true);
         let mut se = FuseSession::new(mnt.as_path(), "uring_serving_test", "", false).unwrap();
         se.mount().unwrap();
-        let abort = ConnectionAbort::new(se.mountpoint());
-        if abort.path.is_none() {
+        let abort = ConnectionAbort::new(&se);
+        if abort.file.is_err() {
             eprintln!("fusectl isn't mounted, skipping");
             return;
         }

@@ -6,8 +6,9 @@
 //!
 //! A *serving layer* owns a mounted [`FuseSession`], drives it with worker
 //! threads and turns [`Drop`] into teardown: stop accepting new requests,
-//! let in-flight requests finish, unmount the session and join all
-//! workers. Three implementations share that shape:
+//! let in-flight requests finish, unmount the session, end a connection
+//! that outlives the unmount and join all workers. Three implementations
+//! share that shape:
 //!
 //! | implementation       | handler model        | transport            |
 //! |----------------------|----------------------|----------------------|
@@ -52,6 +53,8 @@
 //! `AsyncFuseServing` needs the `async-io` feature and `UringFuseServing`
 //! the `uring` feature; [`SyncFuseServing`] is always available.
 
+use std::fs::File;
+use std::io::Write;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
@@ -74,6 +77,17 @@ use crate::{Error, FuseChannelExt, FuseSession, Result};
 /// - Dropping the serving layer stops accepting new requests, lets
 ///   in-flight requests finish, unmounts the session and joins all
 ///   workers.
+/// - Files that are still open on the mount keep its connection up after
+///   the unmount. On Linux, [`SyncFuseServing`] and `AsyncFuseServing` end
+///   it through fusectl, like `umount -f`, once the workers have replied
+///   to the requests they took. Later requests on those files then fail
+///   with `ENOTCONN`. Otherwise a child process that inherited a `/dev/fuse` fd
+///   would keep the connection up with nobody serving it, and an exec that
+///   closes such a file would hang the child for good. This needs fusectl
+///   mounted at `/sys/fs/fuse/connections`, where the user that mounted the
+///   file system may end the connection. Without it, blocking channels and
+///   the tokio-uring runtime serve until the files are closed, and the
+///   other workers stop.
 /// - [`FuseServing::wait`] blocks until the workers have drained after
 ///   teardown driven from outside the process, without tearing anything
 ///   down itself.
@@ -128,8 +142,9 @@ pub struct SyncServingConfig {
     /// `epoll_wait` syscall per request (kernel >= 4.2).
     ///
     /// Blocking channels cannot be woken by [`FuseSession::wake()`]; they
-    /// exit when the connection is torn down. On macOS, where reception is
-    /// inherently blocking, the knob is ignored.
+    /// exit when the connection is torn down, which dropping the serving
+    /// layer does once they are idle (see [`FuseServing`]). On macOS, where
+    /// reception is inherently blocking, the knob is ignored.
     pub blocking: bool,
 }
 
@@ -229,7 +244,7 @@ impl<F: FileSystem + Send + Sync + 'static> Drop for SyncFuseServing<F> {
         // Waking the session is a no-op unless epoll-based channels are
         // registered with it, so it is unconditional: blocking channels
         // exit through the ENODEV that tearing the connection down
-        // produces.
+        // produces, by the unmount or by stop() through fusectl.
         self.workers.stop(&mut self.session, true);
     }
 }
@@ -253,14 +268,16 @@ where
     }
 
     let mut set = WorkerSet::new();
+    #[cfg(target_os = "linux")]
+    set.end_connection_on_stop(&session);
     for (id, ch) in channels.into_iter().enumerate() {
         let server = server.clone();
         let tracker = set.tracker();
         match thread::Builder::new()
             .name(format!("fuse-sync-{id}"))
             .spawn(move || {
-                let _exited = tracker.exit_guard();
-                svc_loop(&server, ch);
+                let exited = tracker.exit_guard();
+                svc_loop(&server, ch, exited.activity());
             }) {
             Ok(handle) => set.push(handle),
             Err(e) => {
@@ -284,15 +301,20 @@ where
 /// The loop every hand-rolled fusedev daemon duplicates: block for the
 /// next request, dispatch it to the server, and stop when the session goes
 /// away — `Ok(None)` after a wake or an unmount, `EBADF` when the kernel
-/// has already shut the connection down.
+/// has already shut the connection down. It also stops after a request
+/// while a stop waits to end the connection.
 fn svc_loop<F: FileSystem + Send + Sync + 'static, C: FuseChannelExt>(
     server: &Arc<Server<F>>,
     mut ch: C,
+    activity: &WorkerActivity,
 ) {
     loop {
         match ch.next_request() {
             Ok(Some((reader, writer))) => {
-                if let Err(e) = server.handle_message(reader, writer, None, None) {
+                activity.busy();
+                let res = server.handle_message(reader, writer, None, None);
+                let stopping = activity.idle();
+                if let Err(e) = res {
                     match e {
                         // The kernel has shut down this session.
                         fuse_backend_core::Error::EncodeMessage(ref err)
@@ -300,11 +322,11 @@ fn svc_loop<F: FileSystem + Send + Sync + 'static, C: FuseChannelExt>(
                         {
                             break;
                         }
-                        _ => {
-                            warn!("sync serving: failed to handle message: {e}");
-                            continue;
-                        }
+                        _ => warn!("sync serving: failed to handle message: {e}"),
                     }
+                }
+                if stopping {
+                    break;
                 }
             }
             Ok(None) => {
@@ -328,6 +350,9 @@ pub(crate) struct WorkerSet {
     exit: Arc<AtomicBool>,
     tracker: Arc<WorkerExitTracker>,
     handles: Vec<JoinHandle<()>>,
+    /// The fusectl `abort` file of the connection, see
+    /// [`WorkerSet::end_connection_on_stop`].
+    abort: Option<File>,
 }
 
 impl WorkerSet {
@@ -336,6 +361,21 @@ impl WorkerSet {
             exit: Arc::new(AtomicBool::new(false)),
             tracker: Arc::new(WorkerExitTracker::default()),
             handles: Vec::new(),
+            abort: None,
+        }
+    }
+
+    /// Make [`WorkerSet::stop`] end the connection of `session` if it
+    /// outlives the unmount, once every worker is idle. The workers must
+    /// report the requests they serve through their [`WorkerActivity`].
+    #[cfg(target_os = "linux")]
+    pub(crate) fn end_connection_on_stop(&mut self, session: &FuseSession) {
+        match crate::linux_session::open_abort_file(session) {
+            Ok(abort) => self.abort = Some(abort),
+            Err(e) => info!(
+                "serving: can't open the fusectl abort file ({e}), so a stop leaves the \
+                 connection of a busy mount up"
+            ),
         }
     }
 
@@ -367,12 +407,24 @@ impl WorkerSet {
     /// and io_uring workers instead exit through the `ENODEV`/ring-error
     /// completion that tearing the connection down produces. In-flight
     /// requests are still served and replied before a worker exits.
+    ///
+    /// Open files keep the connection of a lazily unmounted file system up.
+    /// With [`WorkerSet::end_connection_on_stop`], the connection then ends
+    /// once every worker is idle.
     pub(crate) fn stop(&mut self, session: &mut FuseSession, wake: bool) {
         self.exit.store(true, Ordering::Release);
         if wake {
             let _ = session.wake();
         }
         let _ = session.umount();
+        // See FuseServing for why. If the unmount ended the connection, the
+        // write does nothing.
+        if let Some(mut abort) = self.abort.take() {
+            self.tracker.wait_idle();
+            if let Err(e) = abort.write_all(b"1") {
+                warn!("serving: can't end the FUSE connection that outlived the unmount: {e}");
+            }
+        }
         let handles = std::mem::take(&mut self.handles);
         for handle in handles {
             let _ = handle.join();
@@ -382,45 +434,121 @@ impl WorkerSet {
     /// Block until every worker thread has exited; see
     /// [`FuseServing::wait`].
     pub(crate) fn wait(&self) {
-        let mut finished = self.tracker.finished.lock().unwrap();
-        while *finished < self.handles.len() {
-            finished = self.tracker.notified.wait(finished).unwrap();
+        let mut workers = self.tracker.workers.lock().unwrap();
+        while workers.finished < self.handles.len() {
+            workers = self.tracker.notified.wait(workers).unwrap();
         }
     }
 }
 
 /// Counts worker threads that have exited, so [`WorkerSet::wait`] can
-/// block until all of them have drained without tearing the session down.
+/// block until all of them have drained without tearing the session down,
+/// and tracks which workers serve requests.
 #[derive(Default)]
 pub(crate) struct WorkerExitTracker {
-    finished: Mutex<usize>,
+    workers: Mutex<Workers>,
     notified: Condvar,
+    /// Set once [`WorkerExitTracker::wait_idle`] waits for busy workers.
+    draining: AtomicBool,
+}
+
+#[derive(Default)]
+struct Workers {
+    /// How many worker threads have exited.
+    finished: usize,
+    /// The busy flag of every worker.
+    busy: Vec<Arc<BusyFlag>>,
 }
 
 impl WorkerExitTracker {
     /// Arm a guard that counts this worker when its thread exits.
     pub(crate) fn exit_guard(self: &Arc<Self>) -> WorkerExitGuard {
+        let busy = Arc::new(BusyFlag::default());
+        self.workers.lock().unwrap().busy.push(busy.clone());
         WorkerExitGuard {
-            tracker: self.clone(),
+            activity: WorkerActivity {
+                tracker: self.clone(),
+                busy,
+            },
         }
+    }
+
+    /// Block until no worker serves a request. A worker that takes one
+    /// while this returns isn't waited for.
+    fn wait_idle(&self) {
+        // Pairs with the SeqCst store and load in WorkerActivity::idle():
+        // either the worker sees `draining` and notifies, or the check
+        // below sees it idle.
+        self.draining.store(true, Ordering::SeqCst);
+        let mut workers = self.workers.lock().unwrap();
+        while workers
+            .busy
+            .iter()
+            .any(|busy| busy.0.load(Ordering::SeqCst))
+        {
+            workers = self.notified.wait(workers).unwrap();
+        }
+    }
+}
+
+/// Each worker writes its flag twice per request, so keep the flags on
+/// separate cache lines.
+#[derive(Default)]
+#[repr(align(64))]
+struct BusyFlag(AtomicBool);
+
+/// Reports whether a worker serves requests, so that [`WorkerSet::stop`]
+/// can wait until it has replied to the ones it took.
+#[derive(Clone)]
+pub(crate) struct WorkerActivity {
+    tracker: Arc<WorkerExitTracker>,
+    busy: Arc<BusyFlag>,
+}
+
+impl WorkerActivity {
+    /// The worker took a request.
+    pub(crate) fn busy(&self) {
+        self.busy.0.store(true, Ordering::Relaxed);
+    }
+
+    /// The worker has replied to every request it took. Returns true while a
+    /// stop waits to end the connection. The worker should then take no more
+    /// requests, or new ones could keep the stop waiting.
+    pub(crate) fn idle(&self) -> bool {
+        self.busy.0.store(false, Ordering::SeqCst);
+        let draining = self.tracker.draining.load(Ordering::SeqCst);
+        if draining {
+            let _workers = self.tracker.workers.lock().unwrap();
+            self.tracker.notified.notify_all();
+        }
+        draining
     }
 }
 
 /// Reports one worker exit when dropped, i.e. when its thread finishes.
 pub(crate) struct WorkerExitGuard {
-    tracker: Arc<WorkerExitTracker>,
+    activity: WorkerActivity,
+}
+
+impl WorkerExitGuard {
+    /// Where the worker reports the requests it serves.
+    pub(crate) fn activity(&self) -> &WorkerActivity {
+        &self.activity
+    }
 }
 
 impl Drop for WorkerExitGuard {
     fn drop(&mut self) {
-        let mut finished = self.tracker.finished.lock().unwrap();
-        *finished += 1;
-        self.tracker.notified.notify_all();
+        let tracker = &self.activity.tracker;
+        let mut workers = tracker.workers.lock().unwrap();
+        self.activity.busy.0.store(false, Ordering::SeqCst);
+        workers.finished += 1;
+        tracker.notified.notify_all();
     }
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     use vmm_sys_util::tempdir::TempDir;
@@ -481,10 +609,196 @@ mod tests {
     }
 
     #[cfg(target_os = "linux")]
-    mod linux {
+    pub(crate) mod linux {
         use super::*;
 
+        use std::io::Read;
+        use std::os::fd::AsRawFd;
+        use std::os::unix::process::CommandExt;
+        use std::sync::mpsc;
+        use std::time::Duration;
+
         use fuse_backend_passthrough::{Config, PassthroughFs};
+
+        /// Serves PassthroughFs with `serve` and drops the serving layer while
+        /// a child holds a file on the mount, as a command that a daemon spawns
+        /// does until its exec. The child copies a /dev/fuse fd of the
+        /// connection above the file, so the exec closes the file first, and
+        /// the FLUSH of that close needs an answer. The child waits before its
+        /// exec until the drop has returned. A drop or a child that hangs fails
+        /// the test, once ending the connection through fusectl has freed it.
+        pub(crate) fn stop_with_child_in_exec<S: FuseServing + 'static>(
+            serve: impl FnOnce(FuseSession, Arc<Server<PassthroughFs>>) -> S,
+        ) {
+            let src = TempDir::new().unwrap();
+            std::fs::write(src.as_path().join("hello"), b"held").unwrap();
+            let mnt = TempDir::new().unwrap();
+            let fs = PassthroughFs::<()>::new(Config {
+                root_dir: src.as_path().to_string_lossy().to_string(),
+                do_import: false,
+                ..Default::default()
+            })
+            .unwrap();
+            fs.import().unwrap();
+            let mut se = FuseSession::new(mnt.as_path(), "serving_test", "", false).unwrap();
+            se.mount().unwrap();
+            let serving = serve(se, Arc::new(Server::new(fs)));
+            let mountpoint = serving.session().mountpoint().to_owned();
+            let fuse_fd = serving.session().get_fuse_file().unwrap().as_raw_fd();
+
+            let mut abort = match crate::linux_session::open_abort_file(serving.session()) {
+                Ok(abort) => abort,
+                Err(e) => {
+                    eprintln!("can't open the fusectl abort file ({e}), skipping");
+                    return;
+                }
+            };
+            let held = File::open(mountpoint.join("hello")).unwrap();
+            let held_fd = held.as_raw_fd();
+            let (forked, forked_w) = nix::unistd::pipe2(nix::fcntl::OFlag::O_CLOEXEC).unwrap();
+            let (go_r, go) = nix::unistd::pipe2(nix::fcntl::OFlag::O_CLOEXEC).unwrap();
+
+            let (done_tx, done) = mpsc::channel();
+            let spawner = thread::spawn(move || {
+                let (forked_w, go_r) = (forked_w.as_raw_fd(), go_r.as_raw_fd());
+                let mut cmd = std::process::Command::new("true");
+                // SAFETY: the closure only makes async-signal-safe syscalls on fds that the
+                // child inherited.
+                unsafe {
+                    cmd.pre_exec(move || {
+                        if libc::fcntl(fuse_fd, libc::F_DUPFD_CLOEXEC, held_fd + 1) < 0 {
+                            return Err(std::io::Error::last_os_error());
+                        }
+                        let mut byte = 0u8;
+                        libc::write(forked_w, (&raw const byte).cast(), 1);
+                        libc::read(go_r, (&raw mut byte).cast(), 1);
+                        Ok(())
+                    });
+                }
+                let _ = done_tx.send(cmd.status());
+            });
+            File::from(forked)
+                .read_exact(&mut [0u8])
+                .expect("the child didn't fork");
+
+            let (stopped_tx, stopped) = mpsc::channel();
+            let stopper = thread::spawn(move || {
+                drop(serving);
+                let _ = stopped_tx.send(());
+            });
+            let ((), stop_hung) = recv_or_abort(&stopped, &mut abort);
+            stopper.join().unwrap();
+
+            File::from(go).write_all(b"g").unwrap();
+            let (status, child_hung) = recv_or_abort(&done, &mut abort);
+            spawner.join().unwrap();
+            drop(held);
+
+            assert!(
+                !stop_hung,
+                "the stop hung while a file on the mount was open"
+            );
+            assert!(!child_hung, "the child hung in its exec, flushing the file");
+            assert!(status.unwrap().success());
+        }
+
+        /// Waits for `rx`. If that takes 5s, ends the connection through
+        /// `abort` to free whatever hangs, and waits again. Returns the
+        /// value and whether it had to end the connection.
+        fn recv_or_abort<T>(rx: &mpsc::Receiver<T>, abort: &mut File) -> (T, bool) {
+            match rx.recv_timeout(Duration::from_secs(5)) {
+                Ok(value) => (value, false),
+                Err(_) => {
+                    abort.write_all(b"1").unwrap();
+                    (rx.recv().unwrap(), true)
+                }
+            }
+        }
+
+        /// Answers a LOOKUP of "slow" in the root with ENOENT, but only 100ms
+        /// after `mountpoint` is unmounted, and reports on `started` when it
+        /// gets one.
+        pub(crate) struct SlowLookupFs {
+            mountpoint: std::path::PathBuf,
+            started: mpsc::Sender<()>,
+        }
+
+        impl FileSystem for SlowLookupFs {
+            type Inode = u64;
+            type Handle = u64;
+
+            fn lookup(
+                &self,
+                _ctx: &fuse_backend_core::api::filesystem::Context,
+                parent: u64,
+                name: &std::ffi::CStr,
+            ) -> std::io::Result<fuse_backend_core::api::filesystem::Entry> {
+                if parent == 1 && name.to_bytes() == b"slow" {
+                    let _ = self.started.send(());
+                    for _ in 0..1000 {
+                        let mountinfo = std::fs::read_to_string("/proc/self/mountinfo")?;
+                        if crate::linux_session::mount_minor(&mountinfo, &self.mountpoint).is_none()
+                        {
+                            // Give a stop that wouldn't wait for the reply
+                            // the time to end the connection first.
+                            thread::sleep(Duration::from_millis(100));
+                            break;
+                        }
+                        thread::sleep(Duration::from_millis(10));
+                    }
+                }
+                Err(std::io::Error::from_raw_os_error(libc::ENOENT))
+            }
+
+            fn getattr(
+                &self,
+                _ctx: &fuse_backend_core::api::filesystem::Context,
+                _inode: u64,
+                _handle: Option<u64>,
+            ) -> std::io::Result<(fuse_backend_core::abi::fuse_abi::stat64, Duration)> {
+                // SAFETY: stat64 is plain data, for which zeroes are valid.
+                let mut attr: fuse_backend_core::abi::fuse_abi::stat64 =
+                    unsafe { std::mem::zeroed() };
+                attr.st_ino = 1;
+                attr.st_mode = libc::S_IFDIR | 0o755;
+                attr.st_nlink = 2;
+                Ok((attr, Duration::from_secs(60)))
+            }
+        }
+
+        #[cfg(feature = "async-io")]
+        impl fuse_backend_core::api::filesystem::AsyncFileSystem for SlowLookupFs {}
+
+        /// Serves `SlowLookupFs` with `serve`, looks up "slow" and drops the
+        /// serving layer while the lookup waits. The unmount leaves the
+        /// connection up, because the lookup uses the mount, and the reply
+        /// must still get through.
+        pub(crate) fn stop_with_request_in_flight<S: FuseServing>(
+            serve: impl FnOnce(FuseSession, Arc<Server<SlowLookupFs>>) -> S,
+        ) {
+            let mnt = TempDir::new().unwrap();
+            let (started_tx, started) = mpsc::channel();
+            let fs = SlowLookupFs {
+                mountpoint: mnt.as_path().canonicalize().unwrap(),
+                started: started_tx,
+            };
+            let mut se = FuseSession::new(mnt.as_path(), "serving_test", "", false).unwrap();
+            se.mount().unwrap();
+            let serving = serve(se, Arc::new(Server::new(fs)));
+
+            let slow = mnt.as_path().join("slow");
+            let lookup = thread::spawn(move || std::fs::metadata(slow).unwrap_err());
+            started
+                .recv_timeout(Duration::from_secs(5))
+                .expect("the lookup didn't start");
+            drop(serving);
+            let err = lookup.join().unwrap();
+            assert_eq!(
+                err.raw_os_error(),
+                Some(libc::ENOENT),
+                "the stop failed the request in flight: {err}"
+            );
+        }
 
         fn mount_passthrough(src: &TempDir, mnt: &TempDir, cfg: SyncServingConfig) {
             let fs = PassthroughFs::<()>::new(Config {
@@ -585,6 +899,38 @@ mod tests {
 
             drop(busy);
             umount2(mnt.as_path(), MntFlags::MNT_DETACH).unwrap();
+        }
+
+        fn sync_serving<F: FileSystem + Send + Sync + 'static>(
+            blocking: bool,
+        ) -> impl FnOnce(FuseSession, Arc<Server<F>>) -> SyncFuseServing<F> {
+            move |se, server| {
+                let cfg = SyncServingConfig {
+                    workers: 2,
+                    blocking,
+                };
+                SyncFuseServing::new(se, server, cfg).unwrap()
+            }
+        }
+
+        #[test]
+        fn test_sync_serving_stop_with_request_in_flight() {
+            stop_with_request_in_flight(sync_serving(false));
+        }
+
+        #[test]
+        fn test_sync_serving_blocking_stop_with_request_in_flight() {
+            stop_with_request_in_flight(sync_serving(true));
+        }
+
+        #[test]
+        fn test_sync_serving_stop_with_child_in_exec() {
+            stop_with_child_in_exec(sync_serving(false));
+        }
+
+        #[test]
+        fn test_sync_serving_blocking_stop_with_child_in_exec() {
+            stop_with_child_in_exec(sync_serving(true));
         }
 
         #[test]
