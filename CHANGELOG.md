@@ -324,6 +324,13 @@
   splice copy. A copy between two mounts now gets EXDEV, and a backend's ENOSYS turns into
   EOPNOTSUPP. On both, Linux falls back for that call only. FreeBSD falls back only on
   ENOSYS, so there both stay ENOSYS. The pseudo fs directories answer EISDIR.
+- [361](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/361): `Vfs` forwards LSEEK to the mounted file system when the writeback cache is
+  off, so SEEK_DATA and SEEK_HOLE find the holes in a `PassthroughFs` file. `Vfs` answered
+  ENOSYS, on which the kernel stops sending LSEEK on the connection and treats every file as
+  all data. For a file system without `lseek()`, `Vfs` now gives that answer itself. With the
+  writeback cache `Vfs` still answers ENOSYS, because the kernel doesn't write back cached
+  data before LSEEK. Under no_open, `PassthroughFs` now seeks on a new fd instead of failing
+  with EBADF on the handle 0 that the kernel sends.
 - [303](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/303): The sync server answers a SETXATTR request it received in full
   but cannot decode — no NUL separator in the attribute name, or a value size
   that disagrees with the body — with `EINVAL` instead of dropping it. FUSE
