@@ -39,10 +39,9 @@
 //!   classic transport is the choice.
 //! - **Workload**: on a uring-capable kernel, metadata-heavy workloads
 //!   gain the most (3.7x file creation at 8 threads), while large
-//!   sequential IO currently regresses on uring — a known upstream
-//!   limitation analyzed in `docs/fuse-uring-performance.md` in the
-//!   repository — so classic multi-worker serving stays the throughput
-//!   choice there.
+//!   sequential IO is still slower on uring, see
+//!   `docs/fuse-uring-performance.md` in the repository, so classic
+//!   multi-worker serving stays the throughput choice there.
 //! - **Backing storage**: with local storage, synchronous handlers
 //!   (`FileSystem`) saturate with one worker per CPU. When every request
 //!   hides a network round trip, asynchronous handlers
