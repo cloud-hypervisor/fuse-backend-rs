@@ -279,8 +279,9 @@ impl FileSystem for Vfs {
         let (root, idata_old) = self.get_real_rootfs(olddir)?;
         let (_, idata_new) = self.get_real_rootfs(newdir)?;
 
+        // Like rename(2) between two file systems, so that mv falls back to copying.
         if idata_old.fs_idx() != idata_new.fs_idx() {
-            return Err(Error::from_raw_os_error(libc::EINVAL));
+            return Err(Error::from_raw_os_error(libc::EXDEV));
         }
 
         match root {
@@ -316,7 +317,7 @@ impl FileSystem for Vfs {
         let (_, idata_new) = self.get_real_rootfs(newparent)?;
 
         if idata_old.fs_idx() != idata_new.fs_idx() {
-            return Err(Error::from_raw_os_error(libc::EINVAL));
+            return Err(Error::from_raw_os_error(libc::EXDEV));
         }
 
         match root {
@@ -1021,5 +1022,121 @@ mod tests {
         assert_eq!(errno(vfs.setxattr(&ctx, inode, &name, b"v", 0)), enosys);
         assert_eq!(errno(vfs.getxattr(&ctx, inode, &name, 0)), enosys);
         assert_eq!(errno(vfs.removexattr(&ctx, inode, &name)), enosys);
+    }
+
+    /// A backend that records its `rename()` and `link()` calls, and lets them succeed.
+    struct RenameFs {
+        calls: RenameCalls,
+    }
+
+    type RenameCalls = Arc<Mutex<Vec<(&'static str, u64, u64, u32)>>>;
+
+    impl FileSystem for RenameFs {
+        type Inode = u64;
+        type Handle = u64;
+
+        fn rename(
+            &self,
+            _ctx: &Context,
+            olddir: u64,
+            _oldname: &CStr,
+            newdir: u64,
+            _newname: &CStr,
+            flags: u32,
+        ) -> Result<()> {
+            let call = ("rename", olddir, newdir, flags);
+            self.calls.lock().unwrap().push(call);
+            Ok(())
+        }
+
+        fn link(&self, _ctx: &Context, inode: u64, newparent: u64, _name: &CStr) -> Result<Entry> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(("link", inode, newparent, 0));
+            Ok(Entry {
+                inode,
+                ..Default::default()
+            })
+        }
+    }
+
+    #[cfg(feature = "async-io")]
+    impl AsyncFileSystem for RenameFs {}
+
+    impl BackendFileSystem for RenameFs {
+        fn mount(&self) -> Result<(Entry, u64)> {
+            let root = Entry {
+                inode: 1,
+                ..Default::default()
+            };
+            Ok((root, 0))
+        }
+
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
+    /// Mounts a `RenameFs` at `path`, and returns its index and the calls it gets.
+    fn mount_rename_fs(vfs: &Vfs, path: &str) -> (VfsIndex, RenameCalls) {
+        let calls = RenameCalls::default();
+        let fs = RenameFs {
+            calls: calls.clone(),
+        };
+        (vfs.mount(Box::new(fs), path).unwrap(), calls)
+    }
+
+    /// Renames "a" in `olddir` to "b" in `newdir`, and returns the errno.
+    fn rename_errno(vfs: &Vfs, olddir: VfsInode, newdir: VfsInode, flags: u32) -> Option<i32> {
+        let (a, b) = (CString::new("a").unwrap(), CString::new("b").unwrap());
+        let result = vfs.rename(&Context::default(), olddir, &a, newdir, &b, flags);
+        result.err().and_then(|e| e.raw_os_error())
+    }
+
+    /// Links `inode` as "b" in `newparent`, and returns the errno.
+    fn link_errno(vfs: &Vfs, inode: VfsInode, newparent: VfsInode) -> Option<i32> {
+        let b = CString::new("b").unwrap();
+        let result = vfs.link(&Context::default(), inode, newparent, &b);
+        result.err().and_then(|e| e.raw_os_error())
+    }
+
+    #[test]
+    fn test_rename_link_within_a_mount() {
+        let vfs = Vfs::default();
+        // /a comes first, so the test catches calls that go to the wrong backend.
+        mount_rename_fs(&vfs, "/a");
+        let (b, calls) = mount_rename_fs(&vfs, "/b");
+        let (dir, other_dir, file) = (
+            VfsInode::new(b, 5),
+            VfsInode::new(b, 6),
+            VfsInode::new(b, 7),
+        );
+
+        assert_eq!(rename_errno(&vfs, dir, other_dir, RENAME_NOREPLACE), None);
+        assert_eq!(link_errno(&vfs, file, other_dir), None);
+        assert_eq!(
+            *calls.lock().unwrap(),
+            [("rename", 5, 6, RENAME_NOREPLACE), ("link", 7, 6, 0)]
+        );
+    }
+
+    #[test]
+    fn test_rename_link_across_mounts() {
+        let vfs = Vfs::default();
+        let (a, a_calls) = mount_rename_fs(&vfs, "/x/a");
+        let (b, b_calls) = mount_rename_fs(&vfs, "/x/b");
+        let (in_a, in_b) = (VfsInode::new(a, 5), VfsInode::new(b, 5));
+        // The root and /x, inode 2, are pseudo fs directories.
+        let (root, x) = (VfsInode::from(ROOT_ID), VfsInode::from(2));
+
+        for (from, to) in [(in_a, in_b), (in_a, root), (x, in_b)] {
+            for flags in [0, RENAME_NOREPLACE, RENAME_EXCHANGE] {
+                assert_eq!(rename_errno(&vfs, from, to, flags), Some(libc::EXDEV));
+            }
+            assert_eq!(link_errno(&vfs, from, to), Some(libc::EXDEV));
+        }
+        assert!(a_calls.lock().unwrap().is_empty());
+        assert!(b_calls.lock().unwrap().is_empty());
     }
 }

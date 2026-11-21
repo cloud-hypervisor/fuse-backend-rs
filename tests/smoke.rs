@@ -475,4 +475,69 @@ mod fusedev_tests {
         assert_eq!(requests.0.load(Ordering::Relaxed), 2);
         Ok(())
     }
+
+    #[test]
+    #[ignore] // it depends on privileged mode to pass through /dev/fuse
+    fn integration_test_vfs_mv_across_mounts() -> Result<()> {
+        // A Vfs with two PassthroughFs mounts answers a rename or a link between them with
+        // EXDEV, as two file systems do, so mv copies the file.
+        if !running_as_root() {
+            eprintln!("skipping integration_test_vfs_mv_across_mounts: not running as root");
+            return Ok(());
+        }
+
+        let src_a = TempDir::new().unwrap();
+        let src_b = TempDir::new().unwrap();
+        let mnt_dir = TempDir::new().unwrap();
+        std::fs::write(src_a.as_path().join("file"), b"data").unwrap();
+
+        let vfs = Vfs::new(VfsOptions {
+            no_open: false,
+            ..Default::default()
+        });
+        for (src, path) in [(&src_a, "/a"), (&src_b, "/b")] {
+            let fs = PassthroughFs::<()>::new(Config {
+                root_dir: src.as_path().to_str().unwrap().to_string(),
+                do_import: false,
+                ..Default::default()
+            })
+            .unwrap();
+            fs.import().unwrap();
+            vfs.mount(Box::new(fs), path).unwrap();
+        }
+        let server = Server::new(vfs);
+
+        let mut se = FuseSession::new(mnt_dir.as_path(), "vfs_mv", "", false).unwrap();
+        se.mount().unwrap();
+        let mut ch = se.new_channel().unwrap();
+        let handle = std::thread::spawn(move || {
+            while let Ok(Some((reader, writer))) = ch.get_request() {
+                // Serve until the kernel ends the connection. A command that another test forks
+                // can inherit a file here and FLUSH it at exec, after this test is done.
+                if let Err(e) = server.handle_message(reader, writer, None, None) {
+                    eprintln!("request failed: {e}");
+                }
+            }
+        });
+
+        let mnt = mnt_dir.as_path();
+        let link = std::fs::hard_link(mnt.join("a/file"), mnt.join("b/link"));
+        let mv = Command::new("mv")
+            .arg(mnt.join("a/file"))
+            .arg(mnt.join("b/file"))
+            .output();
+        se.umount().unwrap();
+        handle.join().unwrap();
+
+        let mv = mv?;
+        assert!(
+            mv.status.success(),
+            "{}",
+            String::from_utf8_lossy(&mv.stderr)
+        );
+        assert!(!src_a.as_path().join("file").exists());
+        assert_eq!(std::fs::read(src_b.as_path().join("file"))?, b"data");
+        assert_eq!(link.unwrap_err().raw_os_error(), Some(libc::EXDEV));
+        Ok(())
+    }
 }
