@@ -178,10 +178,10 @@ impl AsyncFileSystem for Vfs {
         datasync: bool,
         handle: <Self as FileSystem>::Handle,
     ) -> Result<()> {
-        match self.get_real_rootfs(inode)? {
+        ok_for_enosys(match self.get_real_rootfs(inode)? {
             (Left(fs), idata) => fs.fsync(ctx, idata.ino(), datasync, handle),
             (Right(fs), idata) => fs.async_fsync(ctx, idata.ino(), datasync, handle).await,
-        }
+        })
     }
 
     async fn async_fallocate(
@@ -193,13 +193,14 @@ impl AsyncFileSystem for Vfs {
         offset: u64,
         length: u64,
     ) -> Result<()> {
-        match self.get_real_rootfs(inode)? {
+        let result = match self.get_real_rootfs(inode)? {
             (Left(fs), idata) => fs.fallocate(ctx, idata.ino(), handle, mode, offset, length),
             (Right(fs), idata) => {
                 fs.async_fallocate(ctx, idata.ino(), handle, mode, offset, length)
                     .await
             }
-        }
+        };
+        errno_for_enosys(result, UNSUPPORTED)
     }
 
     async fn async_opendir(
@@ -286,10 +287,10 @@ impl AsyncFileSystem for Vfs {
         datasync: bool,
         handle: <Self as FileSystem>::Handle,
     ) -> Result<()> {
-        match self.get_real_rootfs(inode)? {
+        ok_for_enosys(match self.get_real_rootfs(inode)? {
             (Left(fs), idata) => fs.fsyncdir(ctx, idata.ino(), datasync, handle),
             (Right(fs), idata) => fs.async_fsyncdir(ctx, idata.ino(), datasync, handle).await,
-        }
+        })
     }
 
     async fn async_releasedir(
