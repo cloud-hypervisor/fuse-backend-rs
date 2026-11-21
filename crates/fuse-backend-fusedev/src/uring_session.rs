@@ -1750,6 +1750,10 @@ fn release_entries(mut ring: FuseRing, entries: Vec<UringEntry>, mut armed: usiz
 ///
 /// The serving layer takes ownership of the mounted session: dropping it
 /// unmounts the filesystem and joins all serving threads.
+///
+/// Unlike `/dev/fuse`, its connection can't be handed to another server, and
+/// `Server::restore_init()` refuses its INIT state.
+/// `docs/fuse-uring-performance.md` explains why.
 pub struct UringFuseServing<F: FileSystem + Send + Sync + 'static> {
     session: FuseSession,
     workers: WorkerSet,
@@ -3036,5 +3040,37 @@ mod tests {
         rx.recv_timeout(Duration::from_secs(5))
             .expect("the workers didn't stop after the connection ended");
         assert!(std::fs::read_dir(mnt.as_path()).is_err());
+    }
+
+    /// The INIT state of a connection served over io_uring can't be
+    /// restored for a takeover, because a new server reading `/dev/fuse`
+    /// would wait for its requests forever.
+    #[test]
+    fn test_uring_serving_refuses_takeover() {
+        let mnt = TempDir::new().unwrap();
+        let server = Arc::new(Server::new(PanicFs));
+        server.set_uring(true);
+        let mut se = FuseSession::new(mnt.as_path(), "uring_takeover_test", "", false).unwrap();
+        se.mount().unwrap();
+        let cfg = UringConfig {
+            workers: 1,
+            entries_per_queue: 1,
+            ..Default::default()
+        };
+        let _serving = match UringFuseServing::new(se, server.clone(), cfg) {
+            Ok(serving) => serving,
+            Err(UringNotSupported) => {
+                eprintln!("FUSE-over-io_uring is not available, skipping");
+                return;
+            }
+            Err(e) => panic!("uring serving failed: {}", e),
+        };
+        let (version, options) = server.init_state();
+        assert!(options.contains(FsOptions::OVER_IO_URING));
+
+        let new = Server::new(PanicFs);
+        let err = new.restore_init(version, options).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::Unsupported);
+        assert!(new.init_state().1.is_empty());
     }
 }

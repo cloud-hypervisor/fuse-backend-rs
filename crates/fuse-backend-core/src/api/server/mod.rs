@@ -48,6 +48,11 @@ pub use crate::abi::fuse_abi::MAX_BUFFER_SIZE;
 const MIN_READ_BUFFER: u32 = 8192;
 const BUFFER_HEADER_SIZE: u32 = 0x1000;
 const DIRENT_PADDING: [u8; 8] = [0; 8];
+/// The `FUSE_OVER_IO_URING` INIT flag. `restore_init()` checks it in every build, but
+/// `FsOptions` and `abi::fuse_uring` name it only with the `fusedev-uring` feature.
+const FUSE_OVER_IO_URING: u64 = 1 << 41;
+#[cfg(all(target_os = "linux", feature = "fusedev-uring"))]
+const _: () = assert!(FUSE_OVER_IO_URING == FsOptions::OVER_IO_URING.bits());
 
 /// Maximum number of pages required for FUSE requests.
 pub const MAX_REQ_PAGES: u16 = 256; // 1MB
@@ -144,7 +149,23 @@ impl<F: FileSystem + Sync> Server<F> {
     /// yet, so a request that a server is still handling would run twice. The kernel ends the
     /// requests read from a FUSE device file description once that description is closed, so
     /// the new server needs the file descriptions that the old one read from.
-    pub fn restore_init(&self, version: ServerVersion, options: FsOptions) {
+    ///
+    /// Fails with `ErrorKind::Unsupported`, and restores nothing, if `options` has
+    /// `FUSE_OVER_IO_URING`. The kernel then keeps the requests of the connection, apart from
+    /// FORGET and INTERRUPT, on its io_uring queues, so a new server reading `/dev/fuse` would
+    /// wait for them forever. `docs/fuse-uring-performance.md` explains why such a connection
+    /// can't be handed over. Rebuild options from another process with
+    /// `FsOptions::from_bits_retain()`, which keeps the flag also in builds without
+    /// `fusedev-uring`.
+    pub fn restore_init(&self, version: ServerVersion, options: FsOptions) -> io::Result<()> {
+        if options.bits() & FUSE_OVER_IO_URING != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "can't take over a FUSE-over-io_uring connection, its requests never reach \
+                 /dev/fuse; serve connections that have to be handed over without \
+                 Server::set_uring()",
+            ));
+        }
         self.vers.store(
             encode_version(version.major, version.minor),
             Ordering::Release,
@@ -153,6 +174,7 @@ impl<F: FileSystem + Sync> Server<F> {
         #[cfg(all(target_os = "linux", feature = "fusedev-uring"))]
         self.negotiated_init_flags
             .store(options.bits(), Ordering::Release);
+        Ok(())
     }
 
     /// Request serving FUSE requests over io_uring (experimental).
