@@ -2083,6 +2083,46 @@ mod tests {
 
     #[test]
     #[cfg(target_os = "linux")]
+    fn test_statx() {
+        use fuse_backend_core::abi::fuse_abi::{STATX_BASIC_STATS, STATX_BTIME};
+
+        let tmpdir = TempDir::new().expect("Cannot create temporary directory.");
+        let path = tmpdir.as_path().join("file");
+        std::fs::write(&path, b"data").unwrap();
+        let fs_cfg = Config {
+            do_import: false,
+            root_dir: tmpdir.as_path().to_string_lossy().to_string(),
+            ..Default::default()
+        };
+        let fs = PassthroughFs::<()>::new(fs_cfg).unwrap();
+        fs.import().unwrap();
+        fs.init(FsOptions::empty()).unwrap();
+
+        let ctx = Context::default();
+        let name = CString::new("file").unwrap();
+        let entry = fs.lookup(&ctx, ROOT_ID, &name).unwrap();
+        let (handle, _, _) = fs
+            .open(&ctx, entry.inode, libc::O_RDONLY as u32, 0)
+            .unwrap();
+        let mask = STATX_BASIC_STATS | STATX_BTIME;
+        let md = std::fs::metadata(&path).unwrap();
+        for handle in [None, handle] {
+            let (sx, _) = fs.statx(&ctx, entry.inode, handle, 0, mask).unwrap();
+            assert_eq!(sx.mask & STATX_BASIC_STATS, STATX_BASIC_STATS);
+            assert_eq!((sx.ino, sx.size, sx.nlink), (md.ino(), 4, 1));
+            assert_eq!(u32::from(sx.mode), md.mode());
+            // Not every file system has birth times.
+            if let Ok(btime) = md.created() {
+                assert_ne!(sx.mask & STATX_BTIME, 0);
+                let sx_btime =
+                    std::time::UNIX_EPOCH + Duration::new(sx.btime.tv_sec as u64, sx.btime.tv_nsec);
+                assert_eq!(sx_btime, btime);
+            }
+        }
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
     fn test_kernel_passthrough_o_direct() {
         use std::os::unix::fs::OpenOptionsExt;
 

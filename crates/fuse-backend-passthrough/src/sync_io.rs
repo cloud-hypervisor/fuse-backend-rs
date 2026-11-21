@@ -21,6 +21,8 @@ use std::time::Duration;
 use super::os_compat;
 use super::*;
 use crate::os::LinuxDirent64;
+#[cfg(target_os = "linux")]
+use fuse_backend_core::abi::fuse_abi::Statx;
 use fuse_backend_core::abi::fuse_abi::{
     stat64, statvfs64, CreateIn, Opcode, FOPEN_IN_KILL_SUIDGID, WRITE_KILL_PRIV,
 };
@@ -1182,6 +1184,25 @@ impl<S: BitmapSlice + Send + Sync> FileSystem for PassthroughFs<S> {
         handle: Option<Handle>,
     ) -> io::Result<(stat64, Duration)> {
         self.do_getattr(inode, handle)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn statx(
+        &self,
+        _ctx: &Context,
+        inode: Inode,
+        handle: Option<Handle>,
+        flags: u32,
+        mask: u32,
+    ) -> io::Result<(Statx, Duration)> {
+        // Like do_getattr(), which also explains the handle.
+        let sx = match (!self.no_open.load(Ordering::Relaxed), handle) {
+            (true, Some(h)) => {
+                statx::fuse_statx(self.handle_map.get(h, inode)?.get_file(), flags, mask)
+            }
+            _ => statx::fuse_statx(&self.inode_map.get(inode)?.get_file()?, flags, mask),
+        }?;
+        Ok((sx, self.cfg.attr_timeout))
     }
 
     fn setattr(

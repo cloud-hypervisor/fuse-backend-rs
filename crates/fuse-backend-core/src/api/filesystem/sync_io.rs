@@ -16,7 +16,9 @@ use super::{
     Context, DirEntry, Entry, FileLock, GetxattrReply, IoctlData, ListxattrReply, ZeroCopyReader,
     ZeroCopyWriter,
 };
-use crate::abi::fuse_abi::{stat64, statvfs64, CreateIn, FsOptions, OpenOptions, SetattrValid};
+use crate::abi::fuse_abi::{
+    stat64, statvfs64, CreateIn, FsOptions, OpenOptions, SetattrValid, Statx,
+};
 #[cfg(feature = "virtiofs")]
 pub use crate::abi::virtio_fs::RemovemappingOne;
 
@@ -113,6 +115,26 @@ pub trait FileSystem {
         inode: Self::Inode,
         handle: Option<Self::Handle>,
     ) -> io::Result<(stat64, Duration)> {
+        Err(io::Error::from_raw_os_error(libc::ENOSYS))
+    }
+
+    /// Get attributes for a file / directory like `statx(2)`, which adds the birth time.
+    ///
+    /// `flags` has the `AT_STATX_*` sync flags of the request and `mask` the `STATX_*` bits of
+    /// the fields it asks for. `Statx::mask` says which fields the reply has. The kernel builds
+    /// the caller's stat from the reply and caches it only if it has all of `STATX_BASIC_STATS`,
+    /// so fill those in as for `getattr()`, or start from `Statx::from(stat64)`. The kernel
+    /// sends this only for fields that `getattr()` doesn't return, so far the birth time, and
+    /// after an `ENOSYS` it uses `getattr()` for good. `handle` and the returned `Duration` are
+    /// as for `getattr()`.
+    fn statx(
+        &self,
+        ctx: &Context,
+        inode: Self::Inode,
+        handle: Option<Self::Handle>,
+        flags: u32,
+        mask: u32,
+    ) -> io::Result<(Statx, Duration)> {
         Err(io::Error::from_raw_os_error(libc::ENOSYS))
     }
 
@@ -989,6 +1011,17 @@ impl<FS: FileSystem> FileSystem for Arc<FS> {
         handle: Option<Self::Handle>,
     ) -> io::Result<(stat64, Duration)> {
         self.deref().getattr(ctx, inode, handle)
+    }
+
+    fn statx(
+        &self,
+        ctx: &Context,
+        inode: Self::Inode,
+        handle: Option<Self::Handle>,
+        flags: u32,
+        mask: u32,
+    ) -> io::Result<(Statx, Duration)> {
+        self.deref().statx(ctx, inode, handle, flags, mask)
     }
 
     fn setattr(

@@ -291,6 +291,7 @@ impl<F: FileSystem + Sync> Server<F> {
             x if x == Opcode::Rename2 as u32 => self.rename2(ctx),
             x if x == Opcode::Lseek as u32 => self.lseek(ctx),
             x if x == Opcode::CopyFileRange as u32 => self.copy_file_range(ctx),
+            x if x == Opcode::Statx as u32 => self.statx(ctx),
             #[cfg(feature = "virtiofs")]
             x if x == Opcode::SetupMapping as u32 => self.setupmapping(ctx, vu_req),
             #[cfg(feature = "virtiofs")]
@@ -380,6 +381,29 @@ impl<F: FileSystem + Sync> Server<F> {
         let result = self.fs.getattr(ctx.context(), ctx.nodeid(), handle);
 
         ctx.handle_attr_result(result)
+    }
+
+    fn statx<S: BitmapSlice, W: Writer>(&self, ctx: &mut SrvContext<'_, F, S, W>) -> Result<usize> {
+        let StatxIn {
+            getattr_flags,
+            fh,
+            sx_flags,
+            sx_mask,
+            ..
+        } = ctx.r.read_obj().map_err(Error::DecodeMessage)?;
+        let handle = if (getattr_flags & GETATTR_FH) != 0 {
+            Some(fh.into())
+        } else {
+            None
+        };
+
+        match self
+            .fs
+            .statx(ctx.context(), ctx.nodeid(), handle, sx_flags, sx_mask)
+        {
+            Ok(res) => ctx.reply_ok(Some(ServerUtil::statx_out(res)), None),
+            Err(e) => ctx.reply_error(e),
+        }
     }
 
     fn setattr<S: BitmapSlice, W: Writer>(
