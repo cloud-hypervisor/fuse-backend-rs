@@ -32,6 +32,9 @@
   directly by the fusedev build script.
 
 ### Added
+- [331](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/331): `Server::notify_poll_wakeup()` wakes the poll(2) calls that wait for a file. It
+  takes the kernel handle that `FileSystem::poll()` gets along with `POLL_SCHEDULE_NOTIFY`. `Vfs`
+  passes POLL requests on to the mounted file systems.
 - [304](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/304): Give FreeBSD a verification path. The Linux wire-format ABI
   body moves out of `fuse_abi_linux.rs` into a shared `fuse_abi_wire.rs`
   (each per-OS prelude re-exports the libc names the body uses), and a new
