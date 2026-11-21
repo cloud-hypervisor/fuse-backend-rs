@@ -196,6 +196,17 @@
   writes of opens that ask for it with zero-copy. It moves the data between the client's pages
   and the file with io_uring fixed-buffer operations. It needs buffer pools and CAP_SYS_ADMIN,
   and serves without it otherwise. `UringConfig` has a new field.
+- [317](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/317): `UringWriter` implements the asynchronous `Writer` methods, so the async server can reply
+  through the FUSE-over-io_uring transport.
+- [317](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/317): `UringFuseServing::new_async()` serves FUSE-over-io_uring with the `AsyncFileSystem` handlers.
+  Each worker runs an async runtime and keeps up to one request per ring entry in flight, so
+  handlers that wait don't hold up the worker's other requests.
+  Its queues get `entries_per_queue` pool buffers, because a request keeps its buffer
+  while its handler waits.
+- [318](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/318): `UringFuseServing::new_async()` serves zero-copy too. `ZeroCopySource::async_write_to_file()`
+  and `AsyncFileReadWriteVolatile::raw_fd()` let `Reader::async_read_to_at()` move zero-copy
+  data, and the fixed-buffer operations of a request run on the worker's ring while its other
+  requests go on. Copies through memory, for files without a descriptor, still block the worker.
 
 ### Changed
 - [325](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/325): The `fuse-backend-fusedev` `uring` transport uses io-uring 0.6 instead of 0.5,
@@ -266,6 +277,15 @@
   that crate's `async-io` too, or its writers fail asynchronous replies with
   `EINVAL`.
 - [281](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/281): `FuseUringEntInOut::padding` is now `offset`, and `FuseUringCmdReq` has a new `bufpool` field.
+- [316](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/316): `UringFuseServing` spreads the ring entries of every kernel queue over its workers, instead of
+  giving each worker whole queues, and the workers register them in rounds, so that requests that
+  arrive together reach different workers. With the default worker per CPU, 1 MiB reads from 8 CPUs
+  got 2.5 times faster. With 8 workers, writes through the writeback cache got 18 to 27% faster,
+  and reads from 8 CPUs whose queues each had a worker of their own got 11 to 17% slower.
+  `UringConfig::workers` can exceed the number of queues, up to `entries_per_queue` times that,
+  and an `entries_per_queue` of 0 counts as 1.
+- [317](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/317): A `UringFuseServing` ring entry without a buffer pool allocates about a third of the memory it
+  used to. It kept two scratch regions the size of its payload area, but used 168 bytes of one.
 - [254](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/254): `fuse-backend-rs` is now a thin facade re-exporting the sub-crates. Every
   historical `fuse_backend_rs::{abi, api, buffer, common, transport, passthrough,
   overlayfs}` import path and cargo feature name (`fusedev`, `virtiofs`,

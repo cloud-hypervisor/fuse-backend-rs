@@ -39,9 +39,9 @@ Three inputs drive the choice:
   on `Error::UringNotSupported`. Everywhere else, including macOS, the
   classic transport is the choice.
 - **Workload**: on a uring-capable kernel, metadata-heavy workloads gain the
-  most (3.7x file creation at 8 threads), while large sequential IO
-  currently regresses on uring — a known upstream limitation analyzed in
-  [fuse-uring-performance.md](../../docs/fuse-uring-performance.md) — so
+  most (3.7x file creation at 8 threads), while large sequential IO is still
+  slower on uring, see
+  [fuse-uring-performance.md](../../docs/fuse-uring-performance.md), so
   classic multi-worker serving stays the throughput choice there.
 - **Backing storage**: with local storage, synchronous handlers
   (`FileSystem`) saturate with one worker per CPU. When every request hides
