@@ -7,8 +7,9 @@
 //! and asynchronous IO paths with external tools such as fio.
 //!
 //! Usage: `fuse-backend-rs-benchmark <src> <mountpoint> [--async] [--uring] [--threads N]
-//! [--sync-blocking] [--thread-pool] [--uring-bufs N] [--uring-zero-copy]
-//! [--no-backing-direct-io] [--kernel-passthrough] [--no-writeback] [--delay-us N] [--splice]`
+//! [--sync-blocking] [--thread-pool] [--uring-entries N] [--uring-bufs N]
+//! [--uring-zero-copy] [--no-backing-direct-io] [--kernel-passthrough] [--no-writeback]
+//! [--delay-us N] [--delay-prefix P] [--splice]`
 //!
 //! - default (sync) mode: requests are served by `N` worker threads of the
 //!   `SyncFuseServing` serving layer, each reading from its own fuse channel
@@ -22,7 +23,8 @@
 //!   `PassthroughFs::enable_async_thread_pool()`.
 //! - `--uring` mode: requests are served through the FUSE-over-io_uring
 //!   transport (`UringFuseServing`, experimental, requires kernel 6.14+);
-//!   `N` limits the number of io_uring worker threads. `--uring-bufs N`
+//!   `N` limits the number of io_uring worker threads. `--uring-entries N`
+//!   sets `UringConfig::entries_per_queue`, 16 by default. `--uring-bufs N`
 //!   sets `UringConfig::bufs_per_queue`, the number of buffers in each
 //!   queue's buffer pool on kernels with buffer pools. `0` gives every ring
 //!   entry a buffer of its own. `--uring-zero-copy` serves reads and writes
@@ -48,7 +50,10 @@
 //! `--delay-us N` makes every LOOKUP and READ wait `N` microseconds before
 //! it is served, like a backend that fetches from a remote store. The
 //! synchronous handlers block their thread for that time, the asynchronous
-//! ones sleep without blocking it.
+//! ones sleep without blocking it. With `--delay-prefix P`, only the
+//! LOOKUPs of names that start with `P` wait, and the READs of the files
+//! they name, so that other requests stand in for cache hits. It needs
+//! `--delay-us`.
 //!
 //! `--splice` makes the sync mode send READ replies with `splice(2)`, see
 //! `FuseSession::set_splice_write()`.
@@ -94,10 +99,12 @@ mod daemon {
         no_writeback: bool,
         splice: bool,
         thread_cnt: u32,
+        uring_entries: usize,
         uring_bufs: usize,
         uring_zero_copy: bool,
         backing_direct_io: bool,
         delay: Duration,
+        delay_prefix: Option<String>,
     }
 
     impl Args {
@@ -132,7 +139,7 @@ mod daemon {
 
     fn help() {
         println!(
-            "Usage:\n   fuse-backend-rs-benchmark <src> <mountpoint> [--async] [--uring] [--threads N] [--sync-blocking] [--thread-pool] [--uring-bufs N] [--uring-zero-copy] [--no-backing-direct-io] [--kernel-passthrough] [--no-writeback] [--delay-us N] [--splice]\n"
+            "Usage:\n   fuse-backend-rs-benchmark <src> <mountpoint> [--async] [--uring] [--threads N] [--sync-blocking] [--thread-pool] [--uring-entries N] [--uring-bufs N] [--uring-zero-copy] [--no-backing-direct-io] [--kernel-passthrough] [--no-writeback] [--delay-us N] [--delay-prefix P] [--splice]\n"
         );
     }
 
@@ -161,10 +168,12 @@ mod daemon {
             no_writeback: false,
             splice: false,
             thread_cnt: 4,
+            uring_entries: 16,
             uring_bufs: UringConfig::default().bufs_per_queue,
             uring_zero_copy: false,
             backing_direct_io: true,
             delay: Duration::ZERO,
+            delay_prefix: None,
         };
         let mut idx = 3;
         while idx < args.len() {
@@ -184,8 +193,16 @@ mod daemon {
                     idx += 1;
                     res.delay = Duration::from_micros(option_value(&args, idx)?);
                 }
+                "--delay-prefix" => {
+                    idx += 1;
+                    res.delay_prefix = Some(option_value(&args, idx)?);
+                }
                 "--uring-zero-copy" => res.uring_zero_copy = true,
                 "--no-backing-direct-io" => res.backing_direct_io = false,
+                "--uring-entries" => {
+                    idx += 1;
+                    res.uring_entries = option_value(&args, idx)?;
+                }
                 "--uring-bufs" => {
                     idx += 1;
                     res.uring_bufs = option_value(&args, idx)?;
@@ -197,7 +214,11 @@ mod daemon {
             }
             idx += 1;
         }
-        if res.src.is_empty() || res.dest.is_empty() || res.thread_cnt == 0 {
+        if res.src.is_empty()
+            || res.dest.is_empty()
+            || res.thread_cnt == 0
+            || (res.delay_prefix.is_some() && res.delay.is_zero())
+        {
             help();
             return Err(Error::from_raw_os_error(libc::EINVAL));
         }
@@ -289,7 +310,7 @@ mod daemon {
             server.set_uring(true);
             let cfg = UringConfig {
                 workers,
-                entries_per_queue: 16,
+                entries_per_queue: args.uring_entries,
                 bufs_per_queue: args.uring_bufs,
                 zero_copy: args.uring_zero_copy,
             };
@@ -343,7 +364,7 @@ mod daemon {
             }
         }
         info!(
-            "passthrough src {} mountpoint {} mode {} threads {} thread pool {} kernel passthrough {} writeback {} delay {:?} splice {}",
+            "passthrough src {} mountpoint {} mode {} threads {} thread pool {} kernel passthrough {} writeback {} delay {:?} delay prefix {:?} splice {}",
             args.src,
             args.dest,
             args.mode(),
@@ -352,6 +373,7 @@ mod daemon {
             args.kernel_passthrough,
             !(args.no_writeback || args.kernel_passthrough),
             args.delay,
+            args.delay_prefix,
             args.splice,
         );
 
@@ -380,7 +402,11 @@ mod daemon {
             serve(Arc::new(Server::new(vfs)), se, &args);
         } else {
             serve(
-                Arc::new(Server::new(DelayFs::new(vfs, args.delay))),
+                Arc::new(Server::new(DelayFs::new(
+                    vfs,
+                    args.delay,
+                    args.delay_prefix.clone(),
+                ))),
                 se,
                 &args,
             );
