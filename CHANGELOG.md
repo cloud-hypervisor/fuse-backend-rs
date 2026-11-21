@@ -196,6 +196,29 @@
   writes of opens that ask for it with zero-copy. It moves the data between the client's pages
   and the file with io_uring fixed-buffer operations. It needs buffer pools and CAP_SYS_ADMIN,
   and serves without it otherwise. `UringConfig` has a new field.
+- [317](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/317): `UringWriter` implements the asynchronous `Writer` methods, so the async server can reply
+  through the FUSE-over-io_uring transport.
+- [317](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/317): `UringFuseServing::new_async()` serves FUSE-over-io_uring with the `AsyncFileSystem` handlers.
+  Each worker runs an async runtime and keeps up to one request per ring entry in flight, so
+  handlers that wait don't hold up the worker's other requests.
+  Its queues get `entries_per_queue` pool buffers, because a request keeps its buffer
+  while its handler waits.
+- [318](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/318): `UringFuseServing::new_async()` serves zero-copy too. `ZeroCopySource::async_write_to_file()`
+  and `AsyncFileReadWriteVolatile::raw_fd()` let `Reader::async_read_to_at()` move zero-copy
+  data, and the fixed-buffer operations of a request run on the worker's ring while its other
+  requests go on. Copies through memory, for files without a descriptor, still block the worker.
+- [319](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/319): A `StopSignal` sets the stop flag of `FuseDevTask`s and wakes the ones that wait for a request
+  on the tokio runtime. `FuseDevTask::new()` takes one in place of the `Arc<AtomicBool>`, which
+  still works and makes an idle task check the flag every 100ms. `AsyncFuseServing` and the
+  `/dev/fuse` thread of `UringFuseServing::new_async()` stop with a signal, so their idle tasks
+  no longer wake 10 times a second.
+- [NNN](link): `UringConfig::defer_taskrun` makes the workers of `UringFuseServing::new()`
+  create their rings with `IORING_SETUP_SINGLE_ISSUER` and `IORING_SETUP_DEFER_TASKRUN`, so the
+  kernel copies requests into their entries when they wait for the next one instead of
+  interrupting their handlers. On Linux 7.3.1, that made stats and 4 KiB reads that a client
+  sends one at a time faster. It is off by default, because Linux 7.2.0-7.2.13 and 7.3.0-7.3.1
+  can miss the wake-up of a worker waiting on such a ring. `new_async()` ignores it.
+  `UringConfig` has a new field.
 
 ### Changed
 - [325](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/325): The `fuse-backend-fusedev` `uring` transport uses io-uring 0.6 instead of 0.5,
@@ -266,6 +289,15 @@
   that crate's `async-io` too, or its writers fail asynchronous replies with
   `EINVAL`.
 - [281](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/281): `FuseUringEntInOut::padding` is now `offset`, and `FuseUringCmdReq` has a new `bufpool` field.
+- [316](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/316): `UringFuseServing` spreads the ring entries of every kernel queue over its workers, instead of
+  giving each worker whole queues, and the workers register them in rounds, so that requests that
+  arrive together reach different workers. With the default worker per CPU, 1 MiB reads from 8 CPUs
+  got 2.5 times faster. With 8 workers, writes through the writeback cache got 18 to 27% faster,
+  and reads from 8 CPUs whose queues each had a worker of their own got 11 to 17% slower.
+  `UringConfig::workers` can exceed the number of queues, up to `entries_per_queue` times that,
+  and an `entries_per_queue` of 0 counts as 1.
+- [317](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/317): A `UringFuseServing` ring entry without a buffer pool allocates about a third of the memory it
+  used to. It kept two scratch regions the size of its payload area, but used 168 bytes of one.
 - [254](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/254): `fuse-backend-rs` is now a thin facade re-exporting the sub-crates. Every
   historical `fuse_backend_rs::{abi, api, buffer, common, transport, passthrough,
   overlayfs}` import path and cargo feature name (`fusedev`, `virtiofs`,
@@ -382,6 +414,11 @@
   them all back, and leaks them if that takes more than a second. A worker that stopped on an
   error while the connection was up freed entries the kernel could still copy requests into. A
   signal that interrupts the worker's `io_uring_enter()` calls no longer stops it.
+- [319](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/319): Dropping a `UringFuseServing` whose mount is busy no longer hangs until the files in the mount
+  close. The unmount leaves such a connection up, and the workers kept waiting for requests. Now
+  the stop signal wakes them through a poll on their rings. Once they have served the requests
+  they took, the last one ends the connection, as closing `/dev/fuse` ends a classic one. An
+  async worker whose entries all wait on handlers no longer checks its stop flag every 100ms.
 - `UringWriter::write_from_at()` fails when the data doesn't fit into the reply body. It counted
   free space in the header slot too, and could read file data past the end of the body.
 - [278](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/278): Treat `EOPNOTSUPP`/`ENOTSUP` and `ENOSYS` from `getxattr` as "not opaque"

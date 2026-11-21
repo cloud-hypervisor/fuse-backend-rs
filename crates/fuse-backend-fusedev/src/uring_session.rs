@@ -10,8 +10,14 @@
 //! the daemon in the SQE command payload.
 //!
 //! The kernel still uses the classic /dev/fuse path for requests it cannot
-//! route through io_uring (FUSE_INTERRUPT and requests queued before entries
-//! were registered), so a classic channel thread keeps serving in parallel.
+//! route through io_uring (FUSE_FORGET, FUSE_INTERRUPT and requests queued
+//! before entries were registered), so a classic channel thread keeps serving
+//! in parallel.
+//!
+//! `UringFuseServing::new()` serves the rings with the synchronous handlers,
+//! one request at a time per worker. `UringFuseServing::new_async()` serves
+//! them with the asynchronous handlers, up to one request per ring entry at
+//! a time per worker.
 //!
 //! On Linux 7.3 and later, the kernel can take the payload buffers from one
 //! buffer pool per queue instead of one buffer per entry. See
@@ -27,7 +33,10 @@ use std::os::unix::io::{AsRawFd, RawFd};
 use std::ptr::NonNull;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Sender};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
+#[cfg(feature = "async-io")]
+use std::task::Poll;
+use std::task::Waker;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -36,21 +45,34 @@ use vm_memory::ByteValued;
 
 use fuse_backend_core::abi::fuse_abi::{InHeader, Opcode, OutHeader, ReadIn};
 use fuse_backend_core::abi::fuse_uring::{
-    FuseUringBufpool, FuseUringCmdReq, FuseUringEntInOut, FuseUringReqHeader,
-    FUSE_IO_URING_CMD_ADD_BUFPOOL, FUSE_IO_URING_CMD_ADD_QUEUE, FUSE_IO_URING_CMD_COMMIT_AND_FETCH,
-    FUSE_IO_URING_CMD_REGISTER, FUSE_URING_ENT_ZERO_COPY, FUSE_URING_IN_OUT_HEADER_SZ,
-    FUSE_URING_IOV_SEGS, FUSE_URING_ZERO_COPY,
+    FuseUringBufpool, FuseUringCmdReq, FuseUringReqHeader, FUSE_IO_URING_CMD_ADD_BUFPOOL,
+    FUSE_IO_URING_CMD_ADD_QUEUE, FUSE_IO_URING_CMD_COMMIT_AND_FETCH, FUSE_IO_URING_CMD_REGISTER,
+    FUSE_URING_ENT_ZERO_COPY, FUSE_URING_IOV_SEGS, FUSE_URING_OP_IN_OUT_SZ, FUSE_URING_ZERO_COPY,
 };
 use fuse_backend_core::api::filesystem::FileSystem;
 use fuse_backend_core::api::server::Server;
 use fuse_backend_core::buffer::{Error::*, Reader, Result, Writer, ZeroCopySource};
 use fuse_backend_core::file_buf::FileVolatileSlice;
 use fuse_backend_core::file_traits::FileReadWriteVolatile;
+#[cfg(feature = "async-io")]
+use fuse_backend_core::{
+    api::filesystem::AsyncFileSystem, async_runtime::Runtime, file_buf::FileVolatileBuf,
+    file_traits::AsyncFileReadWriteVolatile,
+};
+#[cfg(feature = "async-io")]
+use futures_util::{
+    stream::{FuturesUnordered, StreamExt},
+    FutureExt,
+};
+#[cfg(feature = "async-io")]
+use tokio::io::{unix::AsyncFd, Interest};
 use vm_memory::bitmap::BitmapSlice;
 use vm_memory::mmap::MmapRegion;
 
 use crate::serving::{FuseServing, WorkerSet};
-use crate::{FuseBuf, FuseChannel, FuseDevReaderExt, FuseSession, FUSE_HEADER_SIZE};
+#[cfg(feature = "async-io")]
+use crate::FuseDevTask;
+use crate::{FuseChannel, FuseDevReaderExt, FuseSession, StopSignal, FUSE_HEADER_SIZE};
 
 /// Size of `fuse_in_header`/`fuse_out_header` on the wire.
 const IN_HEADER_SIZE: usize = 40;
@@ -82,11 +104,13 @@ struct SqeMirror {
 #[derive(Clone, Copy, Debug)]
 pub struct UringConfig {
     /// Number of worker threads, each owning one io_uring instance. The
-    /// kernel queues are distributed among the workers round-robin.
-    /// `0` means one worker per online CPU.
+    /// workers share the entries of every kernel queue, so several of them
+    /// serve a busy queue. `0` means one worker per online CPU. The worker
+    /// count is capped at `entries_per_queue` times the number of queues,
+    /// so that every worker holds at least one entry.
     pub workers: usize,
     /// Number of ring entries registered per kernel queue, i.e. the number
-    /// of in-flight requests each queue may hold.
+    /// of in-flight requests each queue may hold. `0` counts as 1.
     pub entries_per_queue: usize,
     /// Number of payload buffers in each queue's buffer pool, on kernels
     /// that support buffer pools (Linux 7.3). The kernel lends a buffer to
@@ -96,6 +120,8 @@ pub struct UringConfig {
     /// queue are busy. A pool holds at most `entries_per_queue` buffers,
     /// because each entry holds at most one. `0`, or a kernel without
     /// buffer pools, gives every entry a buffer of its own instead.
+    /// `UringFuseServing::new_async()` makes any other value
+    /// `entries_per_queue`.
     pub bufs_per_queue: usize,
     /// Serve the reads and writes of opens that ask for it with zero-copy
     /// (`OpenOptions::IO_URING_ZERO_COPY`, Linux 7.3). The kernel lends the
@@ -105,8 +131,32 @@ pub struct UringConfig {
     /// needs buffer pools and CAP_SYS_ADMIN, and the transport serves
     /// without it otherwise. File systems must pass reads and writes of
     /// such opens to `ZeroCopyWriter::write_from()` and
-    /// `ZeroCopyReader::read_to()` with a file that has a descriptor.
+    /// `ZeroCopyReader::read_to()`, or their async versions, with a file
+    /// that has a descriptor (`raw_fd()` of `FileReadWriteVolatile` or
+    /// `AsyncFileReadWriteVolatile`). Other files take a slower copy through
+    /// memory.
     pub zero_copy: bool,
+    /// Create the rings of the `UringFuseServing::new()` workers with
+    /// `IORING_SETUP_SINGLE_ISSUER` and `IORING_SETUP_DEFER_TASKRUN`, so the
+    /// kernel copies a request into its entry when the worker waits for the
+    /// next one instead of interrupting its handler. That made requests that
+    /// a client sends one at a time faster, see
+    /// `docs/fuse-uring-performance.md`. A kernel that refuses the flags
+    /// gets rings without them.
+    ///
+    /// It is off by default, because on Linux 7.2.0 to 7.2.13, 7.3.0 and
+    /// 7.3.1 a thread that waits on such a ring can miss its wake-up, and
+    /// the worker then sleeps with a request until a signal interrupts it.
+    /// Commit 8257f6ec45ee ("io_uring: don't lose the DEFER_TASKRUN wake
+    /// up") fixed that in 7.4-rc1, 7.3.2 and 7.2.14. Kernels before 7.2
+    /// don't have the bug.
+    ///
+    /// `UringFuseServing::new_async()` ignores it. Its workers wait for
+    /// completions in epoll, and from Linux 6.3 on, the kernel doesn't wake
+    /// epoll for deferred task work until commit b88902d8745a ("io_uring:
+    /// wake ring pollers for local task_work"), in 7.4-rc1, 7.3.2, 7.2.14
+    /// and 6.18.60.
+    pub defer_taskrun: bool,
 }
 
 impl Default for UringConfig {
@@ -116,6 +166,7 @@ impl Default for UringConfig {
             entries_per_queue: 4,
             bufs_per_queue: 4,
             zero_copy: false,
+            defer_taskrun: false,
         }
     }
 }
@@ -181,6 +232,79 @@ fn possible_cpu_count() -> Result<usize> {
     let content = std::fs::read_to_string("/sys/devices/system/cpu/possible")
         .map_err(|e| SessionFailure(format!("read possible cpu mask: {e}")))?;
     parse_cpu_mask(&content)
+}
+
+/// Assign the ring entries of all queues to `workers` workers, returning
+/// the queue id and registration round of every entry each worker
+/// registers. `entries_per_queue` must be at least 1, and `bufs` is the
+/// number of buffers in each queue's pool.
+///
+/// The kernel puts a request on the queue of the CPU that sends it, and a
+/// single flusher thread sends all writeback WRITEs. A worker that owned
+/// whole queues would serve such a stream alone, so the entries of every
+/// queue go to consecutive workers instead. The kernel hands a request to
+/// any free entry of its queue, so a busy queue reaches the other workers
+/// once one worker's entries are all in use.
+///
+/// The kernel also hands a request to the entry of its queue that became
+/// free last, see `UringWorker::register()`. So each queue registers one
+/// entry of each of its workers last, one per round. A queue with an entry
+/// on every worker registers the one on worker `qid % workers`, which
+/// would own it with whole queues, last, so its requests go there while it
+/// has one at a time. Queues 0 to `workers - 1` end on different workers,
+/// and so do the next `workers` queues and so on. The other entries
+/// register before them, in round 0.
+fn spread_entries(
+    nr_queues: usize,
+    entries_per_queue: usize,
+    workers: usize,
+    bufs: usize,
+) -> Vec<Vec<(u16, usize)>> {
+    let total = nr_queues * entries_per_queue;
+    let workers = workers.clamp(1, total);
+    // The last queue_workers entries of a queue belong to different
+    // workers, and the rest register before them.
+    let queue_workers = entries_per_queue.min(workers);
+    let rest = entries_per_queue - queue_workers;
+    // With buffer pools, the entries that register last keep the buffers.
+    let holders = bufs.clamp(1, queue_workers);
+    // Queue qid's workers start at qid * entries_per_queue % workers, which
+    // repeats after this many queues.
+    let (mut gcd, mut b) = (entries_per_queue, workers);
+    while b != 0 {
+        (gcd, b) = (b, gcd % b);
+    }
+    let period = workers / gcd;
+    let mut entries = vec![Vec::new(); workers];
+    for qid in 0..nr_queues {
+        // Queues workers apart have the same workers, so each one turns
+        // the entries before its last one on, and its other buffers go to
+        // different workers than the previous one's.
+        let turn = qid / workers * (holders - 1);
+        for nth in 0..entries_per_queue {
+            let w = (qid * entries_per_queue + nth) % workers;
+            let round = if nth < rest {
+                0
+            } else {
+                // The number of last entries that register after this one.
+                // The last one is on worker qid % workers if the queue has
+                // an entry on every worker, else it moves on by one after
+                // each period.
+                let after = if queue_workers == workers {
+                    (qid + workers - w) % workers
+                } else {
+                    (qid / period + queue_workers - (nth - rest)) % queue_workers
+                };
+                let after = match after {
+                    0 => 0,
+                    a => (a - 1 + turn) % (queue_workers - 1) + 1,
+                };
+                usize::from(rest > 0) + queue_workers - 1 - after
+            };
+            entries[w].push((qid as u16, round));
+        }
+    }
+    entries
 }
 
 /// What the transport needs to know about a request with this opcode: the
@@ -271,6 +395,7 @@ pub struct UringWriter<'a, S: BitmapSlice = ()> {
 }
 
 /// Reads a file into the client pages of a zero-copy READ.
+#[cfg_attr(feature = "async-io", async_trait::async_trait(?Send))]
 trait ZeroCopySink: Sync {
     /// Read `count` bytes from the file `fd` at offset `off` into the client
     /// pages, starting `pos` bytes into them. Returns how many it read.
@@ -290,6 +415,19 @@ trait ZeroCopySink: Sync {
         count: usize,
         fill: &mut dyn FnMut(&mut [u8]) -> io::Result<usize>,
     ) -> io::Result<usize>;
+
+    /// Like `read_from_file()`, for asynchronous handlers. The default
+    /// calls `read_from_file()`, which blocks the thread.
+    #[cfg(feature = "async-io")]
+    async fn async_read_from_file(
+        &self,
+        pos: usize,
+        fd: RawFd,
+        count: usize,
+        off: u64,
+    ) -> io::Result<usize> {
+        self.read_from_file(pos, fd, count, off)
+    }
 }
 
 /// The reply data of a zero-copy READ: up to `cap` bytes that `sink` reads
@@ -302,6 +440,34 @@ struct ZeroCopyBody<'a> {
 }
 
 impl ZeroCopyBody<'_> {
+    /// Read up to `count` bytes of `fd` at `off` into the client pages,
+    /// after what is there.
+    fn read_from_file(&mut self, fd: RawFd, count: usize, off: u64) -> io::Result<usize> {
+        let cnt = self
+            .sink
+            .read_from_file(self.len, fd, count, off)?
+            .min(count);
+        self.len += cnt;
+        Ok(cnt)
+    }
+
+    /// Like `read_from_file()`, without blocking the worker.
+    #[cfg(feature = "async-io")]
+    async fn async_read_from_file(
+        &mut self,
+        fd: RawFd,
+        count: usize,
+        off: u64,
+    ) -> io::Result<usize> {
+        let cnt = self
+            .sink
+            .async_read_from_file(self.len, fd, count, off)
+            .await?
+            .min(count);
+        self.len += cnt;
+        Ok(cnt)
+    }
+
     /// Copy `data` from memory into the client pages, after what is there.
     fn push_memory(&mut self, data: &[u8]) -> io::Result<()> {
         check_space(self.cap - self.len, data.len())?;
@@ -361,8 +527,8 @@ impl<'a, S: BitmapSlice> UringWriter<'a, S> {
     }
 
     /// Let `sink` produce up to `cap` bytes of reply data, for a zero-copy
-    /// READ. `write_from_at()` then reads the file into the client pages
-    /// instead of the body.
+    /// READ. `write_from_at()` and `async_write_from_at()` then read the file
+    /// into the client pages instead of the body.
     fn with_zero_copy(mut self, sink: &'a dyn ZeroCopySink, cap: usize) -> Self {
         self.zero_copy = Some(ZeroCopyBody { sink, cap, len: 0 });
         self
@@ -493,6 +659,25 @@ impl<'a, S: BitmapSlice> UringWriter<'a, S> {
         Ok(data.len())
     }
 
+    /// The unwritten end of the body region, after checking that `count`
+    /// more bytes fit into it. Free space in the header slot doesn't count,
+    /// because file data only goes into the body.
+    fn body_tail(&mut self, count: usize) -> io::Result<*mut u8> {
+        let spare = self.body.spare_capacity_mut();
+        check_space(spare.len(), count)?;
+        Ok(spare.as_mut_ptr().cast())
+    }
+
+    /// Account `cnt` bytes that a file read placed at `body_tail()`.
+    ///
+    /// # Safety
+    /// The bytes must have been written at the pointer `body_tail(count)`
+    /// returned, with `cnt <= count`.
+    unsafe fn advance_body(&mut self, cnt: usize) {
+        let new_len = self.body.len() + cnt;
+        self.body.set_len(new_len);
+    }
+
     /// Stage data read from a file descriptor at offset `off` into the body
     /// region. Must be called after the header has been fully written.
     pub fn write_from_at<F: FileReadWriteVolatile>(
@@ -514,28 +699,57 @@ impl<'a, S: BitmapSlice> UringWriter<'a, S> {
                 zc.len += cnt;
                 return Ok(cnt);
             };
-            let cnt = zc.sink.read_from_file(zc.len, fd, count, off)?.min(count);
-            zc.len += cnt;
-            return Ok(cnt);
+            return zc.read_from_file(fd, count, off);
         }
-        // File data only goes into the body, so free space in the header
-        // slot doesn't count.
-        check_space(self.body.capacity() - self.body.len(), count)?;
+        let tail = self.body_tail(count)?;
+        // Safe because body_tail() checked that count bytes fit.
         let cnt = src
             .read_vectored_at_volatile(
-                // Safe because the body has room for count more bytes.
-                unsafe {
-                    &[FileVolatileSlice::from_raw_ptr(
-                        self.body.as_mut_ptr().add(self.body.len()),
-                        count,
-                    )]
-                },
+                unsafe { &[FileVolatileSlice::from_raw_ptr(tail, count)] },
                 off,
             )?
             .min(count);
-        let new_len = self.body.len() + cnt;
-        // Safe because the read placed cnt <= count bytes behind the body.
-        unsafe { self.body.set_len(new_len) };
+        // Safe because the read placed cnt <= count bytes at the tail.
+        unsafe { self.advance_body(cnt) };
+        Ok(cnt)
+    }
+
+    /// Stage data read asynchronously from a file at offset `off` into the
+    /// body region, like `write_from_at()`.
+    ///
+    /// The read points into memory the writer borrows, so the caller must
+    /// not drop the future before it completes.
+    #[cfg(feature = "async-io")]
+    pub async fn async_write_from_at<F: AsyncFileReadWriteVolatile + ?Sized>(
+        &mut self,
+        src: &F,
+        count: usize,
+        off: u64,
+    ) -> io::Result<usize> {
+        if let Some(zc) = self.zero_copy.as_mut() {
+            check_space(zc.cap - zc.len, count)?;
+            let Some(fd) = src.raw_fd() else {
+                // Read the file into memory, and copy that into the client
+                // pages.
+                let mut data = Vec::with_capacity(count);
+                // Safe because `data` outlives the read.
+                let buf = unsafe { FileVolatileBuf::from_raw_ptr(data.as_mut_ptr(), 0, count) };
+                let cnt = src.async_read_at_volatile(buf, off).await.0?.min(count);
+                // Safe because the read placed `cnt` bytes into `data`.
+                unsafe { data.set_len(cnt) };
+                zc.push_memory(&data)?;
+                return Ok(cnt);
+            };
+            return zc.async_read_from_file(fd, count, off).await;
+        }
+        let tail = self.body_tail(count)?;
+        // Safe because body_tail() checked that count bytes fit, and the
+        // writer borrows the body region for 'a, which outlives the read.
+        let buf = unsafe { FileVolatileBuf::from_raw_ptr(tail, 0, count) };
+        let (res, _) = src.async_read_at_volatile(buf, off).await;
+        let cnt = res?.min(count);
+        // Safe because the read placed cnt <= count bytes at the tail.
+        unsafe { self.advance_body(cnt) };
         Ok(cnt)
     }
 }
@@ -575,12 +789,10 @@ impl<S: BitmapSlice> Write for UringWriter<'_, S> {
 }
 
 impl<'a, S: BitmapSlice> Writer for UringWriter<'a, S> {
-    // All methods forward to the inherent methods of the same name; the
-    // explicit `UringWriter::` prefix keeps the forwarding unambiguous and
-    // makes removing an inherent method a compile error instead of silent
-    // infinite recursion. The uring transport has no async-io support and
-    // relies on the trait's default `EINVAL` implementations for the
-    // `async_*` methods.
+    // The synchronous methods and `async_write_from_at` forward to the
+    // inherent methods of the same name. The writer only stages the reply in
+    // memory, so the other `async_*` methods run the `io::Write` methods and
+    // `commit()`.
     fn write_from_at<F: FileReadWriteVolatile>(
         &mut self,
         src: F,
@@ -603,6 +815,41 @@ impl<'a, S: BitmapSlice> Writer for UringWriter<'a, S> {
     }
 
     fn commit(&mut self, other: Option<&Self>) -> io::Result<usize> {
+        UringWriter::commit(self, other)
+    }
+
+    #[cfg(feature = "async-io")]
+    async fn async_write(&mut self, data: &[u8]) -> io::Result<usize> {
+        self.write(data)
+    }
+
+    #[cfg(feature = "async-io")]
+    async fn async_write2(&mut self, data: &[u8], data2: &[u8]) -> io::Result<usize> {
+        self.write_vectored(&[IoSlice::new(data), IoSlice::new(data2)])
+    }
+
+    #[cfg(feature = "async-io")]
+    async fn async_write3(&mut self, data: &[u8], data2: &[u8], data3: &[u8]) -> io::Result<usize> {
+        self.write_vectored(&[IoSlice::new(data), IoSlice::new(data2), IoSlice::new(data3)])
+    }
+
+    #[cfg(feature = "async-io")]
+    async fn async_write_all(&mut self, buf: &[u8]) -> io::Result<()> {
+        self.write_all(buf)
+    }
+
+    #[cfg(feature = "async-io")]
+    async fn async_write_from_at<F: AsyncFileReadWriteVolatile + ?Sized>(
+        &mut self,
+        src: &F,
+        count: usize,
+        off: u64,
+    ) -> io::Result<usize> {
+        UringWriter::async_write_from_at(self, src, count, off).await
+    }
+
+    #[cfg(feature = "async-io")]
+    async fn async_commit(&mut self, other: Option<&Self>) -> io::Result<usize> {
         UringWriter::commit(self, other)
     }
 }
@@ -809,6 +1056,53 @@ fn cmd_sqe(
 /// 128-byte SQEs.
 type FuseRing = IoUring<squeue::Entry128, cqueue::Entry>;
 
+/// The setup flags of a worker ring.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RingFlags {
+    /// No setup flags. The kernel copies a request into its entry in task
+    /// work of the worker, which interrupts the worker, also in a handler.
+    Default,
+    /// `IORING_SETUP_SINGLE_ISSUER` and `IORING_SETUP_DEFER_TASKRUN`, since
+    /// Linux 6.1. The task work waits until the worker waits for completions
+    /// in `io_uring_enter()`. Only the thread that created the ring may
+    /// submit to it. See `UringConfig::defer_taskrun` for the kernels that
+    /// miss wake-ups with it.
+    DeferTaskrun,
+}
+
+impl RingFlags {
+    /// Build a ring with these flags and `entries` submission queue
+    /// entries.
+    fn build(self, entries: u32) -> io::Result<FuseRing> {
+        let mut builder = FuseRing::builder();
+        if self == RingFlags::DeferTaskrun {
+            builder.setup_single_issuer().setup_defer_taskrun();
+        }
+        builder.build(entries)
+    }
+
+    /// Run `build` with these flags, and again without flags if it fails
+    /// with EINVAL, which is how a kernel refuses flags it doesn't know.
+    fn build_or_default<T>(
+        self,
+        mut build: impl FnMut(RingFlags) -> io::Result<T>,
+    ) -> io::Result<T> {
+        match build(self) {
+            Err(e) if self != RingFlags::Default && e.raw_os_error() == Some(libc::EINVAL) => {
+                let res = build(RingFlags::Default);
+                // Every worker tries, so warn once, and only if the flags
+                // were what the kernel refused.
+                static WARNED: AtomicBool = AtomicBool::new(false);
+                if res.is_ok() && !WARNED.swap(true, Ordering::Relaxed) {
+                    warn!("uring: the kernel refused a ring with {self:?} ({e}), using no flags");
+                }
+                res
+            }
+            res => res,
+        }
+    }
+}
+
 /// The number of zero-copy requests served, for the tests.
 #[cfg(test)]
 static ZERO_COPY_REQUESTS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
@@ -817,36 +1111,151 @@ static ZERO_COPY_REQUESTS: std::sync::atomic::AtomicUsize = std::sync::atomic::A
 #[cfg(test)]
 static ZERO_COPY_BOUNCES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
-/// `user_data` of a zero-copy fixed-buffer operation. Entry indexes never
-/// reach it.
-const ZERO_COPY_USER_DATA: u64 = u64::MAX;
+/// Set in the `user_data` of a zero-copy fixed-buffer operation. Its low 32
+/// bits are the index of the entry whose request runs it, and bits 32 to 62
+/// count the operations of that entry. Entry indexes never reach it.
+const ZERO_COPY_FLAG: u64 = 1 << 63;
+
+/// The `user_data` of the poll on the stop signal, which completes once the
+/// signal stops. Entry indexes never reach it.
+const STOP_USER_DATA: u64 = ZERO_COPY_FLAG - 1;
+
+/// Lock `mutex`, also if a thread panicked while it held the lock.
+fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// A worker's ring and what it took off the ring. The worker loop shares
+/// it with the requests that run zero-copy operations on the ring.
+struct RingState {
+    ring: FuseRing,
+    completions: Completions,
+}
+
+impl RingState {
+    /// The state of `ring`, while the kernel holds all `nr_entries`
+    /// entries, behind the lock its users share.
+    fn new(ring: FuseRing, nr_entries: usize) -> Mutex<RingState> {
+        Mutex::new(RingState {
+            ring,
+            completions: Completions::new(nr_entries),
+        })
+    }
+
+    /// Take all completions off the ring, see `Completions::receive()`.
+    fn receive(&mut self) {
+        self.completions.receive(&mut self.ring);
+    }
+
+    /// Queue the commit of `entry`, at index `idx`, and count the entry as
+    /// armed, because release_entries() submits anything still queued.
+    fn commit(&mut self, fd: RawFd, entry: &UringEntry, idx: usize) -> io::Result<()> {
+        push_commit(&mut self.ring, fd, entry, idx)?;
+        self.completions.armed += 1;
+        Ok(())
+    }
+
+    /// The ring of `state`, and its completions, which count the entries
+    /// the kernel holds.
+    fn into_parts(state: Mutex<RingState>) -> (FuseRing, Completions) {
+        let state = state.into_inner().unwrap_or_else(PoisonError::into_inner);
+        (state.ring, state.completions)
+    }
+}
 
 /// The completions of ring entries that a worker took off its ring and
-/// hasn't handled yet, and how many entries the kernel still holds.
+/// hasn't handled yet, how many entries the kernel still holds, and the
+/// zero-copy operations of the entries' requests.
 struct Completions {
     queue: VecDeque<(usize, i32)>,
-    nr_entries: usize,
     /// The number of entries whose command the kernel hasn't completed.
     armed: usize,
+    /// The zero-copy operation of each entry's request.
+    ops: Vec<ZeroCopyOp>,
+    /// The async worker loop, to wake when a request takes entry
+    /// completions or the stop off the ring.
+    waker: Option<Waker>,
+    /// Whether the poll on the stop signal completed.
+    stopped: bool,
+}
+
+/// The zero-copy operation that the request in an entry runs on the ring.
+#[derive(Clone, Default)]
+struct ZeroCopyOp {
+    /// How many operations the entry's requests started, modulo 2^31. A
+    /// request that stops waiting for its operation, because the wait
+    /// failed or the handler dropped the future, leaves it running, and the
+    /// count tells its late completion from that of the next operation.
+    started: u32,
+    result: Option<i32>,
+    /// The request future that waits for the result.
+    waker: Option<Waker>,
+}
+
+impl ZeroCopyOp {
+    /// The `user_data` of the current operation of entry `idx`.
+    fn user_data(&self, idx: usize) -> u64 {
+        ZERO_COPY_FLAG | (self.started as u64) << 32 | idx as u64
+    }
 }
 
 impl Completions {
+    /// The completions of a worker whose `nr_entries` entries the kernel
+    /// holds.
+    fn new(nr_entries: usize) -> Completions {
+        Completions {
+            queue: VecDeque::new(),
+            armed: nr_entries,
+            ops: vec![ZeroCopyOp::default(); nr_entries],
+            waker: None,
+            stopped: false,
+        }
+    }
+
     /// Take all completions off `ring`. The entries' completions join the
-    /// queue, and the result of a zero-copy operation is returned.
-    fn receive(&mut self, ring: &mut FuseRing) -> Option<i32> {
-        let mut zero_copy = None;
+    /// queue, and the results of zero-copy operations go to their entries.
+    fn receive(&mut self, ring: &mut FuseRing) {
+        let queued = self.queue.len();
         for cqe in ring.completion() {
-            let idx = cqe.user_data() as usize;
-            if cqe.user_data() == ZERO_COPY_USER_DATA {
-                zero_copy = Some(cqe.result());
-            } else if idx < self.nr_entries {
+            let user_data = cqe.user_data();
+            if user_data & ZERO_COPY_FLAG != 0 {
+                let idx = user_data as u32 as usize;
+                // Nothing waits for the late completion of an abandoned
+                // operation.
+                if let Some(op) = self
+                    .ops
+                    .get_mut(idx)
+                    .filter(|op| op.user_data(idx) == user_data)
+                {
+                    op.result = Some(cqe.result());
+                    if let Some(waker) = op.waker.take() {
+                        waker.wake();
+                    }
+                }
+            } else if (user_data as usize) < self.ops.len() {
                 self.armed = self.armed.saturating_sub(1);
-                self.queue.push_back((idx, cqe.result()));
+                self.queue.push_back((user_data as usize, cqe.result()));
+            } else if user_data == STOP_USER_DATA {
+                // If the kernel can't arm the poll, only the end of the
+                // connection stops the worker, and the stopped workers wait
+                // for it.
+                match cqe.result() {
+                    res if res < 0 => warn!(
+                        "uring worker: waiting for the stop signal failed: {}",
+                        io::Error::from_raw_os_error(-res)
+                    ),
+                    _ => self.stopped = true,
+                }
             } else {
-                warn!("uring worker: CQE with unexpected user_data {}", idx);
+                warn!("uring worker: CQE with unexpected user_data {user_data}");
             }
         }
-        zero_copy
+        // queued() takes no waker once stopped.
+        if self.queue.len() > queued || self.stopped {
+            if let Some(waker) = self.waker.take() {
+                waker.wake();
+            }
+        }
     }
 }
 
@@ -864,11 +1273,13 @@ enum ZeroCopyKind {
 /// pages. Completions of ring entries that arrive meanwhile join the
 /// worker's queue.
 struct ZeroCopyIo<'r> {
-    ring: Mutex<(&'r mut FuseRing, &'r mut Completions)>,
+    state: &'r Mutex<RingState>,
+    /// The index of the entry that holds the request.
+    idx: usize,
     slot: u16,
     /// The worker's memory file, which the copies through memory go
     /// through. The lock keeps two copies from using it at once.
-    bounce: Mutex<&'r BounceBuf>,
+    bounce: &'r Mutex<BounceBuf>,
 }
 
 /// The memory file that a worker's copies of zero-copy data through memory
@@ -910,28 +1321,100 @@ impl BounceBuf {
 }
 
 impl ZeroCopyIo<'_> {
-    /// Run `sqe` on the ring and wait for its result.
-    fn run(&self, sqe: squeue::Entry) -> io::Result<usize> {
-        let sqe = squeue::Entry128::from(sqe.user_data(ZERO_COPY_USER_DATA));
-        let mut guard = self
-            .ring
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let (ring, completions) = &mut *guard;
+    /// Queue `sqe` on the ring as the next operation of the entry.
+    fn start(&self, state: &mut RingState, sqe: squeue::Entry) -> io::Result<()> {
+        let op = &mut state.completions.ops[self.idx];
+        op.started = op.started.wrapping_add(1) & 0x7fff_ffff;
+        op.result = None;
+        op.waker = None;
+        let sqe = squeue::Entry128::from(sqe.user_data(op.user_data(self.idx)));
         // Safe because the operation points at the registered buffer, which
         // the kernel keeps until the entry commits, and the worker commits
-        // only after this returns.
-        while unsafe { ring.submission().push(&sqe) }.is_err() {
-            submit(ring)?;
+        // only after the request is done. A request waits for its operation
+        // even when its handler drops the future, see `PendingOp`.
+        while unsafe { state.ring.submission().push(&sqe) }.is_err() {
+            submit(&mut state.ring)?;
         }
+        Ok(())
+    }
+
+    /// Run `sqe` on the ring and wait for its result, blocking the thread.
+    fn run(&self, sqe: squeue::Entry) -> io::Result<usize> {
+        let mut state = lock(self.state);
+        self.start(&mut state, sqe)?;
         loop {
-            submit_and_wait(ring, 1)?;
-            match completions.receive(ring) {
-                Some(res) if res < 0 => return Err(io::Error::from_raw_os_error(-res)),
-                Some(res) => return Ok(res as usize),
-                None => {}
+            submit_and_wait(&mut state.ring, 1)?;
+            state.receive();
+            if let Some(res) = state.completions.ops[self.idx].result.take() {
+                return fixed_result(res);
             }
         }
+    }
+
+    /// Run `sqe` on the ring and wait for its result. The async worker loop
+    /// takes the result off the ring.
+    #[cfg(feature = "async-io")]
+    async fn run_async(&self, sqe: squeue::Entry) -> io::Result<usize> {
+        {
+            let mut state = lock(self.state);
+            self.start(&mut state, sqe)?;
+            // Once queued, the operation runs on the client pages whether or
+            // not this submits it, so wait for it either way. The worker
+            // loop submits what is still queued, or stops on the error.
+            if let Err(e) = submit(&mut state.ring) {
+                warn!("uring worker: submitting a zero-copy operation: {e}");
+                if let Some(waker) = state.completions.waker.take() {
+                    waker.wake();
+                }
+            }
+        }
+        let pending = PendingOp(self);
+        let res = std::future::poll_fn(|cx| {
+            let mut state = lock(self.state);
+            let op = &mut state.completions.ops[self.idx];
+            match op.result.take() {
+                Some(res) => Poll::Ready(res),
+                None => {
+                    op.waker = Some(cx.waker().clone());
+                    Poll::Pending
+                }
+            }
+        })
+        .await;
+        std::mem::forget(pending);
+        fixed_result(res)
+    }
+}
+
+/// Waits for the zero-copy operation of a request that stops waiting for
+/// it, because its handler dropped the future. The operation goes on in the
+/// client pages, and the entry must not commit before it ends, or the client
+/// could reuse its pages while the operation still writes to them. The wait
+/// blocks the worker, which only a handler that gives up on an operation
+/// pays for. Forget it once the result is in.
+#[cfg(feature = "async-io")]
+struct PendingOp<'a, 'r>(&'a ZeroCopyIo<'r>);
+
+#[cfg(feature = "async-io")]
+impl Drop for PendingOp<'_, '_> {
+    fn drop(&mut self) {
+        let mut state = lock(self.0.state);
+        while state.completions.ops[self.0.idx].result.take().is_none() {
+            // Without the ring, the connection is going away anyway.
+            if submit_and_wait(&mut state.ring, 1).is_err() {
+                return;
+            }
+            state.receive();
+        }
+    }
+}
+
+/// The outcome of a fixed-buffer operation that completed with `res`.
+fn fixed_result(res: i32) -> io::Result<usize> {
+    if res < 0 {
+        Err(io::Error::from_raw_os_error(-res))
+    } else {
+        Ok(res as usize)
     }
 }
 
@@ -957,16 +1440,41 @@ impl ZeroCopyIo<'_> {
         }
         Ok(())
     }
+
+    /// Read `count` bytes of `fd` at `off` into the client pages, starting
+    /// `pos` bytes into them.
+    fn read_fixed(&self, pos: usize, fd: RawFd, count: usize, off: u64) -> squeue::Entry {
+        opcode::ReadFixed::new(types::Fd(fd), pos as *mut u8, fixed_len(count), self.slot)
+            .offset(off)
+            .build()
+    }
+
+    /// Write `count` bytes of the client pages, starting `pos` bytes into
+    /// them, to `fd` at `off`, or at its position if `off` is `None`.
+    fn write_fixed(&self, pos: usize, fd: RawFd, count: usize, off: Option<u64>) -> squeue::Entry {
+        // Offset u64::MAX, the kernel's -1, writes at the file's position.
+        let off = off.unwrap_or(u64::MAX);
+        opcode::WriteFixed::new(types::Fd(fd), pos as *const u8, fixed_len(count), self.slot)
+            .offset(off)
+            .build()
+    }
 }
 
+#[cfg_attr(feature = "async-io", async_trait::async_trait(?Send))]
 impl ZeroCopySink for ZeroCopyIo<'_> {
     fn read_from_file(&self, pos: usize, fd: RawFd, count: usize, off: u64) -> io::Result<usize> {
-        let buf = pos as *mut u8;
-        self.run(
-            opcode::ReadFixed::new(types::Fd(fd), buf, fixed_len(count), self.slot)
-                .offset(off)
-                .build(),
-        )
+        self.run(self.read_fixed(pos, fd, count, off))
+    }
+
+    #[cfg(feature = "async-io")]
+    async fn async_read_from_file(
+        &self,
+        pos: usize,
+        fd: RawFd,
+        count: usize,
+        off: u64,
+    ) -> io::Result<usize> {
+        self.run_async(self.read_fixed(pos, fd, count, off)).await
     }
 
     fn write_from_memory(&self, pos: usize, data: &[u8]) -> io::Result<()> {
@@ -991,10 +1499,7 @@ impl ZeroCopySink for ZeroCopyIo<'_> {
         ZERO_COPY_BOUNCES.fetch_add(1, Ordering::Relaxed);
         // Through the memory file into the client pages, which only
         // fixed-buffer operations reach.
-        let bounce = self
-            .bounce
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let bounce = lock(self.bounce);
         // Safe because this holds the lock.
         let pages = unsafe { bounce.pages() };
         let len = count.min(pages.len());
@@ -1004,6 +1509,7 @@ impl ZeroCopySink for ZeroCopyIo<'_> {
     }
 }
 
+#[cfg_attr(feature = "async-io", async_trait::async_trait(?Send))]
 impl ZeroCopySource for ZeroCopyIo<'_> {
     fn write_to_file(
         &self,
@@ -1012,14 +1518,18 @@ impl ZeroCopySource for ZeroCopyIo<'_> {
         count: usize,
         off: Option<u64>,
     ) -> io::Result<usize> {
-        let buf = pos as *const u8;
-        // Offset u64::MAX, the kernel's -1, writes at the file's position.
-        let off = off.unwrap_or(u64::MAX);
-        self.run(
-            opcode::WriteFixed::new(types::Fd(fd), buf, fixed_len(count), self.slot)
-                .offset(off)
-                .build(),
-        )
+        self.run(self.write_fixed(pos, fd, count, off))
+    }
+
+    #[cfg(feature = "async-io")]
+    async fn async_write_to_file(
+        &self,
+        pos: usize,
+        fd: RawFd,
+        count: usize,
+        off: Option<u64>,
+    ) -> io::Result<usize> {
+        self.run_async(self.write_fixed(pos, fd, count, off)).await
     }
 
     fn read_to_memory(
@@ -1032,10 +1542,7 @@ impl ZeroCopySource for ZeroCopyIo<'_> {
         ZERO_COPY_BOUNCES.fetch_add(1, Ordering::Relaxed);
         // From the client pages into the memory file, then to `take`
         // through the mapping.
-        let bounce = self
-            .bounce
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let bounce = lock(self.bounce);
         let len = count.min(bounce.map.size());
         let n = self.write_to_file(pos, bounce.fd(), len, Some(0))?.min(len);
         // Safe because this holds the lock, and the kernel is done writing
@@ -1093,12 +1600,50 @@ enum Payload {
     Pool(Arc<BufPools>),
 }
 
-/// One ring entry: the memory areas the kernel reads/writes plus scratch
-/// regions used to reassemble requests and collect replies.
+/// Size of an entry's request scratch: the in header plus the largest fixed
+/// arguments a request can carry in `op_in`.
+const REQ_SCRATCH_SIZE: usize = IN_HEADER_SIZE + FUSE_URING_OP_IN_OUT_SZ;
+
+/// A request the kernel delivered into a ring entry, with the Reader over it
+/// and the UringWriter for its reply. Both borrow the entry.
+struct Request<'a> {
+    unique: u64,
+    /// The largest reply body the request may stage.
+    reply_cap: usize,
+    reader: Reader<'a, ()>,
+    writer: UringWriter<'a, ()>,
+    /// How the client pages of a zero-copy request move its data. The
+    /// caller attaches them with `with_zero_copy()`.
+    zero_copy: Option<ZeroCopyKind>,
+}
+
+impl<'a> Request<'a> {
+    /// The request's unique id, reply body capacity, reader and writer,
+    /// with the client pages of a zero-copy request attached through
+    /// `zc_io`.
+    fn with_zero_copy(
+        self,
+        zc_io: Option<&'a ZeroCopyIo<'_>>,
+    ) -> (u64, usize, Reader<'a, ()>, UringWriter<'a, ()>) {
+        let (reader, writer) = match (self.zero_copy, zc_io) {
+            (Some(ZeroCopyKind::Write { len }), Some(io)) => {
+                (self.reader.with_zero_copy(io, len), self.writer)
+            }
+            (Some(ZeroCopyKind::Read { cap }), Some(io)) => {
+                (self.reader, self.writer.with_zero_copy(io, cap))
+            }
+            _ => (self.reader, self.writer),
+        };
+        (self.unique, self.reply_cap, reader, writer)
+    }
+}
+
+/// One ring entry: the memory areas the kernel reads and writes, plus a scratch
+/// region used to reassemble the request header and fixed arguments.
 struct UringEntry {
     qid: u16,
     /// Single allocation, laid out as
-    /// [FuseUringReqHeader][own payload area][request scratch][reply scratch].
+    /// [FuseUringReqHeader][own payload area][request scratch of REQ_SCRATCH_SIZE].
     mem: Box<[u8]>,
     payload: Payload,
     /// The slot of the worker's buffer table where the kernel registers the
@@ -1115,9 +1660,8 @@ impl UringEntry {
             Payload::Own(cap) => cap,
             Payload::Pool(_) => 0,
         };
-        let scratch = FUSE_HEADER_SIZE + own_cap;
         let header_len = std::mem::size_of::<FuseUringReqHeader>();
-        let mem = vec![0u8; header_len + own_cap + 2 * scratch].into_boxed_slice();
+        let mem = vec![0u8; header_len + own_cap + REQ_SCRATCH_SIZE].into_boxed_slice();
         let base = mem.as_ptr();
         // A queue with a buffer pool takes no payload buffer at REGISTER.
         let own_payload = if own_cap == 0 {
@@ -1204,37 +1748,260 @@ impl UringEntry {
     /// `COMMIT_AND_FETCH` hands the client a proper error instead of the
     /// request data still sitting in the entry areas.
     fn stage_error_reply(&mut self, errno: i32) {
-        let header = self.header_mut();
-        let mut in_hdr = InHeader::default();
-        in_hdr
-            .as_mut_slice()
-            .copy_from_slice(&header.in_out[..IN_HEADER_SIZE]);
+        // A partial reply may have overwritten the in header by now, but the
+        // out header keeps `unique` at the same offset.
         let out = OutHeader {
             len: OUT_HEADER_SIZE as u32,
             error: -errno,
-            unique: in_hdr.unique,
+            unique: self.in_header().unique,
         };
+        let header = self.header_mut();
         header.in_out[..OUT_HEADER_SIZE].copy_from_slice(out.as_slice());
         header.ring_ent_in_out.payload_sz = 0;
     }
+
+    /// The header of the request the kernel delivered into this entry.
+    fn in_header(&self) -> InHeader {
+        let mut hdr = InHeader::default();
+        hdr.as_mut_slice()
+            .copy_from_slice(&self.header().in_out[..IN_HEADER_SIZE]);
+        hdr
+    }
+
+    /// How the client pages of the delivered zero-copy request with
+    /// `opcode` and `payload_sz` move its data.
+    fn zero_copy_kind(&self, opcode: u32, payload_sz: usize) -> Result<ZeroCopyKind> {
+        if opcode == Opcode::Read as u32 {
+            // The kernel lends no payload buffer, and the reply data is
+            // ReadIn.size bytes at most.
+            let read_in = ReadIn::from_slice(&self.header().op_in[..size_of::<ReadIn>()])
+                .ok_or_else(|| SessionFailure("uring: malformed zero-copy READ".into()))?;
+            Ok(ZeroCopyKind::Read {
+                cap: read_in.size as usize,
+            })
+        } else if opcode == Opcode::Write as u32 {
+            // The kernel lends a payload buffer for WriteOut, and payload_sz
+            // counts the data in the client pages.
+            Ok(ZeroCopyKind::Write { len: payload_sz })
+        } else {
+            Err(SessionFailure(format!(
+                "uring: zero-copy request with opcode {opcode}"
+            )))
+        }
+    }
+
+    /// Check the request the kernel delivered into this entry, and build
+    /// the Reader over it and the UringWriter for its reply.
+    ///
+    /// This copies the in header and the fixed arguments behind it into the
+    /// request scratch. The payload stays in the payload buffer, the
+    /// entry's own or the one the kernel lent it, and the Reader reads it
+    /// there. The writer puts the reply header into the `in_out` slot and
+    /// the reply body into the payload buffer, so nothing is copied
+    /// afterwards. Returns `None` if the entry already holds the reply.
+    fn request(&mut self) -> Result<Option<Request<'_>>> {
+        let in_header = self.in_header();
+        // Answer an opcode the table doesn't know with ENOSYS here, rather
+        // than dispatch it without its arguments. The kernel then stops
+        // sending it, as it does with FUSE_STATX.
+        let Some((args_len, has_out_args)) = op_args(in_header.opcode) else {
+            self.stage_error_reply(libc::ENOSYS);
+            return Ok(None);
+        };
+        let ent_in_out = self.header().ring_ent_in_out;
+        let zero_copy = if ent_in_out.flags & FUSE_URING_ENT_ZERO_COPY == 0 {
+            None
+        } else {
+            Some(self.zero_copy_kind(in_header.opcode, ent_in_out.payload_sz as usize)?)
+        };
+        let payload_sz = match zero_copy {
+            // The payload buffer holds no data of a zero-copy WRITE.
+            Some(ZeroCopyKind::Write { .. }) => 0,
+            _ => ent_in_out.payload_sz as usize,
+        };
+        let (payload_buf, payload_cap, zc_cap) = match zero_copy {
+            // A zero-copy READ has no payload buffer, even when it asks for
+            // 0 bytes.
+            Some(ZeroCopyKind::Read { cap }) => (NonNull::dangling(), 0, cap),
+            _ => {
+                let (buf, cap) = self.payload_buffer(has_out_args, payload_sz)?;
+                (buf, cap, 0)
+            }
+        };
+        if args_len > FUSE_URING_OP_IN_OUT_SZ || payload_sz > payload_cap {
+            return Err(SessionFailure(format!(
+                "uring: malformed request, opcode {} args {} payload {}",
+                in_header.opcode, args_len, payload_sz
+            )));
+        }
+        let header_len = std::mem::size_of::<FuseUringReqHeader>();
+        let own_cap = self.own_cap();
+        let base = self.mem.as_mut_ptr();
+        // Safe because the entry allocation holds the request header, then
+        // the own payload area, then the request scratch, which fits the in
+        // header plus the largest fixed arguments checked above. The payload
+        // buffer is the own area or a pool buffer the kernel lent the entry,
+        // which the kernel doesn't touch until the entry commits.
+        //
+        // The Reader's payload and the Writer's body are mutable slices over
+        // the same payload buffer, which Rust's aliasing rules don't allow.
+        // This relies on the server parsing the whole request before it
+        // writes the reply. Removing the overlap needs Reader and Writer
+        // APIs over raw pointers.
+        let (scratch, payload, out_header, body) = unsafe {
+            let header = &*(base as *const FuseUringReqHeader);
+            let scratch = std::slice::from_raw_parts_mut(
+                base.add(header_len + own_cap),
+                IN_HEADER_SIZE + args_len,
+            );
+            scratch[..IN_HEADER_SIZE].copy_from_slice(in_header.as_slice());
+            scratch[IN_HEADER_SIZE..].copy_from_slice(&header.op_in[..args_len]);
+            (
+                scratch,
+                std::slice::from_raw_parts_mut(payload_buf.as_ptr(), payload_sz),
+                std::slice::from_raw_parts_mut(base, OUT_HEADER_SIZE),
+                std::slice::from_raw_parts_mut(payload_buf.as_ptr(), payload_cap),
+            )
+        };
+
+        let reader = Reader::from_uring_buffers(scratch, payload)?;
+        Ok(Some(Request {
+            unique: in_header.unique,
+            reply_cap: payload_cap + zc_cap,
+            reader,
+            writer: UringWriter::new(out_header, body),
+            zero_copy,
+        }))
+    }
+
+    /// Record the size of the staged reply, `total` bytes including the
+    /// reply header, whose body may take `reply_cap` bytes. `unique` names
+    /// the request in errors.
+    fn finish(&mut self, unique: u64, reply_cap: usize, total: usize) -> Result<()> {
+        // Forget-like requests have no reply.
+        let payload_len = match total {
+            0 => 0,
+            n if (OUT_HEADER_SIZE..=OUT_HEADER_SIZE + reply_cap).contains(&n) => {
+                n - OUT_HEADER_SIZE
+            }
+            n => {
+                return Err(SessionFailure(format!(
+                    "uring: malformed reply of {n} bytes for unique 0x{unique:x}"
+                )))
+            }
+        };
+        self.header_mut().ring_ent_in_out.payload_sz = payload_len as u32;
+        Ok(())
+    }
 }
 
-/// One io_uring based serving thread, responsible for a subset of the kernel
-/// queues.
+/// The function a worker thread runs: `UringWorker::run()`, or
+/// `UringWorker::run_async()` for asynchronous handlers.
+type RunFn<F> = fn(UringWorker<F>, StopSignal, Sender<io::Result<()>>) -> io::Result<()>;
+
+/// Prepare the body of the thread that serves the requests the kernel sends
+/// through `/dev/fuse`: `UringFuseServing::fallback_sync()`, or
+/// `UringFuseServing::fallback_async()` for asynchronous handlers. The body
+/// sends on the `Sender` once it serves, and exits without sending if it
+/// can't.
+type FallbackFn<F> = fn(
+    &mut FuseSession,
+    Arc<Server<F>>,
+    &mut WorkerSet,
+) -> Result<Box<dyn FnOnce(Sender<()>) + Send>>;
+
+/// One io_uring based serving thread, holding ring entries of several
+/// kernel queues.
 struct UringWorker<F: FileSystem + Send + Sync + 'static> {
     fd: File,
-    qids: Vec<u16>,
-    entries_per_queue: usize,
+    /// Queue id and registration round of every ring entry this worker
+    /// registers.
+    entries: Vec<(u16, usize)>,
     /// Size of the payload area of an entry whose queue has no buffer pool.
     payload_cap: usize,
     /// The queues' buffer pools, if the kernel took them.
     pools: Option<Arc<BufPools>>,
     /// The memory file that copies of zero-copy data through memory go
     /// through, if the queues have zero-copy.
-    bounce: Option<BounceBuf>,
+    bounce: Option<Mutex<BounceBuf>>,
+    /// The registration rounds that all workers take part in.
+    rounds: Arc<RegisterRounds>,
     server: Arc<Server<F>>,
     /// Ends the connection when the worker fails.
     abort: Arc<ConnectionAbort>,
+    /// Lets the workers end the connection once all have stopped.
+    barrier: Arc<StopBarrier>,
+    /// The setup flags of the worker's ring.
+    ring_flags: RingFlags,
+    /// Counts the worker rings that got deferred task work.
+    #[cfg(test)]
+    deferred_rings: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+/// Lets the workers register their entries in rounds, see
+/// `UringWorker::register()`. Every worker waits at the end of each of the
+/// `rounds` rounds until all workers have registered that round's entries.
+struct RegisterRounds {
+    rounds: usize,
+    workers: usize,
+    state: Mutex<RoundsState>,
+    cv: Condvar,
+}
+
+#[derive(Default)]
+struct RoundsState {
+    round: usize,
+    /// The number of workers done with the current round.
+    done: usize,
+    failed: bool,
+}
+
+impl RegisterRounds {
+    fn new(workers: usize, rounds: usize) -> RegisterRounds {
+        RegisterRounds {
+            rounds,
+            workers,
+            state: Mutex::new(RoundsState::default()),
+            cv: Condvar::new(),
+        }
+    }
+
+    /// Wait until all workers are done with the current round. Returns
+    /// false if a worker failed.
+    fn wait(&self) -> bool {
+        let mut state = self.state.lock().unwrap();
+        let round = state.round;
+        state.done += 1;
+        if state.done == self.workers {
+            state.round += 1;
+            state.done = 0;
+            self.cv.notify_all();
+        }
+        let state = self
+            .cv
+            .wait_while(state, |s| s.round == round && !s.failed)
+            .unwrap();
+        !state.failed
+    }
+
+    /// Fail the rounds, which releases the workers waiting for a round, and
+    /// they fail too. A worker that won't take part in all rounds must call
+    /// it, or the others wait forever.
+    fn fail(&self) {
+        // This runs while a panic unwinds, so it must not panic on a
+        // poisoned lock.
+        lock(&self.state).failed = true;
+        self.cv.notify_all();
+    }
+}
+
+/// Fails the rounds when dropped. Forget it once the worker is done.
+struct RoundsGuard<'a>(&'a RegisterRounds);
+
+impl Drop for RoundsGuard<'_> {
+    fn drop(&mut self) {
+        self.0.fail();
+    }
 }
 
 /// Ends a FUSE connection, like `umount -f`, through its `abort` file in
@@ -1294,17 +2061,107 @@ impl ConnectionAbort {
     }
 
     /// End the connection, unless another worker did.
-    fn abort(&self) {
+    fn abort(&self) -> io::Result<()> {
         if self.done.swap(true, Ordering::AcqRel) {
-            return;
+            return Ok(());
         }
         let Some(path) = &self.path else {
-            error!("uring: can't end the FUSE connection without fusectl, unmount it by hand");
-            return;
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "fusectl isn't mounted",
+            ));
         };
-        if let Err(e) = std::fs::write(path, b"1") {
+        std::fs::write(path, b"1")
+    }
+
+    /// End the connection after a worker failed while it was up.
+    fn abort_failed(&self) {
+        if let Err(e) = self.abort() {
             error!("uring: can't end the FUSE connection, unmount it by hand: {e}");
         }
+    }
+}
+
+/// Holds stopped workers back from releasing their entries until no worker
+/// serves anymore. The kernel keeps the entries until the connection ends,
+/// and the connection of a busy mount outlives the unmount. So once the
+/// workers have served the requests they took, the last one to stop ends
+/// such a connection, like closing `/dev/fuse` ends a classic one.
+///
+/// Every worker leaves, also when it fails before serving, see
+/// `BarrierGuard`. A worker that never starts can't leave, but then no
+/// worker serves either, because the registration rounds fail.
+struct StopBarrier {
+    state: Mutex<BarrierState>,
+    cv: Condvar,
+}
+
+struct BarrierState {
+    /// The number of workers that haven't left.
+    serving: usize,
+    /// Whether a worker took the stop off its ring. The serving layer sets
+    /// the exit flag before it unmounts, but stops the signal only after.
+    stopped: bool,
+}
+
+impl StopBarrier {
+    fn new(workers: usize) -> StopBarrier {
+        StopBarrier {
+            state: Mutex::new(BarrierState {
+                serving: workers,
+                stopped: false,
+            }),
+            cv: Condvar::new(),
+        }
+    }
+
+    /// Leave as a worker that took the stop off its ring if `stopped`. The
+    /// last worker to leave ends the connection if a worker stopped and
+    /// `fd` finds the connection up. A stopped worker then waits until all
+    /// workers have left.
+    fn leave(&self, stopped: bool, fd: &File, abort: &ConnectionAbort) {
+        // This runs while a panic unwinds too, so it must not panic on a
+        // poisoned lock.
+        let mut state = lock(&self.state);
+        state.serving -= 1;
+        state.stopped |= stopped;
+        if state.serving == 0 {
+            if state.stopped && !crate::linux_session::is_torn_down(fd) {
+                if let Err(e) = abort.abort() {
+                    warn!("uring: can't end the FUSE connection that outlived the unmount: {e}");
+                }
+            }
+            self.cv.notify_all();
+        }
+        if stopped {
+            let _state = self
+                .cv
+                .wait_while(state, |s| s.serving > 0)
+                .unwrap_or_else(PoisonError::into_inner);
+        }
+    }
+}
+
+/// A worker's place at the `StopBarrier`, which it leaves when the guard
+/// drops, without waiting unless `leave()` says it stopped.
+struct BarrierGuard<'a> {
+    barrier: &'a StopBarrier,
+    fd: &'a File,
+    abort: &'a ConnectionAbort,
+    stopped: bool,
+}
+
+impl BarrierGuard<'_> {
+    /// Leave once done serving, as a worker that took the stop off its ring
+    /// if `stopped`.
+    fn leave(mut self, stopped: bool) {
+        self.stopped = stopped;
+    }
+}
+
+impl Drop for BarrierGuard<'_> {
+    fn drop(&mut self) {
+        self.barrier.leave(self.stopped, self.fd, self.abort);
     }
 }
 
@@ -1312,7 +2169,7 @@ impl ConnectionAbort {
 /// was up. Commands fail with ENOTCONN, ENODEV or ECANCELED once it ended,
 /// also through an unmount from outside, and its minor number may then
 /// belong to a new connection already.
-fn failed_while_connected(result: &io::Result<()>, exit: &AtomicBool) -> bool {
+fn failed_while_connected(result: &io::Result<()>, exit: &StopSignal) -> bool {
     match result {
         Ok(()) => false,
         Err(e)
@@ -1323,135 +2180,214 @@ fn failed_while_connected(result: &io::Result<()>, exit: &AtomicBool) -> bool {
         {
             false
         }
-        Err(_) => !exit.load(Ordering::Relaxed),
+        Err(_) => !exit.is_stopped(),
     }
 }
 
 impl<F: FileSystem + Send + Sync + 'static> UringWorker<F> {
-    fn run(self, exit: Arc<AtomicBool>, ready_tx: Sender<io::Result<()>>) -> io::Result<()> {
-        let total_entries = self.qids.len() * self.entries_per_queue;
-        let mut ring = FuseRing::builder().build((total_entries * 2) as u32)?;
-        if self.bounce.is_some() {
-            if let Err(e) = register_sparse_buffers(&ring, total_entries) {
-                let _ = ready_tx.send(Err(io::Error::other(format!(
-                    "registering the zero-copy buffer table failed: {e}"
-                ))));
+    /// The worker's place at the stop barrier.
+    fn barrier_guard(&self) -> BarrierGuard<'_> {
+        BarrierGuard {
+            barrier: &self.barrier,
+            fd: &self.fd,
+            abort: &self.abort,
+            stopped: false,
+        }
+    }
+
+    /// Create the worker's ring and entries and register the entries,
+    /// reporting the outcome through `ready_tx`. The kernel holds all
+    /// entries afterwards, and the ring polls `stop`. `prepare` runs on the
+    /// new ring before the registration, and its failure fails the setup.
+    fn setup<T>(
+        &self,
+        stop: &StopSignal,
+        ready_tx: &Sender<io::Result<()>>,
+        prepare: impl FnOnce(&FuseRing) -> io::Result<T>,
+    ) -> io::Result<(FuseRing, Vec<UringEntry>, T)> {
+        // Release the other workers from the rounds if this one fails or
+        // panics before it has taken part in all of them.
+        let rounds = RoundsGuard(&self.rounds);
+        let fail = |e: &io::Error| {
+            let _ = ready_tx.send(Err(io::Error::other(e.to_string())));
+        };
+        let created = self.create_ring().and_then(|mut ring| {
+            let prepared = prepare(&ring)?;
+            // The first registration round submits the poll.
+            poll_stop(&mut ring, stop)?;
+            Ok((ring, prepared))
+        });
+        let (mut ring, prepared) = match created {
+            Ok(created) => created,
+            Err(e) => {
+                fail(&e);
                 return Err(e);
             }
+        };
+        let mut entries: Vec<UringEntry> = Vec::with_capacity(self.entries.len());
+        for &(qid, _) in &self.entries {
+            let payload = match &self.pools {
+                Some(pools) => Payload::Pool(pools.clone()),
+                None => Payload::Own(self.payload_cap),
+            };
+            let mut entry = UringEntry::new(qid, payload);
+            if self.bounce.is_some() {
+                entry.zero_copy_slot = Some(entries.len() as u16);
+            }
+            entries.push(entry);
         }
+        match self.register(&mut ring, &entries) {
+            Ok(()) => {
+                std::mem::forget(rounds);
+                let _ = ready_tx.send(Ok(()));
+                Ok((ring, entries, prepared))
+            }
+            Err((e, armed)) => {
+                // Report the error before the others fail the rounds and
+                // report theirs.
+                fail(&e);
+                drop(rounds);
+                // The serving layer tears the connection down when it gets
+                // the error, which gives the registered entries back.
+                drop(prepared);
+                let mut completions = Completions::new(entries.len());
+                completions.armed = armed;
+                release_entries(ring, entries, completions);
+                Err(e)
+            }
+        }
+    }
+
+    /// The worker's ring, with its flags if the kernel takes them, and a
+    /// sparse buffer table of a slot per entry if the queues have zero-copy.
+    fn create_ring(&self) -> io::Result<FuseRing> {
+        let entries = (self.entries.len() * 2) as u32;
+        let ring = self
+            .ring_flags
+            .build_or_default(|flags| flags.build(entries))?;
+        // The flags come together, and io-uring has no getter for
+        // IORING_SETUP_DEFER_TASKRUN.
+        #[cfg(test)]
+        if ring.params().is_setup_single_issuer() {
+            self.deferred_rings.fetch_add(1, Ordering::Relaxed);
+        }
+        if self.bounce.is_some() {
+            register_sparse_buffers(&ring, self.entries.len()).map_err(|e| {
+                io::Error::other(format!(
+                    "registering the zero-copy buffer table failed: {e}"
+                ))
+            })?;
+        }
+        Ok(ring)
+    }
+
+    /// Register `entries` in `self.rounds`, each in the round
+    /// `spread_entries()` gave it. Returns the error and the number of
+    /// entries the kernel holds on failure. That counts every queued
+    /// REGISTER, since `release_entries()` submits what a failed submit
+    /// left queued.
+    ///
+    /// The kernel gives a request to the entry of its queue that became free
+    /// last, so with rounds the entries a queue frees last at startup belong
+    /// to different workers, and the first of them, the last to register, is
+    /// on different workers for different queues.
+    /// `docs/fuse-uring-performance.md` explains why that matters.
+    /// The rounds only set that order at startup. Later it is the order of
+    /// the last commits.
+    fn register(
+        &self,
+        ring: &mut FuseRing,
+        entries: &[UringEntry],
+    ) -> std::result::Result<(), (io::Error, usize)> {
         let fd = self.fd.as_raw_fd();
-
-        let mut entries: Vec<UringEntry> = Vec::with_capacity(total_entries);
-        for qid in &self.qids {
-            for _ in 0..self.entries_per_queue {
-                let payload = match &self.pools {
-                    Some(pools) => Payload::Pool(pools.clone()),
-                    None => Payload::Own(self.payload_cap),
-                };
-                let mut entry = UringEntry::new(*qid, payload);
-                if self.bounce.is_some() {
-                    entry.zero_copy_slot = Some(entries.len() as u16);
+        let mut armed = 0;
+        for round in 0..self.rounds.rounds {
+            {
+                let mut sq = ring.submission();
+                for (idx, (entry, &(_, r))) in entries.iter().zip(&self.entries).enumerate() {
+                    if r != round {
+                        continue;
+                    }
+                    // The CQE of each REGISTER SQE returns once a request
+                    // has been assigned to the entry.
+                    let sqe = entry.cmd_sqe(fd, FUSE_IO_URING_CMD_REGISTER, 0, idx as u64);
+                    // Safe because release_entries() keeps the entries
+                    // alive while the kernel holds them.
+                    if unsafe { sq.push(&sqe) }.is_err() {
+                        return Err((io::Error::other("submission queue full"), armed));
+                    }
+                    armed += 1;
                 }
-                entries.push(entry);
+            }
+            // The kernel registers the entries while it submits them.
+            if let Err(e) = submit(ring) {
+                return Err((e, armed));
+            }
+            if !self.rounds.wait() {
+                return Err((io::Error::other("another worker failed to register"), armed));
             }
         }
+        Ok(())
+    }
 
-        // Register all entries; the CQE of each REGISTER SQE returns once a
-        // request has been assigned to the entry.
-        let registered = (|| {
-            let mut sq = ring.submission();
-            for (idx, entry) in entries.iter().enumerate() {
-                let sqe = entry.cmd_sqe(fd, FUSE_IO_URING_CMD_REGISTER, 0, idx as u64);
-                // Safe because release_entries() keeps the entries alive
-                // while the kernel holds them.
-                unsafe { sq.push(&sqe) }
-                    .map_err(|e| io::Error::other(format!("submission queue full: {e}")))?;
-            }
-            drop(sq);
-            submit(&mut ring)
-        })();
-        let _ = ready_tx.send(match &registered {
-            Ok(()) => Ok(()),
-            Err(e) => Err(io::Error::other(e.to_string())),
-        });
-        registered?;
+    fn run(self, exit: StopSignal, ready_tx: Sender<io::Result<()>>) -> io::Result<()> {
+        let barrier = self.barrier_guard();
+        let (ring, mut entries, ()) = self.setup(&exit, &ready_tx, |_| Ok(()))?;
+        let fd = self.fd.as_raw_fd();
+        let state = RingState::new(ring, entries.len());
         // A handler that panics stops the worker like an error, and the
         // panic goes on once the kernel has given the entries back.
         let mut panic = None;
 
-        let mut completions = Completions {
-            queue: VecDeque::new(),
-            nr_entries: entries.len(),
-            armed: entries.len(),
-        };
         let result = 'serve: loop {
-            if let Err(e) = submit_and_wait(&mut ring, 1) {
-                break 'serve Err(e);
+            {
+                let mut state = lock(&state);
+                if let Err(e) = submit_and_wait(&mut state.ring, 1) {
+                    break 'serve Err(e);
+                }
+                state.receive();
             }
-            // A zero-copy operation whose wait failed in ZeroCopyIo::run()
-            // completes late, with nothing left to do.
-            completions.receive(&mut ring);
 
-            while let Some((idx, res)) = completions.queue.pop_front() {
+            loop {
+                // A request's zero-copy operation may take more completions
+                // off the ring, which join the queue. The lock is released
+                // before the request runs.
+                let (idx, res) = {
+                    let mut state = lock(&state);
+                    match state.completions.queue.pop_front() {
+                        Some(next) => next,
+                        // Once stopped, the worker has served the requests
+                        // it took.
+                        None if state.completions.stopped => break 'serve submit(&mut state.ring),
+                        // The wait at the top of the loop submits the
+                        // commits.
+                        None => break,
+                    }
+                };
                 let entry = &mut entries[idx];
                 if res < 0 {
-                    if exit.load(Ordering::Relaxed) {
-                        break 'serve Ok(());
-                    }
-                    // Registration/commit failures leave the entry in an
-                    // undefined state; stop serving rather than guessing.
-                    break 'serve Err(io::Error::from_raw_os_error(-res));
+                    break 'serve stop_result(&exit, res);
                 }
 
-                match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    self.process(entry, &mut ring, &mut completions)
-                })) {
-                    Ok(Ok(())) => {}
-                    Ok(Err(e)) => {
-                        warn!("uring worker: failed to handle request: {e}");
-                        entry.stage_error_reply(libc::EIO);
-                    }
-                    Err(payload) => {
-                        panic = Some(payload);
-                        break 'serve Err(io::Error::other("a request handler panicked"));
-                    }
+                let served = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    self.process(entry, idx, &state)
+                }));
+                if let Some(payload) = settle(entry, served) {
+                    panic = Some(payload);
+                    break 'serve Err(io::Error::other("a request handler panicked"));
                 }
-
-                let ent: FuseUringEntInOut = entry.header().ring_ent_in_out;
-                let sqe = entry.cmd_sqe(
-                    fd,
-                    FUSE_IO_URING_CMD_COMMIT_AND_FETCH,
-                    ent.commit_id,
-                    idx as u64,
-                );
-                loop {
-                    let pushed = {
-                        let mut sq = ring.submission();
-                        // Safe because release_entries() keeps the entries
-                        // alive while the kernel holds them.
-                        unsafe { sq.push(&sqe) }.is_ok()
-                    };
-                    if pushed {
-                        break;
-                    }
-                    // The submission queue can never hold more outstanding
-                    // commits than completed entries, so submitting must
-                    // eventually make room.
-                    if let Err(e) = submit(&mut ring) {
-                        break 'serve Err(e);
-                    }
+                if let Err(e) = lock(&state).commit(fd, entry, idx) {
+                    break 'serve Err(e);
                 }
-                // Count the commit once it is queued, because
-                // release_entries() submits anything still queued.
-                completions.armed += 1;
             }
-            // The wait at the top of the loop submits the queued commits.
         };
         // The kernel gives the entries back once the connection ends.
         if failed_while_connected(&result, &exit) {
-            self.abort.abort();
+            self.abort.abort_failed();
         }
-        release_entries(ring, entries, completions.armed);
+        let (ring, completions) = RingState::into_parts(state);
+        barrier.leave(completions.stopped);
+        release_entries(ring, entries, completions);
         if let Some(payload) = panic {
             error!("uring worker: a request handler panicked");
             std::panic::resume_unwind(payload);
@@ -1459,217 +2395,52 @@ impl<F: FileSystem + Send + Sync + 'static> UringWorker<F> {
         result
     }
 
-    /// Handle one delivered request: reassemble the header/args in the
-    /// request scratch, dispatch to the server with scatter types that
-    /// reference the entry's payload area directly (zero-copy on the data
-    /// path), and stage the reply straight into the entry areas.
-    ///
-    /// The client pages of a zero-copy request stay with the kernel, and
-    /// fixed-buffer operations on `ring` move the data between them and the
-    /// file. Ring completions that arrive meanwhile go to `stash`.
-    fn process(
-        &self,
-        entry: &mut UringEntry,
-        ring: &mut FuseRing,
-        completions: &mut Completions,
-    ) -> Result<()> {
-        let in_header: InHeader = {
-            let header = entry.header();
-            let mut hdr = InHeader::default();
-            hdr.as_mut_slice()
-                .copy_from_slice(&header.in_out[..IN_HEADER_SIZE]);
-            hdr
-        };
-        // Answer an opcode the table doesn't know with ENOSYS here, rather
-        // than dispatch it without its arguments. The kernel then stops
-        // sending it, as it does with FUSE_STATX.
-        let Some((args_len, has_out_args)) = op_args(in_header.opcode) else {
-            entry.stage_error_reply(libc::ENOSYS);
-            return Ok(());
-        };
-        let ent_in_out = entry.header().ring_ent_in_out;
-        let payload_sz = ent_in_out.payload_sz as usize;
-        if ent_in_out.flags & FUSE_URING_ENT_ZERO_COPY == 0 {
-            return self.process_copied(entry, in_header, args_len, has_out_args, payload_sz, None);
-        }
-
-        let kind = if in_header.opcode == Opcode::Read as u32 {
-            // The kernel lends no payload buffer, and the reply data is
-            // ReadIn.size bytes at most.
-            let read_in = ReadIn::from_slice(&entry.header().op_in[..size_of::<ReadIn>()])
-                .ok_or_else(|| SessionFailure("uring: malformed zero-copy READ".into()))?;
-            ZeroCopyKind::Read {
-                cap: read_in.size as usize,
-            }
-        } else if in_header.opcode == Opcode::Write as u32 {
-            // The kernel lends a payload buffer for WriteOut, and payload_sz
-            // counts the data in the client pages.
-            ZeroCopyKind::Write { len: payload_sz }
-        } else {
-            return Err(SessionFailure(format!(
-                "uring: zero-copy request with opcode {}",
-                in_header.opcode
-            )));
-        };
-        let (Some(slot), Some(bounce)) = (entry.zero_copy_slot, self.bounce.as_ref()) else {
+    /// The zero-copy IO of the request in the entry at index `idx`, whose
+    /// buffer table slot is `slot`, on the ring in `state`.
+    fn zero_copy_io<'r>(
+        &'r self,
+        slot: Option<u16>,
+        idx: usize,
+        state: &'r Mutex<RingState>,
+    ) -> Result<ZeroCopyIo<'r>> {
+        let (Some(slot), Some(bounce)) = (slot, self.bounce.as_ref()) else {
             return Err(SessionFailure(
                 "uring: zero-copy request on a worker without zero-copy".into(),
             ));
         };
         #[cfg(test)]
         ZERO_COPY_REQUESTS.fetch_add(1, Ordering::Relaxed);
-        let zc_io = ZeroCopyIo {
-            ring: Mutex::new((ring, completions)),
+        Ok(ZeroCopyIo {
+            state,
+            idx,
             slot,
-            bounce: Mutex::new(bounce),
-        };
-        // The payload buffer holds no data of a zero-copy WRITE.
-        let payload_sz = match kind {
-            ZeroCopyKind::Write { .. } => 0,
-            ZeroCopyKind::Read { .. } => payload_sz,
-        };
-        self.process_copied(
-            entry,
-            in_header,
-            args_len,
-            has_out_args,
-            payload_sz,
-            Some((&zc_io, kind)),
-        )
+            bounce,
+        })
     }
 
-    /// Serve the request in `entry` whose payload buffer holds `payload_sz`
-    /// bytes, and move the data of a zero-copy request through `zero_copy`.
-    fn process_copied(
-        &self,
-        entry: &mut UringEntry,
-        in_header: InHeader,
-        args_len: usize,
-        has_out_args: bool,
-        payload_sz: usize,
-        zero_copy: Option<(&ZeroCopyIo<'_>, ZeroCopyKind)>,
-    ) -> Result<()> {
-        let zc_cap = match zero_copy {
-            Some((_, ZeroCopyKind::Read { cap })) => cap,
-            _ => 0,
+    /// Serve the request delivered into `entry`, at index `idx`, and stage
+    /// its reply there.
+    ///
+    /// The client pages of a zero-copy request stay with the kernel, and
+    /// fixed-buffer operations on the ring in `state` move the data between
+    /// them and the file.
+    fn process(&self, entry: &mut UringEntry, idx: usize, state: &Mutex<RingState>) -> Result<()> {
+        let slot = entry.zero_copy_slot;
+        let Some(request) = entry.request()? else {
+            return Ok(());
         };
-        let (payload_buf, payload_cap) = match zero_copy {
-            // A zero-copy READ has no payload buffer, even when it asks for
-            // 0 bytes.
-            Some((_, ZeroCopyKind::Read { .. })) => (NonNull::dangling(), 0),
-            _ => entry.payload_buffer(has_out_args, payload_sz)?,
-        };
-        if args_len > FUSE_URING_IN_OUT_HEADER_SZ || payload_sz > payload_cap {
-            return Err(SessionFailure(format!(
-                "uring: malformed request, opcode {} args {} payload {}",
-                in_header.opcode, args_len, payload_sz
-            )));
-        }
-
-        let header_len = std::mem::size_of::<FuseUringReqHeader>();
-        let own_cap = entry.own_cap();
-        let scratch = FUSE_HEADER_SIZE + own_cap;
-        let base = entry.mem.as_mut_ptr();
-
-        // Assemble only the small header/args portion in the request scratch
-        // region (40 + args_len bytes). The payload (up to ~128K for large
-        // writes) stays in the entry's payload area and is read directly by
-        // the scatter Reader, eliminating the per-request payload memcpy.
-        //
-        // Safe because the slices below address disjoint regions of the
-        // entry allocation and live for the duration of this function only.
-        unsafe {
-            let header = &*(base as *const FuseUringReqHeader);
-            let req_scratch =
-                std::slice::from_raw_parts_mut(base.add(header_len + own_cap), scratch);
-            let mut off = 0;
-            req_scratch[off..off + IN_HEADER_SIZE]
-                .copy_from_slice(&header.in_out[..IN_HEADER_SIZE]);
-            off += IN_HEADER_SIZE;
-            req_scratch[off..off + args_len].copy_from_slice(&header.op_in[..args_len]);
-        }
-
-        let total = {
-            // Build a scatter Reader:
-            //   Buffer 1 (header scratch): InHeader + opcode args
-            //   Buffer 2 (payload buffer): request payload — only when
-            //     payload_sz > 0, avoiding a copy of up to ~128K.
-            //
-            // Build a scatter Writer:
-            //   Header slot (entry.in_out): fuse_out_header (16 bytes)
-            //   Body slot (payload buffer): reply body
-            // Both are written in place — no post-copy after handle_message.
-            let header_args_len = IN_HEADER_SIZE + args_len;
-            let header_scratch = unsafe {
-                std::slice::from_raw_parts_mut(base.add(header_len + own_cap), header_args_len)
-            };
-
-            let reader = if payload_sz > 0 {
-                // SAFETY: The Reader's buffer 2 and the Writer's body below
-                // both cover the payload buffer, the entry's own or the one
-                // the kernel lent it, which the kernel doesn't touch until
-                // the entry commits.
-                // This is technically overlapping mutable borrows, but is
-                // sound because:
-                //   (1) The Reader is fully consumed during argument parsing
-                //       (before handle_message returns).
-                //   (2) The Writer only writes to the payload area during
-                //       reply construction (after the Reader is consumed).
-                //   (3) Both slices are constructed via raw pointers inside
-                //       unsafe blocks, so the borrow checker doesn't track
-                //       them across the handle_message call.
-                // A future refactor could eliminate this by using raw
-                // pointers in both Reader and Writer APIs.
-                let entry_payload =
-                    unsafe { std::slice::from_raw_parts_mut(payload_buf.as_ptr(), payload_sz) };
-                Reader::<()>::from_uring_buffers(header_scratch, entry_payload)?
-            } else {
-                Reader::<()>::from_fuse_buffer(FuseBuf::new(header_scratch))?
-            };
-            let reader = match zero_copy {
-                Some((zc_io, ZeroCopyKind::Write { len })) => reader.with_zero_copy(zc_io, len),
-                _ => reader,
-            };
-
-            // The reply header goes into entry.in_out[0..OUT_HEADER_SIZE] and
-            // the reply body goes directly into the payload buffer.
-            // See SAFETY comment above regarding overlap with Reader's buffer 2.
-            let in_out_header = unsafe { std::slice::from_raw_parts_mut(base, OUT_HEADER_SIZE) };
-            let payload_area =
-                unsafe { std::slice::from_raw_parts_mut(payload_buf.as_ptr(), payload_cap) };
-            let writer = UringWriter::<()>::new(in_out_header, payload_area);
-            let writer = match zero_copy {
-                Some((zc_io, ZeroCopyKind::Read { cap })) => writer.with_zero_copy(zc_io, cap),
-                _ => writer,
-            };
-
-            self.server
-                .handle_message(reader, writer, None, None)
-                .map_err(|e| {
-                    SessionFailure(format!(
-                        "uring: handle message unique 0x{:x}: {}",
-                        in_header.unique, e
-                    ))
-                })?
-        };
-
-        if total > 0 {
-            // The scatter writer already placed the reply directly in the
-            // entry areas; just record the payload size and validate.
-            if total < OUT_HEADER_SIZE || total > OUT_HEADER_SIZE + payload_cap + zc_cap {
-                return Err(SessionFailure(format!(
-                    "uring: malformed reply of {} bytes for unique 0x{:x}",
-                    total, in_header.unique
-                )));
-            }
-            let payload_len = total - OUT_HEADER_SIZE;
-            entry.header_mut().ring_ent_in_out.payload_sz = payload_len as u32;
-        } else {
-            // Forget-like requests carry no reply.
-            entry.header_mut().ring_ent_in_out.payload_sz = 0;
-        }
-
-        Ok(())
+        let zc_io = request
+            .zero_copy
+            .map(|_| self.zero_copy_io(slot, idx, state))
+            .transpose()?;
+        let (unique, reply_cap, reader, writer) = request.with_zero_copy(zc_io.as_ref());
+        let total = self
+            .server
+            .handle_message(reader, writer, None, None)
+            .map_err(|e| {
+                SessionFailure(format!("uring: handle message unique 0x{unique:x}: {e}"))
+            })?;
+        entry.finish(unique, reply_cap, total)
     }
 }
 
@@ -1683,6 +2454,21 @@ fn submit(ring: &mut FuseRing) -> io::Result<()> {
     }
 }
 
+/// Queue a poll on the eventfd of `stop`, which completes with
+/// `STOP_USER_DATA` once the signal stops.
+fn poll_stop(ring: &mut FuseRing, stop: &StopSignal) -> io::Result<()> {
+    let event = stop
+        .event()
+        .ok_or_else(|| io::Error::other("the stop signal has no eventfd"))?;
+    let sqe = opcode::PollAdd::new(types::Fd(event.as_raw_fd()), libc::POLLIN as u32)
+        .build()
+        .user_data(STOP_USER_DATA);
+    // Safe because a poll has no buffer, and the kernel holds a reference
+    // to the eventfd while it waits.
+    unsafe { ring.submission().push(&squeue::Entry128::from(sqe)) }
+        .map_err(|_| io::Error::other("submission queue full"))
+}
+
 /// Submit what is queued on `ring` and wait for `want` completions, retrying
 /// when a signal interrupts the wait.
 fn submit_and_wait(ring: &mut FuseRing, want: usize) -> io::Result<()> {
@@ -1692,6 +2478,306 @@ fn submit_and_wait(ring: &mut FuseRing, want: usize) -> io::Result<()> {
             Err(e) if e.raw_os_error() == Some(libc::EINTR) => {}
             Err(e) => return Err(e),
         }
+    }
+}
+
+#[cfg(feature = "async-io")]
+impl<F: AsyncFileSystem + Send + Sync + 'static> UringWorker<F> {
+    /// Serve requests with the asynchronous handlers, each in its own
+    /// future, on an async runtime of this thread.
+    fn run_async(self, exit: StopSignal, ready_tx: Sender<io::Result<()>>) -> io::Result<()> {
+        // Create the runtime and register the ring fd with it before the
+        // registration, so a failure fails the constructor and can't free
+        // entries the kernel holds. Runtime::new() panics on failure. That
+        // has to become an error here, because the other workers keep the
+        // ready channel open and the constructor would never see this
+        // thread exit.
+        let barrier = self.barrier_guard();
+        // serve_async() waits in epoll, see UringConfig::defer_taskrun.
+        debug_assert_eq!(self.ring_flags, RingFlags::Default);
+        let (ring, entries, (runtime, ring_ready)) = self.setup(&exit, &ready_tx, |ring| {
+            let runtime = std::panic::catch_unwind(Runtime::new)
+                .map_err(|_| io::Error::other("failed to create the async runtime"))?;
+            // Safe because the AsyncFd is dropped in serve_async(), before
+            // release_entries() closes the ring.
+            let ring_ready = runtime
+                .block_on(async {
+                    unsafe { AsyncFd::register_with_interest(ring.as_raw_fd(), Interest::READABLE) }
+                })
+                .map_err(io::Error::from)?;
+            Ok((runtime, ring_ready))
+        })?;
+        let state = RingState::new(ring, entries.len());
+        let mut entries: Vec<Option<UringEntry>> = entries.into_iter().map(Some).collect();
+        // Like run(), the worker goes on with a handler's panic once the
+        // kernel has given the entries back.
+        let mut panic = None;
+        let result =
+            runtime.block_on(self.serve_async(&state, ring_ready, &mut entries, &exit, &mut panic));
+        let (ring, completions) = RingState::into_parts(state);
+        barrier.leave(completions.stopped);
+        release_entries(ring, entries.into_iter().flatten().collect(), completions);
+        if let Some(payload) = panic {
+            error!("uring worker: a request handler panicked");
+            std::panic::resume_unwind(payload);
+        }
+        result
+    }
+
+    /// The loop of `run_async()`. A delivered request moves its entry into
+    /// a request future, which hands it back with the reply staged. So the
+    /// kernel and a handler never use an entry at the same time, and a
+    /// waiting handler doesn't hold up the requests in other entries.
+    ///
+    /// The ring fd is readable while completions are queued, so the loop
+    /// sleeps in the runtime until a completion or a request future is
+    /// ready. It commits all requests that are done by then and submits
+    /// the commits in one `io_uring_enter()`.
+    ///
+    /// The loop stops once the poll on the stop signal completes, or when
+    /// tearing the connection down fails the command of an armed entry.
+    async fn serve_async(
+        &self,
+        state: &Mutex<RingState>,
+        ring_ready: AsyncFd<RawFd>,
+        entries: &mut [Option<UringEntry>],
+        exit: &StopSignal,
+        panic: &mut Option<Box<dyn std::any::Any + Send>>,
+    ) -> io::Result<()> {
+        let fd = self.fd.as_raw_fd();
+        let mut inflight = FuturesUnordered::new();
+        let mut completed = VecDeque::new();
+
+        let result = 'serve: loop {
+            let stopped = {
+                let mut state = lock(state);
+                // The loop takes these completions itself, so it needn't
+                // wake up for them.
+                state.completions.waker = None;
+                state.receive();
+                std::mem::swap(&mut state.completions.queue, &mut completed);
+                state.completions.stopped
+            };
+            while let Some((idx, res)) = completed.pop_front() {
+                let Some(mut entry) = entries[idx].take() else {
+                    break 'serve Err(io::Error::other(format!(
+                        "completion for entry {idx}, which a handler holds"
+                    )));
+                };
+                if res < 0 {
+                    entries[idx] = Some(entry);
+                    break 'serve stop_result(exit, res);
+                }
+                inflight.push(async move {
+                    let served =
+                        std::panic::AssertUnwindSafe(self.process_async(&mut entry, idx, state))
+                            .catch_unwind()
+                            .await;
+                    let caught = settle(&mut entry, served);
+                    (idx, entry, caught)
+                });
+            }
+            {
+                let mut state = lock(state);
+                if !state.ring.submission().is_empty() {
+                    if let Err(e) = submit(&mut state.ring) {
+                        break 'serve Err(e);
+                    }
+                }
+            }
+            // The requests delivered before the stop finish in the drain
+            // below.
+            if stopped {
+                break 'serve Ok(());
+            }
+
+            tokio::select! {
+                biased;
+                Some(done) = inflight.next(), if !inflight.is_empty() => {
+                    let mut done = Some(done);
+                    while let Some((idx, entry, caught)) = done {
+                        if let Some(payload) = caught {
+                            // The handler may have left a read into the
+                            // entry running, so leak the entry. The kernel
+                            // doesn't hold it.
+                            std::mem::forget(entry);
+                            *panic = Some(payload);
+                            break 'serve Err(io::Error::other("a request handler panicked"));
+                        }
+                        let committed = lock(state).commit(fd, &entry, idx);
+                        entries[idx] = Some(entry);
+                        if let Err(e) = committed {
+                            break 'serve Err(e);
+                        }
+                        // Polling the other requests takes the lock too.
+                        done = inflight.next().now_or_never().flatten();
+                    }
+                }
+                // Entry completions or the stop that a request took off the
+                // ring, or a zero-copy operation that a request couldn't
+                // submit.
+                () = queued(state) => {}
+                ready = ring_ready.readable() => match ready {
+                    // Clear the readiness before draining the completion
+                    // queue at the top of the loop, so a completion that
+                    // arrives in between makes the fd readable again.
+                    Ok(mut guard) => guard.clear_ready(),
+                    Err(e) => break 'serve Err(e),
+                },
+            }
+        };
+
+        // A failed worker ends the connection now, so the requests on its
+        // queues don't wait for it, and the kernel gives its entries back.
+        if failed_while_connected(&result, exit) {
+            self.abort.abort_failed();
+        }
+
+        // Let the requests in flight finish before release_entries() can
+        // free their entries, because a handler may have a read into its
+        // entry pending in the kernel. Their replies still go out if the
+        // connection is up. Handlers that don't finish in time are leaked
+        // with their entries, so a stuck one can't hang the shutdown. The
+        // results of their zero-copy operations still come off the ring.
+        let drain = async {
+            loop {
+                tokio::select! {
+                    biased;
+                    done = inflight.next() => {
+                        let Some((idx, entry, caught)) = done else { break };
+                        if let Some(payload) = caught {
+                            std::mem::forget(entry);
+                            panic.get_or_insert(payload);
+                            continue;
+                        }
+                        let mut state = lock(state);
+                        if state.commit(fd, &entry, idx).is_ok() {
+                            let _ = submit(&mut state.ring);
+                        }
+                        entries[idx] = Some(entry);
+                    }
+                    ready = ring_ready.readable() => {
+                        // Without the ring, the waiting requests can't
+                        // finish, and the code below leaks them.
+                        let Ok(mut guard) = ready else { break };
+                        guard.clear_ready();
+                        lock(state).receive();
+                    }
+                }
+            }
+        };
+        let _ = tokio::time::timeout(DRAIN_TIMEOUT, drain).await;
+        if !inflight.is_empty() {
+            warn!(
+                "uring worker: leaking {} requests whose handlers didn't finish",
+                inflight.len()
+            );
+            std::mem::forget(inflight);
+        }
+        result
+    }
+
+    /// Serve the request delivered into `entry`, at index `idx`, with the
+    /// asynchronous handlers, like `process()`.
+    async fn process_async(
+        &self,
+        entry: &mut UringEntry,
+        idx: usize,
+        state: &Mutex<RingState>,
+    ) -> Result<()> {
+        let slot = entry.zero_copy_slot;
+        let Some(request) = entry.request()? else {
+            return Ok(());
+        };
+        let zc_io = request
+            .zero_copy
+            .map(|_| self.zero_copy_io(slot, idx, state))
+            .transpose()?;
+        let (unique, reply_cap, reader, writer) = request.with_zero_copy(zc_io.as_ref());
+        // Safe because the reader and writer borrow `entry`, which the
+        // request future owns, and the worker never drops a request future
+        // before it completes. A future whose poll panicked is dropped, but
+        // its entry is leaked.
+        let total = unsafe { self.server.async_handle_message(reader, writer, None, None) }
+            .await
+            .map_err(|e| {
+                SessionFailure(format!("uring: handle message unique 0x{unique:x}: {e}"))
+            })?;
+        entry.finish(unique, reply_cap, total)
+    }
+}
+
+/// Wait until the queue in `state` holds entry completions, its ring
+/// operations to submit, or the stop.
+#[cfg(feature = "async-io")]
+async fn queued(state: &Mutex<RingState>) {
+    std::future::poll_fn(|cx| {
+        let mut state = lock(state);
+        if state.completions.queue.is_empty()
+            && state.ring.submission().is_empty()
+            && !state.completions.stopped
+        {
+            state.completions.waker = Some(cx.waker().clone());
+            Poll::Pending
+        } else {
+            Poll::Ready(())
+        }
+    })
+    .await
+}
+
+/// How long a stopping async worker waits for its handlers to finish.
+#[cfg(feature = "async-io")]
+const DRAIN_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Stage an EIO reply in `entry` if its handler failed, and return the
+/// panic payload if it panicked.
+fn settle(
+    entry: &mut UringEntry,
+    served: std::thread::Result<Result<()>>,
+) -> Option<Box<dyn std::any::Any + Send>> {
+    match served {
+        Ok(Ok(())) => None,
+        Ok(Err(e)) => {
+            warn!("uring worker: failed to handle request: {e}");
+            entry.stage_error_reply(libc::EIO);
+            None
+        }
+        Err(payload) => Some(payload),
+    }
+}
+
+/// What a worker returns after a command failed with `res`. It is `Ok` if
+/// the serving layer is stopping, which fails the commands as it tears the
+/// connection down, and the error otherwise. A failed command leaves the
+/// entry in an undefined state, so the worker stops instead of guessing.
+fn stop_result(exit: &StopSignal, res: i32) -> io::Result<()> {
+    if exit.is_stopped() {
+        Ok(())
+    } else {
+        Err(io::Error::from_raw_os_error(-res))
+    }
+}
+
+/// Queue the `COMMIT_AND_FETCH` for the entry at `idx`, which hands its
+/// staged reply to the kernel and registers it for the next request.
+fn push_commit(ring: &mut FuseRing, fd: RawFd, entry: &UringEntry, idx: usize) -> io::Result<()> {
+    let commit_id = entry.header().ring_ent_in_out.commit_id;
+    let sqe = entry.cmd_sqe(
+        fd,
+        FUSE_IO_URING_CMD_COMMIT_AND_FETCH,
+        commit_id,
+        idx as u64,
+    );
+    loop {
+        // Safe because release_entries() keeps the entries alive while the
+        // kernel holds them.
+        if unsafe { ring.submission().push(&sqe) }.is_ok() {
+            return Ok(());
+        }
+        // The submission queue can never hold more outstanding commits than
+        // completed entries, so submitting must eventually make room.
+        submit(ring)?;
     }
 }
 
@@ -1707,7 +2793,9 @@ const RELEASE_TIMEOUT: Duration = Duration::from_secs(1);
 /// which arrive quickly once the connection is torn down. If they don't
 /// arrive within `RELEASE_TIMEOUT`, leak the entries instead of freeing
 /// memory the kernel may still write to.
-fn release_entries(mut ring: FuseRing, entries: Vec<UringEntry>, mut armed: usize) {
+fn release_entries(mut ring: FuseRing, entries: Vec<UringEntry>, completions: Completions) {
+    let nr_entries = completions.ops.len();
+    let mut armed = completions.armed;
     let deadline = Instant::now() + RELEASE_TIMEOUT;
     while armed > 0 {
         let left = deadline.saturating_duration_since(Instant::now());
@@ -1732,10 +2820,12 @@ fn release_entries(mut ring: FuseRing, entries: Vec<UringEntry>, mut armed: usiz
                 break;
             }
         }
-        let len = entries.len();
+        // Count the completions tagged with an entry index. An async worker
+        // passes only the entries it holds again, so `entries` may be
+        // shorter than the worker's entry count.
         armed = armed.saturating_sub(
             ring.completion()
-                .filter(|cqe| (cqe.user_data() as usize) < len)
+                .filter(|cqe| cqe.user_data() < nr_entries as u64)
                 .count(),
         );
     }
@@ -1753,12 +2843,15 @@ fn release_entries(mut ring: FuseRing, entries: Vec<UringEntry>, mut armed: usiz
 pub struct UringFuseServing<F: FileSystem + Send + Sync + 'static> {
     session: FuseSession,
     workers: WorkerSet,
-    /// Whether the queues have buffer pools.
+    /// The number of buffers in each queue's pool, or 0 without pools.
     #[cfg(test)]
-    pooled: bool,
+    pool_bufs: usize,
     /// Whether the queues have zero-copy.
     #[cfg(test)]
     zero_copy: bool,
+    /// The number of worker rings with deferred task work.
+    #[cfg(test)]
+    deferred_rings: usize,
     _fs: std::marker::PhantomData<F>,
 }
 
@@ -1771,9 +2864,21 @@ impl<F: FileSystem + Send + Sync + 'static> UringFuseServing<F> {
     /// accepted the capability, returning `Error::UringNotSupported`
     /// otherwise so that the caller can fall back to the classic transport.
     pub fn new(
+        session: FuseSession,
+        server: Arc<Server<F>>,
+        cfg: UringConfig,
+    ) -> Result<UringFuseServing<F>> {
+        Self::start(session, server, cfg, UringWorker::run, Self::fallback_sync)
+    }
+
+    /// Handle INIT, then start the workers, each running `run`, and the
+    /// fallback thread that `fallback` prepares.
+    fn start(
         mut session: FuseSession,
         server: Arc<Server<F>>,
         cfg: UringConfig,
+        run: RunFn<F>,
+        fallback: FallbackFn<F>,
     ) -> Result<UringFuseServing<F>> {
         warn!("FUSE-over-io_uring transport is experimental, the kernel interface may change");
 
@@ -1783,7 +2888,6 @@ impl<F: FileSystem + Send + Sync + 'static> UringFuseServing<F> {
         // The first message on a new connection is always FUSE_INIT; handle
         // it on a classic channel and verify the negotiation outcome.
         let mut init_ch = session.new_channel()?;
-        let fallback_ch = session.new_channel()?;
         match init_ch.get_request() {
             Ok(Some((reader, writer))) => {
                 server
@@ -1808,12 +2912,7 @@ impl<F: FileSystem + Send + Sync + 'static> UringFuseServing<F> {
         } else {
             cfg.workers
         };
-        let workers = workers.min(nr_queues);
-
-        let mut queue_ids: Vec<Vec<u16>> = vec![Vec::new(); workers];
-        for qid in 0..nr_queues {
-            queue_ids[qid % workers].push(qid as u16);
-        }
+        let entries_per_queue = cfg.entries_per_queue.max(1);
 
         let file = session
             .get_fuse_file()
@@ -1823,11 +2922,12 @@ impl<F: FileSystem + Send + Sync + 'static> UringFuseServing<F> {
 
         // A queue's entries hold at most one buffer each, so more buffers
         // than entries would never be lent.
-        let bufs_per_queue = cfg.bufs_per_queue.min(cfg.entries_per_queue.max(1));
+        let bufs_per_queue = cfg.bufs_per_queue.min(entries_per_queue);
+        let spread = spread_entries(nr_queues, entries_per_queue, workers, bufs_per_queue);
+        let workers = spread.len();
         // The kernel takes a 16-bit buffer table slot per entry, and each
         // entry of a worker gets its own slot.
-        let worker_entries =
-            queue_ids.iter().map(Vec::len).max().unwrap_or(0) * cfg.entries_per_queue;
+        let worker_entries = spread.iter().map(Vec::len).max().unwrap_or(0);
         let want_zero_copy = cfg.zero_copy && worker_entries <= u16::MAX as usize + 1;
         if cfg.zero_copy && !want_zero_copy {
             warn!("uring: zero-copy needs at most 65536 entries per worker, serving without it");
@@ -1856,33 +2956,50 @@ impl<F: FileSystem + Send + Sync + 'static> UringFuseServing<F> {
             None
         };
 
-        // Build one worker per queue set, cloning the fuse fd up front so
+        // Build one worker per entry set, cloning the fuse fd up front so
         // cloning failures are reported before any thread is spawned.
         let abort = Arc::new(ConnectionAbort::new(session.mountpoint()));
+        let barrier = Arc::new(StopBarrier::new(workers));
+        let nr_rounds = spread.iter().flatten().map(|&(_, round)| round + 1).max();
+        let rounds = Arc::new(RegisterRounds::new(workers, nr_rounds.unwrap_or(1)));
+        #[cfg(test)]
+        let deferred_rings = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let mut worker_list = Vec::with_capacity(workers);
-        for ids in queue_ids {
+        for entries in spread {
             worker_list.push(UringWorker {
                 fd: file
                     .try_clone()
                     .map_err(|e| SessionFailure(format!("uring: dup fuse fd: {e}")))?,
-                qids: ids,
-                entries_per_queue: cfg.entries_per_queue,
+                entries,
                 payload_cap,
                 pools: pools.clone(),
                 // Zero-copy comes only with buffer pools.
                 bounce: match pools.as_ref().filter(|_| zero_copy) {
-                    Some(pools) => Some(BounceBuf::new(pools.buf_size).map_err(|e| {
-                        SessionFailure(format!("uring: creating the zero-copy memory file: {e}"))
-                    })?),
+                    Some(pools) => {
+                        Some(Mutex::new(BounceBuf::new(pools.buf_size).map_err(|e| {
+                            SessionFailure(format!(
+                                "uring: creating the zero-copy memory file: {e}"
+                            ))
+                        })?))
+                    }
                     None => None,
                 },
+                rounds: rounds.clone(),
                 server: server.clone(),
                 abort: abort.clone(),
+                barrier: barrier.clone(),
+                ring_flags: if cfg.defer_taskrun {
+                    RingFlags::DeferTaskrun
+                } else {
+                    RingFlags::Default
+                },
+                #[cfg(test)]
+                deferred_rings: deferred_rings.clone(),
             });
         }
 
         let mut set = WorkerSet::new();
-        let exit = set.exit_flag();
+        let exit = set.stop_signal()?;
         let tracker = set.tracker();
         let (ready_tx, ready_rx) = channel();
         for (id, worker) in worker_list.into_iter().enumerate() {
@@ -1896,12 +3013,15 @@ impl<F: FileSystem + Send + Sync + 'static> UringFuseServing<F> {
                     // Registration failures are reported through
                     // ready_tx; the return value only carries the error
                     // out of the thread, which nobody reads.
-                    let _ = worker.run(exit, ready_tx);
+                    let _ = run(worker, exit, ready_tx);
                 }
             });
             match handle {
                 Ok(handle) => set.push(handle),
                 Err(e) => {
+                    // Release the workers already waiting for this one in
+                    // the registration rounds, or stop() can't join them.
+                    rounds.fail();
                     set.stop(&mut session, true);
                     return Err(SessionFailure(format!("uring: spawn worker {id}: {e}")));
                 }
@@ -1929,14 +3049,21 @@ impl<F: FileSystem + Send + Sync + 'static> UringFuseServing<F> {
             }
         }
 
+        let fallback = match fallback(&mut session, server, &mut set) {
+            Ok(body) => body,
+            Err(e) => {
+                set.stop(&mut session, true);
+                return Err(e);
+            }
+        };
+        let (fallback_tx, fallback_rx) = channel();
         let fallback = match thread::Builder::new()
             .name("uring-fallback".to_string())
             .spawn({
-                let exit = exit.clone();
                 let tracker = tracker.clone();
                 move || {
                     let _exited = tracker.exit_guard();
-                    Self::fallback_loop(fallback_ch, server, exit)
+                    fallback(fallback_tx)
                 }
             }) {
             Ok(handle) => handle,
@@ -1946,16 +3073,42 @@ impl<F: FileSystem + Send + Sync + 'static> UringFuseServing<F> {
             }
         };
         set.push(fallback);
+        // A fallback thread that panicked while starting, for example while
+        // creating its async runtime, dropped the sender without sending.
+        if fallback_rx.recv().is_err() {
+            set.stop(&mut session, true);
+            return Err(SessionFailure(
+                "uring: fallback thread exited during startup".to_string(),
+            ));
+        }
 
         Ok(UringFuseServing {
             session,
             workers: set,
             #[cfg(test)]
-            pooled: pools.is_some(),
+            pool_bufs: if pools.is_some() { bufs_per_queue } else { 0 },
             #[cfg(test)]
             zero_copy,
+            // The workers created their rings before they reported ready.
+            #[cfg(test)]
+            deferred_rings: deferred_rings.load(Ordering::Relaxed),
             _fs: std::marker::PhantomData,
         })
+    }
+
+    /// Serve the requests that come through `/dev/fuse` with the synchronous
+    /// handlers.
+    fn fallback_sync(
+        session: &mut FuseSession,
+        server: Arc<Server<F>>,
+        set: &mut WorkerSet,
+    ) -> Result<Box<dyn FnOnce(Sender<()>) + Send>> {
+        let exit = set.exit_flag();
+        let ch = session.new_channel()?;
+        Ok(Box::new(move |ready| {
+            let _ = ready.send(());
+            Self::fallback_loop(ch, server, exit)
+        }))
     }
 
     fn fallback_loop(mut ch: FuseChannel, server: Arc<Server<F>>, exit: Arc<AtomicBool>) {
@@ -1987,11 +3140,80 @@ impl<F: FileSystem + Send + Sync + 'static> UringFuseServing<F> {
     }
 }
 
+#[cfg(feature = "async-io")]
+impl<F: AsyncFileSystem + Send + Sync + 'static> UringFuseServing<F> {
+    /// Create an io_uring serving transport that serves requests with the
+    /// asynchronous handlers of `F`.
+    ///
+    /// This works like [`Self::new()`], but every worker runs an async
+    /// runtime from `async_runtime::Runtime::new()` and serves each request
+    /// in its own future, up to one per ring entry it registered. So a
+    /// handler that waits, for example on a remote store, doesn't hold up
+    /// the worker's other requests. `UringConfig::entries_per_queue` bounds
+    /// how many requests sent from one CPU can wait at the same time, so
+    /// set it higher than for synchronous handlers.
+    ///
+    /// The requests that the kernel sends through `/dev/fuse`, such as
+    /// INTERRUPT and the ones it queued before the workers registered their
+    /// entries, go to a `FuseDevTask`, which also uses the asynchronous
+    /// handlers. A stopping worker waits up to 10 seconds for its handlers
+    /// to finish, and leaks the requests of the ones that don't. A leaked
+    /// request keeps the buffer pools mapped, and so does a request whose
+    /// handler panics.
+    ///
+    /// A request keeps its payload buffer while its handler waits, so a
+    /// queue's buffer pool gets `entries_per_queue` buffers, whatever
+    /// non-zero `bufs_per_queue` says. `docs/fuse-uring-performance.md` has
+    /// the numbers. A `bufs_per_queue` of 0 still gives every entry a buffer
+    /// of its own.
+    ///
+    /// The workers ignore `defer_taskrun`, see there.
+    pub fn new_async(
+        session: FuseSession,
+        server: Arc<Server<F>>,
+        mut cfg: UringConfig,
+    ) -> Result<UringFuseServing<F>> {
+        if cfg.bufs_per_queue > 0 {
+            // start() counts 0 entries as 1.
+            cfg.bufs_per_queue = cfg.entries_per_queue.max(1);
+        }
+        cfg.defer_taskrun = false;
+        Self::start(
+            session,
+            server,
+            cfg,
+            UringWorker::run_async,
+            Self::fallback_async,
+        )
+    }
+
+    /// Serve the requests that come through `/dev/fuse` with the asynchronous
+    /// handlers, on a `FuseDevTask` with a file description of its own.
+    fn fallback_async(
+        session: &mut FuseSession,
+        server: Arc<Server<F>>,
+        set: &mut WorkerSet,
+    ) -> Result<Box<dyn FnOnce(Sender<()>) + Send>> {
+        let exit = set.stop_signal()?;
+        let file = session.clone_fuse_file()?;
+        let buf_size = session.bufsize();
+        Ok(Box::new(move |ready| {
+            let runtime = Runtime::new();
+            let mut task = FuseDevTask::new(buf_size, file, server, exit);
+            let _ = ready.send(());
+            runtime.block_on(task.poll_handler());
+        }))
+    }
+}
+
 impl<F: FileSystem + Send + Sync + 'static> Drop for UringFuseServing<F> {
     fn drop(&mut self) {
-        // Tearing down the connection completes all outstanding ring entries
-        // with an error, which unblocks the worker threads; the fallback
-        // thread is woken through its epoll channel.
+        // The unmount ends the connection, which fails the commands of the
+        // armed entries and stops the workers. The stop signal stops them
+        // when a busy mount keeps the connection up, and they end it once
+        // they have served the requests they took. The fallback thread wakes
+        // through its epoll channel, or with the async handlers through its
+        // stop signal or the end of the connection.
         self.workers.stop(&mut self.session, true);
     }
 }
@@ -2026,14 +3248,7 @@ mod tests {
         // The answer must match the transport the mount actually gets.
         let src = TempDir::new().unwrap();
         let mnt = TempDir::new().unwrap();
-        let fs = PassthroughFs::<()>::new(Config {
-            root_dir: src.as_path().to_string_lossy().to_string(),
-            do_import: false,
-            ..Default::default()
-        })
-        .unwrap();
-        fs.import().unwrap();
-        let server = Arc::new(Server::new(fs));
+        let server = passthrough_server(src.as_path(), false);
         server.set_uring(true);
         let mut se = FuseSession::new(mnt.as_path(), "uring_available_test", "", false).unwrap();
         if let Err(e) = se.mount() {
@@ -2045,6 +3260,7 @@ mod tests {
             entries_per_queue: 1,
             bufs_per_queue: 0,
             zero_copy: false,
+            defer_taskrun: false,
         };
         let r = UringFuseServing::new(se, server, cfg);
         if uring_available() {
@@ -2069,6 +3285,98 @@ mod tests {
         assert!(parse_cpu_mask("a-b").is_err());
         assert!(parse_cpu_mask("1-2-3").is_err());
         assert!(possible_cpu_count().unwrap() >= 1);
+    }
+
+    #[test]
+    fn test_spread_entries() {
+        use std::collections::HashSet;
+
+        let cases = [
+            (24, 16, 4, 4),
+            (24, 4, 24, 4),
+            (4, 2, 3, 1),
+            (1, 1, 8, 0),
+            (24, 5, 4, 2),
+            (96, 4, 8, 4),
+            (96, 16, 8, 4),
+            (96, 16, 12, 4),
+            (96, 4, 96, 4),
+            (4, 3, 1, 3),
+        ];
+        for (queues, per_queue, workers, bufs) in cases {
+            let spread = spread_entries(queues, per_queue, workers, bufs);
+            assert_eq!(spread.len(), workers.min(queues * per_queue));
+            let workers = spread.len();
+            let k = per_queue.min(workers);
+            let holders = bufs.clamp(1, k);
+            let mut by_queue = vec![Vec::new(); queues];
+            for (w, q) in spread.iter().enumerate() {
+                for &(qid, round) in q {
+                    by_queue[qid as usize].push((round, w));
+                }
+            }
+            for (qid, by_round) in by_queue.iter_mut().enumerate() {
+                by_round.sort();
+                assert_eq!(by_round.len(), per_queue, "queue {qid}");
+                // The last k entries of a queue take a round each, after the
+                // others, on k different workers, which are all the
+                // queue's workers.
+                let (rest, last) = by_round.split_at(per_queue - k);
+                assert!(last.windows(2).all(|w| w[0].0 < w[1].0), "queue {}", qid);
+                assert!(rest.iter().all(|&(r, _)| r == 0 && r < last[0].0));
+                let owners: HashSet<usize> = last.iter().map(|&(_, w)| w).collect();
+                assert_eq!(owners.len(), k, "queue {qid}");
+                // A queue with an entry on every worker ends on the one that
+                // would own it with whole queues.
+                if k == workers {
+                    assert_eq!(last[k - 1].1, qid % workers, "queue {qid}");
+                }
+            }
+            // Queues 0 to workers - 1 end their registration on different
+            // workers, and so do the next workers queues and so on.
+            let tops: Vec<usize> = by_queue.iter().map(|q| q.last().unwrap().1).collect();
+            for chunk in tops.chunks(workers) {
+                assert_eq!(chunk.iter().collect::<HashSet<_>>().len(), chunk.len());
+            }
+            // Queues workers apart give their other buffers to different
+            // workers, so enough of them hold buffers on all k workers.
+            if k == workers && holders > 1 {
+                let span = (k - 1).div_ceil(holders - 1).saturating_sub(1) * workers;
+                for qid in 0..queues.saturating_sub(span) {
+                    let held: HashSet<usize> = (qid..=qid + span)
+                        .step_by(workers)
+                        .flat_map(|q| by_queue[q][per_queue - holders..].iter().map(|&(_, w)| w))
+                        .collect();
+                    assert_eq!(held.len(), k, "queue {qid}");
+                }
+            }
+            // The workers get the same number of entries, give or take one.
+            let sizes: Vec<usize> = spread.iter().map(Vec::len).collect();
+            assert!(sizes.iter().max().unwrap() - sizes.iter().min().unwrap() <= 1);
+        }
+        // Zero workers count as 1.
+        assert_eq!(spread_entries(2, 1, 0, 0), vec![vec![(0, 0), (1, 0)]]);
+    }
+
+    #[test]
+    fn test_register_rounds() {
+        let rounds = Arc::new(RegisterRounds::new(3, 2));
+        let done: Vec<_> = (0..3)
+            .map(|_| {
+                let rounds = rounds.clone();
+                std::thread::spawn(move || (0..2).all(|_| rounds.wait()))
+            })
+            .collect();
+        assert!(done.into_iter().all(|t| t.join().unwrap()));
+
+        // A failed worker releases the others from their round.
+        let rounds = Arc::new(RegisterRounds::new(2, 1));
+        let waiter = std::thread::spawn({
+            let rounds = rounds.clone();
+            move || rounds.wait()
+        });
+        drop(RoundsGuard(&rounds));
+        assert!(!waiter.join().unwrap());
     }
 
     #[test]
@@ -2176,7 +3484,7 @@ mod tests {
         assert_eq!(entry.qid, 3);
 
         let header_len = std::mem::size_of::<FuseUringReqHeader>();
-        let total = header_len + payload_cap + 2 * (FUSE_HEADER_SIZE + payload_cap);
+        let total = header_len + payload_cap + REQ_SCRATCH_SIZE;
         assert_eq!(entry.mem.len(), total);
 
         // The iovec array must describe the header and payload areas of the
@@ -2230,6 +3538,43 @@ mod tests {
             cmd_bytes[..std::mem::size_of::<FuseUringCmdReq>()],
             *cmd.as_slice()
         );
+    }
+
+    #[test]
+    fn test_ring_flags_fallback() {
+        use RingFlags::*;
+        // Build with `flags`, failing the first attempt with `errno`.
+        let attempts = |flags: RingFlags, errno| {
+            let mut tried = Vec::new();
+            let built = flags.build_or_default(|f| {
+                tried.push(f);
+                match tried.len() {
+                    1 => Err(io::Error::from_raw_os_error(errno)),
+                    _ => Ok(()),
+                }
+            });
+            (built.map_err(|e| e.raw_os_error()), tried)
+        };
+        // A kernel that refuses the flags with EINVAL gets a ring without them.
+        assert_eq!(
+            attempts(DeferTaskrun, libc::EINVAL),
+            (Ok(()), vec![DeferTaskrun, Default])
+        );
+        // Other errors don't fall back, nor does a ring without flags.
+        assert_eq!(
+            attempts(DeferTaskrun, libc::ENOMEM),
+            (Err(Some(libc::ENOMEM)), vec![DeferTaskrun])
+        );
+        assert_eq!(
+            attempts(Default, libc::EINVAL),
+            (Err(Some(libc::EINVAL)), vec![Default])
+        );
+
+        // Kernels since 6.1 take the flags.
+        match DeferTaskrun.build(8) {
+            Ok(ring) => assert!(ring.params().is_setup_single_issuer()),
+            Err(e) => eprintln!("can't create a ring ({e}), skipping"),
+        }
     }
 
     #[test]
@@ -2323,6 +3668,208 @@ mod tests {
         assert_eq!(&body[..16], &(8..24).collect::<Vec<u8>>()[..]);
     }
 
+    #[cfg(feature = "async-io")]
+    #[test]
+    fn test_uring_writer_async() {
+        use fuse_backend_core::async_file::File as AsyncFile;
+        use fuse_backend_core::async_runtime;
+
+        let dir = TempDir::new().unwrap();
+        let path = dir.as_path().join("data");
+        std::fs::write(&path, (0..64).collect::<Vec<u8>>()).unwrap();
+
+        let mut hdr = vec![0u8; OUT_HEADER_SIZE];
+        let mut body = vec![0u8; 32];
+        {
+            let mut w = UringWriter::<'_, ()>::new(&mut hdr, &mut body);
+            async_runtime::block_on(async {
+                // Writes fill the header slot first and spill into the body,
+                // like the synchronous writes do.
+                w.async_write_all(&[0xFF; OUT_HEADER_SIZE + 1])
+                    .await
+                    .unwrap();
+                assert_eq!(w.async_write2(&[1], &[2]).await.unwrap(), 2);
+
+                let file = AsyncFile::async_open(&path, false, false).await.unwrap();
+                // Read through the trait with an unsized file, as the async
+                // server does.
+                let src: &dyn AsyncFileReadWriteVolatile = &file;
+                assert_eq!(
+                    Writer::async_write_from_at(&mut w, src, 16, 8)
+                        .await
+                        .unwrap(),
+                    16
+                );
+                assert_eq!(w.async_commit(None).await.unwrap(), OUT_HEADER_SIZE + 19);
+                // The writer rejects more data than the body has left.
+                assert!(w.async_write_from_at(&file, 16, 0).await.is_err());
+            });
+        }
+
+        assert_eq!(&hdr[..], &[0xFF; OUT_HEADER_SIZE]);
+        assert_eq!(&body[..3], &[0xFF, 1, 2]);
+        assert_eq!(&body[3..19], &(8..24).collect::<Vec<u8>>()[..]);
+    }
+
+    /// The constructor a mount test serves with, `UringFuseServing::new()`
+    /// or `UringFuseServing::new_async()`.
+    type StartFn<F> = fn(FuseSession, Arc<Server<F>>, UringConfig) -> Result<UringFuseServing<F>>;
+
+    /// Mount at `mnt` and serve `server` over io_uring, or return None if
+    /// the kernel rejects FUSE-over-io_uring.
+    fn mount_uring<F: FileSystem + Send + Sync + 'static>(
+        server: Arc<Server<F>>,
+        mnt: &std::path::Path,
+        cfg: UringConfig,
+        start: StartFn<F>,
+    ) -> Option<UringFuseServing<F>> {
+        server.set_uring(true);
+        let mut se = FuseSession::new(mnt, "uring_serving_test", "", false).unwrap();
+        se.mount().unwrap();
+        match start(se, server, cfg) {
+            Ok(serving) => Some(serving),
+            Err(UringNotSupported) => {
+                eprintln!("FUSE-over-io_uring is not available, skipping");
+                None
+            }
+            Err(e) => panic!("uring serving failed: {}", e),
+        }
+    }
+
+    fn passthrough_server(
+        src: &std::path::Path,
+        zero_copy: bool,
+    ) -> Arc<Server<PassthroughFs<()>>> {
+        let fs = PassthroughFs::<()>::new(Config {
+            root_dir: src.to_string_lossy().to_string(),
+            do_import: false,
+            uring_zero_copy: zero_copy,
+            ..Default::default()
+        })
+        .unwrap();
+        fs.import().unwrap();
+        Arc::new(Server::new(fs))
+    }
+
+    #[cfg(feature = "async-io")]
+    mod barrier_fs {
+        /// A root directory in which looking up `wait-<n>` succeeds once
+        /// `barrier` has as many lookups waiting as it was created for.
+        pub(super) struct BarrierFs {
+            pub(super) barrier: tokio::sync::Barrier,
+        }
+
+        use std::ffi::CStr;
+        use std::io;
+        use std::time::Duration;
+
+        use async_trait::async_trait;
+        use fuse_backend_core::abi::fuse_abi::{stat64, FsOptions, ROOT_ID};
+        use fuse_backend_core::api::filesystem::{AsyncFileSystem, Context, Entry, FileSystem};
+
+        fn stat(inode: u64) -> stat64 {
+            // Safe because stat64 is plain data.
+            let mut st: stat64 = unsafe { std::mem::zeroed() };
+            st.st_ino = inode;
+            st.st_nlink = 1;
+            st.st_mode = if inode == ROOT_ID {
+                libc::S_IFDIR | 0o755
+            } else {
+                libc::S_IFREG | 0o444
+            };
+            st
+        }
+
+        impl FileSystem for BarrierFs {
+            type Inode = u64;
+            type Handle = u64;
+
+            fn init(&self, capable: FsOptions) -> io::Result<FsOptions> {
+                // Without PARALLEL_DIROPS, the kernel serializes lookups in a
+                // directory.
+                Ok(capable & FsOptions::PARALLEL_DIROPS)
+            }
+        }
+
+        #[allow(unused_variables)]
+        #[async_trait]
+        impl AsyncFileSystem for BarrierFs {
+            async fn async_lookup(
+                &self,
+                ctx: &Context,
+                parent: u64,
+                name: &CStr,
+            ) -> io::Result<Entry> {
+                let name = name.to_str().unwrap_or_default();
+                let Some(n) = name
+                    .strip_prefix("wait-")
+                    .and_then(|n| n.parse::<u64>().ok())
+                else {
+                    return Err(io::Error::from_raw_os_error(libc::ENOENT));
+                };
+                self.barrier.wait().await;
+                Ok(Entry {
+                    inode: ROOT_ID + 1 + n,
+                    generation: 0,
+                    attr: stat(ROOT_ID + 1 + n),
+                    attr_flags: 0,
+                    attr_timeout: Duration::ZERO,
+                    entry_timeout: Duration::ZERO,
+                })
+            }
+
+            async fn async_getattr(
+                &self,
+                ctx: &Context,
+                inode: u64,
+                handle: Option<u64>,
+            ) -> io::Result<(stat64, Duration)> {
+                Ok((stat(inode), Duration::ZERO))
+            }
+        }
+    }
+
+    #[cfg(feature = "async-io")]
+    #[test]
+    fn test_uring_async_serving_overlaps_requests() {
+        use barrier_fs::BarrierFs;
+
+        const LOOKUPS: usize = 4;
+        let mnt = TempDir::new().unwrap();
+        let server = Arc::new(Server::new(BarrierFs {
+            barrier: tokio::sync::Barrier::new(LOOKUPS),
+        }));
+        // One worker, with room for all lookups even if they come from the
+        // same CPU. Serving them one at a time would never pass the barrier.
+        let cfg = UringConfig {
+            workers: 1,
+            entries_per_queue: LOOKUPS,
+            ..Default::default()
+        };
+        let Some(serving) = mount_uring(server, mnt.as_path(), cfg, UringFuseServing::new_async)
+        else {
+            return;
+        };
+
+        let (tx, rx) = channel();
+        for n in 0..LOOKUPS {
+            let path = mnt.as_path().join(format!("wait-{n}"));
+            let tx = tx.clone();
+            thread::spawn(move || {
+                tx.send(
+                    std::fs::metadata(path)
+                        .map(|_| ())
+                        .map_err(|e| e.to_string()),
+                )
+                .unwrap()
+            });
+        }
+        for _ in 0..LOOKUPS {
+            assert_eq!(rx.recv_timeout(Duration::from_secs(10)), Ok(Ok(())));
+        }
+        drop(serving);
+    }
+
     /// A worker over PassthroughFs, for exercising process() without a
     /// kernel supporting FUSE_URING.
     fn make_worker() -> (UringWorker<Arc<PassthroughFs<()>>>, TempDir) {
@@ -2338,16 +3885,19 @@ mod tests {
 
         let worker = UringWorker {
             fd: File::open("/dev/null").unwrap(),
-            qids: vec![0],
-            entries_per_queue: 1,
+            entries: vec![(0, 0)],
             payload_cap: 4096,
             pools: None,
             bounce: None,
+            rounds: Arc::new(RegisterRounds::new(1, 1)),
             server: Arc::new(Server::new(Arc::new(fs))),
             abort: Arc::new(ConnectionAbort {
                 path: None,
                 done: AtomicBool::new(false),
             }),
+            barrier: Arc::new(StopBarrier::new(1)),
+            ring_flags: RingFlags::Default,
+            deferred_rings: Arc::default(),
         };
         (worker, source)
     }
@@ -2388,13 +3938,8 @@ mod tests {
         worker: &UringWorker<F>,
         entry: &mut UringEntry,
     ) -> Result<()> {
-        let mut ring = FuseRing::builder().build(8).unwrap();
-        let mut completions = Completions {
-            queue: VecDeque::new(),
-            nr_entries: 1,
-            armed: 1,
-        };
-        worker.process(entry, &mut ring, &mut completions)
+        let state = RingState::new(FuseRing::builder().build(8).unwrap(), 1);
+        worker.process(entry, 0, &state)
     }
 
     fn parse_out_header(entry: &UringEntry) -> OutHeader {
@@ -2776,51 +4321,44 @@ mod tests {
             })
     }
 
-    /// Serve a PassthroughFs over io_uring with each queue's buffer pool
-    /// holding `bufs_per_queue` buffers, and zero-copy if `zero_copy`, read
+    /// Serve a PassthroughFs over io_uring with `start`, `workers` workers,
+    /// 2 entries and `bufs_per_queue` buffers per queue, zero-copy if
+    /// `zero_copy`, and deferred task work if `defer_taskrun`. Check that a
+    /// kernel with buffer pools gives each queue `pool_bufs` buffers, read
     /// and write through the mount, then check that dropping the serving
     /// layer gets the ring entries back from the kernel and unmounts.
-    fn check_passthrough_mount(bufs_per_queue: usize, zero_copy: bool) {
+    /// Returns the number of worker rings with deferred task work, or None
+    /// if the kernel refused FUSE-over-io_uring.
+    fn check_passthrough_mount(
+        start: StartFn<PassthroughFs<()>>,
+        workers: usize,
+        bufs_per_queue: usize,
+        zero_copy: bool,
+        defer_taskrun: bool,
+        pool_bufs: usize,
+    ) -> Option<usize> {
         let src = TempDir::new().unwrap();
         std::fs::write(src.as_path().join("hello"), b"over io_uring").unwrap();
         let mnt = TempDir::new().unwrap();
-        let fs = PassthroughFs::<()>::new(Config {
-            root_dir: src.as_path().to_string_lossy().to_string(),
-            do_import: false,
-            uring_zero_copy: zero_copy,
-            ..Default::default()
-        })
-        .unwrap();
-        fs.import().unwrap();
-        let server = Arc::new(Server::new(fs));
-        server.set_uring(true);
-        let mut se = FuseSession::new(mnt.as_path(), "uring_serving_test", "", false).unwrap();
-        se.mount().unwrap();
+        let server = passthrough_server(src.as_path(), zero_copy);
         let cfg = UringConfig {
-            workers: 2,
+            workers,
             entries_per_queue: 2,
             bufs_per_queue,
             zero_copy,
+            defer_taskrun,
         };
-        let serving = match UringFuseServing::new(se, server.clone(), cfg) {
-            Ok(serving) => serving,
-            Err(UringNotSupported) => {
-                eprintln!("FUSE-over-io_uring is not available, skipping");
-                return;
-            }
-            Err(e) => panic!("uring serving failed: {}", e),
-        };
+        let serving = mount_uring(server.clone(), mnt.as_path(), cfg, start)?;
         // Kernels with buffer pools must get them when the config asks, and
         // zero-copy too when the test runs as root.
-        assert_eq!(
-            serving.pooled,
-            bufs_per_queue > 0 && server.uring_bufpool_supported()
-        );
-        if serving.pooled && zero_copy && real_root() {
+        let pooled = server.uring_bufpool_supported();
+        assert_eq!(serving.pool_bufs, if pooled { pool_bufs } else { 0 });
+        if serving.pool_bufs > 0 && zero_copy && real_root() {
             assert!(serving.zero_copy);
         }
         eprintln!(
-            "uring mount: {bufs_per_queue} buffers per queue, zero-copy {}",
+            "uring mount: {workers} workers, {bufs_per_queue} buffers per queue, zero-copy {}, \
+             deferred task work {defer_taskrun}",
             serving.zero_copy
         );
 
@@ -2863,19 +4401,61 @@ mod tests {
         // Tearing the connection down completes the commands of all armed
         // entries, so the workers get their entries back well within
         // RELEASE_TIMEOUT instead of waiting it out and leaking them.
+        let deferred_rings = serving.deferred_rings;
         let start = Instant::now();
         drop(serving);
         assert!(start.elapsed() < RELEASE_TIMEOUT);
         assert!(std::fs::read(mnt.as_path().join("hello")).is_err());
+        Some(deferred_rings)
     }
 
     #[test]
     fn test_uring_serving_mount() {
-        for (bufs_per_queue, zero_copy) in
-            [(0, false), (1, false), (4, false), (1, true), (4, true)]
-        {
-            check_passthrough_mount(bufs_per_queue, zero_copy);
+        for defer_taskrun in [false, true] {
+            for (bufs_per_queue, zero_copy) in
+                [(0, false), (1, false), (4, false), (1, true), (4, true)]
+            {
+                // A pool holds at most as many buffers as the queue has entries.
+                let pool_bufs = bufs_per_queue.min(2);
+                let deferred = check_passthrough_mount(
+                    UringFuseServing::new,
+                    2,
+                    bufs_per_queue,
+                    zero_copy,
+                    defer_taskrun,
+                    pool_bufs,
+                );
+                if let Some(deferred) = deferred {
+                    assert_eq!(deferred, if defer_taskrun { 2 } else { 0 });
+                }
+            }
         }
+    }
+
+    #[cfg(feature = "async-io")]
+    #[test]
+    fn test_uring_async_serving_mount() {
+        // A pool gets a buffer per entry, even when the config asks for 1.
+        check_passthrough_mount(UringFuseServing::new_async, 2, 0, false, false, 0);
+        // The workers ignore defer_taskrun. On Linux 7.3.1, a worker that
+        // took it never answered the first request.
+        let deferred = check_passthrough_mount(UringFuseServing::new_async, 2, 1, false, true, 2);
+        assert_eq!(deferred.unwrap_or(0), 0);
+        check_passthrough_mount(UringFuseServing::new_async, 2, 1, true, false, 2);
+    }
+
+    /// With more workers than queues, every queue's entries are spread over
+    /// several workers.
+    #[test]
+    fn test_uring_serving_more_workers_than_queues() {
+        check_passthrough_mount(
+            UringFuseServing::new,
+            possible_cpu_count().unwrap() + 1,
+            0,
+            false,
+            false,
+            0,
+        );
     }
 
     #[test]
@@ -2941,10 +4521,13 @@ mod tests {
         }
     }
 
-    /// A worker whose handler panics ends the connection, so the request
-    /// fails instead of waiting forever, and `wait()` returns.
-    #[test]
-    fn test_uring_serving_handler_panic() {
+    // The async defaults call the sync handlers, so LOOKUP panics too.
+    #[cfg(feature = "async-io")]
+    impl fuse_backend_core::api::filesystem::AsyncFileSystem for PanicFs {}
+
+    /// A worker of `start` whose handler panics ends the connection, so the
+    /// request fails instead of waiting forever, and `wait()` returns.
+    fn check_handler_panic(start: StartFn<PanicFs>) {
         let mnt = TempDir::new().unwrap();
         let server = Arc::new(Server::new(PanicFs));
         server.set_uring(true);
@@ -2959,8 +4542,9 @@ mod tests {
             entries_per_queue: 1,
             bufs_per_queue: 0,
             zero_copy: false,
+            defer_taskrun: false,
         };
-        let serving = match UringFuseServing::new(se, server, cfg) {
+        let serving = match start(se, server, cfg) {
             Ok(serving) => Arc::new(serving),
             Err(UringNotSupported) => {
                 eprintln!("FUSE-over-io_uring is not available, skipping");
@@ -2985,6 +4569,168 @@ mod tests {
             .expect("the worker didn't end the connection after the panic");
     }
 
+    #[test]
+    fn test_uring_serving_handler_panic() {
+        check_handler_panic(UringFuseServing::new);
+    }
+
+    #[cfg(feature = "async-io")]
+    #[test]
+    fn test_uring_async_serving_handler_panic() {
+        check_handler_panic(UringFuseServing::new_async);
+    }
+
+    /// Like `mount_uring()` with 2 workers and 2 entries per queue, but
+    /// return None also where fusectl isn't mounted.
+    fn mount_with_fusectl<F: FileSystem + Send + Sync + 'static>(
+        server: Arc<Server<F>>,
+        mnt: &std::path::Path,
+        start: StartFn<F>,
+    ) -> Option<UringFuseServing<F>> {
+        let cfg = UringConfig {
+            workers: 2,
+            entries_per_queue: 2,
+            bufs_per_queue: 0,
+            zero_copy: false,
+            defer_taskrun: false,
+        };
+        let serving = mount_uring(server, mnt, cfg, start)?;
+        if ConnectionAbort::new(serving.session.mountpoint())
+            .path
+            .is_none()
+        {
+            eprintln!("fusectl isn't mounted, skipping");
+            return None;
+        }
+        Some(serving)
+    }
+
+    /// Drop `serving` on another thread, and return how long that took.
+    fn timed_drop<T: Send + 'static>(serving: T) -> std::sync::mpsc::Receiver<Duration> {
+        let (tx, rx) = channel();
+        thread::spawn(move || {
+            let start = Instant::now();
+            drop(serving);
+            let _ = tx.send(start.elapsed());
+        });
+        rx
+    }
+
+    /// A busy mount keeps the connection up after the unmount. Stopping
+    /// still stops the workers, which end the connection and get their
+    /// entries back instead of waiting for the mount to go idle.
+    fn check_busy_stop(start: StartFn<PassthroughFs<()>>) {
+        let src = TempDir::new().unwrap();
+        let mnt = TempDir::new().unwrap();
+        let server = passthrough_server(src.as_path(), false);
+        let Some(serving) = mount_with_fusectl(server, mnt.as_path(), start) else {
+            return;
+        };
+        let mountpoint = serving.session.mountpoint().to_path_buf();
+        let busy = File::open(mnt.as_path()).unwrap();
+        let stopped = timed_drop(serving).recv_timeout(Duration::from_secs(5));
+        assert!(stopped.expect("the workers didn't stop") < RELEASE_TIMEOUT);
+        // The stop unmounted, and left no dead mount behind.
+        let mountinfo = std::fs::read_to_string("/proc/self/mountinfo").unwrap();
+        assert_eq!(mount_minor(&mountinfo, &mountpoint), None);
+        // A LOOKUP in the busy directory fails once the connection ended.
+        // Safe because the path is a valid C string and the fd is open.
+        let name = b"missing\0".as_ptr() as *const libc::c_char;
+        let fd = unsafe { libc::openat(busy.as_raw_fd(), name, libc::O_RDONLY) };
+        assert_eq!(fd, -1);
+        assert_eq!(
+            io::Error::last_os_error().raw_os_error(),
+            Some(libc::ENOTCONN)
+        );
+    }
+
+    #[test]
+    fn test_uring_serving_busy_stop() {
+        check_busy_stop(UringFuseServing::new);
+    }
+
+    #[cfg(feature = "async-io")]
+    #[test]
+    fn test_uring_async_serving_busy_stop() {
+        check_busy_stop(UringFuseServing::new_async);
+    }
+
+    /// A file system whose LOOKUP reports on `entered` and then waits until
+    /// the test drops the sender of `open`.
+    struct GateFs {
+        entered: Sender<()>,
+        open: Mutex<std::sync::mpsc::Receiver<()>>,
+    }
+
+    impl FileSystem for GateFs {
+        type Inode = u64;
+        type Handle = u64;
+
+        fn lookup(
+            &self,
+            _ctx: &fuse_backend_core::api::filesystem::Context,
+            _parent: u64,
+            _name: &std::ffi::CStr,
+        ) -> io::Result<fuse_backend_core::api::filesystem::Entry> {
+            let _ = self.entered.send(());
+            let _ = lock(&self.open).recv();
+            Err(io::Error::from_raw_os_error(libc::ENOENT))
+        }
+
+        fn getattr(
+            &self,
+            ctx: &fuse_backend_core::api::filesystem::Context,
+            inode: u64,
+            handle: Option<u64>,
+        ) -> io::Result<(fuse_backend_core::abi::fuse_abi::stat64, Duration)> {
+            PanicFs.getattr(ctx, inode, handle)
+        }
+    }
+
+    // The async defaults call the sync handlers.
+    #[cfg(feature = "async-io")]
+    impl fuse_backend_core::api::filesystem::AsyncFileSystem for GateFs {}
+
+    /// A request in flight when the serving layer stops still gets its
+    /// reply, so the first worker to stop doesn't end the connection.
+    fn check_stop_in_flight(start: StartFn<GateFs>) {
+        let mnt = TempDir::new().unwrap();
+        let (entered, entered_rx) = channel();
+        let (open, open_rx) = channel();
+        let server = Arc::new(Server::new(GateFs {
+            entered,
+            open: Mutex::new(open_rx),
+        }));
+        let Some(serving) = mount_with_fusectl(server, mnt.as_path(), start) else {
+            return;
+        };
+        let path = mnt.as_path().join("gated");
+        let client = thread::spawn(move || std::fs::metadata(path).map(|_| ()));
+        entered_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the LOOKUP didn't arrive");
+        let stopped = timed_drop(serving);
+        // Let the stop reach the workers before the gate opens.
+        thread::sleep(Duration::from_millis(100));
+        drop(open);
+        let reply = client.join().unwrap().unwrap_err();
+        assert_eq!(reply.raw_os_error(), Some(libc::ENOENT));
+        stopped
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the workers didn't stop");
+    }
+
+    #[test]
+    fn test_uring_serving_stop_in_flight() {
+        check_stop_in_flight(UringFuseServing::new);
+    }
+
+    #[cfg(feature = "async-io")]
+    #[test]
+    fn test_uring_async_serving_stop_in_flight() {
+        check_stop_in_flight(UringFuseServing::new_async);
+    }
+
     /// Ending the connection, as a failed worker does, stops every worker,
     /// so `wait()` returns instead of serving on with a hanging queue.
     #[test]
@@ -2994,14 +4740,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let mnt = dir.as_path().join("mount point");
         std::fs::create_dir(&mnt).unwrap();
-        let fs = PassthroughFs::<()>::new(Config {
-            root_dir: src.as_path().to_string_lossy().to_string(),
-            do_import: false,
-            ..Default::default()
-        })
-        .unwrap();
-        fs.import().unwrap();
-        let server = Arc::new(Server::new(fs));
+        let server = passthrough_server(src.as_path(), false);
         server.set_uring(true);
         let mut se = FuseSession::new(mnt.as_path(), "uring_serving_test", "", false).unwrap();
         se.mount().unwrap();
@@ -3015,6 +4754,7 @@ mod tests {
             entries_per_queue: 2,
             bufs_per_queue: 0,
             zero_copy: false,
+            defer_taskrun: false,
         };
         let serving = match UringFuseServing::new(se, server, cfg) {
             Ok(serving) => Arc::new(serving),
@@ -3026,7 +4766,7 @@ mod tests {
         };
         std::fs::read_dir(mnt.as_path()).unwrap().for_each(drop);
 
-        abort.abort();
+        abort.abort().unwrap();
         let (tx, rx) = channel();
         let waiting = serving.clone();
         std::thread::spawn(move || {
