@@ -2158,6 +2158,29 @@ mod tests {
         assert_eq!(out.unique, unique);
     }
 
+    #[test]
+    fn test_server_newer_opcodes_get_enosys() {
+        // SYNCFS, TMPFILE, STATX and COPY_FILE_RANGE_64.
+        let server = Server::new(MockFS);
+        for opcode in 50..=53 {
+            let header = InHeader {
+                len: (size_of::<InHeader>() + 64) as u32,
+                opcode,
+                nodeid: ROOT_ID,
+                ..Default::default()
+            };
+            let mut read_buf = [header.as_slice(), &[0u8; 64]].concat();
+            let mut write_buf = [0u8; 4096];
+            let reader = Reader::<()>::from_slice(&mut read_buf);
+            let writer = TestWriter::new(&mut write_buf);
+            let len = server.handle_message(reader, writer, None, None).unwrap();
+            assert_eq!(len, size_of::<OutHeader>(), "opcode {}", opcode);
+            let mut out = OutHeader::default();
+            out.as_mut_slice().copy_from_slice(&write_buf[..len]);
+            assert_eq!(out.error, -libc::ENOSYS, "opcode {}", opcode);
+        }
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn test_server_init_passthrough() {

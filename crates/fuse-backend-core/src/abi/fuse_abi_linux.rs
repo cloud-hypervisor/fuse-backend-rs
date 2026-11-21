@@ -2,7 +2,7 @@
 //
 // SPDX-License-Identifier: BSD-3-Clause
 
-//! Linux Fuse Application Binary Interfaces, Version 7.31.
+//! Linux Fuse Application Binary Interfaces.
 //!
 //! The wire-format structs live in `fuse_abi_wire.rs`; this prelude only
 //! re-exports the glibc LFS-64 libc names the body uses.
