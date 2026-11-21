@@ -10,6 +10,8 @@ publish = false
 # the main crate's dependency tree or the CI test jobs.
 
 [dependencies]
+async-trait = "0.1.42"
+tokio = { version = "1", features = ["net", "time"] }
 fuse-backend-rs = { path = "../../", default-features = false, features = ["fusedev", "fusedev-uring", "async-io"] }
 log = ">=0.4.6"
 libc = ">=0.2.68"
@@ -17,7 +19,6 @@ simple_logger = ">=1.13.0"
 signal-hook = ">=0.3.10"
 
 [dev-dependencies]
-async-trait = "0.1.42"
 criterion = "0.5"
 vm-memory = { workspace = true }
 vmm-sys-util = "0.15.0"
