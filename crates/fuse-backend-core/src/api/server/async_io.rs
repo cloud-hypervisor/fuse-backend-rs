@@ -609,15 +609,7 @@ impl<F: AsyncFileSystem + Sync> Server<F> {
 
         match result {
             Ok((entry, handle, opts, passthrough)) => {
-                let entry_out = EntryOut {
-                    nodeid: entry.inode,
-                    generation: entry.generation,
-                    entry_valid: entry.entry_timeout.as_secs(),
-                    attr_valid: entry.attr_timeout.as_secs(),
-                    entry_valid_nsec: entry.entry_timeout.subsec_nanos(),
-                    attr_valid_nsec: entry.attr_timeout.subsec_nanos(),
-                    attr: entry.attr.into(),
-                };
+                let entry_out = EntryOut::from(entry);
                 let open_out = OpenOut {
                     fh: handle.map(Into::into).unwrap_or(0),
                     open_flags: opts.bits(),
@@ -769,7 +761,7 @@ mod tests {
 
     use super::super::test_util::TestWriter;
     use super::*;
-    use crate::abi::fuse_abi::{Dirent, InHeader};
+    use crate::abi::fuse_abi::{Dirent, InHeader, FUSE_ATTR_DAX};
     use crate::api::filesystem::{Context, FileSystem, OpenOptions};
     use crate::async_runtime;
 
@@ -1134,7 +1126,7 @@ mod tests {
                 inode: 2,
                 generation: 0,
                 attr: unsafe { std::mem::zeroed() },
-                attr_flags: 0,
+                attr_flags: FUSE_ATTR_DAX,
                 attr_timeout: Duration::from_secs(1),
                 entry_timeout: Duration::from_secs(1),
             };
@@ -1267,6 +1259,8 @@ mod tests {
         let reply = serve_backing(Opcode::Create, &body);
         let offset = size_of::<OutHeader>() + size_of::<EntryOut>();
         assert_eq!(reply.len(), offset + size_of::<OpenOut>());
+        let entry = EntryOut::from_slice(&reply[size_of::<OutHeader>()..offset]).unwrap();
+        assert_eq!(entry.attr.flags, FUSE_ATTR_DAX);
         let out = OpenOut::from_slice(&reply[offset..]).unwrap();
         assert_eq!(out.fh, 4);
         assert_eq!(out.open_flags, OpenOptions::PASSTHROUGH.bits());
