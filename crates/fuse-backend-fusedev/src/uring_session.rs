@@ -2773,6 +2773,13 @@ impl<F: FileSystem + Send + Sync + 'static> UringFuseServing<F> {
     /// INIT request on a classic channel and verifies that the kernel
     /// accepted the capability, returning `Error::UringNotSupported`
     /// otherwise so that the caller can fall back to the classic transport.
+    ///
+    /// Each worker serves one request at a time, and the kernel hands
+    /// requests to the entries of busy workers too. So a handler that takes
+    /// long holds up requests of other queues while other workers idle.
+    /// File systems with slow requests, such as those of a remote store,
+    /// should use `new_async()`, or `SyncFuseServing`, whose threads take a
+    /// request only when they are free.
     pub fn new(
         session: FuseSession,
         server: Arc<Server<F>>,

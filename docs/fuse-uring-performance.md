@@ -53,6 +53,51 @@ The kernel doesn't know which workers are busy, though. A request can land
 on a free entry of a worker that is still serving a slow request of another
 queue, and wait for it while other workers idle.
 
+With `UringFuseServing::new()`, whose workers serve one request at a time,
+that holds fast requests up behind slow ones. The benchmark daemon served
+PassthroughFs over a tmpfs directory with 8 workers, 16 entries per queue
+and `--no-backing-direct-io`, on a 96-CPU machine with Linux 7.3.1, and
+`--delay-us 1000 --delay-prefix slow` made each read of the files named
+`slow.*` wait 1 ms. Four fio jobs read 4 KiB at random from 64 MiB files
+with psync and O_DIRECT, for 10 seconds after a 2 second ramp: alone, next
+to one job that read a slow file the same way, and next to four. The table
+has the reads of the four fast jobs, medians of 3 runs in alternating
+order:
+
+| Serving | Slow jobs | Fast reads/s | p50 | p99 | p99.9 |
+|---------|-----------|--------------|-----|-----|-------|
+| `SyncFuseServing` | 0 | 379k | 10 µs | 14 µs | 18 µs |
+| | 1 | 381k | 10 µs | 14 µs | 17 µs |
+| | 4 | 377k | 10 µs | 15 µs | 17 µs |
+| `AsyncFuseServing` | 0 | 157k | 25 µs | 38 µs | 45 µs |
+| | 1 | 157k | 24 µs | 38 µs | 46 µs |
+| | 4 | 157k | 24 µs | 40 µs | 49 µs |
+| `UringFuseServing::new()` | 0 | 525k | 9 µs | 11 µs | 14 µs |
+| | 1 | 433k | 8 µs | 11 µs | 1.06 ms |
+| | 4 | 163k | 5 µs | 1.06 ms | 1.07 ms |
+| same, 1 entry per queue | 4 | 284k | 7 µs | 14 µs | 2.11 ms |
+| `UringFuseServing::new_async()` | 0 | 414k | 10 µs | 13 µs | 15 µs |
+| | 1 | 411k | 10 µs | 13 µs | 16 µs |
+| | 4 | 389k | 10 µs | 13 µs | 16 µs |
+
+Each queue keeps going to the worker that served it last, and the queues
+end their registration on different workers, see "Buffer pools" below.
+So a slow read holds up the queues of its worker. Next to one slow job,
+fewer than 1 in 100 fast reads of `new()` waited as long as a slow read.
+Next to four, the fast reads fell to 163k/s, with runs between 92k and
+262k depending on the CPUs the jobs ran on, and the slow jobs read 2.9k
+times a second in all, against 3.8k with the other serving layers. When
+every queue ended its registration on the same worker, as a first
+version of the rounds did, all of them went to that worker, and the fast
+reads fell to 105k/s next to one slow job and to 27k/s next to four.
+With one entry per queue, each queue has a single worker. The fast reads
+then ranged from 145k to 305k reads/s, but each CPU can have only one
+request in flight. `new_async()` takes new requests while handlers wait,
+so the slow reads cost the fast ones nothing, as long as the handlers
+don't block the worker thread while they wait. File systems whose
+requests can take long, such as those of a remote store, should use
+`new_async()`, or `SyncFuseServing` if their handlers are synchronous.
+
 ## Root Cause Analysis
 
 ### What It's NOT
