@@ -394,7 +394,10 @@ impl<F: AsyncFileSystem + Sync> Server<F> {
             .await;
 
         match result {
-            Ok(count) => ctx.async_reply_with_data(&data_writer.0, count).await,
+            Ok(count) => match ctx.read_too_long(count, size) {
+                Some(err) => ctx.async_reply_error(err).await,
+                None => ctx.async_reply_with_data(&data_writer.0, count).await,
+            },
             Err(e) => ctx.async_reply_error_explicit(e).await,
         }
     }
@@ -1058,9 +1061,22 @@ impl<'a, F: AsyncFileSystem, S: BitmapSlice, W: Writer> SrvContext<'a, F, S, W> 
         out: Option<T>,
         data: Option<&[u8]>,
     ) -> Result<usize> {
+        self.async_do_reply_ok(out, data, libc::EIO).await
+    }
+
+    /// Replies with `out` and `data`, or with `too_big` if they don't fit in the reply buffer.
+    async fn async_do_reply_ok<T: ByteValued>(
+        &mut self,
+        out: Option<T>,
+        data: Option<&[u8]>,
+        too_big: i32,
+    ) -> Result<usize> {
         let data2 = out.as_ref().map(|v| v.as_slice()).unwrap_or(&[]);
         let data3 = data.unwrap_or(&[]);
         let len = size_of::<OutHeader>() + data2.len() + data3.len();
+        if let Some(err) = self.reply_too_big(len, too_big) {
+            return self.async_reply_error(err).await;
+        }
         let header = OutHeader {
             len: len as u32,
             error: 0,
@@ -1171,7 +1187,10 @@ impl<'a, F: AsyncFileSystem, S: BitmapSlice, W: Writer> SrvContext<'a, F, S, W> 
         result: io::Result<impl Into<XattrReply>>,
     ) -> Result<usize> {
         match result.map(Into::into).and_then(|reply| reply.fit(size)) {
-            Ok(XattrReply::Data(data)) => self.async_reply_ok(None::<u8>, Some(&data)).await,
+            Ok(XattrReply::Data(data)) => {
+                self.async_do_reply_ok(None::<u8>, Some(&data), libc::ERANGE)
+                    .await
+            }
             Ok(XattrReply::Size(size)) => {
                 let out = GetxattrOut {
                     size,
@@ -1190,8 +1209,8 @@ mod tests {
     use std::sync::atomic::AtomicUsize;
 
     use super::super::test_util::{
-        check_malformed, check_oversized, oversized_request, request, request_bodies, request_for,
-        MockFS, NoDax, TestWriter, OVERSIZED_OPCODES,
+        check_fixed, check_malformed, check_oversized, fixed_requests, oversized_request, request,
+        request_bodies, request_for, FixedFs, MockFS, NoDax, TestWriter, OVERSIZED_OPCODES,
     };
     use super::*;
     use crate::abi::fuse_abi::{statvfs64, Dirent, InHeader, RENAME_NOREPLACE, S_IFCHR};
@@ -2558,6 +2577,26 @@ mod tests {
                     .await
             };
             check_oversized(opcode, res, &reply);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_async_server_answers_replies_that_dont_fit() {
+        let server = Server::new(FixedFs);
+        for (opcode, body, room, error) in fixed_requests() {
+            let mut req = request(opcode, &body);
+            let mut reply = vec![0u8; room];
+            let res = unsafe {
+                server
+                    .async_handle_message(
+                        Reader::<()>::from_slice(&mut req),
+                        TestWriter::new(&mut reply),
+                        None,
+                        None,
+                    )
+                    .await
+            };
+            check_fixed(opcode, room, error, res, &reply);
         }
     }
 }

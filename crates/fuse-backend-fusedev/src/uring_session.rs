@@ -2571,10 +2571,10 @@ mod tests {
     }
 
     #[test]
-    fn test_process_rejects_oversized_reply() {
+    fn test_process_oversized_reply_gets_eio() {
         let (worker, _source) = make_worker();
-        // A payload area too small to hold the GETATTR reply body must be
-        // rejected instead of panicking in the staging copy.
+        // The GETATTR reply body doesn't fit in the payload area, so the
+        // server answers EIO without writing it.
         let mut entry = UringEntry::new(0, Payload::Own(8));
         plant_request(
             &mut entry,
@@ -2582,7 +2582,10 @@ mod tests {
             GetattrIn::default().as_slice(),
             &[],
         );
-        assert!(process_entry(&worker, &mut entry).is_err());
+        process_entry(&worker, &mut entry).unwrap();
+        let out = parse_out_header(&entry);
+        assert_eq!((out.len as usize, out.error), (OUT_HEADER_SIZE, -libc::EIO));
+        assert_eq!(entry.header().ring_ent_in_out.payload_sz, 0);
     }
 
     /// A zero-copy sink that records what it was asked to read.
