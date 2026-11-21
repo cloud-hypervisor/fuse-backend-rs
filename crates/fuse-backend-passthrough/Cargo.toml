@@ -45,7 +45,7 @@ default = []
 # forwarding cannot be platform-conditional, so the feature is accepted on the
 # other platforms and falls back to `AsyncFileSystem`'s default methods, which
 # delegate to the synchronous handlers.
-async-io = ["async-trait", "tokio/rt", "fuse-backend-core/async-io"]
+async-io = ["async-trait", "tokio/rt", "tokio/sync", "fuse-backend-core/async-io"]
 # The DAX window callbacks (`setupmapping`/`removemapping`) operate on
 # `fuse_backend_core::abi::virtio_fs` types, which are gated on core's
 # `virtiofs` cfg. The feature is forwarded from the umbrella
