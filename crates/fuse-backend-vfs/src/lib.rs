@@ -633,15 +633,20 @@ impl Vfs {
     /// from external IDs to internal IDs.
     fn remap_ctx_ids(&self, ctx: &mut Context, mapping: Option<(u32, u32, u32)>) -> Result<()> {
         if let Some((internal_id, external_id, range)) = mapping {
-            ctx.uid = remap_id(ctx.uid, external_id, internal_id, range);
-            ctx.gid = remap_id(ctx.gid, external_id, internal_id, range);
+            // FUSE_INVALID_UIDGID stays invalid whatever the mapping.
+            let remap = |id| match id {
+                u32::MAX => id,
+                id => remap_id(id, external_id, internal_id, range),
+            };
+            ctx.uid = remap(ctx.uid);
+            ctx.gid = remap(ctx.gid);
             // Translate the supplementary group list with the same security
             // policy as remap_ctx_supp_gid(): groups outside the mapped range
             // have no host counterpart and are dropped rather than adopted
-            // untranslated.
+            // untranslated, and so is FUSE_INVALID_UIDGID.
             if let Some(groups) = ctx.supplementary_groups.as_mut() {
                 groups.retain_mut(|gid| {
-                    if *gid >= external_id && *gid - external_id < range {
+                    if *gid != u32::MAX && *gid >= external_id && *gid - external_id < range {
                         *gid = *gid - external_id + internal_id;
                         true
                     } else {
@@ -661,14 +666,14 @@ impl Vfs {
     /// request-wide remap has already run (see `id_remap_with_nodeid()`),
     /// so the supplementary group must be translated separately at the
     /// create-family entry points, where the target mount is known.  A
-    /// gid outside the mapped range has no legitimate host counterpart
-    /// and is dropped: a guest must never be able to make the daemon
-    /// adopt an arbitrary host supplementary group.
+    /// gid outside the mapped range, like FUSE_INVALID_UIDGID, has no
+    /// legitimate host counterpart and is dropped: a guest must never be
+    /// able to make the daemon adopt an arbitrary host supplementary group.
     fn remap_ctx_supp_gid(&self, ctx: &mut Context, fs_idx: VfsIndex) {
         if let (Some(gid), Some((internal_id, external_id, range))) =
             (ctx.supp_gid, self.get_effective_id_mapping(fs_idx))
         {
-            ctx.supp_gid = if gid >= external_id && gid - external_id < range {
+            ctx.supp_gid = if gid != u32::MAX && gid >= external_id && gid - external_id < range {
                 Some(gid - external_id + internal_id)
             } else {
                 None

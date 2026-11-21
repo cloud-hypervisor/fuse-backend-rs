@@ -26,6 +26,12 @@ pub struct Config {
     /// connection-wide and comes from `VfsOptions::out_opts` instead. The `Auto` and `Always`
     /// policies never open files with `DIRECT_IO`, so the option does nothing for them.
     pub allow_mmap: bool,
+    /// Whether to negotiate `FsOptions::ALLOW_IDMAP` when mounted on its own, so that the mount
+    /// can be idmapped. The kernel then sends `FUSE_INVALID_UIDGID` as the ids of every request
+    /// that doesn't create an inode. `OverlayFs` and its `PassthroughFs` layers need the ids only
+    /// to create inodes, but layers of other types may need more.
+    /// Behind a `Vfs` the flag comes from `VfsOptions::out_opts` instead.
+    pub allow_idmap: bool,
     pub attr_timeout: Duration,
     pub entry_timeout: Duration,
 }

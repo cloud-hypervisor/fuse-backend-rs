@@ -1659,6 +1659,24 @@ mod tests {
 
     #[test]
     #[cfg(target_os = "linux")]
+    fn test_init_allow_idmap() {
+        let tmpdir = TempDir::new().expect("Cannot create temporary directory.");
+        for allow_idmap in [false, true] {
+            let fs = PassthroughFs::<()>::new(Config {
+                do_import: false,
+                root_dir: tmpdir.as_path().to_string_lossy().to_string(),
+                allow_idmap,
+                ..Default::default()
+            })
+            .unwrap();
+            fs.import().unwrap();
+            let opts = fs.init(FsOptions::ALLOW_IDMAP).unwrap();
+            assert_eq!(opts.contains(FsOptions::ALLOW_IDMAP), allow_idmap);
+        }
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
     fn test_generic_read_write_noopen() {
         let tmpdir = TempDir::new().expect("Cannot create temporary directory.");
         // Prepare passthrough fs.
