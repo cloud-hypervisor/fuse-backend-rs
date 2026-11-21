@@ -212,6 +212,13 @@
   still works and makes an idle task check the flag every 100ms. `AsyncFuseServing` and the
   `/dev/fuse` thread of `UringFuseServing::new_async()` stop with a signal, so their idle tasks
   no longer wake 10 times a second.
+- [NNN](link): `UringConfig::defer_taskrun` makes the workers of `UringFuseServing::new()`
+  create their rings with `IORING_SETUP_SINGLE_ISSUER` and `IORING_SETUP_DEFER_TASKRUN`, so the
+  kernel copies requests into their entries when they wait for the next one instead of
+  interrupting their handlers. On Linux 7.3.1, that made stats and 4 KiB reads that a client
+  sends one at a time faster. It is off by default, because Linux 7.2.0-7.2.13 and 7.3.0-7.3.1
+  can miss the wake-up of a worker waiting on such a ring. `new_async()` ignores it.
+  `UringConfig` has a new field.
 
 ### Changed
 - [325](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/325): The `fuse-backend-fusedev` `uring` transport uses io-uring 0.6 instead of 0.5,

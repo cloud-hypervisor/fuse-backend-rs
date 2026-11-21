@@ -286,6 +286,73 @@ seconds, and the two settings alternated three times:
 Zero-copy saves the copy of the payload, which matters for large
 requests. At 128 KiB the two runs overlap.
 
+## Ring setup flags
+
+The kernel copies a request into its ring entry in task work of the
+worker that owns the ring. With the default ring flags, that work
+interrupts the worker, also while it runs a handler. With
+`UringConfig::defer_taskrun`, the workers of `UringFuseServing::new()`
+create their rings with `IORING_SETUP_SINGLE_ISSUER` and
+`IORING_SETUP_DEFER_TASKRUN` (Linux 6.1), so the work waits until the
+worker waits for completions, and then runs for all the requests that
+arrived meanwhile. A worker creates its ring itself and is the only
+thread that submits to it. If the kernel refuses the flags with EINVAL,
+the worker creates the ring without them.
+
+The setting is off by default because of a kernel bug. On Linux 7.2.0 to
+7.2.13, 7.3.0 and 7.3.1, a thread that waits for completions on such a
+ring can miss its wake-up. It then sleeps with work queued until a signal
+interrupts the wait, and its requests get no answer. Commit 8257f6ec45ee ("io_uring: don't lose the DEFER_TASKRUN wake up")
+fixed it in 7.4-rc1, 7.3.2 and 7.2.14. The bug came with d46ab2c98aba
+("io_uring: switch local task_work to a mpscq") in 7.2, so older kernels
+don't have it.
+
+The table shows the throughput of the benchmark daemon with `--uring
+--no-backing-direct-io`, 4 workers and 16 entries per queue, without and
+with `--uring-defer-taskrun`, on a 96-CPU machine with Linux 7.3.1,
+serving files from a tmpfs as root. fio ran 4 jobs for 8 seconds: direct
+random 4 KiB reads of 256 MiB files, with one read in flight per job
+(psync) or with libaio at depth 16, and direct sequential 1 MiB reads of
+1 GiB files at depth 16. It also created 50000 files per job with the
+filecreate engine. The stats came from a program that called `stat()` on
+those 200000 files from 4 threads in a fresh mount, so each one sent a
+LOOKUP. Each workload got a mount of its own. Medians of 8 runs, 5 for
+the reads at depth 1:
+
+| Workload | Default | Deferred | p99, default | p99, deferred |
+|----------|---------|----------|--------------|---------------|
+| stats | 215k/s | 265k/s | 25 µs | 23 µs |
+| creates | 44.3k/s | 44.9k/s | 114 µs | 111 µs |
+| 4 KiB reads, depth 1 | 376k IOPS | 471k IOPS | 16 µs | 15 µs |
+| 4 KiB reads, depth 16 | 904k IOPS | 885k IOPS | 93 µs | 96 µs |
+| 1 MiB reads | 18342 MiB/s | 18327 MiB/s | 4.2 ms | 3.9 ms |
+| 1 MiB zero-copy reads | 26702 MiB/s | 26755 MiB/s | 2.8 ms | 2.7 ms |
+
+Requests that a client waits for one at a time got faster. The stats ran
+at 205k-247k per second with the default flags and at 240k-293k with
+deferred task work, and the reads at depth 1 at 363k-394k and 451k-503k
+IOPS. The daemon spent 3.6 µs of CPU time per read at depth 1 instead of
+4.1 µs. The other rows stayed within the spread of their runs, and so did
+the CPU time per operation and the VmRSS of the daemon. With 96 workers,
+one per CPU, the stats went from 217k to 250k per second over 3 runs, and
+the creates and 4 KiB reads at depth 16 stayed within the spread. In a
+later set of 5 runs per setting, the stats went from 203k to 277k per
+second (196k-331k and 270k-363k), and the reads at depth 1 from 417k to
+449k IOPS (370k-433k and 434k-559k).
+
+The workers of `UringFuseServing::new_async()` ignore the setting. They
+wait for completions in epoll on the ring fd, and from Linux 6.3 on, the
+kernel doesn't wake epoll for deferred task work until commit
+b88902d8745a ("io_uring: wake ring pollers for local task_work"), which
+is in 7.4-rc1, 7.3.2, 7.2.14 and 6.18.60. On 7.3.1, with the flags, the
+first request after the mount never got an answer.
+
+`IORING_SETUP_COOP_TASKRUN` runs the task work when the worker next
+enters the kernel, instead of interrupting it with an IPI. With both
+kinds of workers, it stayed within the spread of the runs in every
+workload above, and so did `IORING_SETUP_SINGLE_ISSUER` alone, over 3
+runs each.
+
 ## Implementation Notes
 
 ### Current State
@@ -297,6 +364,8 @@ and uses the buffer pools of protocol 7.46 (kernel 7.3) when the kernel has them
 - Per-CPU queue model with configurable entries_per_queue
 - Buffer pools with configurable bufs_per_queue, see "Buffer pools" above
 - Zero-copy for opens that ask for it, see "Zero-copy" above
+- Deferred task work for the synchronous handlers as an option, see "Ring
+  setup flags" above
 - Fallback to classic `/dev/fuse` for notifications/interrupts
 
 ### Tuning Recommendations
@@ -321,6 +390,11 @@ and uses the buffer pools of protocol 7.46 (kernel 7.3) when the kernel has them
   queues. It is capped at `entries_per_queue` times the number of queues.
   Each worker is a thread with its own ring, and with zero-copy also a
   memory file of one payload buffer.
+
+- `defer_taskrun`: Default is off, because some kernels lose wake-ups
+  with it. It speeds up requests that a client sends one at a time with
+  `new()`. "Ring setup flags" above has the numbers and the kernels.
+  `new_async()` ignores it.
 
 ## References
 
