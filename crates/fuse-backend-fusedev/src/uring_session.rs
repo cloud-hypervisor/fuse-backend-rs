@@ -98,11 +98,14 @@ pub struct UringConfig {
     /// takes a reply body, and it lends the free buffer with the lowest
     /// address first. A request waits in the kernel while all buffers of its
     /// queue are busy. A pool holds at most `entries_per_queue` buffers,
-    /// because each entry holds at most one. `0`, or a kernel without
+    /// because each entry holds at most one. `Some(0)`, or a kernel without
     /// buffer pools, gives every entry a buffer of its own instead.
-    /// `UringFuseServing::new_async()` makes any other value
-    /// `entries_per_queue`.
-    pub bufs_per_queue: usize,
+    ///
+    /// `None` gives 4 buffers with `UringFuseServing::new()`, and
+    /// `entries_per_queue` with `UringFuseServing::new_async()`, whose
+    /// requests keep their buffers while their handlers wait. See
+    /// `new_async()` before giving it fewer.
+    pub bufs_per_queue: Option<usize>,
     /// Serve the reads and writes of opens that ask for it with zero-copy
     /// (`OpenOptions::IO_URING_ZERO_COPY`, Linux 7.3). The kernel lends the
     /// client's pages to the request, and the transport moves the data
@@ -123,7 +126,7 @@ impl Default for UringConfig {
         UringConfig {
             workers: 0,
             entries_per_queue: 4,
-            bufs_per_queue: 4,
+            bufs_per_queue: None,
             zero_copy: false,
         }
     }
@@ -2749,6 +2752,10 @@ fn release_entries(mut ring: FuseRing, entries: Vec<UringEntry>, completions: Co
     drop(ring);
 }
 
+/// The buffers per queue of `UringFuseServing::new()` when
+/// `UringConfig::bufs_per_queue` is `None`.
+const DEFAULT_BUFS_PER_QUEUE: usize = 4;
+
 /// Serve FUSE requests over io_uring (experimental).
 ///
 /// The serving layer takes ownership of the mounted session: dropping it
@@ -2785,15 +2792,24 @@ impl<F: FileSystem + Send + Sync + 'static> UringFuseServing<F> {
         server: Arc<Server<F>>,
         cfg: UringConfig,
     ) -> Result<UringFuseServing<F>> {
-        Self::start(session, server, cfg, UringWorker::run, Self::fallback_sync)
+        Self::start(
+            session,
+            server,
+            cfg,
+            DEFAULT_BUFS_PER_QUEUE,
+            UringWorker::run,
+            Self::fallback_sync,
+        )
     }
 
     /// Handle INIT, then start the workers, each running `run`, and the
-    /// fallback thread that `fallback` prepares.
+    /// fallback thread that `fallback` prepares. A `bufs_per_queue` of
+    /// `None` gives the pools `default_bufs` buffers.
     fn start(
         mut session: FuseSession,
         server: Arc<Server<F>>,
         cfg: UringConfig,
+        default_bufs: usize,
         run: RunFn<F>,
         fallback: FallbackFn<F>,
     ) -> Result<UringFuseServing<F>> {
@@ -2839,7 +2855,10 @@ impl<F: FileSystem + Send + Sync + 'static> UringFuseServing<F> {
 
         // A queue's entries hold at most one buffer each, so more buffers
         // than entries would never be lent.
-        let bufs_per_queue = cfg.bufs_per_queue.min(entries_per_queue);
+        let bufs_per_queue = cfg
+            .bufs_per_queue
+            .unwrap_or(default_bufs)
+            .min(entries_per_queue);
         let spread = spread_entries(nr_queues, entries_per_queue, workers, bufs_per_queue);
         let workers = spread.len();
         // The kernel takes a 16-bit buffer table slot per entry, and each
@@ -3067,23 +3086,24 @@ impl<F: AsyncFileSystem + Send + Sync + 'static> UringFuseServing<F> {
     /// handler panics.
     ///
     /// A request keeps its payload buffer while its handler waits, so a
-    /// queue's buffer pool gets `entries_per_queue` buffers, whatever
-    /// non-zero `bufs_per_queue` says. `docs/fuse-uring-performance.md` has
-    /// the numbers. A `bufs_per_queue` of 0 still gives every entry a buffer
-    /// of its own.
+    /// queue's buffer pool gets a buffer per entry unless `bufs_per_queue`
+    /// says otherwise. Fewer buffers take less memory, but the requests that
+    /// wait hold up those of their queue that need a buffer. That can't
+    /// deadlock while no handler waits for another request of the mount. A
+    /// handler that does, such as a READ that waits for a WRITE, needs as
+    /// many buffers per queue as such requests can wait at once, or the
+    /// default. `docs/fuse-uring-performance.md` has the numbers.
     pub fn new_async(
         session: FuseSession,
         server: Arc<Server<F>>,
-        mut cfg: UringConfig,
+        cfg: UringConfig,
     ) -> Result<UringFuseServing<F>> {
-        if cfg.bufs_per_queue > 0 {
-            // start() counts 0 entries as 1.
-            cfg.bufs_per_queue = cfg.entries_per_queue.max(1);
-        }
+        // start() caps the pools at a buffer per entry.
         Self::start(
             session,
             server,
             cfg,
+            usize::MAX,
             UringWorker::run_async,
             Self::fallback_async,
         )
@@ -3160,7 +3180,7 @@ mod tests {
         let cfg = UringConfig {
             workers: 1,
             entries_per_queue: 1,
-            bufs_per_queue: 0,
+            bufs_per_queue: Some(0),
             zero_copy: false,
         };
         let r = UringFuseServing::new(se, server, cfg);
@@ -3639,21 +3659,44 @@ mod tests {
         Arc::new(Server::new(fs))
     }
 
+    /// File systems whose LOOKUPs wait in their async handlers.
     #[cfg(feature = "async-io")]
-    mod barrier_fs {
+    mod waiting_fs {
         /// A root directory in which looking up `wait-<n>` succeeds once
         /// `barrier` has as many lookups waiting as it was created for.
         pub(super) struct BarrierFs {
             pub(super) barrier: tokio::sync::Barrier,
         }
 
+        /// A root directory with a file `f`, in which looking up `hold-<n>`
+        /// waits until an FSYNC.
+        #[derive(Default)]
+        pub(super) struct HoldFs {
+            /// The LOOKUPs of `hold-<n>` in their handlers.
+            pub(super) holding: AtomicUsize,
+            /// Opened by an FSYNC.
+            gate: tokio::sync::watch::Sender<bool>,
+        }
+
         use std::ffi::CStr;
         use std::io;
+        use std::sync::atomic::{AtomicUsize, Ordering};
         use std::time::Duration;
 
         use async_trait::async_trait;
         use fuse_backend_core::abi::fuse_abi::{stat64, FsOptions, ROOT_ID};
         use fuse_backend_core::api::filesystem::{AsyncFileSystem, Context, Entry, FileSystem};
+
+        fn entry(inode: u64) -> Entry {
+            Entry {
+                inode,
+                generation: 0,
+                attr: stat(inode),
+                attr_flags: 0,
+                attr_timeout: Duration::ZERO,
+                entry_timeout: Duration::ZERO,
+            }
+        }
 
         pub(super) fn stat(inode: u64) -> stat64 {
             // Safe because stat64 is plain data.
@@ -3696,14 +3739,63 @@ mod tests {
                     return Err(io::Error::from_raw_os_error(libc::ENOENT));
                 };
                 self.barrier.wait().await;
-                Ok(Entry {
-                    inode: ROOT_ID + 1 + n,
-                    generation: 0,
-                    attr: stat(ROOT_ID + 1 + n),
-                    attr_flags: 0,
-                    attr_timeout: Duration::ZERO,
-                    entry_timeout: Duration::ZERO,
-                })
+                Ok(entry(ROOT_ID + 1 + n))
+            }
+
+            async fn async_getattr(
+                &self,
+                ctx: &Context,
+                inode: u64,
+                handle: Option<u64>,
+            ) -> io::Result<(stat64, Duration)> {
+                Ok((stat(inode), Duration::ZERO))
+            }
+        }
+
+        impl HoldFs {
+            /// Let the LOOKUPs of `hold-<n>` finish.
+            pub(super) fn open_gate(&self) {
+                self.gate.send_replace(true);
+            }
+        }
+
+        impl FileSystem for HoldFs {
+            type Inode = u64;
+            type Handle = u64;
+
+            fn init(&self, capable: FsOptions) -> io::Result<FsOptions> {
+                Ok(capable & FsOptions::PARALLEL_DIROPS)
+            }
+
+            fn fsync(&self, _ctx: &Context, _inode: u64, _data: bool, _h: u64) -> io::Result<()> {
+                self.open_gate();
+                Ok(())
+            }
+        }
+
+        #[allow(unused_variables)]
+        #[async_trait]
+        impl AsyncFileSystem for HoldFs {
+            async fn async_lookup(
+                &self,
+                ctx: &Context,
+                parent: u64,
+                name: &CStr,
+            ) -> io::Result<Entry> {
+                let name = name.to_str().unwrap_or_default();
+                if name == "f" {
+                    return Ok(entry(ROOT_ID + 1));
+                }
+                let Some(n) = name
+                    .strip_prefix("hold-")
+                    .and_then(|n| n.parse::<u64>().ok())
+                else {
+                    return Err(io::Error::from_raw_os_error(libc::ENOENT));
+                };
+                self.holding.fetch_add(1, Ordering::SeqCst);
+                let _ = self.gate.subscribe().wait_for(|open| *open).await;
+                self.holding.fetch_sub(1, Ordering::SeqCst);
+                Ok(entry(ROOT_ID + 2 + n))
             }
 
             async fn async_getattr(
@@ -3720,7 +3812,7 @@ mod tests {
     #[cfg(feature = "async-io")]
     #[test]
     fn test_uring_async_serving_overlaps_requests() {
-        use barrier_fs::BarrierFs;
+        use waiting_fs::BarrierFs;
 
         const LOOKUPS: usize = 4;
         let mnt = TempDir::new().unwrap();
@@ -3786,7 +3878,7 @@ mod tests {
                 inode: u64,
                 _handle: Option<u64>,
             ) -> io::Result<(stat64, Duration)> {
-                Ok((super::barrier_fs::stat(inode), Duration::ZERO))
+                Ok((super::waiting_fs::stat(inode), Duration::ZERO))
             }
         }
 
@@ -4327,15 +4419,15 @@ mod tests {
     }
 
     /// Serve a PassthroughFs over io_uring with `start`, `workers` workers,
-    /// 2 entries and `bufs_per_queue` buffers per queue, and zero-copy if
-    /// `zero_copy`. Check that a kernel with buffer pools gives each queue
-    /// `pool_bufs` buffers, read and write through the mount, then check
-    /// that dropping the serving layer gets the ring entries back from the
-    /// kernel and unmounts.
+    /// 2 entries per queue, `bufs_per_queue`, and zero-copy if `zero_copy`.
+    /// Check that a kernel with buffer pools gives each queue `pool_bufs`
+    /// buffers, read and write through the mount, then check that dropping
+    /// the serving layer gets the ring entries back from the kernel and
+    /// unmounts.
     fn check_passthrough_mount(
         start: StartFn<PassthroughFs<()>>,
         workers: usize,
-        bufs_per_queue: usize,
+        bufs_per_queue: Option<usize>,
         zero_copy: bool,
         pool_bufs: usize,
     ) {
@@ -4360,8 +4452,8 @@ mod tests {
             assert!(serving.zero_copy);
         }
         eprintln!(
-            "uring mount: {workers} workers, {bufs_per_queue} buffers per queue, zero-copy {}",
-            serving.zero_copy
+            "uring mount: {workers} workers, {} buffers per queue, zero-copy {}",
+            serving.pool_bufs, serving.zero_copy
         );
 
         assert_eq!(
@@ -4411,11 +4503,16 @@ mod tests {
 
     #[test]
     fn test_uring_serving_mount() {
-        for (bufs_per_queue, zero_copy) in
-            [(0, false), (1, false), (4, false), (1, true), (4, true)]
-        {
-            // A pool holds at most as many buffers as the queue has entries.
-            let pool_bufs = bufs_per_queue.min(2);
+        // A pool holds at most as many buffers as the queue has entries, and
+        // the default of 4 is more.
+        for (bufs_per_queue, zero_copy, pool_bufs) in [
+            (Some(0), false, 0),
+            (Some(1), false, 1),
+            (Some(4), false, 2),
+            (None, false, 2),
+            (Some(1), true, 1),
+            (Some(4), true, 2),
+        ] {
             check_passthrough_mount(
                 UringFuseServing::new,
                 2,
@@ -4429,10 +4526,127 @@ mod tests {
     #[cfg(feature = "async-io")]
     #[test]
     fn test_uring_async_serving_mount() {
-        // A pool gets a buffer per entry, even when the config asks for 1.
-        check_passthrough_mount(UringFuseServing::new_async, 2, 0, false, 0);
-        check_passthrough_mount(UringFuseServing::new_async, 2, 1, false, 2);
-        check_passthrough_mount(UringFuseServing::new_async, 2, 1, true, 2);
+        // A pool gets a buffer per entry by default, and fewer on request.
+        for (bufs_per_queue, zero_copy, pool_bufs) in [
+            (Some(0), false, 0),
+            (None, false, 2),
+            (Some(1), false, 1),
+            (Some(1), true, 1),
+        ] {
+            check_passthrough_mount(
+                UringFuseServing::new_async,
+                2,
+                bufs_per_queue,
+                zero_copy,
+                pool_bufs,
+            );
+        }
+    }
+
+    /// Pin the calling thread to `cpu`, so that its requests go to the
+    /// queue of that CPU.
+    #[cfg(feature = "async-io")]
+    fn pin_to_cpu(cpu: usize) {
+        // Safe because the set is plain data that outlives the call.
+        unsafe {
+            let mut set: libc::cpu_set_t = std::mem::zeroed();
+            libc::CPU_SET(cpu, &mut set);
+            let size = std::mem::size_of::<libc::cpu_set_t>();
+            assert_eq!(libc::sched_setaffinity(0, size, &set), 0);
+        }
+    }
+
+    /// A smaller pool than one buffer per entry holds up only the requests
+    /// that need a buffer. One LOOKUP holds the only buffer of its queue
+    /// while it waits, a second waits in the kernel for the buffer, and an
+    /// FSYNC, which needs no buffer, still reaches the handler and lets
+    /// both finish. If the FSYNC waited behind the second LOOKUP, the mount
+    /// would hang.
+    #[cfg(feature = "async-io")]
+    #[test]
+    fn test_uring_async_serving_small_pool() {
+        let mnt = TempDir::new().unwrap();
+        let fs = Arc::new(waiting_fs::HoldFs::default());
+        let server = Arc::new(Server::new(fs.clone()));
+        let cfg = UringConfig {
+            workers: 1,
+            entries_per_queue: 4,
+            bufs_per_queue: Some(1),
+            zero_copy: false,
+        };
+        let Some(serving) = mount_uring(
+            server.clone(),
+            mnt.as_path(),
+            cfg,
+            UringFuseServing::new_async,
+        ) else {
+            return;
+        };
+        if !server.uring_bufpool_supported() {
+            eprintln!("the kernel has no buffer pools, skipping");
+            return;
+        }
+        assert_eq!(serving.pool_bufs, 1);
+        // Dropping the serving layer waits for the LOOKUPs, so let them
+        // finish when a check fails, before the drop.
+        struct Release(Arc<waiting_fs::HoldFs>);
+        impl Drop for Release {
+            fn drop(&mut self) {
+                self.0.open_gate();
+            }
+        }
+        let _release = Release(fs.clone());
+        let abort = ConnectionAbort::new(serving.session.mountpoint());
+        let Some(waiting) = abort.path.as_ref().map(|p| p.with_file_name("waiting")) else {
+            eprintln!("fusectl isn't mounted, skipping");
+            return;
+        };
+        // The number of requests the kernel waits for.
+        let waiting = move || -> usize {
+            let n = std::fs::read_to_string(&waiting).unwrap();
+            n.trim().parse().unwrap()
+        };
+        let file = File::open(mnt.as_path().join("f")).unwrap();
+
+        // Send the requests from one CPU, so they share its queue.
+        // Safe because sched_getcpu() takes no arguments.
+        let cpu = unsafe { libc::sched_getcpu() };
+        assert!(cpu >= 0);
+        let cpu = cpu as usize;
+        let (tx, rx) = channel();
+        for n in 0..2 {
+            let path = mnt.as_path().join(format!("hold-{n}"));
+            let tx = tx.clone();
+            thread::spawn(move || {
+                pin_to_cpu(cpu);
+                let res = std::fs::metadata(path)
+                    .map(|_| ())
+                    .map_err(|e| e.to_string());
+                tx.send(res).unwrap();
+            });
+            let start = Instant::now();
+            while waiting() < n + 1 {
+                assert!(start.elapsed() < Duration::from_secs(5), "no LOOKUP {}", n);
+                thread::sleep(Duration::from_millis(10));
+            }
+        }
+        // The second LOOKUP waits for the buffer that the first one holds.
+        thread::sleep(Duration::from_millis(100));
+        assert_eq!(fs.holding.load(Ordering::SeqCst), 1);
+
+        let fsync = thread::spawn(move || {
+            pin_to_cpu(cpu);
+            file.sync_all()
+        });
+        for _ in 0..2 {
+            let Ok(res) = rx.recv_timeout(Duration::from_secs(5)) else {
+                abort.abort().unwrap();
+                panic!("the LOOKUPs waited for the FSYNC, and it for a buffer");
+            };
+            assert_eq!(res, Ok(()));
+        }
+        fsync.join().unwrap().unwrap();
+        drop(serving);
     }
 
     /// With more workers than queues, every queue's entries are spread over
@@ -4442,7 +4656,7 @@ mod tests {
         check_passthrough_mount(
             UringFuseServing::new,
             possible_cpu_count().unwrap() + 1,
-            0,
+            Some(0),
             false,
             0,
         );
@@ -4530,7 +4744,7 @@ mod tests {
         let cfg = UringConfig {
             workers: 1,
             entries_per_queue: 1,
-            bufs_per_queue: 0,
+            bufs_per_queue: Some(0),
             zero_copy: false,
         };
         let serving = match start(se, server, cfg) {
@@ -4579,7 +4793,7 @@ mod tests {
         let cfg = UringConfig {
             workers: 2,
             entries_per_queue: 2,
-            bufs_per_queue: 0,
+            bufs_per_queue: Some(0),
             zero_copy: false,
         };
         let serving = mount_uring(server, mnt, cfg, start)?;
@@ -4740,7 +4954,7 @@ mod tests {
         let cfg = UringConfig {
             workers: 2,
             entries_per_queue: 2,
-            bufs_per_queue: 0,
+            bufs_per_queue: Some(0),
             zero_copy: false,
         };
         let serving = match UringFuseServing::new(se, server, cfg) {
