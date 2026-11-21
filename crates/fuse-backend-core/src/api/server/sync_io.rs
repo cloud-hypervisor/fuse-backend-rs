@@ -744,8 +744,20 @@ impl<F: FileSystem + Sync> Server<F> {
         ctx: &mut SrvContext<'_, F, S, W>,
     ) -> Result<usize> {
         let SetxattrIn { size, flags } = ctx.r.read_obj().map_err(Error::DecodeMessage)?;
-        let buf =
-            ServerUtil::get_message_body(&mut ctx.r, &ctx.in_header, size_of::<SetxattrIn>())?;
+        // macFUSE gives bit 29 of the INIT flags another meaning.
+        #[cfg(not(target_os = "macos"))]
+        let in_size = if self.options.load(Ordering::Acquire) & FsOptions::SETXATTR_EXT.bits() != 0
+        {
+            let SetxattrIn2 { setxattr_flags, .. } =
+                ctx.r.read_obj().map_err(Error::DecodeMessage)?;
+            ctx.context.setxattr_flags = setxattr_flags;
+            size_of::<SetxattrIn>() + size_of::<SetxattrIn2>()
+        } else {
+            size_of::<SetxattrIn>()
+        };
+        #[cfg(target_os = "macos")]
+        let in_size = size_of::<SetxattrIn>();
+        let buf = ServerUtil::get_message_body(&mut ctx.r, &ctx.in_header, in_size)?;
 
         // The name and value and encoded one after another and separated by a '\0' character.
         let split_pos = match buf.iter().position(|c| *c == b'\0').map(|p| p + 1) {
@@ -2156,6 +2168,73 @@ mod tests {
         server.handle_message(reader, writer, None, None).unwrap();
         let out = OutHeader::from_slice(&write_buf[..size_of::<OutHeader>()]).unwrap();
         assert_eq!(out.unique, unique);
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn test_server_setxattr_ext() {
+        use crate::api::filesystem::Context;
+        use std::ffi::CStr;
+
+        // Records the setxattr flags and the name and value of the last setxattr request.
+        #[derive(Default)]
+        struct XattrFs(std::sync::Mutex<Option<(u32, Vec<u8>)>>);
+        impl FileSystem for XattrFs {
+            type Inode = u64;
+            type Handle = u64;
+
+            fn setxattr(
+                &self,
+                ctx: &Context,
+                _inode: u64,
+                name: &CStr,
+                value: &[u8],
+                _flags: u32,
+            ) -> io::Result<()> {
+                *self.0.lock().unwrap() =
+                    Some((ctx.setxattr_flags, [name.to_bytes(), value].concat()));
+                Ok(())
+            }
+        }
+
+        let name_value = b"system.posix_acl_access\0value";
+        let setxattr_in = SetxattrIn { size: 5, flags: 0 };
+        let setxattr_in2 = SetxattrIn2 {
+            setxattr_flags: SETXATTR_ACL_KILL_SGID,
+            padding: 0,
+        };
+        for ext in [false, true] {
+            let server = Server::new(XattrFs::default());
+            let in2: &[u8] = if ext {
+                let (version, _) = server.init_state();
+                server.restore_init(version, FsOptions::SETXATTR_EXT);
+                setxattr_in2.as_slice()
+            } else {
+                &[]
+            };
+            let header = InHeader {
+                len: (size_of::<InHeader>()
+                    + size_of::<SetxattrIn>()
+                    + in2.len()
+                    + name_value.len()) as u32,
+                opcode: Opcode::Setxattr as u32,
+                nodeid: ROOT_ID,
+                ..Default::default()
+            };
+            let mut read_buf =
+                [header.as_slice(), setxattr_in.as_slice(), in2, name_value].concat();
+            let mut write_buf = [0u8; 4096];
+            let reader = Reader::<()>::from_slice(&mut read_buf);
+            let writer = TestWriter::new(&mut write_buf);
+            server.handle_message(reader, writer, None, None).unwrap();
+            let mut out = OutHeader::default();
+            out.as_mut_slice()
+                .copy_from_slice(&write_buf[..size_of::<OutHeader>()]);
+            assert_eq!(out.error, 0, "ext {}", ext);
+            let (flags, name_value) = server.fs.0.lock().unwrap().take().unwrap();
+            assert_eq!(flags, if ext { SETXATTR_ACL_KILL_SGID } else { 0 });
+            assert_eq!(name_value, b"system.posix_acl_accessvalue");
+        }
     }
 
     #[cfg(target_os = "linux")]

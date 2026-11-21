@@ -32,6 +32,13 @@
   directly by the fusedev build script.
 
 ### Added
+- [342](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/342): Support `FsOptions::SETXATTR_EXT` on Linux and FreeBSD. The
+  server reads the flags of the extended setxattr request into the new
+  `Context::setxattr_flags`, on `/dev/fuse` and on io_uring. `PassthroughFs`
+  negotiates it and clears the set-group-ID bit before it sets
+  `system.posix_acl_access` when the kernel sends `SETXATTR_ACL_KILL_SGID`.
+  `Vfs` passes the flags to its backends but leaves the option out of its
+  default `out_opts`.
 - [304](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/304): Give FreeBSD a verification path. The Linux wire-format ABI
   body moves out of `fuse_abi_linux.rs` into a shared `fuse_abi_wire.rs`
   (each per-OS prelude re-exports the libc names the body uses), and a new
