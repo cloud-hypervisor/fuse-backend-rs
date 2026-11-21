@@ -42,9 +42,11 @@ impl FileSetLen for File {
 
 /// A trait similar to `Read` and `Write`, but uses [FileVolatileSlice] objects as data buffers.
 pub trait FileReadWriteVolatile {
-    /// The file descriptor behind this file, if it has one. A transport
-    /// uses it to move data between the file and memory the server can't
-    /// map, such as the client pages of FUSE-over-io_uring zero-copy.
+    /// The file descriptor behind this file, if it has one. A transport can
+    /// use it to move the file's data with a syscall such as `splice(2)`
+    /// instead of copying it through memory. It also lets a transport move
+    /// data between the file and memory the server can't map, such as the
+    /// client pages of FUSE-over-io_uring zero-copy.
     fn raw_fd(&self) -> Option<RawFd> {
         None
     }
@@ -482,6 +484,12 @@ mod async_io {
     /// The [AsyncFileReadWriteVolatile] trait is designed to support io-uring based asynchronous IO.
     #[async_trait::async_trait(?Send)]
     pub trait AsyncFileReadWriteVolatile {
+        /// The file descriptor behind this file, if it has one, like
+        /// [FileReadWriteVolatile::raw_fd].
+        fn raw_fd(&self) -> Option<RawFd> {
+            None
+        }
+
         /// Read bytes from this file at `offset` into the given slice in asynchronous mode.
         ///
         /// Return the number of bytes read on success.
@@ -525,6 +533,10 @@ mod async_io {
 
     #[async_trait::async_trait(?Send)]
     impl AsyncFileReadWriteVolatile for File {
+        fn raw_fd(&self) -> Option<RawFd> {
+            Some(self.as_raw_fd())
+        }
+
         async fn async_read_at_volatile(
             &self,
             buf: FileVolatileBuf,
@@ -858,6 +870,10 @@ mod async_io {
 
     #[async_trait::async_trait(?Send)]
     impl<T: AsyncFileReadWriteVolatile + ?Sized> AsyncFileReadWriteVolatile for Arc<T> {
+        fn raw_fd(&self) -> Option<RawFd> {
+            <T as AsyncFileReadWriteVolatile>::raw_fd(&**self)
+        }
+
         async fn async_read_at_volatile(
             &self,
             buf: FileVolatileBuf,

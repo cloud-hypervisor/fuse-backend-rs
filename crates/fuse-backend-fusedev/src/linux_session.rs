@@ -18,6 +18,7 @@ use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, PoisonError};
 
+use crate::splice::SplicePipes;
 use crate::{FuseChannelExt, FuseDevReaderExt, FuseSessionExt};
 use fuse_backend_core::abi::fuse_abi::BackingMap;
 use mio::{Events, Poll, Token, Waker};
@@ -67,6 +68,7 @@ pub struct FuseSession {
     // fusermount binary, default to fusermount3
     fusermount: String,
     mount_flags: Option<MsFlags>,
+    splice_write: bool,
     // Set once detach() has unmounted the file system. A detached mount that is still in use
     // keeps the connection up, so umount() and later detach() calls check this flag to avoid
     // unmounting the mountpoint again. Another mount may be there by then.
@@ -113,6 +115,7 @@ impl FuseSession {
             fusermount: FUSERMOUNT_BIN.to_string(),
             allow_other: true,
             mount_flags: None,
+            splice_write: false,
             detached: Mutex::new(false),
         })
     }
@@ -121,6 +124,33 @@ impl FuseSession {
     /// under the given mnt ns.
     pub fn set_target_mntns(&mut self, pid: Option<libc::pid_t>) {
         self.target_mntns = pid;
+    }
+
+    /// Send READ replies with `splice(2)` when the file system takes the data
+    /// from a file through `ZeroCopyWriter::write_from()`, as `PassthroughFs`
+    /// does. The data then goes from the file's page cache into the FUSE
+    /// request without a copy through user space. It's off by default.
+    ///
+    /// Channels created afterwards get two pipes each for this on their first
+    /// splice. `AsyncFuseServing` splices too, with two pipes for each request
+    /// buffer, see `FuseDevTask::set_splice_write()`. The io_uring queues of
+    /// `UringFuseServing` don't. A channel copies the replies that don't fit
+    /// in its pipes, and stops splicing if the kernel refuses to.
+    ///
+    /// A pipe grows to fit the largest READ it carried and keeps that size.
+    /// Its slots count against the user's `/proc/sys/fs/pipe-user-pages-soft`,
+    /// 16384 by default. For the READs of up to 128 KiB that the kernel sends
+    /// by default, a pair takes up to 128 slots of 4 KiB. With
+    /// `FsOptions::MAX_PAGES`, READs of 1 MiB grow both pipes to
+    /// `pipe-max-size`, 256 slots by default, unless the daemon has
+    /// `CAP_SYS_RESOURCE`. Those READs still copy, because their header
+    /// doesn't fit. A sync channel has one pair, and an async worker one per
+    /// request buffer, up to `max_inflight`, 16 by default. So 8 async
+    /// workers with 16 READs in flight each can reach the limit, or 2 with
+    /// READs of 1 MiB. From then on the user's pipes stop growing, and every
+    /// new pipe of that user gets two slots.
+    pub fn set_splice_write(&mut self, splice: bool) {
+        self.splice_write = splice;
     }
 
     /// Set fusermount binary, default to fusermount3.
@@ -297,7 +327,7 @@ impl FuseSession {
             let file = file
                 .try_clone()
                 .map_err(|e| SessionFailure(format!("dup fd: {e}")))?;
-            let channel = FuseChannel::new(file, self.bufsize)?;
+            let channel = FuseChannel::new(file, self.bufsize, self.splice_pipes())?;
             let waker = channel.get_waker();
             self.add_waker(waker)?;
 
@@ -318,7 +348,21 @@ impl FuseSession {
     /// Requires kernel support for `FUSE_DEV_IOC_CLONE` (kernel >= 4.2).
     pub fn new_blocking_channel(&self) -> Result<BlockingFuseChannel> {
         let file = self.clone_fuse_file()?;
-        Ok(BlockingFuseChannel::new(file, self.bufsize))
+        Ok(BlockingFuseChannel::new(
+            file,
+            self.bufsize,
+            self.splice_pipes(),
+        ))
+    }
+
+    /// Whether `set_splice_write()` turned splicing on.
+    #[cfg(feature = "async-io")]
+    pub(crate) fn splice_write(&self) -> bool {
+        self.splice_write
+    }
+
+    fn splice_pipes(&self) -> Option<SplicePipes> {
+        self.splice_write.then(SplicePipes::new)
     }
 
     /// Wake channel loop and exit
@@ -370,10 +414,11 @@ pub struct FuseChannel {
     waker: Arc<Waker>,
     buf: Vec<u8>,
     events: Events,
+    splice: Option<SplicePipes>,
 }
 
 impl FuseChannel {
-    fn new(file: File, bufsize: usize) -> Result<Self> {
+    fn new(file: File, bufsize: usize, splice: Option<SplicePipes>) -> Result<Self> {
         let poll = Poll::new().map_err(|e| SessionFailure(format!("epoll create: {e}")))?;
         let waker = Waker::new(poll.registry(), EXIT_FUSE_EVENT)
             .map_err(|e| SessionFailure(format!("epoll register session fd: {e}")))?;
@@ -439,6 +484,7 @@ impl FuseChannel {
             waker,
             buf: vec![0x0u8; bufsize],
             events: Events::with_capacity(POLL_EVENTS_CAPACITY),
+            splice,
         })
     }
 
@@ -501,7 +547,9 @@ impl FuseChannel {
                         // Reader::new() and Writer::new() should always return success.
                         let reader =
                             Reader::from_fuse_buffer(FuseBuf::new(&mut self.buf[..len])).unwrap();
-                        let writer = FuseDevWriter::new(fd, buf).unwrap();
+                        let writer = FuseDevWriter::new(fd, buf)
+                            .unwrap()
+                            .with_splice(self.splice.as_ref());
                         return Ok(Some((reader, writer)));
                     }
                     Err(e) => match e {
@@ -557,13 +605,15 @@ impl FuseChannel {
 pub struct BlockingFuseChannel {
     file: File,
     buf: Vec<u8>,
+    splice: Option<SplicePipes>,
 }
 
 impl BlockingFuseChannel {
-    fn new(file: File, bufsize: usize) -> Self {
+    fn new(file: File, bufsize: usize, splice: Option<SplicePipes>) -> Self {
         BlockingFuseChannel {
             file,
             buf: vec![0x0u8; bufsize],
+            splice,
         }
     }
 
@@ -592,7 +642,9 @@ impl BlockingFuseChannel {
                     // Reader::new() and Writer::new() should always return success.
                     let reader =
                         Reader::from_fuse_buffer(FuseBuf::new(&mut self.buf[..len])).unwrap();
-                    let writer = FuseDevWriter::new(fd, buf).unwrap();
+                    let writer = FuseDevWriter::new(fd, buf)
+                        .unwrap()
+                        .with_splice(self.splice.as_ref());
                     return Ok(Some((reader, writer)));
                 }
                 Err(e) => match e {
@@ -974,7 +1026,7 @@ mod tests {
     #[test]
     fn test_new_channel() {
         let file = File::from(nix::unistd::dup(std::io::stdout()).unwrap());
-        let _ = FuseChannel::new(file, 3).unwrap();
+        let _ = FuseChannel::new(file, 3, None).unwrap();
     }
 
     #[test]
@@ -1081,6 +1133,7 @@ mod asyncio {
     use fuse_backend_core::buffer::Reader;
     use fuse_backend_core::file_buf::FileVolatileBuf;
 
+    use crate::splice::SplicePipes;
     use crate::{FuseBuf, FuseDevReaderExt, FuseDevWriter};
 
     /// Default limit on the number of concurrently processed requests.
@@ -1101,38 +1154,53 @@ mod asyncio {
     /// the kernel, which throttles the clients on its own once its queues
     /// fill up.
     struct BufferPool {
-        free: RefCell<Vec<Vec<u8>>>,
+        free: RefCell<Vec<RequestBuf>>,
         created: Cell<usize>,
         buf_size: usize,
         max_inflight: usize,
+        /// Set if the requests splice their READ replies. Their pipes are
+        /// siblings of these, so that they stop splicing together.
+        splice: Option<SplicePipes>,
+    }
+
+    /// The buffer of an in-flight request, and the pipes its READ reply
+    /// splices through. A request can wait between the splice of its data and
+    /// the reply, so every request needs pipes of its own.
+    struct RequestBuf {
+        buf: Vec<u8>,
+        splice: Option<SplicePipes>,
     }
 
     impl BufferPool {
-        fn new(buf_size: usize, max_inflight: usize) -> Self {
+        fn new(buf_size: usize, max_inflight: usize, splice: bool) -> Self {
             BufferPool {
                 free: RefCell::new(Vec::new()),
                 created: Cell::new(0),
                 buf_size,
                 max_inflight: max_inflight.max(1),
+                splice: splice.then(SplicePipes::new),
             }
         }
 
         /// Get a buffer from the pool, allocating a new one lazily if the
         /// pool is empty but the limit hasn't been reached yet, or return
         /// `None` if all buffers are in use.
-        fn try_acquire(&self) -> Option<Vec<u8>> {
+        fn try_acquire(&self) -> Option<RequestBuf> {
             if let Some(buf) = self.free.borrow_mut().pop() {
                 return Some(buf);
             }
             if self.created.get() < self.max_inflight {
                 self.created.set(self.created.get() + 1);
-                return Some(vec![0x0u8; self.buf_size]);
+                return Some(RequestBuf {
+                    buf: vec![0x0u8; self.buf_size],
+                    splice: self.splice.as_ref().map(SplicePipes::sibling),
+                });
             }
             None
         }
 
         /// Return a buffer to the pool for reuse.
-        fn release(&self, buf: Vec<u8>) {
+        fn release(&self, buf: RequestBuf) {
             self.free.borrow_mut().push(buf);
         }
     }
@@ -1164,6 +1232,7 @@ mod asyncio {
         server: Arc<Server<F>>,
         buf_size: usize,
         max_inflight: usize,
+        splice_write: bool,
     }
 
     impl<F: AsyncFileSystem + Sync> FuseDevTask<F> {
@@ -1238,7 +1307,23 @@ mod asyncio {
                 state,
                 buf_size,
                 max_inflight: max_inflight.max(1),
+                splice_write: false,
             }
+        }
+
+        /// Send READ replies with `splice(2)`, as `FuseSession::set_splice_write()` does for
+        /// the channels of a session. `AsyncFuseServing` calls this with the setting of its
+        /// session. It's off by default.
+        ///
+        /// A READ reply splices when the file system hands the transport a file with a
+        /// descriptor through `ZeroCopyWriter::write_from()`, or through
+        /// `AsyncZeroCopyWriter::async_write_from()` on a runtime whose file IO blocks the
+        /// thread, see `FuseDevWriter::async_write_from_at()`. The splice runs on the runtime
+        /// thread. Each request buffer gets two pipes on its first splice and keeps them until
+        /// `poll_handler()` returns, so a task holds up to `max_inflight` pairs. See
+        /// `FuseSession::set_splice_write()` for what they count against.
+        pub fn set_splice_write(&mut self, splice: bool) {
+            self.splice_write = splice;
         }
 
         /// Handler to process fuse requests in asynchronous mode.
@@ -1336,7 +1421,7 @@ mod asyncio {
                 }
                 _ => None,
             };
-            let pool = BufferPool::new(self.buf_size, self.max_inflight);
+            let pool = BufferPool::new(self.buf_size, self.max_inflight, self.splice_write);
             let mut inflight = FuturesUnordered::new();
 
             'serve: while !self.state.load(Ordering::Acquire) {
@@ -1362,7 +1447,7 @@ mod asyncio {
                 // of the read future, so that its borrow of `buf` ends before
                 // the buffer is handed over to a request or the pool.
                 let read_result = {
-                    let read = read_request(&self.file, ready.as_ref(), &self.state, &mut buf);
+                    let read = read_request(&self.file, ready.as_ref(), &self.state, &mut buf.buf);
                     tokio::pin!(read);
 
                     loop {
@@ -1578,9 +1663,10 @@ mod asyncio {
     async fn handle_request<F: AsyncFileSystem + Sync>(
         server: Arc<Server<F>>,
         fd: RawFd,
-        mut buf: Vec<u8>,
+        mut req: RequestBuf,
         len: usize,
-    ) -> Vec<u8> {
+    ) -> RequestBuf {
+        let buf = &mut req.buf;
         // ###############################################
         // Note: it's a heavy hack to reuse the same underlying data
         // buffer for both Reader and Writer, in order to reduce memory
@@ -1591,7 +1677,9 @@ mod asyncio {
         // Reader::from_fuse_buffer() and FuseDevWriter::new() should always
         // return success.
         let reader = Reader::<()>::from_fuse_buffer(FuseBuf::new(&mut buf[0..len])).unwrap();
-        let writer = FuseDevWriter::<()>::new(fd, buf_slice).unwrap();
+        let writer = FuseDevWriter::<()>::new(fd, buf_slice)
+            .unwrap()
+            .with_splice(req.splice.as_ref());
         let result = unsafe {
             server
                 .async_handle_message(reader, writer, None, None)
@@ -1603,7 +1691,7 @@ mod asyncio {
             error!("failed to handle fuse request, {}", e);
         }
 
-        buf
+        req
     }
 
     #[cfg(test)]
@@ -1628,13 +1716,13 @@ mod asyncio {
 
         #[test]
         fn test_buffer_pool_limit() {
-            let pool = BufferPool::new(64, 2);
+            let pool = BufferPool::new(64, 2, false);
 
             // Buffers are allocated lazily up to the limit...
             let buf1 = pool.try_acquire().unwrap();
             let buf2 = pool.try_acquire().unwrap();
-            assert_eq!(buf1.len(), 64);
-            assert_eq!(buf2.len(), 64);
+            assert_eq!(buf1.buf.len(), 64);
+            assert_eq!(buf2.buf.len(), 64);
             // ...and no buffer is handed out once the limit is reached.
             assert!(pool.try_acquire().is_none());
 
@@ -1647,9 +1735,27 @@ mod asyncio {
         }
 
         #[test]
+        fn test_buffer_pool_splice_pipes() {
+            assert!(BufferPool::new(64, 1, false)
+                .try_acquire()
+                .unwrap()
+                .splice
+                .is_none());
+
+            // Each buffer gets pipes of its own, and they stop splicing together.
+            let pool = BufferPool::new(64, 2, true);
+            let a = pool.try_acquire().unwrap().splice.unwrap();
+            let b = pool.try_acquire().unwrap().splice.unwrap();
+            assert!(a.enabled() && b.enabled());
+            let sock = std::os::unix::net::UnixStream::pair().unwrap().0;
+            assert_eq!(a.splice_in(sock.as_raw_fd(), 0, 0x1000), None);
+            assert!(!a.enabled() && !b.enabled());
+        }
+
+        #[test]
         fn test_buffer_pool_limit_clamped() {
             // A limit of 0 is clamped to 1, so the pool stays usable.
-            let pool = BufferPool::new(64, 0);
+            let pool = BufferPool::new(64, 0, false);
             assert!(pool.try_acquire().is_some());
             assert!(pool.try_acquire().is_none());
         }

@@ -27,7 +27,8 @@ libc = "0.2.68"
 log = "0.4.6"
 # nix dropped its default features in 0.27, so the modules the sessions use
 # are listed explicitly. `time` covers the timerfd the async-serving tests
-# drive tokio's IO driver with; `event` provides epoll on Linux.
+# drive tokio's IO driver with; `event` provides epoll on Linux; `zerocopy`
+# provides splice on Linux.
 nix = { version = "0.31", features = [
     "event",
     "fs",
@@ -40,6 +41,7 @@ nix = { version = "0.31", features = [
     "time",
     "uio",
     "user",
+    "zerocopy",
 ] }
 tokio = { version = "1.53.3", optional = true }
 vm-memory = { workspace = true }
