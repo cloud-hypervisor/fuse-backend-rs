@@ -2460,7 +2460,7 @@ mod tests {
         // A name without its NUL: the server answers EINVAL, and the
         // worker commits that reply instead of its EIO.
         plant_request(&mut entry, Opcode::Lookup as u32, &[], b"fuse-file");
-        worker.process(&mut entry).unwrap();
+        process_entry(&worker, &mut entry).unwrap();
         let out = parse_out_header(&entry);
         assert_eq!(
             (out.len as usize, out.error),
