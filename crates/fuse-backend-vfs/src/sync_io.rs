@@ -368,6 +368,33 @@ impl FileSystem for Vfs {
         }
     }
 
+    // An ENOSYS would turn O_TMPFILE off for every mount on the connection, so a file system
+    // without tmpfile() answers EOPNOTSUPP, which the kernel otherwise returns for it.
+    fn tmpfile(
+        &self,
+        ctx: &Context,
+        parent: VfsInode,
+        args: CreateIn,
+    ) -> Result<(Entry, Option<u64>, OpenOptions, Option<u32>)> {
+        // The supp gid is parsed after the request-wide id remap, so
+        // translate it here, where the target mount is known.
+        let mut ctx = ctx.clone();
+        self.remap_ctx_supp_gid(&mut ctx, parent.fs_idx());
+
+        let res = match self.get_real_rootfs(parent)? {
+            (Left(fs), idata) => fs.tmpfile(&ctx, idata.ino(), args),
+            (Right(fs), idata) => fs
+                .tmpfile(&ctx, idata.ino(), args)
+                .and_then(|(a, b, c, d)| {
+                    self.convert_backend_entry(idata, a).map(|a| (a, b, c, d))
+                }),
+        };
+        res.map_err(|e| match e.raw_os_error() {
+            Some(libc::ENOSYS) => Error::from_raw_os_error(libc::EOPNOTSUPP),
+            _ => e,
+        })
+    }
+
     fn read(
         &self,
         ctx: &Context,

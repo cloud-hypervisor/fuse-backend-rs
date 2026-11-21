@@ -127,6 +127,7 @@ pub(crate) fn request_bodies() -> Vec<(Opcode, Vec<u8>)> {
                 RemovemappingOne::default().as_slice(),
             ),
         ),
+        (Opcode::Tmpfile, body(CreateIn::default(), b"/\0")),
     ]
 }
 
