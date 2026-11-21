@@ -23,10 +23,13 @@ impl AsyncFileSystem for Vfs {
         match self.get_real_rootfs(parent)? {
             (Left(fs), idata) => self.lookup_pseudo(fs, idata, ctx, name),
             (Right(fs), idata) => {
+                if let Some(entry) = self.lookup_mount_root_parent(ctx, idata, name) {
+                    return entry;
+                }
                 // parent is in an underlying rootfs
                 let entry = fs.async_lookup(ctx, idata.ino(), name).await?;
                 // lookup success, hash it to a real fuse inode
-                self.convert_backend_entry(idata, entry)
+                self.convert_lookup_entry(idata, entry)
             }
         }
     }
@@ -313,7 +316,7 @@ mod tests {
     use fuse_backend_core::buffer::{Reader, Writer};
     use fuse_backend_core::file_traits::FileReadWriteVolatile;
 
-    use super::super::tests::FakeFileSystemOne;
+    use super::super::tests::{dot_lookup_cases, FakeFileSystemOne};
     use super::*;
     use crate::Vfs;
 
@@ -364,6 +367,23 @@ mod tests {
             assert_eq!(entry3.inode, 0);
         });
         handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_vfs_async_dot_lookups() {
+        let ctx = Context::new();
+        for path in ["/", "/sub", "/x/sub"] {
+            let (vfs, cases) = dot_lookup_cases(path);
+            for (parent, name, expected) in cases {
+                let name = CString::new(name).unwrap();
+                let entry = vfs.async_lookup(&ctx, parent.into(), &name).await.unwrap();
+                assert_eq!(
+                    (entry.inode, entry.generation),
+                    expected,
+                    "mounted at {path}: async_lookup({parent:#x}, {name:?})"
+                );
+            }
+        }
     }
 
     const DIR_HANDLE: u64 = 7;

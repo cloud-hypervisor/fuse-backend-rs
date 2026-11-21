@@ -291,6 +291,12 @@
   and no code in the workspace relied on it.
 
 ### Fixed
+- [NNN](link): `Vfs` answers the lookups of "." and ".." that the kernel sends with
+  `FsOptions::EXPORT_SUPPORT` with the node ids it already has. The root of a file system
+  mounted at "/" comes back as `ROOT_ID` with generation 0 instead of under a second node id,
+  and ".." of the root of a file system mounted elsewhere is the parent of its mountpoint, not
+  the root itself. So `open_by_handle_at()` of a directory whose dentry has left the cache
+  connects to the mount root instead of failing with ESTALE.
 - [329](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/329): The servers no longer reply to NOTIFY_REPLY when `FileSystem::notify_reply()`
   fails, which the default implementation does. The kernel takes no reply to NOTIFY_REPLY, and
   sends it under the unique number that the server picked for NOTIFY_RETRIEVE, so the reply
