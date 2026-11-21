@@ -49,6 +49,7 @@ use fuse_backend_core::file_traits::FileReadWriteVolatile;
 use vm_memory::bitmap::BitmapSlice;
 use vm_memory::mmap::MmapRegion;
 
+use crate::linux_session::mount_minor_at;
 use crate::serving::{FuseServing, WorkerSet};
 use crate::{FuseBuf, FuseChannel, FuseDevReaderExt, FuseSession, FUSE_HEADER_SIZE};
 
@@ -1249,30 +1250,6 @@ struct ConnectionAbort {
     done: AtomicBool,
 }
 
-/// The minor device number of the last mount at `mountpoint`, an
-/// absolute path, in `mountinfo`, the format of /proc/self/mountinfo.
-fn mount_minor(mountinfo: &str, mountpoint: &std::path::Path) -> Option<u32> {
-    // mountinfo writes space, tab, newline and backslash as octal escapes.
-    let mountpoint: String = mountpoint
-        .to_str()?
-        .chars()
-        .map(|c| match c {
-            ' ' | '\t' | '\n' | '\\' => format!("\\{:03o}", c as u32),
-            c => c.to_string(),
-        })
-        .collect();
-    mountinfo.lines().rev().find_map(|line| {
-        // ID, parent ID, major:minor, root, mount point, ...
-        let mut fields = line.split(' ');
-        let dev = fields.nth(2)?;
-        let point = fields.nth(1)?;
-        if point != mountpoint {
-            return None;
-        }
-        dev.split_once(':')?.1.parse().ok()
-    })
-}
-
 impl ConnectionAbort {
     /// The abort file of the connection mounted at `mountpoint`. fusectl
     /// names connections after the minor number of the mount's device,
@@ -1280,9 +1257,7 @@ impl ConnectionAbort {
     /// mountpoint would wait for a FUSE request that nobody serves yet.
     /// `FuseSession` keeps the mountpoint canonical, as mountinfo has it.
     fn new(mountpoint: &std::path::Path) -> ConnectionAbort {
-        let path = std::fs::read_to_string("/proc/self/mountinfo")
-            .ok()
-            .and_then(|info| mount_minor(&info, mountpoint))
+        let path = mount_minor_at(mountpoint)
             .map(|minor| {
                 std::path::PathBuf::from(format!("/sys/fs/fuse/connections/{minor}/abort"))
             })
@@ -2880,19 +2855,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_mount_minor() {
-        let info = "22 1 0:21 / /proc rw - proc proc rw\n\
-                    95 30 0:84 / /tmp/a rw - fuse.x x rw\n\
-                    96 30 0:86 / /tmp/a rw - fuse.x x rw\n";
-        // The last mount at a path is the one in effect.
-        assert_eq!(mount_minor(info, "/tmp/a".as_ref()), Some(86));
-        assert_eq!(mount_minor(info, "/tmp/b".as_ref()), None);
-        // Special characters are octal escapes.
-        let info = "97 30 0:88 / /tmp/a\\040b rw - fuse.x x rw\n";
-        assert_eq!(mount_minor(info, "/tmp/a b".as_ref()), Some(88));
-    }
-
     /// A file system whose LOOKUP panics.
     struct PanicFs;
 
@@ -2925,7 +2887,8 @@ mod tests {
     }
 
     /// A worker whose handler panics ends the connection, so the request
-    /// fails instead of waiting forever, and `wait()` returns.
+    /// fails instead of waiting forever, `wait()` returns, and the drop
+    /// unmounts the dead mount.
     #[test]
     fn test_uring_serving_handler_panic() {
         let mnt = TempDir::new().unwrap();
@@ -2933,6 +2896,7 @@ mod tests {
         server.set_uring(true);
         let mut se = FuseSession::new(mnt.as_path(), "uring_panic_test", "", false).unwrap();
         se.mount().unwrap();
+        let mountpoint = se.mountpoint().to_owned();
         if ConnectionAbort::new(se.mountpoint()).path.is_none() {
             eprintln!("fusectl isn't mounted, skipping");
             return;
@@ -2962,14 +2926,18 @@ mod tests {
         let waiting = serving.clone();
         std::thread::spawn(move || {
             waiting.wait();
+            drop(waiting);
             let _ = tx.send(());
         });
         rx.recv_timeout(Duration::from_secs(5))
             .expect("the worker didn't end the connection after the panic");
+        drop(serving);
+        assert_eq!(mount_minor_at(&mountpoint), None);
     }
 
     /// Ending the connection, as a failed worker does, stops every worker,
-    /// so `wait()` returns instead of serving on with a hanging queue.
+    /// so `wait()` returns instead of serving on with a hanging queue, and
+    /// the drop unmounts the dead mount.
     #[test]
     fn test_uring_serving_connection_abort() {
         let src = TempDir::new().unwrap();
@@ -2988,6 +2956,7 @@ mod tests {
         server.set_uring(true);
         let mut se = FuseSession::new(mnt.as_path(), "uring_serving_test", "", false).unwrap();
         se.mount().unwrap();
+        let mountpoint = se.mountpoint().to_owned();
         let abort = ConnectionAbort::new(se.mountpoint());
         if abort.path.is_none() {
             eprintln!("fusectl isn't mounted, skipping");
@@ -3014,10 +2983,13 @@ mod tests {
         let waiting = serving.clone();
         std::thread::spawn(move || {
             waiting.wait();
+            drop(waiting);
             let _ = tx.send(());
         });
         rx.recv_timeout(Duration::from_secs(5))
             .expect("the workers didn't stop after the connection ended");
         assert!(std::fs::read_dir(mnt.as_path()).is_err());
+        drop(serving);
+        assert_eq!(mount_minor_at(&mountpoint), None);
     }
 }
