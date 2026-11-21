@@ -631,7 +631,10 @@ impl<F: FileSystem + Sync> Server<F> {
             owner,
             flags,
         ) {
-            Ok(count) => ctx.reply_with_data(&data_writer.0, count),
+            Ok(count) => match ctx.read_too_long(count, size) {
+                Some(err) => ctx.reply_error(err),
+                None => ctx.reply_with_data(&data_writer.0, count),
+            },
             Err(e) => ctx.reply_error(e),
         }
     }
@@ -804,7 +807,7 @@ impl<F: FileSystem + Sync> Server<F> {
                     // value.
                     ctx.reply_error(io::Error::from_raw_os_error(libc::ERANGE))
                 } else {
-                    ctx.reply_ok(None::<u8>, Some(&val))
+                    ctx.do_reply_ok(None::<u8>, Some(&val), libc::ERANGE)
                 }
             }
             Ok(GetxattrReply::Count(count)) => {
@@ -850,7 +853,7 @@ impl<F: FileSystem + Sync> Server<F> {
                     // name list longer than the requested size with EINVAL.
                     ctx.reply_error(io::Error::from_raw_os_error(libc::ERANGE))
                 } else {
-                    ctx.reply_ok(None::<u8>, Some(&val))
+                    ctx.do_reply_ok(None::<u8>, Some(&val), libc::ERANGE)
                 }
             }
             Ok(ListxattrReply::Count(count)) => {
@@ -1593,9 +1596,22 @@ impl<F: FileSystem + Sync> Server<F> {
 
 impl<F: FileSystem, S: BitmapSlice, W: Writer> SrvContext<'_, F, S, W> {
     fn reply_ok<T: ByteValued>(&mut self, out: Option<T>, data: Option<&[u8]>) -> Result<usize> {
+        self.do_reply_ok(out, data, libc::EIO)
+    }
+
+    /// Replies with `out` and `data`, or with `too_big` if they don't fit in the reply buffer.
+    fn do_reply_ok<T: ByteValued>(
+        &mut self,
+        out: Option<T>,
+        data: Option<&[u8]>,
+        too_big: i32,
+    ) -> Result<usize> {
         let data2 = out.as_ref().map(|v| v.as_slice()).unwrap_or(&[]);
         let data3 = data.unwrap_or(&[]);
         let len = size_of::<OutHeader>() + data2.len() + data3.len();
+        if let Some(err) = self.reply_too_big(len, too_big) {
+            return self.reply_error(err);
+        }
         let header = OutHeader {
             len: len as u32,
             error: 0,
@@ -1802,8 +1818,8 @@ pub(super) fn add_dirent<W: Writer>(
 #[cfg(test)]
 mod tests {
     use super::super::test_util::{
-        check_malformed, check_oversized, oversized_request, request, request_bodies, MockFS,
-        NoDax, TestWriter, OVERSIZED_OPCODES,
+        check_fixed, check_malformed, check_oversized, fixed_requests, oversized_request, request,
+        request_bodies, FixedFs, MockFS, NoDax, TestWriter, OVERSIZED_OPCODES,
     };
     use super::*;
 
@@ -3011,22 +3027,18 @@ mod tests {
     }
 
     #[test]
-    fn test_server_sends_one_reply_when_it_fails() {
-        // The INIT reply doesn't fit in the buffer, but an error reply would.
-        let init_in = InitIn {
-            major: KERNEL_VERSION,
-            minor: KERNEL_MINOR_VERSION,
-            ..Default::default()
-        };
-        let mut req = request(Opcode::Init, init_in.as_slice());
-        let mut reply = [0u8; size_of::<OutHeader>() + 8];
-        let res = Server::new(MockFS).handle_message(
-            Reader::<()>::from_slice(&mut req),
-            TestWriter::new(&mut reply),
-            None,
-            None,
-        );
-        assert!(matches!(res, Err(Error::EncodeMessage(_))));
-        assert!(reply.iter().all(|&b| b == 0));
+    fn test_server_answers_replies_that_dont_fit() {
+        let server = Server::new(FixedFs);
+        for (opcode, body, room, error) in fixed_requests() {
+            let mut req = request(opcode, &body);
+            let mut reply = vec![0u8; room];
+            let res = server.handle_message(
+                Reader::<()>::from_slice(&mut req),
+                TestWriter::new(&mut reply),
+                None,
+                None,
+            );
+            check_fixed(opcode, room, error, res, &reply);
+        }
     }
 }

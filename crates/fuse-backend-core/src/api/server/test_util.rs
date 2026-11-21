@@ -11,6 +11,7 @@
 //! without depending on transport specific machinery.
 
 use std::cmp;
+use std::ffi::CStr;
 use std::io::{self, IoSlice};
 use std::mem::size_of;
 use std::ptr::copy_nonoverlapping;
@@ -20,7 +21,7 @@ use vm_memory::{ByteValued, VolatileSlice};
 use crate::abi::fuse_abi::*;
 #[cfg(feature = "virtiofs")]
 use crate::abi::virtio_fs::{RemovemappingIn, RemovemappingOne, SetupmappingIn};
-use crate::api::filesystem::FileSystem;
+use crate::api::filesystem::{Context, FileSystem, GetxattrReply, ListxattrReply, ZeroCopyWriter};
 use crate::buffer::{IoBuffers, Result, Writer};
 use crate::file_traits::FileReadWriteVolatile;
 
@@ -38,6 +39,127 @@ impl FileSystem for MockFS {
 
 #[cfg(feature = "async-io")]
 impl crate::api::filesystem::AsyncFileSystem for MockFS {}
+
+/// How many bytes [`FixedFs`] returns for READ, GETXATTR and LISTXATTR.
+const FIXED_LEN: usize = 16;
+
+/// A [`FileSystem`] that answers READ, GETXATTR and LISTXATTR with [`FIXED_LEN`] bytes, whatever
+/// size the request asks for.
+pub(crate) struct FixedFs;
+
+impl FileSystem for FixedFs {
+    type Inode = u64;
+    type Handle = u64;
+
+    fn read(
+        &self,
+        _ctx: &Context,
+        _inode: u64,
+        _handle: u64,
+        w: &mut dyn ZeroCopyWriter,
+        _size: u32,
+        _offset: u64,
+        _lock_owner: Option<u64>,
+        _flags: u32,
+    ) -> io::Result<usize> {
+        w.write_all(&[1; FIXED_LEN])?;
+        Ok(FIXED_LEN)
+    }
+
+    fn getxattr(
+        &self,
+        _ctx: &Context,
+        _inode: u64,
+        _name: &CStr,
+        _size: u32,
+    ) -> io::Result<GetxattrReply> {
+        Ok(GetxattrReply::Value(vec![1; FIXED_LEN]))
+    }
+
+    fn listxattr(&self, _ctx: &Context, _inode: u64, _size: u32) -> io::Result<ListxattrReply> {
+        Ok(ListxattrReply::Names(vec![1; FIXED_LEN]))
+    }
+}
+
+#[cfg(feature = "async-io")]
+impl crate::api::filesystem::AsyncFileSystem for FixedFs {}
+
+/// Returns requests that [`FixedFs`] answers, the size of the reply buffer for each, and the
+/// error the server answers with: 0 for a reply that fills the buffer, ERANGE for an xattr
+/// value or name list that doesn't fit, and EIO for other replies that don't.
+pub(crate) fn fixed_requests() -> Vec<(Opcode, Vec<u8>, usize, i32)> {
+    let hdr = size_of::<OutHeader>();
+    let open = body(OpenIn::default(), &[]);
+    let init = InitIn {
+        major: KERNEL_VERSION,
+        minor: KERNEL_MINOR_VERSION,
+        ..Default::default()
+    };
+    let xattr_in = GetxattrIn {
+        size: FIXED_LEN as u32,
+        ..Default::default()
+    };
+    let getxattr = body(xattr_in, b"user.a\0");
+    let listxattr = body(xattr_in, &[]);
+    let read = |size: usize| {
+        let read_in = ReadIn {
+            size: size as u32,
+            ..Default::default()
+        };
+        body(read_in, &[])
+    };
+    let open_len = hdr + size_of::<OpenOut>();
+    let fixed = hdr + FIXED_LEN;
+    vec![
+        (Opcode::Open, open.clone(), open_len, 0),
+        (Opcode::Open, open, open_len - 1, libc::EIO),
+        (Opcode::Init, body(init, &[]), hdr + 8, libc::EIO),
+        // The value fits the size the request asks for, but not the buffer.
+        (Opcode::Getxattr, getxattr.clone(), fixed, 0),
+        (Opcode::Getxattr, getxattr, fixed - 1, libc::ERANGE),
+        (Opcode::Listxattr, listxattr.clone(), fixed, 0),
+        (Opcode::Listxattr, listxattr, fixed - 1, libc::ERANGE),
+        // The file system returns more than the request asks for.
+        (Opcode::Read, read(FIXED_LEN), fixed, 0),
+        (Opcode::Read, read(FIXED_LEN - 1), fixed, libc::EIO),
+    ]
+}
+
+/// Checks that the server answered a request from [`fixed_requests()`] with one reply that
+/// fills the buffer, or with one header-only reply with `error`.
+pub(crate) fn check_fixed(
+    opcode: Opcode,
+    room: usize,
+    error: i32,
+    res: crate::Result<usize>,
+    reply: &[u8],
+) {
+    let what = format!("{:?} with {} bytes of room, errno {}", opcode, room, error);
+    let len = if error == 0 {
+        room
+    } else {
+        size_of::<OutHeader>()
+    };
+    check_reply(&what, res, reply, len, error);
+}
+
+/// Checks that the server sent one reply of `len` bytes with `errno`, which is 0 for success.
+fn check_reply(what: &str, res: crate::Result<usize>, reply: &[u8], len: usize, errno: i32) {
+    // The server returns the number of bytes written, so a second reply would show here.
+    assert_eq!(res.ok(), Some(len), "{}", what);
+    let out = OutHeader::from_slice(&reply[..size_of::<OutHeader>()]).unwrap();
+    assert_eq!(
+        (out.len as usize, out.error, out.unique),
+        (len, -errno, UNIQUE),
+        "{}",
+        what
+    );
+}
+
+/// Returns the bytes of `arg` followed by `tail`.
+fn body<T: ByteValued>(arg: T, tail: &[u8]) -> Vec<u8> {
+    [arg.as_slice(), tail].concat()
+}
 
 /// The opcodes to send `oversized_request()` with: one that takes a reply, and those that take
 /// none.
@@ -67,9 +189,6 @@ pub(crate) fn request(opcode: Opcode, body: &[u8]) -> Vec<u8> {
 /// Returns a body for each opcode that has one, such that every shorter prefix of it is
 /// malformed: a fixed part cut short, a name without its NUL, or a value shorter than its size.
 pub(crate) fn request_bodies() -> Vec<(Opcode, Vec<u8>)> {
-    fn body<T: ByteValued>(arg: T, tail: &[u8]) -> Vec<u8> {
-        [arg.as_slice(), tail].concat()
-    }
     let batch_forget_in = BatchForgetIn { count: 1, dummy: 0 };
     let setxattr_in = SetxattrIn { size: 4, flags: 0 };
     vec![
@@ -182,7 +301,6 @@ impl crate::api::filesystem::FsCacheReqHandler for NoDax {
 /// bytes: one `EINVAL` reply if the request takes a reply, and none if it takes none.
 pub(crate) fn check_malformed(opcode: Opcode, len: usize, res: crate::Result<usize>, reply: &[u8]) {
     let what = format!("{:?} with {} bytes", opcode, len);
-    let out_len = size_of::<OutHeader>();
     if !super::takes_reply(opcode as u32) {
         // INTERRUPT doesn't read its body, so it doesn't fail.
         assert!(
@@ -194,15 +312,7 @@ pub(crate) fn check_malformed(opcode: Opcode, len: usize, res: crate::Result<usi
         assert!(reply.iter().all(|&b| b == 0), "{} got a reply", what);
         return;
     }
-    // The server returns the number of bytes written, so a second reply would show here.
-    assert_eq!(res.ok(), Some(out_len), "{}", what);
-    let out = OutHeader::from_slice(&reply[..out_len]).unwrap();
-    assert_eq!(
-        (out.len as usize, out.error, out.unique),
-        (out_len, -libc::EINVAL, UNIQUE),
-        "{}",
-        what
-    );
+    check_reply(&what, res, reply, size_of::<OutHeader>(), libc::EINVAL);
 }
 
 /// A [`Writer`] that captures reply messages into a caller supplied buffer.
