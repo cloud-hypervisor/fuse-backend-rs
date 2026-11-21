@@ -315,7 +315,7 @@
   fails, which the default implementation does. The kernel takes no reply to NOTIFY_REPLY, and
   sends it under the unique number that the server picked for NOTIFY_RETRIEVE, so the reply
   could end another request. `handle_message()` returns the error instead.
-- [NNN](link): With `allow_direct_io` off, a create with O_DIRECT no longer opens the new host
+- [322](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/322): With `allow_direct_io` off, a create with O_DIRECT no longer opens the new host
   file with O_DIRECT, which made buffered IO on it fail with EINVAL. `PassthroughFs::create()`
   now builds the host open flags with the same helper as `open_inode()`.
 - [347](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/347): `Vfs` forwards COPY_FILE_RANGE to the mounted file system that holds both
