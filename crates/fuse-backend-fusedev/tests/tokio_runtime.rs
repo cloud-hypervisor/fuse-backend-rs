@@ -526,7 +526,7 @@ mod tokio_runtime {
         // test sends the resend before the new server reads, so the kernel doesn't send again a
         // request that the new server is handling.
         let new = Arc::new(Server::new(Arc::new(TestFs::default())));
-        new.restore_init(version, options);
+        new.restore_init(version, options).unwrap();
         let mut buf = vec![0u8; 0x1000];
         let writer = FuseDevWriter::<()>::new(file.as_raw_fd(), &mut buf).unwrap();
         new.notify_resend(writer).unwrap();
@@ -798,7 +798,7 @@ mod tokio_runtime {
 
         let new = Arc::new(Server::new(stack.fs.clone()));
         let (version, options) = old.init_state();
-        new.restore_init(version, options);
+        new.restore_init(version, options).unwrap();
         let mut buf = vec![0u8; 0x1000];
         let writer = FuseDevWriter::<()>::new(file.as_raw_fd(), &mut buf).unwrap();
         new.notify_resend(writer).unwrap();
