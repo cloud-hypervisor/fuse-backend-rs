@@ -19,15 +19,39 @@ The uring transport excels at metadata operations because it eliminates the
 per-request syscall overhead (read/write on `/dev/fuse`). With 8 threads,
 filecreate achieves **3.7x** throughput compared to sync.
 
-### Sequential I/O: Known Regression
+### Sequential I/O
 
 | Workload | 1-thread | 8-thread |
 |----------|----------|----------|
 | seqread | -44 to +5% | **-37%** |
 | seqwrite | -1 to -15% | **-28 to -34%** |
 
-The sequential I/O regression is a **known upstream limitation**, not a bug in
-this implementation. See "Root Cause Analysis" below.
+These numbers predate the fix in "Queue ownership" below, which removed
+most of the seqwrite regression. The rest of the sequential I/O gap may come
+from the upstream changes described in "Root Cause Analysis".
+
+## Queue ownership
+
+The kernel puts each request on the queue of the CPU that sends it. With the
+writeback cache, the flusher thread sends the WRITEs, from one CPU at a time.
+The workers used to own whole queues, so the worker that owned that CPU's
+queue served every WRITE while the others waited for requests. Over a few
+seconds the flusher moves between CPUs, so the per-thread CPU time looked
+evenly spread, but at any moment one worker was writing.
+
+Profiling a 4-job 1 MiB seqwrite through the writeback cache with 4 workers
+showed the uring workers spending most of their samples in
+`io_cqring_wait`, waiting for requests, while the sync threads were busy in
+`ext4_buffered_write_iter`. `UringFuseServing` now spreads the entries of
+every queue over the workers, and the kernel hands a request to any free
+entry of its queue, so a queue that gets more requests than one worker can
+serve reaches the other workers too. In that profile run, seqwrite went
+from 3.99 GiB/s to 5.79 GiB/s, against 6.83 GiB/s for sync. The workers now
+contend on the backing file's inode lock, as the sync threads do.
+
+The kernel doesn't know which workers are busy, though. A request can land
+on a free entry of a worker that is still serving a slow request of another
+queue, and wait for it while other workers idle.
 
 ## Root Cause Analysis
 
@@ -42,7 +66,8 @@ this implementation. See "Root Cause Analysis" below.
    Both classic and uring paths benefit equally.
 
 3. **Not pipeline depth**: Increasing `entries_per_queue` from 4 to 16 had
-   zero impact on sequential I/O performance.
+   zero impact on sequential I/O performance, when each worker owned whole
+   queues.
 
 ### What It Is
 
@@ -152,6 +177,68 @@ IOPS with and without pools. VmRSS counts only the pages that requests
 touched, so workloads with fewer requests in flight use far less memory
 than this.
 
+The kernel hands a request to the entry of its queue that became free last,
+and once its buffers are busy, an entry that commits takes the next waiting
+request with the buffer it already holds. So the entries that get the
+buffers first keep them under load. The workers register their entries in
+rounds, so that those entries belong to different workers. Without the
+rounds, 1 MiB reads in the setup above ran at 530 to 937 MiB/s, because the
+worker that registered last served every queue alone.
+
+A first version of the rounds had every queue register in the same order
+of workers, so the entries that keep the buffers of a queue belonged to
+the same workers in every queue. With fewer buffers than workers, the
+other workers had nothing to do. So each queue registers the last entry
+of each of its workers in a round of its own, after its other entries,
+and consecutive queues end on different workers. The benchmark
+daemon served PassthroughFs over a tmpfs directory with 8 workers and 16
+entries per queue, on a 96-CPU machine with Linux 7.3.1. 8 fio jobs, each
+pinned to its own CPU, read 1 MiB with O_DIRECT and libaio at depth 16 for
+8 seconds. Medians of 3 runs in alternating order:
+
+| Buffers per queue | Reads | No rounds | Same order | Each queue ends elsewhere |
+|-------------------|-------|-----------|------------|---------------------------|
+| 4 (default) | random | 9.1 GiB/s | 13.4 GiB/s | 39.4 GiB/s |
+| 4 (default) | sequential | 12.6 GiB/s | 13.6 GiB/s | 39.8 GiB/s |
+| 8 | random | 12.9 GiB/s | 39.1 GiB/s | 39.0 GiB/s |
+
+With the same order, 4 workers served all queues and the others idled.
+With 8 buffers, as many as workers, the order made no difference. So the
+default of 4 buffers doesn't hold back a mount with more workers than
+buffers, as long as several queues are busy, but a single busy queue
+still reaches only as many workers as it has buffers.
+
+Spreading the entries costs reads where whole queues gave each busy
+queue a worker of its own. In the setup above, with medians of 3 runs:
+
+| Workers | Entries per queue | fio CPUs | Whole queues | Spread |
+|---------|-------------------|----------|--------------|--------|
+| 8 | 16 | 8 to 15 | 52.9 GiB/s | 46.8 GiB/s |
+| 8 | 16 | 8, 15, ..., 57 | 52.4 GiB/s | 43.4 GiB/s |
+| 8 | 16 | 8, 16, ..., 64 | 5.8 GiB/s | 43.9 GiB/s |
+| 96, one per CPU | 4 | 8 to 15 | 48.9 GiB/s | 124.0 GiB/s |
+
+In the first two layouts, each busy queue had a worker of its own, and
+the spread reads 11 to 17% slower for the same reason in both. With
+whole queues, requests rarely waited, so each took the lowest free
+buffer of its queue and a worker reused one or two buffers. With the
+spread, each worker holds buffers of several queues and cycles through
+them, and a request costs about a quarter more cycles, half of the extra
+in the kernel's `fuse_copy_fill()` getting the buffer pages with
+`get_user_pages_fast()`.
+
+When a queue has an entry on every worker, it registers the entry on
+the worker that owned it with whole queues last. A queue with one
+request at a time then goes to the same worker as before, so no layout
+reaches fewer workers. Queues the worker count apart, like those of the
+third row, have the same workers, and each gives its other buffers to
+different workers than the one before. With fewer entries per queue
+than workers, fewer workers than queues, and an entry count that
+doesn't divide the worker count, a layout can still reach fewer workers
+than whole queues did, with one request in flight per queue, or with
+more if each queue has fewer buffers than entries. The default starts a
+worker per online CPU, which is usually one per queue.
+
 ## Zero-copy
 
 On Linux 7.3 and later, a queue with a buffer pool can also serve reads
@@ -217,16 +304,21 @@ and uses the buffer pools of protocol 7.46 (kernel 7.3) when the kernel has them
 
 ### Tuning Recommendations
 
-- `entries_per_queue`: Default is 4. Increasing to 16+ does not help
-  sequential I/O (bottleneck is elsewhere), but may help high-concurrency
-  metadata workloads.
+- `entries_per_queue`: Default is 4. The entries of each queue are spread
+  over the workers, so a busy queue reaches at most this many workers, and
+  never more than `workers`. With buffer pools, requests with a payload or
+  reply body also need one of the queue's `bufs_per_queue` buffers. Past the
+  worker count, more entries only queue more requests on the same workers.
 
 - `bufs_per_queue`: Default is 4. On Linux 7.3 and later it caps the
   requests with a payload or reply body that one queue serves at once, and
   with it the memory of the payload buffers.
 
-- Thread count: The per-CPU queue model means optimal performance when
-  worker threads match available CPU cores.
+- `workers`: Default is one per CPU. A worker serves the requests of any
+  queue it holds entries of, so the count no longer has to match the
+  queues. It is capped at `entries_per_queue` times the number of queues.
+  Each worker is a thread with its own ring, and with zero-copy also a
+  memory file of one payload buffer.
 
 ## References
 

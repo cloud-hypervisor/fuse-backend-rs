@@ -266,6 +266,13 @@
   that crate's `async-io` too, or its writers fail asynchronous replies with
   `EINVAL`.
 - [281](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/281): `FuseUringEntInOut::padding` is now `offset`, and `FuseUringCmdReq` has a new `bufpool` field.
+- [316](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/316): `UringFuseServing` spreads the ring entries of every kernel queue over its workers, instead of
+  giving each worker whole queues, and the workers register them in rounds, so that requests that
+  arrive together reach different workers. With the default worker per CPU, 1 MiB reads from 8 CPUs
+  got 2.5 times faster. With 8 workers, writes through the writeback cache got 18 to 27% faster,
+  and reads from 8 CPUs whose queues each had a worker of their own got 11 to 17% slower.
+  `UringConfig::workers` can exceed the number of queues, up to `entries_per_queue` times that,
+  and an `entries_per_queue` of 0 counts as 1.
 - [254](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/254): `fuse-backend-rs` is now a thin facade re-exporting the sub-crates. Every
   historical `fuse_backend_rs::{abi, api, buffer, common, transport, passthrough,
   overlayfs}` import path and cargo feature name (`fusedev`, `virtiofs`,

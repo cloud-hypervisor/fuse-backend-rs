@@ -27,7 +27,7 @@ use std::os::unix::io::{AsRawFd, RawFd};
 use std::ptr::NonNull;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Sender};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -82,11 +82,13 @@ struct SqeMirror {
 #[derive(Clone, Copy, Debug)]
 pub struct UringConfig {
     /// Number of worker threads, each owning one io_uring instance. The
-    /// kernel queues are distributed among the workers round-robin.
-    /// `0` means one worker per online CPU.
+    /// workers share the entries of every kernel queue, so several of them
+    /// serve a busy queue. `0` means one worker per online CPU. The worker
+    /// count is capped at `entries_per_queue` times the number of queues,
+    /// so that every worker holds at least one entry.
     pub workers: usize,
     /// Number of ring entries registered per kernel queue, i.e. the number
-    /// of in-flight requests each queue may hold.
+    /// of in-flight requests each queue may hold. `0` counts as 1.
     pub entries_per_queue: usize,
     /// Number of payload buffers in each queue's buffer pool, on kernels
     /// that support buffer pools (Linux 7.3). The kernel lends a buffer to
@@ -181,6 +183,79 @@ fn possible_cpu_count() -> Result<usize> {
     let content = std::fs::read_to_string("/sys/devices/system/cpu/possible")
         .map_err(|e| SessionFailure(format!("read possible cpu mask: {e}")))?;
     parse_cpu_mask(&content)
+}
+
+/// Assign the ring entries of all queues to `workers` workers, returning
+/// the queue id and registration round of every entry each worker
+/// registers. `entries_per_queue` must be at least 1, and `bufs` is the
+/// number of buffers in each queue's pool.
+///
+/// The kernel puts a request on the queue of the CPU that sends it, and a
+/// single flusher thread sends all writeback WRITEs. A worker that owned
+/// whole queues would serve such a stream alone, so the entries of every
+/// queue go to consecutive workers instead. The kernel hands a request to
+/// any free entry of its queue, so a busy queue reaches the other workers
+/// once one worker's entries are all in use.
+///
+/// The kernel also hands a request to the entry of its queue that became
+/// free last, see `UringWorker::register()`. So each queue registers one
+/// entry of each of its workers last, one per round. A queue with an entry
+/// on every worker registers the one on worker `qid % workers`, which
+/// would own it with whole queues, last, so its requests go there while it
+/// has one at a time. Queues 0 to `workers - 1` end on different workers,
+/// and so do the next `workers` queues and so on. The other entries
+/// register before them, in round 0.
+fn spread_entries(
+    nr_queues: usize,
+    entries_per_queue: usize,
+    workers: usize,
+    bufs: usize,
+) -> Vec<Vec<(u16, usize)>> {
+    let total = nr_queues * entries_per_queue;
+    let workers = workers.clamp(1, total);
+    // The last queue_workers entries of a queue belong to different
+    // workers, and the rest register before them.
+    let queue_workers = entries_per_queue.min(workers);
+    let rest = entries_per_queue - queue_workers;
+    // With buffer pools, the entries that register last keep the buffers.
+    let holders = bufs.clamp(1, queue_workers);
+    // Queue qid's workers start at qid * entries_per_queue % workers, which
+    // repeats after this many queues.
+    let (mut gcd, mut b) = (entries_per_queue, workers);
+    while b != 0 {
+        (gcd, b) = (b, gcd % b);
+    }
+    let period = workers / gcd;
+    let mut entries = vec![Vec::new(); workers];
+    for qid in 0..nr_queues {
+        // Queues workers apart have the same workers, so each one turns
+        // the entries before its last one on, and its other buffers go to
+        // different workers than the previous one's.
+        let turn = qid / workers * (holders - 1);
+        for nth in 0..entries_per_queue {
+            let w = (qid * entries_per_queue + nth) % workers;
+            let round = if nth < rest {
+                0
+            } else {
+                // The number of last entries that register after this one.
+                // The last one is on worker qid % workers if the queue has
+                // an entry on every worker, else it moves on by one after
+                // each period.
+                let after = if queue_workers == workers {
+                    (qid + workers - w) % workers
+                } else {
+                    (qid / period + queue_workers - (nth - rest)) % queue_workers
+                };
+                let after = match after {
+                    0 => 0,
+                    a => (a - 1 + turn) % (queue_workers - 1) + 1,
+                };
+                usize::from(rest > 0) + queue_workers - 1 - after
+            };
+            entries[w].push((qid as u16, round));
+        }
+    }
+    entries
 }
 
 /// What the transport needs to know about a request with this opcode: the
@@ -1219,12 +1294,13 @@ impl UringEntry {
     }
 }
 
-/// One io_uring based serving thread, responsible for a subset of the kernel
-/// queues.
+/// One io_uring based serving thread, holding ring entries of several
+/// kernel queues.
 struct UringWorker<F: FileSystem + Send + Sync + 'static> {
     fd: File,
-    qids: Vec<u16>,
-    entries_per_queue: usize,
+    /// Queue id and registration round of every ring entry this worker
+    /// registers.
+    entries: Vec<(u16, usize)>,
     /// Size of the payload area of an entry whose queue has no buffer pool.
     payload_cap: usize,
     /// The queues' buffer pools, if the kernel took them.
@@ -1232,9 +1308,80 @@ struct UringWorker<F: FileSystem + Send + Sync + 'static> {
     /// The memory file that copies of zero-copy data through memory go
     /// through, if the queues have zero-copy.
     bounce: Option<BounceBuf>,
+    /// The registration rounds that all workers take part in.
+    rounds: Arc<RegisterRounds>,
     server: Arc<Server<F>>,
     /// Ends the connection when the worker fails.
     abort: Arc<ConnectionAbort>,
+}
+
+/// Lets the workers register their entries in rounds, see
+/// `UringWorker::register()`. Every worker waits at the end of each of the
+/// `rounds` rounds until all workers have registered that round's entries.
+struct RegisterRounds {
+    rounds: usize,
+    workers: usize,
+    state: Mutex<RoundsState>,
+    cv: Condvar,
+}
+
+#[derive(Default)]
+struct RoundsState {
+    round: usize,
+    /// The number of workers done with the current round.
+    done: usize,
+    failed: bool,
+}
+
+impl RegisterRounds {
+    fn new(workers: usize, rounds: usize) -> RegisterRounds {
+        RegisterRounds {
+            rounds,
+            workers,
+            state: Mutex::new(RoundsState::default()),
+            cv: Condvar::new(),
+        }
+    }
+
+    /// Wait until all workers are done with the current round. Returns
+    /// false if a worker failed.
+    fn wait(&self) -> bool {
+        let mut state = self.state.lock().unwrap();
+        let round = state.round;
+        state.done += 1;
+        if state.done == self.workers {
+            state.round += 1;
+            state.done = 0;
+            self.cv.notify_all();
+        }
+        let state = self
+            .cv
+            .wait_while(state, |s| s.round == round && !s.failed)
+            .unwrap();
+        !state.failed
+    }
+
+    /// Fail the rounds, which releases the workers waiting for a round, and
+    /// they fail too. A worker that won't take part in all rounds must call
+    /// it, or the others wait forever.
+    fn fail(&self) {
+        // This runs while a panic unwinds, so it must not panic on a
+        // poisoned lock.
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .failed = true;
+        self.cv.notify_all();
+    }
+}
+
+/// Fails the rounds when dropped. Forget it once the worker is done.
+struct RoundsGuard<'a>(&'a RegisterRounds);
+
+impl Drop for RoundsGuard<'_> {
+    fn drop(&mut self) {
+        self.0.fail();
+    }
 }
 
 /// Ends a FUSE connection, like `umount -f`, through its `abort` file in
@@ -1328,53 +1475,120 @@ fn failed_while_connected(result: &io::Result<()>, exit: &AtomicBool) -> bool {
 }
 
 impl<F: FileSystem + Send + Sync + 'static> UringWorker<F> {
-    fn run(self, exit: Arc<AtomicBool>, ready_tx: Sender<io::Result<()>>) -> io::Result<()> {
-        let total_entries = self.qids.len() * self.entries_per_queue;
-        let mut ring = FuseRing::builder().build((total_entries * 2) as u32)?;
-        if self.bounce.is_some() {
-            if let Err(e) = register_sparse_buffers(&ring, total_entries) {
-                let _ = ready_tx.send(Err(io::Error::other(format!(
-                    "registering the zero-copy buffer table failed: {e}"
-                ))));
+    /// Create the worker's ring and entries and register the entries,
+    /// reporting the outcome through `ready_tx`. The kernel holds all
+    /// entries afterwards.
+    fn setup(&self, ready_tx: &Sender<io::Result<()>>) -> io::Result<(FuseRing, Vec<UringEntry>)> {
+        // Release the other workers from the rounds if this one fails or
+        // panics before it has taken part in all of them.
+        let rounds = RoundsGuard(&self.rounds);
+        let fail = |e: &io::Error| {
+            let _ = ready_tx.send(Err(io::Error::other(e.to_string())));
+        };
+        let mut ring = match self.create_ring() {
+            Ok(ring) => ring,
+            Err(e) => {
+                fail(&e);
                 return Err(e);
             }
+        };
+        let mut entries: Vec<UringEntry> = Vec::with_capacity(self.entries.len());
+        for &(qid, _) in &self.entries {
+            let payload = match &self.pools {
+                Some(pools) => Payload::Pool(pools.clone()),
+                None => Payload::Own(self.payload_cap),
+            };
+            let mut entry = UringEntry::new(qid, payload);
+            if self.bounce.is_some() {
+                entry.zero_copy_slot = Some(entries.len() as u16);
+            }
+            entries.push(entry);
         }
+        match self.register(&mut ring, &entries) {
+            Ok(()) => {
+                std::mem::forget(rounds);
+                let _ = ready_tx.send(Ok(()));
+                Ok((ring, entries))
+            }
+            Err((e, armed)) => {
+                // Report the error before the others fail the rounds and
+                // report theirs.
+                fail(&e);
+                drop(rounds);
+                // The serving layer tears the connection down when it gets
+                // the error, which gives the registered entries back.
+                release_entries(ring, entries, armed);
+                Err(e)
+            }
+        }
+    }
+
+    /// The worker's ring, with a sparse buffer table of a slot per entry if
+    /// the queues have zero-copy.
+    fn create_ring(&self) -> io::Result<FuseRing> {
+        let ring = FuseRing::builder().build((self.entries.len() * 2) as u32)?;
+        if self.bounce.is_some() {
+            register_sparse_buffers(&ring, self.entries.len()).map_err(|e| {
+                io::Error::other(format!(
+                    "registering the zero-copy buffer table failed: {e}"
+                ))
+            })?;
+        }
+        Ok(ring)
+    }
+
+    /// Register `entries` in `self.rounds`, each in the round
+    /// `spread_entries()` gave it. Returns the error and the number of
+    /// entries the kernel holds on failure. That counts every queued
+    /// REGISTER, since `release_entries()` submits what a failed submit
+    /// left queued.
+    ///
+    /// The kernel gives a request to the entry of its queue that became free
+    /// last, so with rounds the entries a queue frees last at startup belong
+    /// to different workers, and the first of them, the last to register, is
+    /// on different workers for different queues.
+    /// `docs/fuse-uring-performance.md` explains why that matters.
+    /// The rounds only set that order at startup. Later it is the order of
+    /// the last commits.
+    fn register(
+        &self,
+        ring: &mut FuseRing,
+        entries: &[UringEntry],
+    ) -> std::result::Result<(), (io::Error, usize)> {
         let fd = self.fd.as_raw_fd();
-
-        let mut entries: Vec<UringEntry> = Vec::with_capacity(total_entries);
-        for qid in &self.qids {
-            for _ in 0..self.entries_per_queue {
-                let payload = match &self.pools {
-                    Some(pools) => Payload::Pool(pools.clone()),
-                    None => Payload::Own(self.payload_cap),
-                };
-                let mut entry = UringEntry::new(*qid, payload);
-                if self.bounce.is_some() {
-                    entry.zero_copy_slot = Some(entries.len() as u16);
+        let mut armed = 0;
+        for round in 0..self.rounds.rounds {
+            {
+                let mut sq = ring.submission();
+                for (idx, (entry, &(_, r))) in entries.iter().zip(&self.entries).enumerate() {
+                    if r != round {
+                        continue;
+                    }
+                    // The CQE of each REGISTER SQE returns once a request
+                    // has been assigned to the entry.
+                    let sqe = entry.cmd_sqe(fd, FUSE_IO_URING_CMD_REGISTER, 0, idx as u64);
+                    // Safe because release_entries() keeps the entries
+                    // alive while the kernel holds them.
+                    if unsafe { sq.push(&sqe) }.is_err() {
+                        return Err((io::Error::other("submission queue full"), armed));
+                    }
+                    armed += 1;
                 }
-                entries.push(entry);
+            }
+            // The kernel registers the entries while it submits them.
+            if let Err(e) = submit(ring) {
+                return Err((e, armed));
+            }
+            if !self.rounds.wait() {
+                return Err((io::Error::other("another worker failed to register"), armed));
             }
         }
+        Ok(())
+    }
 
-        // Register all entries; the CQE of each REGISTER SQE returns once a
-        // request has been assigned to the entry.
-        let registered = (|| {
-            let mut sq = ring.submission();
-            for (idx, entry) in entries.iter().enumerate() {
-                let sqe = entry.cmd_sqe(fd, FUSE_IO_URING_CMD_REGISTER, 0, idx as u64);
-                // Safe because release_entries() keeps the entries alive
-                // while the kernel holds them.
-                unsafe { sq.push(&sqe) }
-                    .map_err(|e| io::Error::other(format!("submission queue full: {e}")))?;
-            }
-            drop(sq);
-            submit(&mut ring)
-        })();
-        let _ = ready_tx.send(match &registered {
-            Ok(()) => Ok(()),
-            Err(e) => Err(io::Error::other(e.to_string())),
-        });
-        registered?;
+    fn run(self, exit: Arc<AtomicBool>, ready_tx: Sender<io::Result<()>>) -> io::Result<()> {
+        let (mut ring, mut entries) = self.setup(&ready_tx)?;
+        let fd = self.fd.as_raw_fd();
         // A handler that panics stops the worker like an error, and the
         // panic goes on once the kernel has given the entries back.
         let mut panic = None;
@@ -1808,12 +2022,7 @@ impl<F: FileSystem + Send + Sync + 'static> UringFuseServing<F> {
         } else {
             cfg.workers
         };
-        let workers = workers.min(nr_queues);
-
-        let mut queue_ids: Vec<Vec<u16>> = vec![Vec::new(); workers];
-        for qid in 0..nr_queues {
-            queue_ids[qid % workers].push(qid as u16);
-        }
+        let entries_per_queue = cfg.entries_per_queue.max(1);
 
         let file = session
             .get_fuse_file()
@@ -1823,11 +2032,12 @@ impl<F: FileSystem + Send + Sync + 'static> UringFuseServing<F> {
 
         // A queue's entries hold at most one buffer each, so more buffers
         // than entries would never be lent.
-        let bufs_per_queue = cfg.bufs_per_queue.min(cfg.entries_per_queue.max(1));
+        let bufs_per_queue = cfg.bufs_per_queue.min(entries_per_queue);
+        let spread = spread_entries(nr_queues, entries_per_queue, workers, bufs_per_queue);
+        let workers = spread.len();
         // The kernel takes a 16-bit buffer table slot per entry, and each
         // entry of a worker gets its own slot.
-        let worker_entries =
-            queue_ids.iter().map(Vec::len).max().unwrap_or(0) * cfg.entries_per_queue;
+        let worker_entries = spread.iter().map(Vec::len).max().unwrap_or(0);
         let want_zero_copy = cfg.zero_copy && worker_entries <= u16::MAX as usize + 1;
         if cfg.zero_copy && !want_zero_copy {
             warn!("uring: zero-copy needs at most 65536 entries per worker, serving without it");
@@ -1856,17 +2066,18 @@ impl<F: FileSystem + Send + Sync + 'static> UringFuseServing<F> {
             None
         };
 
-        // Build one worker per queue set, cloning the fuse fd up front so
+        // Build one worker per entry set, cloning the fuse fd up front so
         // cloning failures are reported before any thread is spawned.
         let abort = Arc::new(ConnectionAbort::new(session.mountpoint()));
+        let nr_rounds = spread.iter().flatten().map(|&(_, round)| round + 1).max();
+        let rounds = Arc::new(RegisterRounds::new(workers, nr_rounds.unwrap_or(1)));
         let mut worker_list = Vec::with_capacity(workers);
-        for ids in queue_ids {
+        for entries in spread {
             worker_list.push(UringWorker {
                 fd: file
                     .try_clone()
                     .map_err(|e| SessionFailure(format!("uring: dup fuse fd: {e}")))?,
-                qids: ids,
-                entries_per_queue: cfg.entries_per_queue,
+                entries,
                 payload_cap,
                 pools: pools.clone(),
                 // Zero-copy comes only with buffer pools.
@@ -1876,6 +2087,7 @@ impl<F: FileSystem + Send + Sync + 'static> UringFuseServing<F> {
                     })?),
                     None => None,
                 },
+                rounds: rounds.clone(),
                 server: server.clone(),
                 abort: abort.clone(),
             });
@@ -1902,6 +2114,9 @@ impl<F: FileSystem + Send + Sync + 'static> UringFuseServing<F> {
             match handle {
                 Ok(handle) => set.push(handle),
                 Err(e) => {
+                    // Release the workers already waiting for this one in
+                    // the registration rounds, or stop() can't join them.
+                    rounds.fail();
                     set.stop(&mut session, true);
                     return Err(SessionFailure(format!("uring: spawn worker {id}: {e}")));
                 }
@@ -2069,6 +2284,98 @@ mod tests {
         assert!(parse_cpu_mask("a-b").is_err());
         assert!(parse_cpu_mask("1-2-3").is_err());
         assert!(possible_cpu_count().unwrap() >= 1);
+    }
+
+    #[test]
+    fn test_spread_entries() {
+        use std::collections::HashSet;
+
+        let cases = [
+            (24, 16, 4, 4),
+            (24, 4, 24, 4),
+            (4, 2, 3, 1),
+            (1, 1, 8, 0),
+            (24, 5, 4, 2),
+            (96, 4, 8, 4),
+            (96, 16, 8, 4),
+            (96, 16, 12, 4),
+            (96, 4, 96, 4),
+            (4, 3, 1, 3),
+        ];
+        for (queues, per_queue, workers, bufs) in cases {
+            let spread = spread_entries(queues, per_queue, workers, bufs);
+            assert_eq!(spread.len(), workers.min(queues * per_queue));
+            let workers = spread.len();
+            let k = per_queue.min(workers);
+            let holders = bufs.clamp(1, k);
+            let mut by_queue = vec![Vec::new(); queues];
+            for (w, q) in spread.iter().enumerate() {
+                for &(qid, round) in q {
+                    by_queue[qid as usize].push((round, w));
+                }
+            }
+            for (qid, by_round) in by_queue.iter_mut().enumerate() {
+                by_round.sort();
+                assert_eq!(by_round.len(), per_queue, "queue {qid}");
+                // The last k entries of a queue take a round each, after the
+                // others, on k different workers, which are all the
+                // queue's workers.
+                let (rest, last) = by_round.split_at(per_queue - k);
+                assert!(last.windows(2).all(|w| w[0].0 < w[1].0), "queue {}", qid);
+                assert!(rest.iter().all(|&(r, _)| r == 0 && r < last[0].0));
+                let owners: HashSet<usize> = last.iter().map(|&(_, w)| w).collect();
+                assert_eq!(owners.len(), k, "queue {qid}");
+                // A queue with an entry on every worker ends on the one that
+                // would own it with whole queues.
+                if k == workers {
+                    assert_eq!(last[k - 1].1, qid % workers, "queue {qid}");
+                }
+            }
+            // Queues 0 to workers - 1 end their registration on different
+            // workers, and so do the next workers queues and so on.
+            let tops: Vec<usize> = by_queue.iter().map(|q| q.last().unwrap().1).collect();
+            for chunk in tops.chunks(workers) {
+                assert_eq!(chunk.iter().collect::<HashSet<_>>().len(), chunk.len());
+            }
+            // Queues workers apart give their other buffers to different
+            // workers, so enough of them hold buffers on all k workers.
+            if k == workers && holders > 1 {
+                let span = (k - 1).div_ceil(holders - 1).saturating_sub(1) * workers;
+                for qid in 0..queues.saturating_sub(span) {
+                    let held: HashSet<usize> = (qid..=qid + span)
+                        .step_by(workers)
+                        .flat_map(|q| by_queue[q][per_queue - holders..].iter().map(|&(_, w)| w))
+                        .collect();
+                    assert_eq!(held.len(), k, "queue {qid}");
+                }
+            }
+            // The workers get the same number of entries, give or take one.
+            let sizes: Vec<usize> = spread.iter().map(Vec::len).collect();
+            assert!(sizes.iter().max().unwrap() - sizes.iter().min().unwrap() <= 1);
+        }
+        // Zero workers count as 1.
+        assert_eq!(spread_entries(2, 1, 0, 0), vec![vec![(0, 0), (1, 0)]]);
+    }
+
+    #[test]
+    fn test_register_rounds() {
+        let rounds = Arc::new(RegisterRounds::new(3, 2));
+        let done: Vec<_> = (0..3)
+            .map(|_| {
+                let rounds = rounds.clone();
+                std::thread::spawn(move || (0..2).all(|_| rounds.wait()))
+            })
+            .collect();
+        assert!(done.into_iter().all(|t| t.join().unwrap()));
+
+        // A failed worker releases the others from their round.
+        let rounds = Arc::new(RegisterRounds::new(2, 1));
+        let waiter = std::thread::spawn({
+            let rounds = rounds.clone();
+            move || rounds.wait()
+        });
+        drop(RoundsGuard(&rounds));
+        assert!(!waiter.join().unwrap());
     }
 
     #[test]
@@ -2338,11 +2645,11 @@ mod tests {
 
         let worker = UringWorker {
             fd: File::open("/dev/null").unwrap(),
-            qids: vec![0],
-            entries_per_queue: 1,
+            entries: vec![(0, 0)],
             payload_cap: 4096,
             pools: None,
             bounce: None,
+            rounds: Arc::new(RegisterRounds::new(1, 1)),
             server: Arc::new(Server::new(Arc::new(fs))),
             abort: Arc::new(ConnectionAbort {
                 path: None,
@@ -2780,7 +3087,7 @@ mod tests {
     /// holding `bufs_per_queue` buffers, and zero-copy if `zero_copy`, read
     /// and write through the mount, then check that dropping the serving
     /// layer gets the ring entries back from the kernel and unmounts.
-    fn check_passthrough_mount(bufs_per_queue: usize, zero_copy: bool) {
+    fn check_passthrough_mount(workers: usize, bufs_per_queue: usize, zero_copy: bool) {
         let src = TempDir::new().unwrap();
         std::fs::write(src.as_path().join("hello"), b"over io_uring").unwrap();
         let mnt = TempDir::new().unwrap();
@@ -2797,7 +3104,7 @@ mod tests {
         let mut se = FuseSession::new(mnt.as_path(), "uring_serving_test", "", false).unwrap();
         se.mount().unwrap();
         let cfg = UringConfig {
-            workers: 2,
+            workers,
             entries_per_queue: 2,
             bufs_per_queue,
             zero_copy,
@@ -2820,7 +3127,7 @@ mod tests {
             assert!(serving.zero_copy);
         }
         eprintln!(
-            "uring mount: {bufs_per_queue} buffers per queue, zero-copy {}",
+            "uring mount: {workers} workers, {bufs_per_queue} buffers per queue, zero-copy {}",
             serving.zero_copy
         );
 
@@ -2874,8 +3181,15 @@ mod tests {
         for (bufs_per_queue, zero_copy) in
             [(0, false), (1, false), (4, false), (1, true), (4, true)]
         {
-            check_passthrough_mount(bufs_per_queue, zero_copy);
+            check_passthrough_mount(2, bufs_per_queue, zero_copy);
         }
+    }
+
+    /// With more workers than queues, every queue's entries are spread over
+    /// several workers.
+    #[test]
+    fn test_uring_serving_more_workers_than_queues() {
+        check_passthrough_mount(possible_cpu_count().unwrap() + 1, 0, false);
     }
 
     #[test]
