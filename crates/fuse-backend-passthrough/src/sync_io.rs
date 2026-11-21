@@ -753,6 +753,10 @@ impl<S: BitmapSlice + Send + Sync> FileSystem for PassthroughFs<S> {
             opts |= capable & FsOptions::DIRECT_IO_ALLOW_MMAP;
         }
 
+        if self.cfg.syncfs {
+            opts |= capable & FsOptions::HAS_SYNCFS;
+        }
+
         if capable.contains(FsOptions::PERFILE_DAX) {
             opts |= FsOptions::PERFILE_DAX;
             self.perfile_dax.store(true, Ordering::Relaxed);
@@ -1604,6 +1608,17 @@ impl<S: BitmapSlice + Send + Sync> FileSystem for PassthroughFs<S> {
         fsops::setxattr(file.as_raw_fd(), name, value, flags)
     }
 
+    #[cfg(target_os = "linux")]
+    fn syncfs(&self, _ctx: &Context, inode: Inode) -> io::Result<()> {
+        // syncfs(2) rejects the O_PATH descriptor that the inode keeps.
+        let file = self.open_inode(inode, libc::O_RDONLY)?;
+        // SAFETY: syncfs() takes no pointers, and `file` is open for the call.
+        if unsafe { libc::syncfs(file.as_raw_fd()) } < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
     fn getxattr(
         &self,
         _ctx: &Context,
@@ -2235,6 +2250,18 @@ mod tests {
         // no_open opens the file again for each request.
         fs.no_open.store(true, Ordering::Relaxed);
         io(entry.inode, 0);
+    }
+
+    #[test]
+    fn test_syncfs() {
+        let source = TempDir::new().unwrap();
+        let fs = PassthroughFs::<()>::new(Config {
+            root_dir: source.as_path().to_str().unwrap().to_string(),
+            ..Default::default()
+        })
+        .unwrap();
+        fs.import().unwrap();
+        fs.syncfs(&prepare_context(), ROOT_ID).unwrap();
     }
 
     #[test]

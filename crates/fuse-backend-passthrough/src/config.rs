@@ -221,6 +221,15 @@ pub struct Config {
     ///
     /// The default is `false`.
     pub uring_zero_copy: bool,
+
+    /// Whether to ask for `FsOptions::HAS_SYNCFS`, so that `syncfs(2)` and `sync(2)` of the
+    /// mount sync the host file system that holds `root_dir`. Once it is negotiated, every
+    /// `sync(2)` on the system waits for the server.
+    ///
+    /// Behind a `Vfs` the flag comes from `VfsOptions::out_opts` instead.
+    ///
+    /// The default value for this option is `false`.
+    pub syncfs: bool,
 }
 
 impl Default for Config {
@@ -247,6 +256,7 @@ impl Default for Config {
             allow_direct_io: true,
             allow_mmap: false,
             uring_zero_copy: false,
+            syncfs: false,
         }
     }
 }

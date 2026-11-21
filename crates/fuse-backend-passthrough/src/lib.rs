@@ -1658,6 +1658,31 @@ mod tests {
     }
 
     #[test]
+    fn test_init_gates_has_syncfs() {
+        let tmpdir = TempDir::new().expect("Cannot create temporary directory.");
+        for syncfs in [false, true] {
+            let fs_cfg = Config {
+                do_import: false,
+                root_dir: tmpdir.as_path().to_string_lossy().to_string(),
+                syncfs,
+                ..Default::default()
+            };
+            let fs = PassthroughFs::<()>::new(fs_cfg).unwrap();
+            fs.import().unwrap();
+            for offered in [false, true] {
+                let mut capable = FsOptions::empty();
+                capable.set(FsOptions::HAS_SYNCFS, offered);
+                let opts = fs.init(capable).unwrap();
+                assert_eq!(
+                    opts.contains(FsOptions::HAS_SYNCFS),
+                    syncfs && offered,
+                    "syncfs {syncfs}, offered {offered}"
+                );
+            }
+        }
+    }
+
+    #[test]
     #[cfg(target_os = "linux")]
     fn test_generic_read_write_noopen() {
         let tmpdir = TempDir::new().expect("Cannot create temporary directory.");

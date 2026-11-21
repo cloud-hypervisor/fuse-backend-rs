@@ -242,6 +242,9 @@ const HAS_RESEND: u64 = 1_u64 << 39;
 #[cfg(feature = "fusedev-uring")]
 const OVER_IO_URING: u64 = 1_u64 << 41;
 
+// The server asks for FUSE_SYNCFS on syncfs(2) and sync(2) (protocol 7.47).
+const HAS_SYNCFS: u64 = 1_u64 << 44;
+
 // The kernel sends a supplementary group matching the parent directory's
 // group in create/mkdir/symlink/mknod requests (FUSE_EXT_GROUPS extension).
 const CREATE_SUPP_GROUP: u64 = 1_u64 << 34;
@@ -532,6 +535,15 @@ bitflags! {
         #[cfg(feature = "fusedev-uring")]
         const OVER_IO_URING = OVER_IO_URING;
 
+        /// Asks the kernel to send `Opcode::Syncfs` when `syncfs(2)` or `sync(2)` syncs the
+        /// mount (protocol 7.47, Linux 7.4). virtiofs and fuseblk mounts send it without this
+        /// flag.
+        ///
+        /// A server that doesn't answer it stalls every `sync(2)` on the system. So the kernel
+        /// offers the flag only to a server that opened `/dev/fuse` with `CAP_SYS_ADMIN` in the
+        /// initial user namespace, and ignores it from others.
+        const HAS_SYNCFS = HAS_SYNCFS;
+
         /// Indicates that the kernel sends a supplementary group matching the
         /// parent directory's group in create/mkdir/symlink/mknod requests
         /// (FUSE_EXT_GROUPS extension), so that objects created in setgid
@@ -813,7 +825,8 @@ pub enum Opcode {
     CopyFileRange = 47,
     SetupMapping = 48,
     RemoveMapping = 49,
-    MaxOpcode = 50,
+    Syncfs = 50,
+    MaxOpcode = 51,
 
     /* Reserved opcodes: helpful to detect structure endian-ness in case of e.g. virtiofs */
     CuseInitBswapReserved = 1_048_576, /* CUSE_INIT << 8 */
@@ -874,6 +887,7 @@ impl From<u32> for Opcode {
             47 => Opcode::CopyFileRange,
             48 => Opcode::SetupMapping,
             49 => Opcode::RemoveMapping,
+            50 => Opcode::Syncfs,
             _ => Opcode::MaxOpcode,
         }
     }
@@ -1136,6 +1150,13 @@ pub struct FsyncIn {
     pub padding: u32,
 }
 unsafe impl ByteValued for FsyncIn {}
+
+#[repr(C)]
+#[derive(Debug, Default, Copy, Clone)]
+pub struct SyncfsIn {
+    pub padding: u64,
+}
+unsafe impl ByteValued for SyncfsIn {}
 
 #[repr(C)]
 #[derive(Debug, Default, Copy, Clone)]
@@ -1609,6 +1630,7 @@ mod tests {
             Opcode::CopyFileRange,
             Opcode::SetupMapping,
             Opcode::RemoveMapping,
+            Opcode::Syncfs,
         ];
         for op in valid {
             assert_eq!(Opcode::from(op as u32) as u32, op as u32);

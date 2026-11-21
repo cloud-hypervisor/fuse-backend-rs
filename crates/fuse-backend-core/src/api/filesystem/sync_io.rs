@@ -535,6 +535,16 @@ pub trait FileSystem {
         Ok(st)
     }
 
+    /// Write the file system that contains `inode` to stable storage, like `syncfs(2)`.
+    ///
+    /// virtiofs sends this with the root inode when the guest syncs the file system. Since
+    /// Linux 6.18 fuseblk mounts send it too, and since Linux 7.4 any mount that negotiated
+    /// `FsOptions::HAS_SYNCFS`.
+    /// If this method returns `ENOSYS`, the kernel stops sending it.
+    fn syncfs(&self, ctx: &Context, inode: Self::Inode) -> io::Result<()> {
+        Err(io::Error::from_raw_os_error(libc::ENOSYS))
+    }
+
     /// Set an extended attribute.
     ///
     /// If this method fails with an `ENOSYS` error, then the kernel will treat that as a permanent
@@ -1183,6 +1193,10 @@ impl<FS: FileSystem> FileSystem for Arc<FS> {
 
     fn statfs(&self, ctx: &Context, inode: Self::Inode) -> io::Result<statvfs64> {
         self.deref().statfs(ctx, inode)
+    }
+
+    fn syncfs(&self, ctx: &Context, inode: Self::Inode) -> io::Result<()> {
+        self.deref().syncfs(ctx, inode)
     }
 
     fn setxattr(
