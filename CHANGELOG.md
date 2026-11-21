@@ -302,6 +302,12 @@
   and no code in the workspace relied on it.
 
 ### Fixed
+- [376](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/376): `Vfs` answers the lookups of "." and ".." that the kernel sends with
+  `FsOptions::EXPORT_SUPPORT` with the node ids it already has. The root of a file system
+  mounted at "/" comes back as `ROOT_ID` with generation 0 instead of under a second node id,
+  and ".." of the root of a file system mounted elsewhere is the parent of its mountpoint, not
+  the root itself. So `open_by_handle_at()` of a directory whose dentry has left the cache
+  connects to the mount root instead of failing with ESTALE.
 - [328](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/328): The servers answer a request that fails before it gets a reply. A malformed
   request (a short body, a name without its NUL, a size that disagrees with the body) gets
   `EINVAL`, and a failure of the server itself, such as remapping the ids, gets `EIO`. Most early
