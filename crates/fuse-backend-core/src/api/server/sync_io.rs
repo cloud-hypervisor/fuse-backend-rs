@@ -260,6 +260,8 @@ impl<F: FileSystem + Sync> Server<F> {
             x if x == Opcode::Read as u32 => self.read(ctx),
             x if x == Opcode::Write as u32 => self.write(ctx),
             x if x == Opcode::Statfs as u32 => self.statfs(ctx),
+            #[cfg(not(target_os = "macos"))]
+            x if x == Opcode::Syncfs as u32 => self.syncfs(ctx),
             x if x == Opcode::Release as u32 => self.release(ctx),
             x if x == Opcode::Fsync as u32 => self.fsync(ctx),
             x if x == Opcode::Setxattr as u32 => self.setxattr(ctx),
@@ -687,6 +689,18 @@ impl<F: FileSystem + Sync> Server<F> {
     ) -> Result<usize> {
         match self.fs.statfs(ctx.context(), ctx.nodeid()) {
             Ok(st) => ctx.reply_ok(Some(Kstatfs::from(st)), None),
+            Err(e) => ctx.reply_error(e),
+        }
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    pub(super) fn syncfs<S: BitmapSlice, W: Writer>(
+        &self,
+        ctx: &mut SrvContext<'_, F, S, W>,
+    ) -> Result<usize> {
+        let _: SyncfsIn = ctx.r.read_obj().map_err(Error::DecodeMessage)?;
+        match self.fs.syncfs(ctx.context(), ctx.nodeid()) {
+            Ok(()) => ctx.reply_ok(None::<u8>, None),
             Err(e) => ctx.reply_error(e),
         }
     }
@@ -2156,6 +2170,38 @@ mod tests {
         server.handle_message(reader, writer, None, None).unwrap();
         let out = OutHeader::from_slice(&write_buf[..size_of::<OutHeader>()]).unwrap();
         assert_eq!(out.unique, unique);
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn test_server_syncfs() {
+        use crate::api::filesystem::Context;
+
+        struct SyncFs;
+        impl FileSystem for SyncFs {
+            type Inode = u64;
+            type Handle = u64;
+
+            fn syncfs(&self, _: &Context, inode: u64) -> io::Result<()> {
+                assert_eq!(inode, ROOT_ID);
+                Ok(())
+            }
+        }
+
+        fn serve<F: FileSystem + Sync>(server: &Server<F>) -> i32 {
+            let mut read_buf = request(Opcode::Syncfs, SyncfsIn::default().as_slice());
+            let mut write_buf = [0u8; 4096];
+            let reader = Reader::<()>::from_slice(&mut read_buf);
+            let writer = TestWriter::new(&mut write_buf);
+            let len = server.handle_message(reader, writer, None, None).unwrap();
+            assert_eq!(len, size_of::<OutHeader>());
+            let mut out = OutHeader::default();
+            out.as_mut_slice().copy_from_slice(&write_buf[..len]);
+            out.error
+        }
+
+        assert_eq!(serve(&Server::new(SyncFs)), 0);
+        assert_eq!(serve(&Server::new(MockFS)), -libc::ENOSYS);
     }
 
     #[cfg(target_os = "linux")]
