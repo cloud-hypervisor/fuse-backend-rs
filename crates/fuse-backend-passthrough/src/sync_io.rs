@@ -153,6 +153,12 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
         Ok(FileFlagGuard::Writer(guard))
     }
 
+    /// Whether an open, READ or WRITE with `flags` does direct IO on the host
+    /// file. Without `allow_direct_io`, the host file never has O_DIRECT.
+    pub(super) fn is_direct_io(&self, flags: u32) -> bool {
+        self.cfg.allow_direct_io && flags & (os_compat::O_DIRECT as u32) != 0
+    }
+
     /// Serve a write request targeting a file opened with `O_DIRECT`.
     ///
     /// The payload of a fuse WRITE request sits in the request buffer right
@@ -470,10 +476,7 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
         // on this handle through the direct IO path: serving an O_DIRECT fd
         // through the page-cache path fails with EINVAL because the page-cache
         // buffers don't satisfy direct IO alignment requirements.
-        if self.cfg.allow_direct_io
-            && flags & (os_compat::O_DIRECT as u32) != 0
-            && flags & (libc::O_DIRECTORY as u32) == 0
-        {
+        if self.is_direct_io(flags) && flags & (libc::O_DIRECTORY as u32) == 0 {
             opts |= OpenOptions::DIRECT_IO;
         }
         match self.cfg.cache_policy {
@@ -606,7 +609,7 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
         // alignment constraints the transport buffers don't satisfy, so stage
         // the data through an aligned bounce buffer. An aligned `w` takes the
         // data directly, and reads until EOF like `read_direct()`.
-        if self.cfg.allow_direct_io && flags & (os_compat::O_DIRECT as u32) != 0 {
+        if self.is_direct_io(flags) {
             if !aligned {
                 return self.read_direct(&f, w, size as usize, offset);
             }
@@ -663,7 +666,7 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
         // alignment constraints the transport buffers don't satisfy, so stage
         // the payload through an aligned bounce buffer. An aligned `r` gives
         // the payload directly, and writes all of it like `write_direct()`.
-        if self.cfg.allow_direct_io && flags & (os_compat::O_DIRECT as u32) != 0 {
+        if self.is_direct_io(flags) {
             if !aligned {
                 return self.write_direct(&f, r, size as usize, offset);
             }
