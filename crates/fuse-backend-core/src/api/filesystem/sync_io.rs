@@ -936,9 +936,20 @@ pub trait FileSystem {
         Err(io::Error::from_raw_os_error(libc::ENOSYS))
     }
 
-    /// TODO: support this
-    fn notify_reply(&self) -> io::Result<()> {
-        Err(io::Error::from_raw_os_error(libc::ENOSYS))
+    /// Receive the data that `Server::notify_retrieve()` asked the kernel for.
+    ///
+    /// `r` holds `size` bytes of `inode`, starting at `offset`, and `unique` is the id passed to
+    /// `notify_retrieve()`. The kernel expects no reply. The default implementation drops the
+    /// data.
+    fn notify_reply(
+        &self,
+        ctx: &Context,
+        inode: Self::Inode,
+        unique: u64,
+        offset: u64,
+        size: u32,
+        r: &mut dyn ZeroCopyReader,
+    ) {
     }
 
     /// Remap the external IDs in context to internal IDs.
@@ -1415,9 +1426,17 @@ impl<FS: FileSystem> FileSystem for Arc<FS> {
             .poll(ctx, inode, handle, khandle, flags, events)
     }
 
-    /// Send notify reply.
-    fn notify_reply(&self) -> io::Result<()> {
-        self.deref().notify_reply()
+    fn notify_reply(
+        &self,
+        ctx: &Context,
+        inode: Self::Inode,
+        unique: u64,
+        offset: u64,
+        size: u32,
+        r: &mut dyn ZeroCopyReader,
+    ) {
+        self.deref()
+            .notify_reply(ctx, inode, unique, offset, size, r)
     }
 
     #[inline]
