@@ -22,7 +22,7 @@ use std::marker::PhantomData;
 use std::mem::size_of;
 #[cfg(all(target_os = "linux", feature = "fusedev-uring"))]
 use std::sync::atomic::AtomicBool;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU16, AtomicU32, AtomicU64, Ordering};
 
 use crate::abi::fuse_abi::*;
 use crate::api::filesystem::{Context, FileSystem, ZeroCopyReader, ZeroCopyWriter};
@@ -67,6 +67,12 @@ pub struct Server<F: FileSystem + Sync> {
     negotiated_init_flags: AtomicU64,
     /// Max stack depth sent in the INIT reply with `FsOptions::PASSTHROUGH`.
     max_stack_depth: AtomicU32,
+    /// `max_background` of the INIT reply.
+    max_background: AtomicU16,
+    /// `congestion_threshold` of the INIT reply, 0 for three quarters of `max_background`.
+    congestion_threshold: AtomicU16,
+    /// Upper bound for `max_readahead` of the INIT reply.
+    max_readahead: AtomicU32,
     /// Whether the kernel offered io_uring buffer pools in INIT.
     #[cfg(all(target_os = "linux", feature = "fusedev-uring"))]
     uring_bufpool: AtomicBool,
@@ -90,6 +96,9 @@ impl<F: FileSystem + Sync> Server<F> {
             #[cfg(all(target_os = "linux", feature = "fusedev-uring"))]
             negotiated_init_flags: AtomicU64::new(0),
             max_stack_depth: AtomicU32::new(1),
+            max_background: AtomicU16::new(u16::MAX),
+            congestion_threshold: AtomicU16::new(0),
+            max_readahead: AtomicU32::new(u32::MAX),
             #[cfg(all(target_os = "linux", feature = "fusedev-uring"))]
             uring_bufpool: AtomicBool::new(false),
             #[cfg(all(target_os = "linux", feature = "fusedev-uring"))]
@@ -116,6 +125,51 @@ impl<F: FileSystem + Sync> Server<F> {
         }
         self.max_stack_depth.store(depth, Ordering::Relaxed);
         Ok(())
+    }
+
+    /// Set how many background requests, such as readahead and writeback, the kernel sends
+    /// before new ones wait for earlier ones to finish. The default is `u16::MAX`. Call it
+    /// before the server handles the INIT request.
+    ///
+    /// Without `CAP_SYS_ADMIN`, Linux lowers the value to its `max_user_bgreq` module
+    /// parameter. It ignores 0 and keeps its own default of 12, so 0 fails with `EINVAL`.
+    /// FreeBSD ignores the value.
+    pub fn set_max_background(&self, max: u16) -> io::Result<()> {
+        if max == 0 {
+            return Err(io::Error::from_raw_os_error(libc::EINVAL));
+        }
+        self.max_background.store(max, Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// Set how many background requests make the kernel treat the connection as congested,
+    /// which makes it skip asynchronous readahead and background writeback. The default is
+    /// three quarters of the `set_max_background()` value. Call it before the server handles
+    /// the INIT request.
+    ///
+    /// The INIT reply lowers a threshold above `max_background` to it, because the kernel never
+    /// has more background requests than that. Without `CAP_SYS_ADMIN`, Linux lowers it to its
+    /// `max_user_congthresh` module parameter. It ignores 0 and keeps its own default of 9, so
+    /// 0 fails with `EINVAL`. FreeBSD ignores the value.
+    pub fn set_congestion_threshold(&self, threshold: u16) -> io::Result<()> {
+        if threshold == 0 {
+            return Err(io::Error::from_raw_os_error(libc::EINVAL));
+        }
+        self.congestion_threshold
+            .store(threshold, Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// Set the most bytes the kernel reads ahead of a sequential reader. The INIT reply sends
+    /// the smaller of this and the kernel's offer, 128 KiB on Linux, so this can only lower
+    /// readahead. Writing `/sys/class/bdi/<major>:<minor>/read_ahead_kb` after the mount raises
+    /// it. The default of `u32::MAX` keeps the offer. Linux rounds the value down to whole
+    /// pages, so 0 or anything under a page turns readahead off. Call it before the server
+    /// handles the INIT request.
+    ///
+    /// It does nothing on macOS, where the INIT reply always sends 0.
+    pub fn set_max_readahead(&self, bytes: u32) {
+        self.max_readahead.store(bytes, Ordering::Relaxed);
     }
 
     /// Get the protocol version and the options enabled at INIT, for `restore_init()`. Before
