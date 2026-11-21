@@ -321,6 +321,133 @@ mod fusedev_tests {
 
     #[test]
     #[ignore] // it depends on privileged mode to pass through /dev/fuse
+    fn integration_test_idmapped_mount() -> Result<()> {
+        use fuse_backend_rs::api::server::Server;
+        use fuse_backend_rs::passthrough::{Config, PassthroughFs};
+        use fuse_backend_rs::transport::{FuseSession, SyncFuseServing, SyncServingConfig};
+        use nix::errno::Errno;
+        use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+        use std::sync::Arc;
+
+        // Root creates a file through an idmapped mount of the FUSE mount, and the backing
+        // file gets the owner that the idmapping gives root.
+        if !running_as_root() {
+            eprintln!("skipping integration_test_idmapped_mount: not running as root");
+            return Ok(());
+        }
+        if !kernel_at_least(6, 12) {
+            eprintln!(
+                "skipping integration_test_idmapped_mount: kernel {} can't idmap FUSE mounts",
+                kernel_release()
+            );
+            return Ok(());
+        }
+
+        let src_dir = TempDir::new().unwrap();
+        let mnt_dir = TempDir::new().unwrap();
+        let idmapped_dir = TempDir::new().unwrap();
+        // The kernel lets nobody write to a directory whose owner the idmapping doesn't map.
+        std::os::unix::fs::chown(src_dir.as_path(), Some(1000), Some(1000))?;
+
+        let fs = PassthroughFs::<()>::new(Config {
+            root_dir: src_dir.as_path().to_str().unwrap().to_string(),
+            allow_idmap: true,
+            ..Default::default()
+        })
+        .unwrap();
+        let mut se = FuseSession::new(mnt_dir.as_path(), "idmap", "", false).unwrap();
+        se.mount().unwrap();
+        let server = Arc::new(Server::new(fs));
+        let serving = SyncFuseServing::new(se, server, SyncServingConfig::default()).unwrap();
+        // Idmapping fails until the INIT reply, and opening the root waits for it.
+        std::fs::read_dir(mnt_dir.as_path())?;
+
+        // A user namespace whose uid and gid 1000 are 0 outside it. Through a mount idmapped
+        // with it, what uid 1000 owns shows as owned by root, and what root creates gets uid
+        // 1000.
+        let mut cmd = Command::new("sleep");
+        cmd.arg("60");
+        // SAFETY: the closure only calls unshare(), which is async-signal-safe.
+        unsafe {
+            cmd.pre_exec(|| {
+                Errno::result(libc::unshare(libc::CLONE_NEWUSER))?;
+                Ok(())
+            });
+        }
+        let mut child = cmd.spawn()?;
+        let pid = child.id();
+
+        let empty = CString::default();
+        let mnt = CString::new(mnt_dir.as_path().as_os_str().as_bytes()).unwrap();
+        let idmapped = CString::new(idmapped_dir.as_path().as_os_str().as_bytes()).unwrap();
+        // Map the child's user namespace, then clone the FUSE mount, idmap the clone with that
+        // namespace and attach it. The child is killed after this whether or not it fails.
+        let idmap = || -> Result<()> {
+            std::fs::write(format!("/proc/{pid}/uid_map"), "1000 0 1")?;
+            std::fs::write(format!("/proc/{pid}/gid_map"), "1000 0 1")?;
+            let userns = std::fs::File::open(format!("/proc/{pid}/ns/user"))?;
+            let attr = libc::mount_attr {
+                attr_set: libc::MOUNT_ATTR_IDMAP,
+                attr_clr: 0,
+                propagation: 0,
+                userns_fd: userns.as_raw_fd() as u64,
+            };
+            // SAFETY: the paths and `attr` outlive the calls.
+            let fd = Errno::result(unsafe {
+                libc::syscall(
+                    libc::SYS_open_tree,
+                    libc::AT_FDCWD,
+                    mnt.as_ptr(),
+                    libc::OPEN_TREE_CLONE | libc::OPEN_TREE_CLOEXEC,
+                )
+            })?;
+            // SAFETY: open_tree() returned a new fd, which nothing else owns.
+            let tree = unsafe { OwnedFd::from_raw_fd(fd as i32) };
+            // SAFETY: `tree` is open, and the path and `attr` outlive the call.
+            Errno::result(unsafe {
+                libc::syscall(
+                    libc::SYS_mount_setattr,
+                    tree.as_raw_fd(),
+                    empty.as_ptr(),
+                    libc::AT_EMPTY_PATH,
+                    &attr,
+                    std::mem::size_of::<libc::mount_attr>(),
+                )
+            })?;
+            // SAFETY: `tree` is open, and the paths outlive the call.
+            Errno::result(unsafe {
+                libc::syscall(
+                    libc::SYS_move_mount,
+                    tree.as_raw_fd(),
+                    empty.as_ptr(),
+                    libc::AT_FDCWD,
+                    idmapped.as_ptr(),
+                    libc::MOVE_MOUNT_F_EMPTY_PATH,
+                )
+            })?;
+            Ok(())
+        };
+        let res = idmap();
+        let _ = child.kill();
+        let _ = child.wait();
+        // Writing and reading send requests with FUSE_INVALID_UIDGID.
+        let path = idmapped_dir.as_path().join("file");
+        let created = res.and_then(|()| {
+            std::fs::write(&path, b"data")?;
+            Ok((std::fs::read(&path)?, std::fs::metadata(&path)?))
+        });
+        let _ = nix::mount::umount2(idmapped_dir.as_path(), nix::mount::MntFlags::MNT_DETACH);
+        drop(serving);
+
+        let (data, md) = created?;
+        assert_eq!((data.as_slice(), md.uid()), (&b"data"[..], 0));
+        let md = std::fs::metadata(src_dir.as_path().join("file"))?;
+        assert_eq!((md.uid(), md.gid()), (1000, 1000));
+        Ok(())
+    }
+
+    #[test]
+    #[ignore] // it depends on privileged mode to pass through /dev/fuse
     fn integration_test_direct_io_shared_mmap() -> Result<()> {
         // An O_DIRECT open of a file on the mount gets DIRECT_IO, and the kernel fails a shared
         // mmap of such a file with ENODEV unless the server negotiated FUSE_DIRECT_IO_ALLOW_MMAP.
