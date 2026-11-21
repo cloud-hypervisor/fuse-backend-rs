@@ -968,6 +968,8 @@ impl<F: FileSystem + Sync> Server<F> {
                 let enabled = capable & want;
                 #[cfg(all(target_os = "linux", feature = "fusedev-uring"))]
                 let enabled = self.apply_extra_init_flags(capable, enabled);
+                #[cfg(target_os = "linux")]
+                let (enabled, request_timeout) = self.apply_request_timeout(capable, enabled);
                 // Capability bits 32 and above (FUSE_SECURITY_CTX,
                 // FUSE_CREATE_SUPP_GROUP, ...) travel in flags2 of the reply,
                 // and the kernel applies flags2 only when the daemon also sets
@@ -1010,6 +1012,10 @@ impl<F: FileSystem + Sync> Server<F> {
                 }
                 #[cfg(all(target_os = "linux", feature = "fusedev-uring"))]
                 self.record_uring_init(flags_u64, out.max_write, out.max_pages);
+                #[cfg(target_os = "linux")]
+                {
+                    out.request_timeout = request_timeout;
+                }
                 self.vers.store(
                     encode_version(version.major, version.minor),
                     Ordering::Release,
@@ -2104,6 +2110,53 @@ mod tests {
             out.flags2 & (FsOptions::CREATE_SUPP_GROUP.bits() >> 32) as u32,
             0
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_server_init_request_timeout() {
+        // The timeout set on the server, whether the kernel offers the flag, and the timeout in
+        // the reply.
+        for (secs, offered, expected) in [(30, true, 30), (30, false, 0), (0, true, 0)] {
+            let init_in = InitIn {
+                major: KERNEL_VERSION,
+                minor: KERNEL_MINOR_VERSION,
+                max_readahead: 0,
+                flags: FsOptions::INIT_EXT.bits() as u32,
+            };
+            let flags2 = if offered {
+                (FsOptions::REQUEST_TIMEOUT.bits() >> 32) as u32
+            } else {
+                0
+            };
+            let init_in2 = InitIn2 {
+                flags2,
+                unused: [0; 11],
+            };
+            let mut read_buf = [init_in.as_slice(), init_in2.as_slice()].concat();
+            let mut write_buf = [0u8; 4096];
+            let server = Server::new(MockFS);
+            server.set_request_timeout(secs);
+            let res = server
+                .init(
+                    &mut prepare_srvcontext(&mut read_buf, &mut write_buf),
+                    |_| {},
+                )
+                .unwrap();
+            let mut out = InitOut::default();
+            out.as_mut_slice()
+                .copy_from_slice(&write_buf[size_of::<OutHeader>()..res]);
+            assert_eq!(
+                out.request_timeout, expected,
+                "secs {} offered {}",
+                secs, offered
+            );
+            assert_eq!(out.flags2 & flags2 != 0, expected != 0);
+            assert_eq!(
+                out.flags & FsOptions::INIT_EXT.bits() as u32 != 0,
+                expected != 0
+            );
+        }
     }
 
     #[cfg(target_os = "linux")]
