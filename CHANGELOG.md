@@ -32,6 +32,14 @@
   directly by the fusedev build script.
 
 ### Added
+- [370](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/370): `OverlayFs` handles `FUSE_SYNCFS` by syncing its upper layer, the
+  only one it writes to. Without an upper layer it answers success.
+- [344](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/344): Handle `FUSE_SYNCFS` (protocol 7.34), which virtiofs sends
+  when the guest syncs the file system. Since Linux 6.18 fuseblk mounts send it
+  too. The new `FileSystem::syncfs()` defaults to `ENOSYS`, after which the
+  kernel stops sending it. `Vfs` syncs every mounted backend when asked for its
+  root, and `PassthroughFs` calls `syncfs(2)` on the shared directory.
+  `Opcode::MaxOpcode` moves to 51.
 - [304](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/304): Give FreeBSD a verification path. The Linux wire-format ABI
   body moves out of `fuse_abi_linux.rs` into a shared `fuse_abi_wire.rs`
   (each per-OS prelude re-exports the libc names the body uses), and a new

@@ -498,6 +498,27 @@ impl FileSystem for Vfs {
         }
     }
 
+    fn syncfs(&self, ctx: &Context, inode: VfsInode) -> Result<()> {
+        if !inode.is_pseudo_fs() {
+            return self.get_fs_by_idx(inode.fs_idx())?.syncfs(ctx, inode.ino());
+        }
+        // The kernel sends this for the root, which holds every backend. Sync them all, and
+        // answer ENOSYS only if all of them did, so that the kernel keeps sending it otherwise.
+        self.mountpoints
+            .load()
+            .values()
+            .map(|mnt| {
+                self.get_fs_by_idx(mnt.fs_idx)
+                    .and_then(|fs| fs.syncfs(ctx, mnt.ino))
+            })
+            .max_by_key(|res| match res {
+                Err(e) if e.raw_os_error() == Some(libc::ENOSYS) => 0,
+                Ok(()) => 1,
+                Err(_) => 2,
+            })
+            .unwrap_or(Ok(()))
+    }
+
     fn setxattr(
         &self,
         ctx: &Context,
