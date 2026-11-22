@@ -329,20 +329,50 @@ directory and 4 workers, had 0.82M IOPS for these writes with 4 buffers
 per queue and 1.07M with 16. Here, with an XFS directory and 4 workers, 4
 buffers gave 2.36M IOPS and 16 gave 2.42M.
 
+The reads are slower with a buffer per entry because larger pools miss
+the caches more. Each busy queue cycles through all of its buffers, so the
+8 pools of the reads hold 128 MiB with 16 buffers, 64 MiB with 8 and 32
+MiB with 4, and the machine has 32 MiB of L3 for each group of 8 cores. A
+1 MiB read writes its whole buffer and then reads it back. perf stat
+counted the daemon's threads in another set of runs of the reads, on
+Linux 7.3.4, for 8 seconds each, medians of 3. This set read faster at
+every pool size than the set of the table above, so compare its rows
+only with each other. The AMD cores count where the fills of their L1
+data cache came from. L3 misses show only in the L3's own counters,
+which this machine doesn't expose:
+
+| Buffers per queue | 1 MiB reads | Cycles per read | Fills per read from DRAM | Fills per read from the L3 |
+|-------------------|-------------|-----------------|--------------------------|----------------------------|
+| 16 (default) | 37.9 GiB/s | 926k | 8.4k | 11.7k |
+| 8 | 49.0 GiB/s | 716k | 6.2k | 17.7k |
+| 4 | 52.7 GiB/s | 666k | 6.0k | 18.4k |
+
+With 16 buffers, a read took 29% more cycles than with 8, with 35% more
+fills from DRAM and a third fewer from the L3. 4 KiB reads at depth 16
+from the same 8 jobs touch one page of a buffer each, and the pool size
+changed them by less than 7%, between 745k and 793k IOPS.
+
 The cost shows when slow requests hold the buffers. Each of 4 CPUs ran two
 fio jobs with O_DIRECT. One kept 8 reads of a slow file in flight, each of
 which waited 1 ms as in "Queue ownership". The other read 4 KiB of a fast
-file, one read at a time. VmRSS stayed under 7 MiB with any pool:
+file, one read at a time. VmRSS stayed under 7 MiB with any pool. The
+rows marked "later" ran with the perf counts above, on Linux 7.3.4:
 
 | Buffers per queue | Fast reads/s | p50 | p99 | Slow reads/s |
 |-------------------|--------------|-----|-----|--------------|
 | 16 (default) | 378k | 10 µs | 16 µs | 31.5k |
+| 16, later | 338k | 11 µs | 18 µs | 31.4k |
+| 8, later | 29.7k | 105 µs | 494 µs | 31.3k |
 | 4 | 3.2k | 1.22 ms | 1.91 ms | 15.8k |
 | 1 | 2.1k | 1.02 ms | 8.09 ms | 3.9k |
 | `AsyncFuseServing` | 138k | 27 µs | 59 µs | 30.1k |
 
-With 4 buffers, the slow reads of a CPU held all of its queue's buffers,
-and each fast read waited for one of them to finish.
+So the default stays a buffer per entry. Fewer buffers than entries,
+such as 8 for 16 entries, read 1 MiB faster from handlers that don't
+wait, but hold up fast requests once a queue has as many waiting
+requests as buffers. With 4 buffers, and most of the time with 8, the
+slow reads of a CPU held all of its queue's buffers, and each fast read
+waited for one of them to finish.
 
 Waiting for a buffer doesn't deadlock a file system whose handlers finish
 on their own. The kernel lends a buffer to an entry only together with a
@@ -433,7 +463,9 @@ and uses the buffer pools of protocol 7.46 (kernel 7.3) when the kernel has them
   over the workers, so a busy queue reaches at most this many workers, and
   never more than `workers`. With buffer pools, requests with a payload or
   reply body also need one of the queue's `bufs_per_queue` buffers. Past the
-  worker count, more entries only queue more requests on the same workers.
+  worker count, more entries only queue more requests on the same workers,
+  and with `new_async()` and the default `bufs_per_queue` they also grow
+  the pools.
 
 - `bufs_per_queue`: Default is 4 with `new()` and one per entry with
   `new_async()`. On Linux 7.3 and later it caps the requests with a
@@ -441,7 +473,9 @@ and uses the buffer pools of protocol 7.46 (kernel 7.3) when the kernel has them
   memory of the payload buffers. A busy queue reaches only as many
   workers as it has buffers. With `new_async()`, a request keeps its
   buffer while its handler waits, so slow requests hold up the others of
-  their queue. See "Smaller pools with the async handlers" above.
+  their queue. A file system whose handlers don't wait can read large
+  requests faster with fewer buffers than entries, because smaller pools
+  miss the caches less. See "Smaller pools with the async handlers" above.
 
 - `workers`: Default is one per CPU. A worker serves the requests of any
   queue it holds entries of, so the count no longer has to match the

@@ -103,8 +103,11 @@ pub struct UringConfig {
     ///
     /// `None` gives 4 buffers with `UringFuseServing::new()`, and
     /// `entries_per_queue` with `UringFuseServing::new_async()`, whose
-    /// requests keep their buffers while their handlers wait. See
-    /// `new_async()` before giving it fewer.
+    /// requests keep their buffers while their handlers wait. Fewer buffers
+    /// than entries take less memory and miss the caches less, so large
+    /// requests go faster, but once as many requests of a queue wait as it
+    /// has buffers, they hold up the others. See `new_async()` before giving
+    /// it fewer.
     pub bufs_per_queue: Option<usize>,
     /// Serve the reads and writes of opens that ask for it with zero-copy
     /// (`OpenOptions::IO_URING_ZERO_COPY`, Linux 7.3). The kernel lends the
@@ -3087,12 +3090,14 @@ impl<F: AsyncFileSystem + Send + Sync + 'static> UringFuseServing<F> {
     ///
     /// A request keeps its payload buffer while its handler waits, so a
     /// queue's buffer pool gets a buffer per entry unless `bufs_per_queue`
-    /// says otherwise. Fewer buffers take less memory, but the requests that
-    /// wait hold up those of their queue that need a buffer. That can't
-    /// deadlock while no handler waits for another request of the mount. A
-    /// handler that does, such as a READ that waits for a WRITE, needs as
-    /// many buffers per queue as such requests can wait at once, or the
-    /// default. `docs/fuse-uring-performance.md` has the numbers.
+    /// says otherwise, and by default more entries make larger pools. Fewer
+    /// buffers take less memory and miss the caches less, but the requests
+    /// that wait hold up those of their queue that need a buffer, once as
+    /// many wait as the queue has buffers. That can't deadlock while no
+    /// handler waits for another request of the mount. A handler that does,
+    /// such as a READ that waits for a WRITE, needs as many buffers per
+    /// queue as such requests can wait at once, or the default.
+    /// `docs/fuse-uring-performance.md` has the numbers.
     pub fn new_async(
         session: FuseSession,
         server: Arc<Server<F>>,
