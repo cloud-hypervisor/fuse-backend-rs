@@ -246,6 +246,9 @@
   fails with EEXIST. `UringConfig` has a new field.
 
 ### Changed
+- [384](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/384): The async workers of `UringFuseServing::new_async()` submit the fixed-buffer
+  reads and writes of zero-copy requests together with the commits, in one `io_uring_enter()`
+  per round of their loop instead of one per operation.
 - [325](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/325): The `fuse-backend-fusedev` `uring` transport uses io-uring 0.6 instead of 0.5,
   and depends on it only on Linux.
 - [324](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/324): `fuse-backend-core` uses bitflags 2 instead of 1. The flag types (`FsOptions`,

@@ -423,6 +423,47 @@ kinds of workers, it stayed within the spread of the runs in every
 workload above, and so did `IORING_SETUP_SINGLE_ISSUER` alone, over 3
 runs each.
 
+## The async worker loop
+
+An async worker serves its requests in futures on a single-threaded
+runtime. A loop takes the completions off the ring, polls the requests,
+and submits what they queued, the commits and the fixed-buffer reads and
+writes of zero-copy requests, in one `io_uring_enter()`. Before, each
+zero-copy operation went to the kernel in an `io_uring_enter()` of its
+own when its request queued it.
+
+The table shows the zero-copy requests in the setup of the table in
+"Ring setup flags", before and after operations went to the loop's
+submit, also with deferred task work, as medians of 3 passes. The
+syscall counts are from a separate run with `perf stat` on the daemon:
+
+| Workload | Before | After | Deferred, before | Deferred, after |
+|----------|--------|-------|------------------|-----------------|
+| 2 KiB files, 1 thread | 24.5k/s | 26.0k/s | 18.8k/s | 20.8k/s |
+| 2 KiB files, 4 threads | 91.5k/s | 94.4k/s | 75.6k/s | 78.6k/s |
+| 4 KiB, 1 job, depth 1 | 75.3k IOPS | 74.9k IOPS | 60.4k IOPS | 67.3k IOPS |
+| CPU time per read | 19.0 µs | 19.3 µs | 17.0 µs | 14.8 µs |
+| Syscalls per read | 10.0 | 10.0 | 6.0 | 2.0 |
+| 4 KiB, 4 jobs, depth 1 | 287k IOPS | 280k IOPS | 241k IOPS | 252k IOPS |
+| 4 KiB, 4 jobs, depth 16 | 698k IOPS | 722k IOPS | 750k IOPS | 863k IOPS |
+| CPU time per read | 22.9 µs | 20.8 µs | 19.4 µs | 15.8 µs |
+| `io_uring_enter()` per read | 1.01 | 0.40 | 1.26 | 0.26 |
+| 64 KiB, 1 job, depth 1 | 40.4k IOPS | 40.0k IOPS | 37.1k IOPS | 32.6k IOPS |
+| 64 KiB, 4 jobs, depth 16 | 690k IOPS | 697k IOPS | 710k IOPS | 735k IOPS |
+| `io_uring_enter()` per read | 1.08 | 0.91 | 1.39 | 0.44 |
+
+With deferred task work, a read at depth 1 takes 2 syscalls instead of
+6, and 4 KiB reads at depth 1 got 11% faster at 13% less CPU time, also
+in an earlier run (59.5k against 66.6k IOPS). Small files got 4% to 11%
+faster. At depth 16 the loop makes a fifth to a third of the
+`io_uring_enter()` calls. 4 KiB reads at depth 16 gained 15% in these
+passes but 1% in the earlier run, so that row varies too much between
+runs to tell. The 64 KiB reads at depth 1 measured 36.3k and 36.4k IOPS
+over 6 passes of their own, so their loss above doesn't hold up. Without
+deferred task work, 4 KiB reads at depth 16 gained 3%, 7% in the earlier
+run, with 40% of the `io_uring_enter()` calls, and the other rows
+stayed within the spread of the runs.
+
 ## Implementation Notes
 
 ### Current State
