@@ -302,6 +302,13 @@
   and no code in the workspace relied on it.
 
 ### Fixed
+- [NNN](link): A `FuseDevTask` that keeps finding requests lets its runtime run. On tokio,
+  `AsyncFd::ready()` takes none of the task's budget, and the read of a readable fuse fd doesn't
+  wait, so a task that kept finding requests never returned to its runtime. The timers, IO and
+  other tasks there waited until the clients paused, and so did the `AsyncFuseServing` handlers
+  that waited for a timer or for a task they spawned. After 64 requests read in a row without
+  waiting, the task now waits for the new `fuse_backend_core::async_runtime::park()`, which yields
+  on tokio and waits for the runtime to park on tokio-uring.
 - [328](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/328): The servers answer a request that fails before it gets a reply. A malformed
   request (a short body, a name without its NUL, a size that disagrees with the body) gets
   `EINVAL`, and a failure of the server itself, such as remapping the ids, gets `EIO`. Most early

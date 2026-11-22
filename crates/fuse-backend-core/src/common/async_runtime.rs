@@ -322,6 +322,30 @@ pub fn spawn<T: std::future::Future + 'static>(task: T) -> tokio::task::JoinHand
     Runtime::spawn(task)
 }
 
+/// Let the runtime of the current thread park once, or poll its driver.
+///
+/// A task that never waits keeps its runtime from parking. The runtime then doesn't poll its
+/// timers and IO, and tokio-uring, which submits io_uring operations only when its runtime
+/// parks, doesn't submit them. With tokio-uring, this returns once the runtime parked and
+/// submitted what was queued. With tokio, it yields, and the runtime polls its driver before it
+/// polls the task again.
+///
+/// With tokio-uring, the future isn't `Send`. A handler of an `AsyncFileSystem`, whose futures
+/// must be `Send`, runs it in a task with [`spawn()`].
+///
+/// This function must be called from the context of a `Runtime` object,
+/// i.e. within the future passed to `Runtime::block_on()`.
+pub async fn park() {
+    match *RUNTIME_TYPE {
+        RuntimeType::Tokio => tokio::task::yield_now().await,
+        // A no-op completes only once the runtime submitted it.
+        #[cfg(target_os = "linux")]
+        RuntimeType::Uring => {
+            let _ = tokio_uring::no_op().await;
+        }
+    }
+}
+
 /// Spawn a blocking task on the blocking thread pool of the default `Runtime`,
 /// returning a [`JoinHandle`] for it.
 ///

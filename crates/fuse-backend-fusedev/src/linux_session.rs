@@ -1062,6 +1062,7 @@ pub use asyncio::FuseDevTask;
 /// Task context to handle fuse request in asynchronous mode.
 mod asyncio {
     use std::cell::{Cell, RefCell};
+    use std::future::Future;
     use std::os::fd::AsFd;
     use std::os::unix::io::{AsRawFd, RawFd};
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -1078,6 +1079,7 @@ mod asyncio {
     use fuse_backend_core::api::filesystem::AsyncFileSystem;
     use fuse_backend_core::api::server::Server;
     use fuse_backend_core::async_file::File as AsyncFile;
+    use fuse_backend_core::async_runtime;
     use fuse_backend_core::buffer::Reader;
     use fuse_backend_core::file_buf::FileVolatileBuf;
 
@@ -1298,7 +1300,9 @@ mod asyncio {
         ///
         /// With the tokio runtime, the task waits for requests through the IO driver of the
         /// tokio runtime that polls it, and panics if that runtime has IO disabled. If no tokio
-        /// runtime polls it, it retries reads in a loop.
+        /// runtime polls it, it retries reads in a loop. A task that keeps finding requests
+        /// yields every few requests with `async_runtime::park()`, so that the runtime's
+        /// timers, IO and other tasks run.
         pub async fn poll_handler(&mut self) {
             // TODO: register the request buffers as io uring buffers.
             let fd = self.file.as_raw_fd();
@@ -1338,6 +1342,8 @@ mod asyncio {
             };
             let pool = BufferPool::new(self.buf_size, self.max_inflight);
             let mut inflight = FuturesUnordered::new();
+            // See `PARK_AFTER_READS`.
+            let mut reads_without_wait = 0;
 
             'serve: while !self.state.load(Ordering::Acquire) {
                 // Get a buffer for the next request. If the pool is exhausted,
@@ -1362,10 +1368,19 @@ mod asyncio {
                 // of the read future, so that its borrow of `buf` ends before
                 // the buffer is handed over to a request or the pool.
                 let read_result = {
-                    let read = read_request(&self.file, ready.as_ref(), &self.state, &mut buf);
-                    tokio::pin!(read);
+                    let park = reads_without_wait >= PARK_AFTER_READS;
+                    let inner =
+                        read_request(&self.file, ready.as_ref(), &self.state, &mut buf, park);
+                    tokio::pin!(inner);
+                    // Whether the read returned to the runtime before it completed.
+                    let mut waited = false;
+                    let mut read = std::future::poll_fn(|cx| {
+                        let poll = inner.as_mut().poll(cx);
+                        waited |= poll.is_pending();
+                        poll
+                    });
 
-                    loop {
+                    let result = loop {
                         tokio::select! {
                             biased;
                             // Complete in-flight requests first, see the function doc.
@@ -1378,9 +1393,11 @@ mod asyncio {
                                 break result;
                             }
                         }
-                    }
+                    };
+                    reads_without_wait = if waited { 0 } else { reads_without_wait + 1 };
                     // The read future has completed, so dropping it can't cancel
                     // an in-flight read and lose a request anymore.
+                    result
                 };
 
                 match read_result {
@@ -1428,6 +1445,7 @@ mod asyncio {
                                 // and reactor events are processed). Yield to
                                 // the runtime before retrying instead.
                                 tokio::task::yield_now().await;
+                                reads_without_wait = 0;
                                 continue 'serve;
                             }
                             _ => {
@@ -1456,6 +1474,16 @@ mod asyncio {
 
     /// How often a task waiting for a request checks its `state` flag.
     const STATE_CHECK_INTERVAL: Duration = Duration::from_millis(100);
+
+    /// How many requests a task reads in a row, without its read returning to the runtime,
+    /// before it lets the runtime park with `async_runtime::park()`.
+    ///
+    /// With tokio, a task whose fd stays readable finds the next request at once, because
+    /// `AsyncFd::ready()` takes none of the task's budget and the read doesn't wait. It would
+    /// never return to its runtime, and the runtime's timers, IO and other tasks wouldn't run.
+    /// With tokio-uring, every read is io_uring IO that waits for the runtime to park. Parking
+    /// every 8 requests cost 32 fio jobs 3% of their IOPS on tokio.
+    const PARK_AFTER_READS: u32 = 64;
 
     /// A `TimerFd` that exposes the raw fd tokio's `AsyncFd` needs.
     ///
@@ -1542,13 +1570,18 @@ mod asyncio {
     /// `state` asks the task to stop while it waits for one.
     ///
     /// With `ready`, wait until the fd is readable before each read, and wait
-    /// again if the read finds no request.
+    /// again if the read finds no request. With `park`, let the runtime park
+    /// first, see `PARK_AFTER_READS`.
     async fn read_request(
         file: &AsyncFile,
         ready: Option<&DeviceReadiness>,
         state: &AtomicBool,
         buf: &mut [u8],
+        park: bool,
     ) -> std::io::Result<Option<usize>> {
+        if park {
+            async_runtime::park().await;
+        }
         loop {
             let guard = match ready {
                 Some(ready) => loop {
