@@ -29,8 +29,9 @@
 //!   entry a buffer of its own. `--uring-zero-copy` serves reads and writes
 //!   with zero-copy (`UringConfig::zero_copy` and
 //!   `Config::uring_zero_copy`), which needs CAP_SYS_ADMIN.
-//!   Without `--async`, `--uring-defer-taskrun` defers the task work of the
-//!   workers' rings (`UringConfig::defer_taskrun`).
+//!   `--uring-defer-taskrun` defers the task work of the workers' rings
+//!   (`UringConfig::defer_taskrun`), with `--async` only on the kernels it
+//!   names.
 //! - `--uring --async` mode: requests are served through FUSE-over-io_uring
 //!   with the asynchronous handlers (`UringFuseServing::new_async`), and
 //!   each of the `N` workers keeps several requests in flight.
@@ -212,8 +213,8 @@ mod daemon {
             help();
             return Err(Error::from_raw_os_error(libc::EINVAL));
         }
-        // Only the workers of UringFuseServing::new() defer their task work.
-        if res.uring_defer_taskrun && (!res.as_uring || res.as_async) {
+        // Only the uring workers defer their task work.
+        if res.uring_defer_taskrun && !res.as_uring {
             help();
             return Err(Error::from_raw_os_error(libc::EINVAL));
         }

@@ -341,12 +341,81 @@ later set of 5 runs per setting, the stats went from 203k to 277k per
 second (196k-331k and 270k-363k), and the reads at depth 1 from 417k to
 449k IOPS (370k-433k and 434k-559k).
 
-The workers of `UringFuseServing::new_async()` ignore the setting. They
-wait for completions in epoll on the ring fd, and from Linux 6.3 on, the
-kernel doesn't wake epoll for deferred task work until commit
-b88902d8745a ("io_uring: wake ring pollers for local task_work"), which
-is in 7.4-rc1, 7.3.2, 7.2.14 and 6.18.60. On 7.3.1, with the flags, the
-first request after the mount never got an answer.
+The workers of `UringFuseServing::new_async()` wait for completions in
+epoll on the ring fd, and from Linux 6.3 on, the kernel doesn't wake
+epoll for deferred task work until commit b88902d8745a ("io_uring: wake
+ring pollers for local task_work"), which is in 7.4-rc1, 7.3.2, 7.2.14
+and 6.18.60. On 7.3.1, with the flags, the first request after the mount
+never got an answer. So they take the setting only on those releases
+and later ones of their branches, as uname(2) reports them, and run the
+task work themselves when epoll wakes them.
+
+The worker has to run all of that work. An `io_uring_enter()` with
+`IORING_ENTER_GETEVENTS` runs at most 20 items of task work, or as many
+as the completions it waits for (`IO_LOCAL_TW_DEFAULT_MAX` in Linux
+7.3), and the kernel wakes epoll only for work it queues while none is
+queued. A worker that ran 20 of a burst of completions and went back to
+epoll heard of neither the rest nor anything after it. In a test that wrote files from 4 threads,
+that stranded a worker about once in 23 runs. So a worker waits for as
+many completions as its ring holds, with a timeout of zero, which runs
+all queued work and returns. `IORING_SETUP_TASKRUN_FLAG` can't tell
+instead when work is left, because the kernel can set `IORING_SQ_TASKRUN`
+after the worker ran the work, and with no work queued, nothing clears
+it. A worker that entered the kernel until the flag cleared spun.
+
+A process that serves its own mount can strand itself with deferred task
+work. If its workers die while a ring holds a request whose task work
+hasn't run, for example because the process gets killed, nothing runs
+that work, and a thread of the same process that waits for the request
+keeps the ring open, so the process never exits. It stays in D state
+until a reboot. A daemon that dies closes its rings, which ends the
+requests, so only a process that is its own client can strand itself.
+The tests of the transport run their clients in child processes for
+that reason. Only the worker may enter such a ring, so zero-copy IO from
+another thread, such as a scoped thread of a handler, fails with EEXIST
+before it queues anything.
+
+The async workers gain less from the setting than the sync ones. The
+table shows the benchmark daemon with `--uring --async
+--no-backing-direct-io`, 8 workers and 16 entries per queue, without and
+with `--uring-defer-taskrun`, also with `--uring-zero-copy`, serving a
+tmpfs as root on a 96-core machine with Linux 7.3.4. `PassthroughFs`
+had the fix of #381, so its zero-copy READs read the file with io_uring.
+Each setting got a mount of its own per pass, which ran, in order: a
+walk of 64 directories of 256 empty files with readdir and fstatat in
+the fresh mount; 2,000 files of 2 KiB that one thread, or 4 threads 500
+each, opened, read and closed in a loop; direct random reads of 4 KiB
+and 64 KiB from 1 GiB files with fio, 1 or 4 jobs, with psync at depth 1
+or libaio at depth 16; a direct sequential read of a 64 MiB file in
+1 MiB blocks; and 4 jobs reading files of 32 MiB that way. fio ran on 4
+CPUs of its own, for 3 seconds after 1 second of ramp. Medians of 3
+passes, in alternating order, and the daemon's CPU time per read at
+4 KiB and depth 1:
+
+| Workload | Copy | Deferred | Zero-copy | Zero-copy, deferred |
+|----------|------|----------|-----------|---------------------|
+| walk | 143k/s | 144k/s | 146k/s | 139k/s |
+| 2 KiB files, 1 thread | 28.5k/s | 24.4k/s | 24.5k/s | 18.8k/s |
+| 2 KiB files, 4 threads | 104k/s | 90.0k/s | 91.5k/s | 75.6k/s |
+| 4 KiB, 1 job, depth 1 | 93.4k IOPS | 115k IOPS | 75.3k IOPS | 60.4k IOPS |
+| CPU time per read | 11.7 µs | 8.5 µs | 19.0 µs | 17.0 µs |
+| 4 KiB, 4 jobs, depth 1 | 350k IOPS | 437k IOPS | 287k IOPS | 241k IOPS |
+| 4 KiB, 1 job, depth 16 | 263k IOPS | 256k IOPS | 253k IOPS | 256k IOPS |
+| 4 KiB, 4 jobs, depth 16 | 696k IOPS | 683k IOPS | 698k IOPS | 750k IOPS |
+| 64 KiB, 1 job, depth 1 | 47.7k IOPS | 43.9k IOPS | 40.4k IOPS | 37.1k IOPS |
+| 64 KiB, 4 jobs, depth 16 | 435k IOPS | 437k IOPS | 690k IOPS | 710k IOPS |
+| 64 MiB sequential | 6226 MiB/s | 5925 MiB/s | 8583 MiB/s | 8289 MiB/s |
+| 4 x 32 MiB | 16094 MiB/s | 18201 MiB/s | 31959 MiB/s | 23149 MiB/s |
+
+Buffered reads of 4 KiB at depth 1 got 23% to 25% faster, at 27% less
+CPU time per read. There the loop finds the next request in the same
+`io_uring_enter()` that submits the last reply, so it makes 2 syscalls
+per read instead of 6 and never waits in epoll. Small files got 13% to
+23% slower, zero-copy reads at depth 1 16% to 20%, and 64 KiB reads at
+depth 1 8%. The zero-timeout wait above puts the worker to sleep until
+the timer interrupt on every enter that finds no work, which costs a
+context switch, and those workloads pay it more often than they save.
+The 4 x 32 MiB row varies by up to 90% between runs in every setting.
 
 `IORING_SETUP_COOP_TASKRUN` runs the task work when the worker next
 enters the kernel, instead of interrupting it with an IPI. With both
@@ -365,8 +434,7 @@ and uses the buffer pools of protocol 7.46 (kernel 7.3) when the kernel has them
 - Per-CPU queue model with configurable entries_per_queue
 - Buffer pools with configurable bufs_per_queue, see "Buffer pools" above
 - Zero-copy for opens that ask for it, see "Zero-copy" above
-- Deferred task work for the synchronous handlers as an option, see "Ring
-  setup flags" above
+- Deferred task work as an option, see "Ring setup flags" above
 - Fallback to classic `/dev/fuse` for notifications/interrupts
 
 ### Tuning Recommendations
@@ -394,8 +462,9 @@ and uses the buffer pools of protocol 7.46 (kernel 7.3) when the kernel has them
 
 - `defer_taskrun`: Default is off, because some kernels lose wake-ups
   with it. It speeds up requests that a client sends one at a time with
-  `new()`. "Ring setup flags" above has the numbers and the kernels.
-  `new_async()` ignores it.
+  `new()`. `new_async()` takes it only on the kernels that wake epoll for
+  it, and there it speeds up 4 KiB reads at depth 1 but slows down small
+  files. "Ring setup flags" above has the numbers and the kernels.
 
 ## References
 
