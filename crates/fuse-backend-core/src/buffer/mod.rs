@@ -863,11 +863,13 @@ mod tests {
         VolatileSlice,
     };
 
+    /// A zero-copy write `RecordingSource` was asked to perform: reader
+    /// position, file descriptor, byte count, file offset.
+    type RecordedWrite = (usize, std::os::unix::io::RawFd, usize, Option<u64>);
+
     /// A zero-copy source that records what it was asked to write.
     #[derive(Default)]
-    struct RecordingSource(
-        std::sync::Mutex<Vec<(usize, std::os::unix::io::RawFd, usize, Option<u64>)>>,
-    );
+    struct RecordingSource(std::sync::Mutex<Vec<RecordedWrite>>);
 
     impl super::ZeroCopySource for RecordingSource {
         fn write_to_file(
