@@ -217,10 +217,23 @@ pub struct Config {
     /// option changes nothing. Files that the backing store opens with
     /// O_DIRECT don't get it, because their IO goes through an aligned
     /// bounce buffer, which zero-copy data would reach only through a
-    /// slower copy.
+    /// slower copy. Read-only opens of files below
+    /// `uring_zero_copy_min_size` don't get it either.
     ///
     /// The default is `false`.
     pub uring_zero_copy: bool,
+    /// The smallest file, in bytes, whose read-only opens ask for zero-copy
+    /// with `uring_zero_copy`. The kernel chooses zero-copy per open, and
+    /// every READ of such an open registers the client's pages with the
+    /// server's ring and takes a fixed-buffer read, which costs more than
+    /// copying a small reply. A file smaller than this at open has only
+    /// small reads. Opens with write access ask for zero-copy at any size,
+    /// because the file can grow. `0` asks for it on every open. The reads
+    /// of a larger file can be small too, and if most of them are, leave
+    /// `uring_zero_copy` off.
+    ///
+    /// The default is 64 KiB.
+    pub uring_zero_copy_min_size: u64,
 }
 
 impl Default for Config {
@@ -247,6 +260,7 @@ impl Default for Config {
             allow_direct_io: true,
             allow_mmap: false,
             uring_zero_copy: false,
+            uring_zero_copy_min_size: 64 << 10,
         }
     }
 }

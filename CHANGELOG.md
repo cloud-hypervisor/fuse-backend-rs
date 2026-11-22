@@ -235,6 +235,9 @@
   still works and makes an idle task check the flag every 100ms. `AsyncFuseServing` and the
   `/dev/fuse` thread of `UringFuseServing::new_async()` stop with a signal, so their idle tasks
   no longer wake 10 times a second.
+- [383](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/383): With `passthrough::Config::uring_zero_copy`, read-only opens of files smaller
+  than the new `Config::uring_zero_copy_min_size`, 64 KiB by default, don't ask for zero-copy.
+  The kernel chooses zero-copy per open, and smaller READs copy faster.
 
 ### Changed
 - [325](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/325): The `fuse-backend-fusedev` `uring` transport uses io-uring 0.6 instead of 0.5,

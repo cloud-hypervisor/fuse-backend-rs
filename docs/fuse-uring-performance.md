@@ -268,7 +268,10 @@ with a file that has no descriptor, still works, but slower. The worker
 then copies the data through a memory file that it keeps mapped. It runs
 `WRITE_FIXED` from the client pages into the file and hands over the
 mapped bytes, or fills the mapping and runs `READ_FIXED` from the file
-into the client pages.
+into the client pages. `ZeroCopyWriter::prefers_fd()` tells a file
+system that a reply works this way, so `PassthroughFs` gives a zero-copy
+READ its file instead of reading page-cache hits inline with
+`RWF_NOWAIT`.
 
 The table shows the throughput of the benchmark daemon with `--uring
 --no-backing-direct-io`, 4 workers and 16 entries per queue, on a 24-CPU
@@ -285,6 +288,92 @@ seconds, and the two settings alternated three times:
 
 Zero-copy saves the copy of the payload, which matters for large
 requests. At 128 KiB the two runs overlap.
+
+### Small reads
+
+Zero-copy costs more than copying for small READs, and a server can't
+copy just those. `can_zero_copy_req()` in fs/fuse/dev_uring.c takes
+every READ and WRITE with pages of an open with
+`FOPEN_IO_URING_ZERO_COPY`, whatever its size. The commit of a zero-copy
+READ sets `skip_folio_copy`, so the kernel copies no reply into the
+client pages.
+Each such READ pays for registering the client pages and for a
+`READ_FIXED` on the worker's ring. io_uring serves a `READ_FIXED` of a
+page-cache hit inline on a file system with `FMODE_NOWAIT`, such as XFS,
+and hands it to its worker threads on one without, such as tmpfs.
+
+The benchmark daemon served PassthroughFs with 8 workers, 16 entries per
+queue and `--no-backing-direct-io`, on a 96-CPU machine with Linux 7.3.4,
+as root, from a tmpfs directory and from an XFS directory with a warm
+page cache. fio read 1 GiB files at random with O_DIRECT, from one job or
+four, each pinned to its own CPU, with psync at depth 1 or with libaio at
+depth 16, for 3 seconds after a 1 second ramp. The `new_async()` rows
+on XFS come from a build with `ZeroCopyWriter::prefers_fd()`, which
+makes no difference on tmpfs, where `PassthroughFs` doesn't read inline.
+The tables have the IOPS of zero-copy against those of copying, medians
+of 3 runs in alternating order:
+
+On tmpfs:
+
+| Read size | `new()`, 1 job, depth 1 | `new()`, 4 jobs, depth 16 | `new_async()`, 1 job, depth 1 | `new_async()`, 4 jobs, depth 16 |
+|-----------|---|---|---|---|
+| 4 KiB | 0.35 | 0.63 | 0.68 | 1.00 |
+| 16 KiB | 0.45 | 0.68 | 0.81 | 1.02 |
+| 32 KiB | 0.51 | 0.70 | 0.91 | 1.14 |
+| 64 KiB | 0.60 | 0.89 | 0.98 | 1.49 |
+| 128 KiB | 0.74 | 1.24 | 1.09 | 2.11 |
+| 1 MiB | 1.12 | 2.67 | 1.40 | 2.71 |
+
+On XFS:
+
+| Read size | `new()`, 1 job, depth 1 | `new()`, 4 jobs, depth 16 | `new_async()`, 1 job, depth 1 | `new_async()`, 4 jobs, depth 16 |
+|-----------|---|---|---|---|
+| 4 KiB | 0.98 | 0.71 | 0.87 | 1.03 |
+| 16 KiB | 1.03 | 0.74 | 0.94 | 1.06 |
+| 32 KiB | 1.16 | 0.96 | 1.00 | 1.10 |
+| 64 KiB | 1.22 | 1.23 | 1.10 | 1.22 |
+| 128 KiB | 1.29 | 1.56 | 1.24 | 1.37 |
+| 1 MiB | 1.61 | 2.71 | 1.61 | 1.74 |
+
+On tmpfs, a zero-copy READ waited for an io_uring worker thread, and
+`new()` spent 11.0 µs of CPU time per 4 KiB read with one job instead of
+3.3 µs. Its copying reads at depth 1 varied between mounts, from 108k to
+222k IOPS at 4 KiB, while the zero-copy ones stayed near 77k. On XFS,
+`new()` read as fast with zero-copy as with copying at depth 1. With 4
+jobs at depth 16, zero-copy cost `new()` 30% to 37% of its IOPS at 4
+KiB on both file systems. Zero-copy paid from 64 KiB on XFS. On tmpfs
+it paid from 128 KiB, except with `new()` at depth 1, where it paid only
+at 1 MiB. Sequential reads of the same sizes on tmpfs crossed over at the
+same sizes.
+
+While a file stays below 64 KiB, none of its READs returns 64 KiB or
+more, so with `Config::uring_zero_copy_min_size`, 64 KiB by default,
+`PassthroughFs` doesn't ask for zero-copy on a read-only open of it.
+Opens with write access ask at any size, because the file can grow.
+64 KiB keeps zero-copy where it pays on XFS. On tmpfs, or another file
+system without `FMODE_NOWAIT`, a larger minimum fits `new()` better. The
+READs of a large file can be small too. If most of them are, serve
+without zero-copy.
+
+The test read 2,000 files of 2 KiB, one after the other, from one job or
+from four jobs with 500 files each, in the setup above. The files/s and
+the daemon's CPU time per file, medians of 3 runs:
+
+| File system | Serving | Jobs | Zero-copy on every open | With the 64 KiB minimum |
+|-------------|---------|------|-------------------------|-------------------------|
+| tmpfs | `new()` | 1 | 30k/s, 27.4 µs | 31k/s, 24.0 µs |
+| tmpfs | `new()` | 4 | 117k/s, 25.0 µs | 122k/s, 22.4 µs |
+| tmpfs | `new_async()` | 1 | 27k/s, 38.3 µs | 28k/s, 34.1 µs |
+| tmpfs | `new_async()` | 4 | 98k/s, 35.1 µs | 103k/s, 29.8 µs |
+| XFS | `new()` | 1 | 31k/s, 23.7 µs | 32k/s, 23.6 µs |
+| XFS | `new()` | 4 | 123k/s, 22.3 µs | 127k/s, 22.5 µs |
+| XFS | `new_async()` | 1 | 27k/s, 35.6 µs | 28k/s, 34.0 µs |
+| XFS | `new_async()` | 4 | 103k/s, 30.0 µs | 98k/s, 29.0 µs |
+
+On tmpfs, the minimum saved 10% to 15% of the daemon's CPU time per
+file. Each file also costs a LOOKUP, an OPEN, a FLUSH and a RELEASE, so
+its READ is a small part of it. On XFS, the rates stayed within the
+spread of the runs, which was up to 5%.
 
 ## Implementation Notes
 
@@ -315,6 +404,12 @@ and uses the buffer pools of protocol 7.46 (kernel 7.3) when the kernel has them
   per queue, 4 KiB random writes with the async handlers reached 0.82M
   IOPS, against 1.05M with a buffer per entry. The synchronous handlers
   showed no difference.
+
+- `zero_copy`: Default is off. It costs more than copying for READs
+  below 64 KiB on XFS, and on tmpfs below 128 KiB with `new_async()` and
+  below 1 MiB with `new()` at depth 1, see "Small reads" above. With
+  `PassthroughFs`, `Config::uring_zero_copy_min_size` keeps read-only
+  opens of smaller files on copies.
 
 - `workers`: Default is one per CPU. A worker serves the requests of any
   queue it holds entries of, so the count no longer has to match the

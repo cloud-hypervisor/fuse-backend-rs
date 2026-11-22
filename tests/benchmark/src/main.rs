@@ -8,7 +8,8 @@
 //!
 //! Usage: `fuse-backend-rs-benchmark <src> <mountpoint> [--async] [--uring] [--threads N]
 //! [--sync-blocking] [--thread-pool] [--uring-bufs N] [--uring-zero-copy]
-//! [--no-backing-direct-io] [--kernel-passthrough] [--no-writeback] [--delay-us N] [--splice]`
+//! [--uring-zero-copy-min-size N] [--no-backing-direct-io] [--kernel-passthrough]
+//! [--no-writeback] [--delay-us N] [--splice]`
 //!
 //! - default (sync) mode: requests are served by `N` worker threads of the
 //!   `SyncFuseServing` serving layer, each reading from its own fuse channel
@@ -28,6 +29,8 @@
 //!   entry a buffer of its own. `--uring-zero-copy` serves reads and writes
 //!   with zero-copy (`UringConfig::zero_copy` and
 //!   `Config::uring_zero_copy`), which needs CAP_SYS_ADMIN.
+//!   `--uring-zero-copy-min-size N` sets `Config::uring_zero_copy_min_size`,
+//!   the smallest file whose read-only opens ask for it.
 //! - `--uring --async` mode: requests are served through FUSE-over-io_uring
 //!   with the asynchronous handlers (`UringFuseServing::new_async`), and
 //!   each of the `N` workers keeps several requests in flight.
@@ -96,6 +99,7 @@ mod daemon {
         thread_cnt: u32,
         uring_bufs: usize,
         uring_zero_copy: bool,
+        uring_zero_copy_min_size: u64,
         backing_direct_io: bool,
         delay: Duration,
     }
@@ -132,7 +136,7 @@ mod daemon {
 
     fn help() {
         println!(
-            "Usage:\n   fuse-backend-rs-benchmark <src> <mountpoint> [--async] [--uring] [--threads N] [--sync-blocking] [--thread-pool] [--uring-bufs N] [--uring-zero-copy] [--no-backing-direct-io] [--kernel-passthrough] [--no-writeback] [--delay-us N] [--splice]\n"
+            "Usage:\n   fuse-backend-rs-benchmark <src> <mountpoint> [--async] [--uring] [--threads N] [--sync-blocking] [--thread-pool] [--uring-bufs N] [--uring-zero-copy] [--uring-zero-copy-min-size N] [--no-backing-direct-io] [--kernel-passthrough] [--no-writeback] [--delay-us N] [--splice]\n"
         );
     }
 
@@ -163,6 +167,7 @@ mod daemon {
             thread_cnt: 4,
             uring_bufs: UringConfig::default().bufs_per_queue,
             uring_zero_copy: false,
+            uring_zero_copy_min_size: Config::default().uring_zero_copy_min_size,
             backing_direct_io: true,
             delay: Duration::ZERO,
         };
@@ -189,6 +194,10 @@ mod daemon {
                 "--uring-bufs" => {
                     idx += 1;
                     res.uring_bufs = option_value(&args, idx)?;
+                }
+                "--uring-zero-copy-min-size" => {
+                    idx += 1;
+                    res.uring_zero_copy_min_size = option_value(&args, idx)?;
                 }
                 _ => {
                     help();
@@ -218,6 +227,7 @@ mod daemon {
         src: &str,
         thread_pool: bool,
         uring_zero_copy: bool,
+        uring_zero_copy_min_size: u64,
         allow_direct_io: bool,
         backing_files: Option<Arc<FuseBackingFiles>>,
         no_writeback: bool,
@@ -239,6 +249,7 @@ mod daemon {
             root_dir: src.to_string(),
             do_import: false,
             uring_zero_copy,
+            uring_zero_copy_min_size,
             allow_direct_io,
             ..Default::default()
         };
@@ -362,6 +373,7 @@ mod daemon {
             &args.src,
             args.thread_pool,
             args.uring_zero_copy,
+            args.uring_zero_copy_min_size,
             args.backing_direct_io,
             backing_files.clone(),
             args.no_writeback,

@@ -1317,6 +1317,50 @@ mod tests {
         assert_eq!(n, 0);
     }
 
+    /// Read-only opens of files below `uring_zero_copy_min_size` don't ask
+    /// for zero-copy, and other opens do.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn test_uring_zero_copy_min_size() {
+        let source = TempDir::new().unwrap();
+        std::fs::write(source.as_path().join("small"), [0u8; 100]).unwrap();
+        std::fs::write(source.as_path().join("big"), [0u8; 200]).unwrap();
+        let mut fs = PassthroughFs::<()>::new(Config {
+            root_dir: source.as_path().to_str().unwrap().to_string(),
+            uring_zero_copy: true,
+            uring_zero_copy_min_size: 200,
+            ..Default::default()
+        })
+        .unwrap();
+        fs.import().unwrap();
+        let ctx = Context::default();
+        let zero_copy = |fs: &PassthroughFs, name: &str, flags: i32| {
+            let name = CString::new(name).unwrap();
+            let entry = fs.lookup(&ctx, ROOT_ID, &name).unwrap();
+            let (_, opts, _) = fs.open(&ctx, entry.inode, flags as u32, 0).unwrap();
+            opts.contains(OpenOptions::IO_URING_ZERO_COPY)
+        };
+        assert!(!zero_copy(&fs, "small", libc::O_RDONLY));
+        assert!(zero_copy(&fs, "big", libc::O_RDONLY));
+        assert!(zero_copy(&fs, "small", libc::O_RDWR));
+        assert!(zero_copy(&fs, "small", libc::O_WRONLY));
+
+        // A created file is empty, but the create has write access.
+        let args = CreateIn {
+            flags: libc::O_RDWR as u32,
+            mode: 0o644,
+            umask: 0,
+            fuse_flags: 0,
+        };
+        let name = CString::new("created").unwrap();
+        let (_, _, opts, _) = fs.create(&ctx, ROOT_ID, &name, args).unwrap();
+        assert!(opts.contains(OpenOptions::IO_URING_ZERO_COPY));
+
+        // 0 asks for zero-copy on every open.
+        fs.cfg.uring_zero_copy_min_size = 0;
+        assert!(zero_copy(&fs, "small", libc::O_RDONLY));
+    }
+
     #[test]
     fn test_passthroughfs_dir_timeout() {
         log::set_max_level(log::LevelFilter::Trace);

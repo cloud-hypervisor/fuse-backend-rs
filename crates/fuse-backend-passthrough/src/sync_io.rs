@@ -451,7 +451,7 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
         let file = self.open_inode(inode, flags as i32)?;
         drop(killpriv);
 
-        let zero_copy = self.zero_copy_option(flags);
+        let zero_copy = self.zero_copy_option(flags, &file);
         // Only regular files pass through, `opendir` also gets here.
         let backing_id = if flags & (libc::O_DIRECTORY as u32) == 0 {
             self.acquire_backing_id(inode, &file)
@@ -513,16 +513,23 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
         Ok((Some(handle), opts, backing_id))
     }
 
-    /// The option that asks for FUSE-over-io_uring zero-copy on a file opened
-    /// with `flags`, if the config wants it. Reads and writes of a backing
-    /// file opened with O_DIRECT go through an aligned bounce buffer, so
-    /// zero-copy data would take a slower copy through memory.
+    /// The option that asks for FUSE-over-io_uring zero-copy on `file`,
+    /// opened with `flags`, if the config wants it. Reads and writes of a
+    /// backing file opened with O_DIRECT go through an aligned bounce buffer,
+    /// so zero-copy data would take a slower copy through memory. A read-only
+    /// open of a file smaller than `uring_zero_copy_min_size` has only small
+    /// reads, which copy faster.
     #[cfg_attr(not(target_os = "linux"), allow(unused_variables))]
-    fn zero_copy_option(&self, flags: u32) -> OpenOptions {
+    fn zero_copy_option(&self, flags: u32, file: &File) -> OpenOptions {
         #[cfg(target_os = "linux")]
         if self.cfg.uring_zero_copy
             && flags & (libc::O_DIRECTORY as u32) == 0
             && !(self.cfg.allow_direct_io && flags & (libc::O_DIRECT as u32) != 0)
+            && !(flags as i32 & libc::O_ACCMODE == libc::O_RDONLY
+                && self.cfg.uring_zero_copy_min_size > 0
+                && file
+                    .metadata()
+                    .is_ok_and(|m| m.len() < self.cfg.uring_zero_copy_min_size))
         {
             return OpenOptions::IO_URING_ZERO_COPY;
         }
@@ -1067,7 +1074,7 @@ impl<S: BitmapSlice + Send + Sync> FileSystem for PassthroughFs<S> {
             }
         };
 
-        let zero_copy = self.zero_copy_option(args.flags);
+        let zero_copy = self.zero_copy_option(args.flags, &file);
         let mut backing_id = None;
         let ret_handle = if !self.no_open.load(Ordering::Relaxed) {
             backing_id = self.acquire_backing_id(entry.inode, &file);
