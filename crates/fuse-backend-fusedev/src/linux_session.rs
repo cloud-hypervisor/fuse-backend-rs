@@ -1065,7 +1065,7 @@ mod asyncio {
     use std::future::Future;
     use std::os::fd::AsFd;
     use std::os::unix::io::{AsRawFd, RawFd};
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::Arc;
     use std::time::Duration;
 
@@ -1078,10 +1078,9 @@ mod asyncio {
 
     use fuse_backend_core::api::filesystem::AsyncFileSystem;
     use fuse_backend_core::api::server::Server;
-    use fuse_backend_core::async_file::File as AsyncFile;
+    use fuse_backend_core::async_file::{File as AsyncFile, TrackedRequest};
     use fuse_backend_core::async_runtime;
     use fuse_backend_core::buffer::Reader;
-    use fuse_backend_core::file_buf::FileVolatileBuf;
 
     use crate::{FuseBuf, FuseDevReaderExt, FuseDevWriter};
 
@@ -1101,7 +1100,8 @@ mod asyncio {
     /// exhausted, the caller serves in-flight requests first instead of
     /// reading new ones (back pressure), and unread requests queue up in
     /// the kernel, which throttles the clients on its own once its queues
-    /// fill up.
+    /// fill up. A buffer leaked with its request doesn't count against the
+    /// limit, see `release_done()`, so the limit doesn't bound leaks.
     struct BufferPool {
         free: RefCell<Vec<Vec<u8>>>,
         created: Cell<usize>,
@@ -1137,6 +1137,15 @@ mod asyncio {
         fn release(&self, buf: Vec<u8>) {
             self.free.borrow_mut().push(buf);
         }
+
+        /// Return the buffer of a completed request, or, if the request
+        /// leaked it, let the pool allocate another one in its place.
+        fn release_done(&self, buf: Option<Vec<u8>>) {
+            match buf {
+                Some(buf) => self.release(buf),
+                None => self.created.set(self.created.get() - 1),
+            }
+        }
     }
 
     /// Task context to handle fuse request in asynchronous mode.
@@ -1166,6 +1175,7 @@ mod asyncio {
         server: Arc<Server<F>>,
         buf_size: usize,
         max_inflight: usize,
+        leaked: Arc<AtomicUsize>,
     }
 
     impl<F: AsyncFileSystem + Sync> FuseDevTask<F> {
@@ -1240,7 +1250,15 @@ mod asyncio {
                 state,
                 buf_size,
                 max_inflight: max_inflight.max(1),
+                leaked: Arc::default(),
             }
+        }
+
+        /// The number of requests that this task leaked, each with a request buffer of
+        /// `buf_size` bytes and a reference to the server, because IO into the buffer was in
+        /// flight when the request was dropped or completed. See `async_file::TrackedRequest`.
+        pub fn leaked_requests(&self) -> usize {
+            self.leaked.load(Ordering::Relaxed)
         }
 
         /// Handler to process fuse requests in asynchronous mode.
@@ -1286,11 +1304,12 @@ mod asyncio {
         /// `new()`, keep a duplicate from `File::try_clone()` to hand the file description to the
         /// new server.
         ///
-        /// Don't drop this future with tokio-uring while the session is up. tokio-uring doesn't
-        /// cancel the read pending in the kernel, so the kernel copies the next request into the
-        /// request buffer that the drop freed, and nothing answers that request until another
-        /// `notify_resend()`. To stop such a task, set `state` and let it serve one more request,
-        /// or tear the session down.
+        /// With tokio-uring, dropping this future is safe, for example in a `select!` with a
+        /// shutdown signal, but it doesn't cancel the IO in the kernel. The read that waits for a
+        /// request owns its buffer, and the kernel can still copy the next request into it.
+        /// Nothing answers that request until another `notify_resend()`, so for a takeover, set
+        /// `state` and let the task serve one more request instead. A request with IO into its
+        /// buffer in flight is leaked, see `leaked_requests()` and `async_file::File`.
         ///
         /// Note: when driven by the tokio-uring runtime, io_uring submission queue entries
         /// are submitted to the kernel whenever the runtime parks, so the driving future
@@ -1352,8 +1371,8 @@ mod asyncio {
                 let mut buf = match pool.try_acquire() {
                     Some(buf) => buf,
                     None => {
-                        if let Some(buf) = inflight.next().await {
-                            pool.release(buf);
+                        if let Some(done) = inflight.next().await {
+                            pool.release_done(done);
                             continue 'serve;
                         }
                         // Unreachable: the pool never hands out more buffers
@@ -1387,7 +1406,7 @@ mod asyncio {
                             res = inflight.next(), if !inflight.is_empty() => {
                                 // Safe: the set is non-empty, so next() only returns
                                 // once a request future has completed.
-                                pool.release(res.unwrap());
+                                pool.release_done(res.unwrap());
                             }
                             result = &mut read => {
                                 break result;
@@ -1414,8 +1433,11 @@ mod asyncio {
                         break 'serve;
                     }
                     Ok(Some(len)) => {
-                        let server = self.server.clone();
-                        inflight.push(handle_request(server, fd, buf, len));
+                        let request = handle_request(self.server.clone(), fd, buf, len);
+                        // SAFETY: the request owns its buffer, which it returns, and an
+                        // `Arc` of the server, so a leak keeps the file system alive too.
+                        let request = unsafe { TrackedRequest::new(request, self.leaked.clone()) };
+                        inflight.push(request);
                     }
                     Err(e) => {
                         pool.release(buf);
@@ -1464,8 +1486,8 @@ mod asyncio {
 
             // Drain all in-flight requests before returning, so quiescing the
             // task doesn't drop requests without a reply.
-            while let Some(buf) = inflight.next().await {
-                pool.release(buf);
+            while let Some(done) = inflight.next().await {
+                pool.release_done(done);
             }
 
             // TODO: unregister the request buffers as io uring buffers.
@@ -1572,11 +1594,15 @@ mod asyncio {
     /// With `ready`, wait until the fd is readable before each read, and wait
     /// again if the read finds no request. With `park`, let the runtime park
     /// first, see `PARK_AFTER_READS`.
+    ///
+    /// The read owns the buffer until it completes. A drop of this future
+    /// during the read leaves `buf` empty, and tokio-uring frees the buffer
+    /// later.
     async fn read_request(
         file: &AsyncFile,
         ready: Option<&DeviceReadiness>,
         state: &AtomicBool,
-        buf: &mut [u8],
+        buf: &mut Vec<u8>,
         park: bool,
     ) -> std::io::Result<Option<usize>> {
         if park {
@@ -1594,9 +1620,8 @@ mod asyncio {
                 },
                 None => None,
             };
-            // Safe because `vbuf` doesn't out-live `buf`.
-            let vbuf = unsafe { FileVolatileBuf::new(buf) };
-            let (result, _vbuf) = file.async_read_at(vbuf, 0).await;
+            let (result, read_buf) = file.async_read_owned_at(std::mem::take(buf), 0).await;
+            *buf = read_buf;
             match (result, guard) {
                 (Err(e), Some(mut guard)) if e.raw_os_error() == Some(libc::EAGAIN) => {
                     guard.clear_ready();
@@ -1677,6 +1702,24 @@ mod asyncio {
             assert!(pool.try_acquire().is_none());
             pool.release(buf2);
             pool.release(buf3);
+        }
+
+        #[test]
+        fn test_buffer_pool_leaked_buffer() {
+            let pool = BufferPool::new(64, 1);
+            let buf = pool.try_acquire().unwrap();
+            assert!(pool.try_acquire().is_none());
+
+            // A leaked buffer makes room for a new one.
+            std::mem::forget(buf);
+            pool.release_done(None);
+            let buf = pool.try_acquire().unwrap();
+            assert!(pool.try_acquire().is_none());
+
+            // A returned buffer goes back to the free list.
+            pool.release_done(Some(buf));
+            assert!(pool.try_acquire().is_some());
+            assert!(pool.try_acquire().is_none());
         }
 
         #[test]
