@@ -224,8 +224,7 @@
   Each worker runs an async runtime and keeps up to one request per ring entry in flight, so
   handlers that wait don't hold up the worker's other requests.
   Its queues get `entries_per_queue` pool buffers, because a request keeps its buffer
-  while its handler waits. A worker lets its runtime park every 64 requests, so the timers and
-  tokio-uring IO that handlers wait for still run while requests keep coming.
+  while its handler waits.
 - [318](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/318): `UringFuseServing::new_async()` serves zero-copy too. `ZeroCopySource::async_write_to_file()`
   and `AsyncFileReadWriteVolatile::raw_fd()` let `Reader::async_read_to_at()` move zero-copy
   data, and the fixed-buffer operations of a request run on the worker's ring while its other
@@ -249,6 +248,11 @@
 - [384](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/384): The async workers of `UringFuseServing::new_async()` submit the fixed-buffer
   reads and writes of zero-copy requests together with the commits, in one `io_uring_enter()`
   per round of their loop instead of one per operation.
+- [NNN](link): While none of their requests waits for anything but its zero-copy operation on
+  the ring, the async workers of `UringFuseServing::new_async()` wait for the next request in
+  `io_uring_enter()` instead of epoll, which saves a trip through the runtime per request. They
+  let their runtime park at least every millisecond, so tasks, timers and tokio-uring IO on a
+  worker's runtime run up to about 1 ms late.
 - [325](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/325): The `fuse-backend-fusedev` `uring` transport uses io-uring 0.6 instead of 0.5,
   and depends on it only on Linux.
 - [324](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/324): `fuse-backend-core` uses bitflags 2 instead of 1. The flag types (`FsOptions`,

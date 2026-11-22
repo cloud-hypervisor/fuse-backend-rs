@@ -1297,6 +1297,9 @@ struct Completions {
     waker: Option<Waker>,
     /// Whether the poll on the stop signal completed.
     stopped: bool,
+    /// How many request futures wait for the result of their zero-copy
+    /// operation.
+    op_waiters: usize,
 }
 
 /// The zero-copy operation that the request in an entry runs on the ring.
@@ -1321,6 +1324,32 @@ impl ZeroCopyOp {
 }
 
 impl Completions {
+    /// Whether the async worker loop, with `inflight` requests, can only
+    /// wait for the ring. It has no completion or stop to handle then, and
+    /// no request waits for anything but its operation on the ring.
+    #[cfg(feature = "async-io")]
+    fn idle(&self, inflight: usize) -> bool {
+        self.queue.is_empty() && !self.stopped && self.op_waiters == inflight
+    }
+
+    /// Let `waker` wait for the result of the operation of entry `idx`.
+    #[cfg(feature = "async-io")]
+    fn set_op_waker(&mut self, idx: usize, waker: &Waker) {
+        if self.ops[idx].waker.replace(waker.clone()).is_none() {
+            self.op_waiters += 1;
+        }
+    }
+
+    /// Take the waker of the request future that waits for the result of
+    /// the operation of entry `idx`, if one does.
+    fn take_op_waker(&mut self, idx: usize) -> Option<Waker> {
+        let waker = self.ops[idx].waker.take();
+        if waker.is_some() {
+            self.op_waiters -= 1;
+        }
+        waker
+    }
+
     /// The completions of a worker whose `nr_entries` entries the kernel
     /// holds.
     fn new(nr_entries: usize) -> Completions {
@@ -1330,6 +1359,7 @@ impl Completions {
             ops: vec![ZeroCopyOp::default(); nr_entries],
             waker: None,
             stopped: false,
+            op_waiters: 0,
         }
     }
 
@@ -1348,7 +1378,7 @@ impl Completions {
                 {
                     op.result = Some(cqe.result());
                     op.in_flight = false;
-                    if let Some(waker) = op.waker.take() {
+                    if let Some(waker) = self.take_op_waker(idx) {
                         waker.wake();
                     }
                 }
@@ -1450,10 +1480,10 @@ impl ZeroCopyIo<'_> {
         }
         // A request can give up on an operation and start the next one.
         state.wait_for_op(self.idx)?;
+        state.completions.take_op_waker(self.idx);
         let op = &mut state.completions.ops[self.idx];
         op.started = op.started.wrapping_add(1) & 0x7fff_ffff;
         op.result = None;
-        op.waker = None;
         let sqe = squeue::Entry128::from(sqe.user_data(op.user_data(self.idx)));
         // Safe because the operation points at the registered buffer, which
         // the kernel keeps until the entry commits, and the worker commits
@@ -1501,7 +1531,7 @@ impl ZeroCopyIo<'_> {
                     "uring: a zero-copy operation can't complete on another thread than the worker that started it with deferred task work",
                 )));
             }
-            state.completions.ops[self.idx].waker = Some(cx.waker().clone());
+            state.completions.set_op_waker(self.idx, cx.waker());
             Poll::Pending
         })
         .await;
@@ -2575,6 +2605,16 @@ fn submit(ring: &mut FuseRing) -> io::Result<()> {
     }
 }
 
+/// Submit what is queued on `ring`, if anything is.
+#[cfg(feature = "async-io")]
+fn submit_queued(ring: &mut FuseRing) -> io::Result<()> {
+    if ring.submission().is_empty() {
+        Ok(())
+    } else {
+        submit(ring)
+    }
+}
+
 /// Queue a poll on the eventfd of `stop`, which completes with
 /// `STOP_USER_DATA` once the signal stops.
 fn poll_stop(ring: &mut FuseRing, stop: &StopSignal) -> io::Result<()> {
@@ -2652,11 +2692,13 @@ impl<F: AsyncFileSystem + Send + Sync + 'static> UringWorker<F> {
     ///
     /// The ring fd is readable while completions are queued, or with
     /// deferred task work, while that work is queued. So the loop sleeps in
-    /// the runtime until a completion or a request future is ready. It
-    /// commits all requests that are done by then and submits the commits,
-    /// and the zero-copy operations that the requests queued, in one
-    /// `io_uring_enter()`. It lets the runtime park every
-    /// `PARK_AFTER_REQUESTS` requests.
+    /// the runtime until a completion or a request future is ready. While
+    /// its requests wait only for their zero-copy operations, it waits in
+    /// the ring instead, for up to `IDLE_WAIT` at a time, see
+    /// `wait_in_ring()`. It commits all requests that are done by then and
+    /// submits the commits, and the zero-copy operations that the requests
+    /// queued, in one `io_uring_enter()`. A busy loop lets the runtime park
+    /// at least every `IDLE_WAIT`.
     ///
     /// The loop stops once the poll on the stop signal completes, or when
     /// tearing the connection down fails the command of an armed entry.
@@ -2671,8 +2713,8 @@ impl<F: AsyncFileSystem + Send + Sync + 'static> UringWorker<F> {
         let fd = self.fd.as_raw_fd();
         let mut inflight = FuturesUnordered::new();
         let mut completed = VecDeque::new();
-        // The requests taken since the last park().
-        let mut taken = 0;
+        // When an idle loop next sleeps in the runtime instead of the ring.
+        let mut runtime_due = Instant::now() + IDLE_WAIT;
 
         let result = 'serve: loop {
             let stopped = {
@@ -2704,24 +2746,51 @@ impl<F: AsyncFileSystem + Send + Sync + 'static> UringWorker<F> {
                     let caught = settle(&mut entry, served);
                     (idx, entry, caught)
                 });
-                taken += 1;
             }
-            {
+            let now = Instant::now();
+            // Whether a busy loop lets the runtime park below.
+            let due = now >= runtime_due;
+            // Whether the loop goes idle into the select below, where it
+            // sleeps in the runtime. An idle loop isn't stopped.
+            let idle = {
                 let mut state = lock(state);
-                if !state.ring.submission().is_empty() {
-                    if let Err(e) = submit(&mut state.ring) {
-                        break 'serve Err(e);
+                let idle = state.completions.idle(inflight.len());
+                if idle {
+                    // Readiness that the runtime saw before is stale, because
+                    // the loop took those completions since. Later
+                    // completions make the fd readable again.
+                    if let Some(Ok(mut guard)) = ring_ready.readable().now_or_never() {
+                        guard.clear_ready();
+                    }
+                    // Once the runtime is due, the loop sleeps in it, also
+                    // under load, so that it runs its other tasks, timers and
+                    // IO, and tokio-uring submits.
+                    if !due {
+                        match wait_in_ring(&mut state, runtime_due - now) {
+                            Ok(true) => continue 'serve,
+                            Ok(false) => {}
+                            Err(e) => break 'serve Err(e),
+                        }
                     }
                 }
-            }
+                if let Err(e) = submit_queued(&mut state.ring) {
+                    break 'serve Err(e);
+                }
+                idle
+            };
             // The requests delivered before the stop finish in the drain
             // below.
             if stopped {
                 break 'serve Ok(());
             }
-            if taken >= PARK_AFTER_REQUESTS {
-                taken = 0;
+            if !idle && due {
+                // A busy loop may not go idle for a while, so it lets the
+                // runtime park. A yield isn't enough on tokio-uring, which
+                // submits only when its runtime parks. The budget starts
+                // when the park returns, like the idle loop's after its
+                // sleep.
                 async_runtime::park().await;
+                runtime_due = Instant::now() + IDLE_WAIT;
             }
 
             tokio::select! {
@@ -2756,6 +2825,11 @@ impl<F: AsyncFileSystem + Send + Sync + 'static> UringWorker<F> {
                     Ok(mut guard) => guard.clear_ready(),
                     Err(e) => break 'serve Err(e),
                 },
+            }
+            // The budget starts when the sleep ends, so a request that
+            // ends a long sleep still gets the wait in the ring.
+            if idle {
+                runtime_due = Instant::now() + IDLE_WAIT;
             }
         };
 
@@ -2848,6 +2922,45 @@ impl<F: AsyncFileSystem + Send + Sync + 'static> UringWorker<F> {
     }
 }
 
+/// How long an async worker goes without its runtime at most. An idle one
+/// waits in its ring up to that long before it sleeps in the runtime, see
+/// `wait_in_ring()`, and a busy one lets it park as often. So the
+/// runtime's other tasks, its timers and IO, and the submissions
+/// tokio-uring makes when it parks wait no longer than that.
+///
+/// A busy worker's returns to the runtime don't restart the budget, because
+/// a runtime with a task to run or a woken `block_on()` future polls its
+/// driver without parking. An idle worker's sleep restarts it. None of its
+/// requests can wake the runtime then, so it parks unless other tasks keep
+/// it busy.
+#[cfg(feature = "async-io")]
+const IDLE_WAIT: Duration = Duration::from_millis(1);
+
+/// Submit what is queued on the ring in `state` and wait up to `timeout`
+/// for a completion, while the async worker loop is idle. Returns whether
+/// the loop should go round again instead of sleeping in its runtime.
+///
+/// A loop that sleeps in its runtime goes through it for each request, and
+/// on a ring without deferred task work, the task work that delivers the
+/// request first interrupts the epoll_wait() with EINTR. A wait in
+/// io_uring_enter() runs that work and returns with the request.
+#[cfg(feature = "async-io")]
+fn wait_in_ring(state: &mut RingState, timeout: Duration) -> io::Result<bool> {
+    let timeout = types::Timespec::from(timeout);
+    let args = types::SubmitArgs::new().timespec(&timeout);
+    match state.ring.submitter().submit_with_args(1, &args) {
+        Ok(_) => {}
+        Err(e) if matches!(e.raw_os_error(), Some(libc::ETIME | libc::EINTR)) => {}
+        // The completion queue overflowed, which the top of the loop drains.
+        Err(e) if e.raw_os_error() == Some(libc::EBUSY) => return Ok(true),
+        Err(e) => return Err(e),
+    }
+    // The enter returns how many entries it submitted, also when the wait
+    // timed out, and an enter that submits only part of the queue returns
+    // before it waits.
+    Ok(!state.ring.completion().is_empty() || !state.ring.submission().is_empty())
+}
+
 /// Wait until the ring in `state` has operations to submit, or while
 /// `serving`, until its queue holds entry completions or the stop.
 #[cfg(feature = "async-io")]
@@ -2864,17 +2977,6 @@ async fn queued(state: &Mutex<RingState>, serving: bool) {
     })
     .await
 }
-
-/// How many requests an async worker takes before it lets its runtime park
-/// with `async_runtime::park()`, whose doc says why that matters.
-///
-/// While requests keep coming, the worker finds them on its ring without
-/// waiting, and its runtime never parks. A return to the runtime isn't
-/// enough, because a runtime with a task to run or a woken `block_on()`
-/// future polls its driver without parking. So unlike `PARK_AFTER_READS` of
-/// `FuseDevTask`, the count doesn't restart when the worker waited.
-#[cfg(feature = "async-io")]
-const PARK_AFTER_REQUESTS: usize = 64;
 
 /// How long a stopping async worker waits for its handlers to finish.
 #[cfg(feature = "async-io")]
@@ -3318,6 +3420,12 @@ impl<F: AsyncFileSystem + Send + Sync + 'static> UringFuseServing<F> {
     /// of its own.
     ///
     /// The workers take `defer_taskrun` only on the kernels it names.
+    ///
+    /// While none of its requests waits for anything but the ring, a worker
+    /// waits for the next one in `io_uring_enter()` instead of its runtime.
+    /// It lets the runtime park at least every millisecond, also when it is
+    /// busy, so tasks, timers and tokio-uring IO that an application or a
+    /// handler starts on the worker's runtime run up to about 1 ms late.
     pub fn new_async(
         session: FuseSession,
         server: Arc<Server<F>>,
@@ -4242,6 +4350,82 @@ mod tests {
         drop(serving);
     }
 
+    /// A root directory whose first GETATTR starts a task on the runtime of
+    /// the worker that serves it, which counts the ticks of a 1 ms interval.
+    #[cfg(feature = "async-io")]
+    struct TickerFs {
+        ticks: Arc<std::sync::atomic::AtomicUsize>,
+        started: AtomicBool,
+    }
+
+    #[cfg(feature = "async-io")]
+    impl FileSystem for TickerFs {
+        type Inode = u64;
+        type Handle = u64;
+    }
+
+    #[cfg(feature = "async-io")]
+    #[async_trait::async_trait]
+    impl AsyncFileSystem for TickerFs {
+        async fn async_getattr(
+            &self,
+            _ctx: &fuse_backend_core::api::filesystem::Context,
+            inode: u64,
+            _handle: Option<u64>,
+        ) -> io::Result<(fuse_backend_core::abi::fuse_abi::stat64, Duration)> {
+            if !self.started.swap(true, Ordering::Relaxed) {
+                let ticks = self.ticks.clone();
+                tokio::spawn(async move {
+                    let mut interval = tokio::time::interval(Duration::from_millis(1));
+                    // A burst of missed ticks would count a runtime that ran
+                    // once at the end as one that ran all along.
+                    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                    loop {
+                        interval.tick().await;
+                        ticks.fetch_add(1, Ordering::Relaxed);
+                    }
+                });
+            }
+            // Without an attribute timeout, every stat(2) sends a GETATTR.
+            Ok((barrier_fs::stat(inode), Duration::ZERO))
+        }
+    }
+
+    /// A worker that waits in its ring between requests still runs the
+    /// other tasks and the timers of its runtime.
+    #[cfg(feature = "async-io")]
+    #[test]
+    fn test_uring_async_serving_runs_other_tasks() {
+        let mnt = TempDir::new().unwrap();
+        let ticks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let server = Arc::new(Server::new(TickerFs {
+            ticks: ticks.clone(),
+            started: AtomicBool::new(false),
+        }));
+        // One worker for 4 client threads, so that it always has a request
+        // to serve.
+        let cfg = UringConfig {
+            workers: 1,
+            entries_per_queue: 4,
+            ..Default::default()
+        };
+        let Some(serving) = mount_uring(server, mnt.as_path(), cfg, UringFuseServing::new_async)
+        else {
+            return;
+        };
+        // The client keeps the worker busy for 500 ms, sending each GETATTR
+        // right after the last reply.
+        let client = in_client(&format!("stat-loop\n{}\n500\n4", mnt.as_path().display()));
+        let ticks = ticks.load(Ordering::Relaxed);
+        eprintln!("{} {ticks} ticks", client.trim());
+        assert!(
+            ticks >= 100,
+            "the worker's runtime ran its timer {} times",
+            ticks
+        );
+        drop(serving);
+    }
+
     #[cfg(feature = "async-io")]
     mod slow_lookup_fs {
         /// A root directory whose attributes don't stay cached, so each stat
@@ -4933,6 +5117,27 @@ mod tests {
             ["zero-copy off the worker"] => {
                 zero_copy_off_worker();
                 println!("client: ok");
+            }
+            // stat(2) in a loop for the milliseconds given, from as many
+            // threads as given.
+            ["stat-loop", path, ms, threads] => {
+                let end = Instant::now() + Duration::from_millis(ms.parse().unwrap());
+                let stats: usize = std::thread::scope(|scope| {
+                    let threads: Vec<_> = (0..threads.parse().unwrap())
+                        .map(|_| {
+                            scope.spawn(|| {
+                                let mut stats = 0;
+                                while Instant::now() < end {
+                                    std::fs::metadata(path).unwrap();
+                                    stats += 1;
+                                }
+                                stats
+                            })
+                        })
+                        .collect();
+                    threads.into_iter().map(|t| t.join().unwrap()).sum()
+                });
+                println!("client: {stats} stats");
             }
             // One read(2) of up to a page.
             ["read", path] => {
