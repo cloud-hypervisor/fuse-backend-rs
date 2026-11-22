@@ -421,9 +421,9 @@ impl FuseChannel {
         // request makes every channel's `epoll_wait` report readable and they
         // all race into `read()`, where all but one get `EAGAIN` and re-poll
         // (thundering herd). EPOLLEXCLUSIVE makes the kernel wake a single
-        // waiting channel per event instead. It requires level-triggered mode
-        // (which we use) and kernel >= 4.5; older kernels reject the flag with
-        // EINVAL, so fall back to a plain EPOLLIN registration there.
+        // waiting channel per event instead. It requires kernel >= 4.5; older
+        // kernels reject the flag with EINVAL, so fall back to a plain EPOLLIN
+        // registration there.
         // mio owns the epoll instance; the registration below goes straight
         // to `epoll_ctl(2)` on its fd because mio's registry always adds
         // EPOLLET (edge triggered) and would miss events, and nix's `Epoll`
@@ -1103,14 +1103,16 @@ pub use asyncio::FuseDevTask;
 mod asyncio {
     use std::cell::{Cell, RefCell};
     use std::future::Future;
-    use std::os::fd::AsFd;
+    use std::os::fd::{AsFd, BorrowedFd};
     use std::os::unix::io::{AsRawFd, RawFd};
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     use futures_util::stream::{FuturesUnordered, StreamExt};
+    use nix::errno::Errno;
     use nix::fcntl::{fcntl, FcntlArg, OFlag};
+    use nix::sys::epoll::{Epoll, EpollCreateFlags, EpollEvent, EpollFlags, EpollTimeout};
     use nix::sys::time::TimeSpec;
     use nix::sys::timerfd::{ClockId, Expiration, TimerFd, TimerFlags, TimerSetTimeFlags};
     use tokio::io::unix::{AsyncFd, AsyncFdReadyGuard};
@@ -1206,6 +1208,7 @@ mod asyncio {
         server: Arc<Server<F>>,
         buf_size: usize,
         max_inflight: usize,
+        block_while_idle: bool,
     }
 
     impl<F: AsyncFileSystem + Sync> FuseDevTask<F> {
@@ -1280,7 +1283,20 @@ mod asyncio {
                 state,
                 buf_size,
                 max_inflight: max_inflight.max(1),
+                block_while_idle: false,
             }
+        }
+
+        /// Wait for requests in `epoll_wait(2)` while no request is in flight, blocking the
+        /// thread that polls `poll_handler()`.
+        ///
+        /// The task's fd joins an epoll instance of its own with `EPOLLEXCLUSIVE`, so a new
+        /// request wakes one of the idle tasks that serve clones of the connection, not all of
+        /// them. On both runtimes, the task then reads the fd with `read(2)` once it's readable.
+        /// See `read_exclusive()` and `Exclusive`. Use this only for a task that has its runtime
+        /// to itself. A task that no tokio runtime polls ignores this.
+        pub(crate) fn block_while_idle(&mut self) {
+            self.block_while_idle = true;
         }
 
         /// Handler to process fuse requests in asynchronous mode.
@@ -1309,13 +1325,17 @@ mod asyncio {
         /// in-flight work while a read is pending, the read is driven to completion
         /// before the loop restarts, because the kernel may consume a request from
         /// its queue into the read buffer at any point, and canceling the read
-        /// afterwards would silently lose that request.
+        /// afterwards would silently lose that request. A task that blocks while
+        /// idle is the exception. It reads with nonblocking `read(2)`, which
+        /// leaves no read pending in the kernel, so it can drop its read when the
+        /// last request in flight completes, and start over to block.
         ///
         /// It returns when it finds `state` set, or when the fuse session is torn down (EOF or
         /// `ENODEV` from the fuse device). With the tokio runtime, an idle task checks `state`
         /// every 100ms. If it can't create the timer for that, it logs a warning. With
         /// tokio-uring, a read waiting in the kernel usually completes only when a request
-        /// arrives or the session is torn down, and the task checks `state` then.
+        /// arrives or the session is torn down, and the task checks `state` then. A task that
+        /// blocks while idle checks it every 10ms on both runtimes.
         ///
         /// To stop an idle task without tearing the session down, for example for a takeover
         /// with `Server::restore_init()`, drop this future. Do this only with the tokio runtime,
@@ -1356,8 +1376,17 @@ mod asyncio {
             if self.state.load(Ordering::Acquire) {
                 return;
             }
-            let ready = match &self.file {
-                AsyncFile::Tokio(_) if tokio::runtime::Handle::try_current().is_err() => {
+            let in_tokio = tokio::runtime::Handle::try_current().is_ok();
+            let exclusive = if self.block_while_idle && in_tokio {
+                DeviceReadiness::exclusive(fd)
+                    .map_err(|e| warn!("can't wait for requests with EPOLLEXCLUSIVE: {}", e))
+                    .ok()
+            } else {
+                None
+            };
+            let blocks_while_idle = exclusive.is_some();
+            let ready = exclusive.or_else(|| match &self.file {
+                AsyncFile::Tokio(_) if !in_tokio => {
                     warn!("not polled by a tokio runtime, retrying fuse device reads instead of waiting for requests");
                     None
                 }
@@ -1379,7 +1408,7 @@ mod asyncio {
                     }
                 }
                 _ => None,
-            };
+            });
             let pool = BufferPool::new(self.buf_size, self.max_inflight);
             let mut inflight = FuturesUnordered::new();
             // See `PARK_AFTER_READS`.
@@ -1409,8 +1438,15 @@ mod asyncio {
                 // the buffer is handed over to a request or the pool.
                 let read_result = {
                     let park = reads_without_wait >= PARK_AFTER_READS;
-                    let inner =
-                        read_request(&self.file, ready.as_ref(), &self.state, &mut buf, park);
+                    let idle = inflight.is_empty();
+                    let inner = read_request(
+                        &self.file,
+                        ready.as_ref(),
+                        &self.state,
+                        &mut buf,
+                        park,
+                        idle,
+                    );
                     tokio::pin!(inner);
                     // Whether the read returned to the runtime before it completed.
                     let mut waited = false;
@@ -1428,16 +1464,31 @@ mod asyncio {
                                 // Safe: the set is non-empty, so next() only returns
                                 // once a request future has completed.
                                 pool.release(res.unwrap());
+                                // A task that blocks while idle can drop its read, see
+                                // the function doc, and start over to block.
+                                if inflight.is_empty() && blocks_while_idle {
+                                    break None;
+                                }
                             }
                             result = &mut read => {
-                                break result;
+                                break Some(result);
                             }
                         }
                     };
-                    reads_without_wait = if waited { 0 } else { reads_without_wait + 1 };
+                    // A task that blocks while idle ignores `park` and counts its own reads,
+                    // see `Exclusive`.
+                    reads_without_wait = if waited {
+                        0
+                    } else {
+                        reads_without_wait.saturating_add(1)
+                    };
                     // The read future has completed, so dropping it can't cancel
                     // an in-flight read and lose a request anymore.
                     result
+                };
+                let Some(read_result) = read_result else {
+                    pool.release(buf);
+                    continue 'serve;
                 };
 
                 match read_result {
@@ -1512,8 +1563,26 @@ mod asyncio {
         }
     }
 
-    /// How often a task waiting for a request checks its `state` flag.
+    /// How often a task waiting for a request through its runtime checks its `state` flag.
     const STATE_CHECK_INTERVAL: Duration = Duration::from_millis(100);
+
+    /// The tick of a task that blocks while idle, see `FuseDevTask::block_while_idle()`. The
+    /// tick ends `wait_idle()`, and the task then lets its runtime park once, see
+    /// `DeviceReadiness::park_turn()`, so the runtime runs its other tasks and submits their IO
+    /// at least this often.
+    const IDLE_TURN_INTERVAL: Duration = Duration::from_millis(10);
+
+    /// How long a task that blocks while idle waits through its runtime on each tick. Long
+    /// enough that the runtime gets to park before the timer fires.
+    const PARK_TURN: Duration = Duration::from_micros(100);
+
+    /// How long a task that keeps finding requests without waiting reads on before it waits, see
+    /// `Exclusive::spin()`.
+    const HOT_SPIN: Duration = Duration::from_micros(20);
+
+    /// How many reads in a row must have found a request without waiting before a task spins,
+    /// see `Exclusive::spin()`.
+    const SPIN_AFTER: u32 = 2;
 
     /// How many requests a task reads in a row, without its read returning to the runtime,
     /// before it lets the runtime park with `async_runtime::park()`.
@@ -1524,6 +1593,10 @@ mod asyncio {
     /// With tokio-uring, every read is io_uring IO that waits for the runtime to park. Parking
     /// every 8 requests cost 32 fio jobs 3% of their IOPS on tokio.
     const PARK_AFTER_READS: u32 = 64;
+
+    /// How many requests a task that blocks while idle reads, since its runtime last parked or
+    /// it last blocked, before it lets the runtime park, see `Exclusive::park_if_due()`.
+    const EXCLUSIVE_PARK_AFTER_READS: u32 = 8;
 
     /// A `TimerFd` that exposes the raw fd tokio's `AsyncFd` needs.
     ///
@@ -1549,11 +1622,148 @@ mod asyncio {
         device: AsyncFd<RawFd>,
         // Without a timer, an idle task checks `state` once a request arrives.
         tick: Option<AsyncFd<AsyncTimerFd>>,
+        // See `FuseDevTask::block_while_idle()`. `device` is then registered on the fd of its
+        // epoll instance and drops first.
+        exclusive: Option<Exclusive>,
+    }
+
+    /// The epoll instance of a task that blocks while idle. It holds the tick, and the device
+    /// with `EPOLLEXCLUSIVE` while the task waits for requests.
+    ///
+    /// Every new request calls into each instance that holds the device, under the lock of the
+    /// connection's request queue, and wakes the runtime of an instance that its task doesn't
+    /// block on. With 8 workers that kept finding requests, that cost half the IOPS of 32 fio
+    /// jobs. So a task that finds a request without waiting takes the device out, and puts it
+    /// back before it waits.
+    struct Exclusive {
+        epoll: Epoll,
+        device: RawFd,
+        // Whether `epoll` holds the device.
+        armed: Cell<bool>,
+        // The requests read since the runtime last parked or the task last blocked.
+        reads: Cell<u32>,
+        // The reads in a row that found a request without waiting.
+        streak: Cell<u32>,
+    }
+
+    impl Exclusive {
+        fn device(&self) -> BorrowedFd<'_> {
+            // SAFETY: the task owns the device fd and keeps it open while it polls this.
+            unsafe { BorrowedFd::borrow_raw(self.device) }
+        }
+
+        /// Put the device into the epoll instance before the task waits. The instance then
+        /// reports a request that arrived since the last read.
+        fn arm(&self) -> std::io::Result<()> {
+            self.streak.set(0);
+            if !self.armed.get() {
+                // Edge-triggered, because a level-triggered instance polls the device again on
+                // every wait, under the lock of the connection's request queue.
+                self.epoll.add(
+                    self.device(),
+                    EpollEvent::new(
+                        EpollFlags::EPOLLIN | EpollFlags::EPOLLEXCLUSIVE | EpollFlags::EPOLLET,
+                        DEVICE_EVENT,
+                    ),
+                )?;
+                self.armed.set(true);
+            }
+            Ok(())
+        }
+
+        /// Take the device out of the epoll instance after a read that found a request without
+        /// waiting.
+        ///
+        /// The task has the request already, so if that fails, the device stays in.
+        fn found_request(&self) {
+            self.streak.set(self.streak.get() + 1);
+            if self.armed.get() {
+                match self.epoll.delete(self.device()) {
+                    Ok(()) => self.armed.set(false),
+                    Err(e) => warn!(
+                        "can't take the fuse device out of the epoll instance: {}",
+                        e
+                    ),
+                }
+            }
+        }
+
+        /// Keep reading for `HOT_SPIN` after a read that found nothing, if the last
+        /// `SPIN_AFTER` reads found a request without waiting. Requests that come that fast
+        /// would otherwise cost a wakeup each. After a single such read, the spin cost the IOPS
+        /// of one job a fifth in some runs, because each request still woke a blocked task.
+        fn spin(&self, buf: &mut [u8]) -> std::io::Result<Option<usize>> {
+            if self.streak.get() < SPIN_AFTER {
+                return Ok(None);
+            }
+            let start = Instant::now();
+            loop {
+                // Each read takes the lock of the request queue.
+                for _ in 0..64 {
+                    std::hint::spin_loop();
+                }
+                if let Some(len) = read_now(self.device(), buf)? {
+                    return Ok(Some(len));
+                }
+                if start.elapsed() >= HOT_SPIN {
+                    return Ok(None);
+                }
+            }
+        }
+
+        /// Block the thread until the epoll instance reports the device or `tick`, and return
+        /// whether it reported the device.
+        fn wait_idle(&self, tick: Option<&AsyncFd<AsyncTimerFd>>) -> std::io::Result<bool> {
+            let mut events = [EpollEvent::empty(); 2];
+            loop {
+                match self.epoll.wait(&mut events, EpollTimeout::NONE) {
+                    Ok(n) => {
+                        let reported = |data| events[..n].iter().any(|e| e.data() == data);
+                        let device = reported(DEVICE_EVENT);
+                        // The runtime runs at least on every tick while the task blocks. A tick
+                        // that comes with a request doesn't end the wait, so the runtime parks
+                        // before the next read instead. The instance holds the tick
+                        // level-triggered, so consume its expirations, or the next wait would
+                        // end on them at once and park the runtime a second time.
+                        let park = device && reported(TICK_EVENT);
+                        if let Some(tick) = tick.filter(|_| park) {
+                            // EAGAIN means there were none.
+                            let _ = tick.get_ref().0.wait();
+                        }
+                        self.reads
+                            .set(if park { EXCLUSIVE_PARK_AFTER_READS } else { 0 });
+                        return Ok(device);
+                    }
+                    Err(Errno::EINTR) => continue,
+                    Err(e) => return Err(e.into()),
+                }
+            }
+        }
+
+        /// Count a request that the task read.
+        fn read_one(&self) {
+            self.reads.set(self.reads.get() + 1);
+        }
+
+        /// Let the runtime park after `EXCLUSIVE_PARK_AFTER_READS` requests read since it last parked or
+        /// the task last blocked.
+        ///
+        /// Otherwise a task that keeps finding requests never lets its runtime park, so its
+        /// timers and IO don't run, and tokio-uring doesn't submit the IO of the requests in
+        /// flight. A wait through the runtime doesn't count, because it can end on readiness
+        /// that the runtime saw before without parking.
+        async fn park_if_due(&self) {
+            if self.reads.get() >= EXCLUSIVE_PARK_AFTER_READS {
+                async_runtime::park().await;
+                // Not before, because the serving loop can drop the read while it waits.
+                self.reads.set(0);
+            }
+        }
     }
 
     impl DeviceReadiness {
         fn new(device: AsyncFd<RawFd>) -> Self {
-            let tick = match Self::timer() {
+            let tick = match Self::timer(STATE_CHECK_INTERVAL) {
                 Ok(tick) => Some(tick),
                 Err(e) => {
                     warn!(
@@ -1563,17 +1773,51 @@ mod asyncio {
                     None
                 }
             };
-            DeviceReadiness { device, tick }
+            DeviceReadiness {
+                device,
+                tick,
+                exclusive: None,
+            }
         }
 
-        /// A timer that becomes readable every `STATE_CHECK_INTERVAL`.
-        fn timer() -> std::io::Result<AsyncFd<AsyncTimerFd>> {
+        /// Wait for the device `fd` through an epoll instance that holds it with
+        /// `EPOLLEXCLUSIVE`.
+        ///
+        /// The instance holds the tick too. Fails if it can't create the tick, which an idle
+        /// task needs to let its runtime run, see `IDLE_TURN_INTERVAL`.
+        fn exclusive(fd: RawFd) -> std::io::Result<Self> {
+            let tick = Self::timer(IDLE_TURN_INTERVAL)?;
+            let exclusive = Exclusive {
+                epoll: Epoll::new(EpollCreateFlags::EPOLL_CLOEXEC)?,
+                device: fd,
+                armed: Cell::new(false),
+                reads: Cell::new(0),
+                streak: Cell::new(0),
+            };
+            exclusive.arm()?;
+            exclusive.epoll.add(
+                tick.get_ref().0.as_fd(),
+                EpollEvent::new(EpollFlags::EPOLLIN, TICK_EVENT),
+            )?;
+            // SAFETY: `device` drops before `exclusive`, which closes the epoll fd.
+            let registered = unsafe {
+                AsyncFd::register_with_interest(exclusive.epoll.0.as_raw_fd(), Interest::READABLE)
+            }?;
+            Ok(DeviceReadiness {
+                device: registered,
+                tick: Some(tick),
+                exclusive: Some(exclusive),
+            })
+        }
+
+        /// A timer that becomes readable every `period`.
+        fn timer(period: Duration) -> std::io::Result<AsyncFd<AsyncTimerFd>> {
             let timer = TimerFd::new(
                 ClockId::CLOCK_MONOTONIC,
                 TimerFlags::TFD_NONBLOCK | TimerFlags::TFD_CLOEXEC,
             )?;
             timer.set(
-                Expiration::Interval(TimeSpec::from_duration(STATE_CHECK_INTERVAL)),
+                Expiration::Interval(TimeSpec::from_duration(period)),
                 TimerSetTimeFlags::empty(),
             )?;
             // SAFETY: the `AsyncFd` owns `timer`, so its fd stays open for as
@@ -1594,15 +1838,42 @@ mod asyncio {
             tokio::select! {
                 biased;
                 ready = device => ready.map(Some),
-                ready = tick.ready(Interest::READABLE) => {
-                    let mut guard = ready?;
-                    // Consume the expirations, so the next one makes the timer
-                    // readable again. EAGAIN means there were none.
-                    let _ = tick.get_ref().0.wait();
-                    guard.clear_ready();
-                    Ok(None)
-                }
+                ready = Self::next_tick(tick) => ready.map(|_| None),
             }
+        }
+
+        /// Let the runtime park once. Arm the tick to fire `PARK_TURN` from now, and wait for it
+        /// through the runtime.
+        ///
+        /// A runtime with a pending wakeup polls its driver without parking, and tokio-uring
+        /// submits the IO that tasks start only when its runtime parks. Waiting for a tick that
+        /// fired already ends without a park, so this waits for a tick it arms itself.
+        async fn park_turn(&self) -> std::io::Result<()> {
+            let Some(tick) = &self.tick else {
+                return Ok(());
+            };
+            // Arming the timer drops the expirations it hasn't reported yet.
+            tick.get_ref().0.set(
+                Expiration::IntervalDelayed(
+                    TimeSpec::from_duration(PARK_TURN),
+                    TimeSpec::from_duration(IDLE_TURN_INTERVAL),
+                ),
+                TimerSetTimeFlags::empty(),
+            )?;
+            // The runtime can still report the tick that ended `wait_idle()`, which has no
+            // expirations left.
+            while !Self::next_tick(tick).await? {}
+            Ok(())
+        }
+
+        /// Wait until the timer is readable, and return whether it had expired.
+        async fn next_tick(tick: &AsyncFd<AsyncTimerFd>) -> std::io::Result<bool> {
+            let mut guard = tick.ready(Interest::READABLE).await?;
+            // Consume the expirations, so the next one makes the timer readable again. EAGAIN
+            // means there were none.
+            let expired = tick.get_ref().0.wait().is_ok();
+            guard.clear_ready();
+            Ok(expired)
         }
     }
 
@@ -1611,14 +1882,21 @@ mod asyncio {
     ///
     /// With `ready`, wait until the fd is readable before each read, and wait
     /// again if the read finds no request. With `park`, let the runtime park
-    /// first, see `PARK_AFTER_READS`.
+    /// first, see `PARK_AFTER_READS`. A task that blocks while idle reads with
+    /// `read_exclusive()` instead.
     async fn read_request(
         file: &AsyncFile,
         ready: Option<&DeviceReadiness>,
         state: &AtomicBool,
         buf: &mut [u8],
         park: bool,
+        idle: bool,
     ) -> std::io::Result<Option<usize>> {
+        if let Some(ready) = ready {
+            if let Some(exclusive) = &ready.exclusive {
+                return read_exclusive(ready, exclusive, state, buf, idle).await;
+            }
+        }
         if park {
             async_runtime::park().await;
         }
@@ -1643,6 +1921,84 @@ mod asyncio {
                 }
                 (result, _) => return result.map(Some),
             }
+        }
+    }
+
+    /// `read_request()` for a task that blocks while idle. With nothing in flight (`idle`), it
+    /// blocks in `wait_idle()`, and otherwise it waits for the epoll instance through the
+    /// runtime.
+    async fn read_exclusive(
+        ready: &DeviceReadiness,
+        exclusive: &Exclusive,
+        state: &AtomicBool,
+        buf: &mut [u8],
+        idle: bool,
+    ) -> std::io::Result<Option<usize>> {
+        exclusive.park_if_due().await;
+        // The epoll instance is edge-triggered, so it reports requests that arrive together
+        // once. Read before every wait, idle or not.
+        let found = match read_now(exclusive.device(), buf)? {
+            None if idle => exclusive.spin(buf)?,
+            found => found,
+        };
+        if let Some(len) = found {
+            exclusive.read_one();
+            exclusive.found_request();
+            return Ok(Some(len));
+        }
+        exclusive.arm()?;
+        if idle {
+            // Let the tasks that the last requests woke run before the task blocks. This polls
+            // the runtime's IO driver but doesn't park the runtime, so tokio-uring submits
+            // their IO only on the next tick. Parking would cost a quarter to a third of the
+            // IOPS of one job.
+            tokio::task::yield_now().await;
+        }
+        loop {
+            if state.load(Ordering::Acquire) {
+                return Ok(None);
+            }
+            let guard = if idle {
+                if !exclusive.wait_idle(ready.tick.as_ref())? {
+                    // The tick ended `wait_idle()`. Let the runtime park once, then run the
+                    // tasks that woke meanwhile before blocking again. Waiting for the device
+                    // too would end at once on the readiness that the tick left on the epoll
+                    // instance, and cost a read that finds nothing.
+                    ready.park_turn().await?;
+                    tokio::task::yield_now().await;
+                    continue;
+                }
+                None
+            } else {
+                match ready.wait().await? {
+                    None => continue,
+                    guard => guard,
+                }
+            };
+            if let Some(len) = read_now(exclusive.device(), buf)? {
+                exclusive.read_one();
+                return Ok(Some(len));
+            }
+            match guard {
+                Some(mut guard) => guard.clear_ready(),
+                // Another task read the request that ended `wait_idle()`. A tick that came with
+                // it is still due, so let the runtime park before blocking again.
+                None => exclusive.park_if_due().await,
+            }
+        }
+    }
+
+    /// The `epoll_event` data of the device and of the tick in the instance of
+    /// `DeviceReadiness::exclusive()`.
+    const DEVICE_EVENT: u64 = 0;
+    const TICK_EVENT: u64 = 1;
+
+    /// Read a request from the nonblocking device `fd`, or return `None` if none is pending.
+    fn read_now(fd: BorrowedFd<'_>, buf: &mut [u8]) -> std::io::Result<Option<usize>> {
+        match nix::unistd::read(fd, buf) {
+            Ok(len) => Ok(Some(len)),
+            Err(Errno::EAGAIN) => Ok(None),
+            Err(e) => Err(e.into()),
         }
     }
 

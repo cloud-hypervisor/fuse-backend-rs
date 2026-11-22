@@ -71,6 +71,7 @@ mod daemon {
         src: String,
         dest: String,
         as_async: bool,
+        async_block_idle: bool,
         as_uring: bool,
         sync_blocking: bool,
         thread_pool: bool,
@@ -102,7 +103,7 @@ mod daemon {
 
     fn help() {
         println!(
-            "Usage:\n   fuse-backend-rs-benchmark <src> <mountpoint> [--async|--uring] [--threads N] [--sync-blocking] [--thread-pool] [--uring-bufs N] [--uring-zero-copy] [--no-backing-direct-io] [--kernel-passthrough] [--no-writeback] [--splice]\n"
+            "Usage:\n   fuse-backend-rs-benchmark <src> <mountpoint> [--async|--uring] [--threads N] [--async-block-idle] [--sync-blocking] [--thread-pool] [--uring-bufs N] [--uring-zero-copy] [--no-backing-direct-io] [--kernel-passthrough] [--no-writeback] [--splice]\n"
         );
     }
 
@@ -116,6 +117,7 @@ mod daemon {
             src: args[1].clone(),
             dest: args[2].clone(),
             as_async: false,
+            async_block_idle: false,
             as_uring: false,
             sync_blocking: false,
             thread_pool: false,
@@ -131,6 +133,7 @@ mod daemon {
         while idx < args.len() {
             match args[idx].as_str() {
                 "--async" => res.as_async = true,
+                "--async-block-idle" => res.async_block_idle = true,
                 "--uring" => res.as_uring = true,
                 "--sync-blocking" => res.sync_blocking = true,
                 "--thread-pool" => res.thread_pool = true,
@@ -174,8 +177,8 @@ mod daemon {
             help();
             return Err(Error::from_raw_os_error(libc::EINVAL));
         }
-        // The blocking thread pool belongs to the async runtime.
-        if res.thread_pool && !res.as_async {
+        // The blocking thread pool and the exclusive idle wait belong to the async workers.
+        if (res.thread_pool || res.async_block_idle) && !res.as_async {
             help();
             return Err(Error::from_raw_os_error(libc::EINVAL));
         }
@@ -256,9 +259,15 @@ mod daemon {
 
     /// Serve requests with `thread_cnt` asynchronous workers until a
     /// termination signal is received.
-    fn run_async(server: Arc<Server<Arc<Vfs>>>, se: FuseSession, thread_cnt: u32) {
+    fn run_async(
+        server: Arc<Server<Arc<Vfs>>>,
+        se: FuseSession,
+        thread_cnt: u32,
+        block_while_idle: bool,
+    ) {
         let cfg = AsyncServingConfig {
             workers: thread_cnt as usize,
+            block_while_idle,
             ..Default::default()
         };
         let serving = match AsyncFuseServing::new(se, server, cfg) {
@@ -382,7 +391,7 @@ mod daemon {
                 args.uring_zero_copy,
             );
         } else if args.as_async {
-            run_async(server, se, args.thread_cnt);
+            run_async(server, se, args.thread_cnt, args.async_block_idle);
         } else {
             run_sync(server, se, args.thread_cnt, args.sync_blocking);
         }

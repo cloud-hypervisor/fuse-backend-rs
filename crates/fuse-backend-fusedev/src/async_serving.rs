@@ -13,10 +13,13 @@
 //!   the tokio-uring runtime is selected),
 //! - a [`FuseDevTask`] serving each request to completion on that thread.
 //!
-//! The kernel hands each request to whichever worker has a pending read,
-//! and every request is served wholly by one worker, so `?Send` request
-//! futures and the zero-copy buffer traits keep their single-thread
-//! guarantees.
+//! The kernel hands each request to whichever worker reads it first, and
+//! every request is served wholly by one worker, so `?Send` request futures
+//! and the zero-copy buffer traits keep their single-thread guarantees.
+//!
+//! Idle workers wait on the shared request queue without exclusivity, so a
+//! new request wakes all of them. With
+//! [`AsyncServingConfig::block_while_idle`], it wakes one instead.
 
 use std::sync::mpsc::{channel, Sender};
 use std::sync::Arc;
@@ -43,6 +46,26 @@ pub struct AsyncServingConfig {
     /// so the memory used by in-flight requests scales with
     /// `workers * max_inflight`. `0` selects the `FuseDevTask` default.
     pub max_inflight: usize,
+    /// Let an idle worker block its thread in `epoll_wait(2)` on an epoll
+    /// instance of its own, which holds the worker's file description with
+    /// `EPOLLEXCLUSIVE`, so that a new request wakes one idle worker instead
+    /// of all of them. Off by default.
+    ///
+    /// With 8 workers and one client reading 4 KiB at random, this took the
+    /// IOPS from 52k to 197k on tokio-uring and from 130k to 192k on tokio,
+    /// and the daemon's CPU from 5.8 to 0.9 and from 3.6 to 0.8.
+    ///
+    /// A worker that blocks lets its runtime run only every 10ms. A task on
+    /// that runtime that isn't tied to a request, for example one started
+    /// with `fuse_backend_core::async_runtime::spawn()`, and that a timer, IO
+    /// or another thread wakes, can run up to 10ms late. On tokio-uring, the
+    /// IO it starts can be submitted up to 10ms late too. A task woken from
+    /// another thread ran 4.8ms late at the median, against 8us without
+    /// this. A worker that keeps finding requests reads on for 20us before
+    /// it waits, which raised the p99.9 latency of 4 clients from 29us to
+    /// 191us on tokio-uring and from 55us to 146us on tokio. With 32 clients
+    /// on tokio-uring, the IOPS were 2% lower, 704k against 720k.
+    pub block_while_idle: bool,
 }
 
 impl Default for AsyncServingConfig {
@@ -50,6 +73,7 @@ impl Default for AsyncServingConfig {
         AsyncServingConfig {
             workers: 1,
             max_inflight: 0,
+            block_while_idle: false,
         }
     }
 }
@@ -86,6 +110,7 @@ impl<F: AsyncFileSystem + Send + Sync + 'static> AsyncFuseServing<F> {
     ) -> Result<AsyncFuseServing<F>> {
         let workers = cfg.workers.max(1);
         let max_inflight = cfg.max_inflight;
+        let block_while_idle = cfg.block_while_idle;
         let buf_size = session.bufsize();
 
         // Clone one file description per worker up front, so cloning
@@ -128,6 +153,9 @@ impl<F: AsyncFileSystem + Send + Sync + 'static> AsyncFuseServing<F> {
                                 FuseDevTask::new_with_max_inflight(buf_size, file, server, exit, n)
                             }
                         };
+                        if block_while_idle {
+                            task.block_while_idle();
+                        }
                         guard.ready();
                         runtime.block_on(task.poll_handler());
                     }
@@ -248,7 +276,7 @@ mod tests {
             server,
             AsyncServingConfig {
                 workers: 2,
-                max_inflight: 0,
+                ..Default::default()
             },
         )
         .unwrap();
@@ -572,7 +600,7 @@ mod tests {
             server,
             AsyncServingConfig {
                 workers: 1,
-                max_inflight: 0,
+                ..Default::default()
             },
         )
         .unwrap();

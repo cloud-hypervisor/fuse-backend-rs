@@ -44,6 +44,14 @@
   permission bits, owner and group of the directories `Vfs` serves itself: its root while no file
   system is mounted at `/`, and the directories on the path to each mount point. The defaults
   keep today's root-owned `0777` ([#148](https://github.com/cloud-hypervisor/fuse-backend-rs/issues/148)).
+- [388](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/388): `AsyncServingConfig::block_while_idle` lets an idle `AsyncFuseServing` worker block in
+  `epoll_wait(2)` on an epoll instance that holds its fd with `EPOLLEXCLUSIVE`, so that a request
+  wakes one idle worker instead of all of them. With 8 workers and one fio job, the IOPS went from
+  52k to 197k on tokio-uring and from 130k to 192k on tokio, and the daemon's CPU from 5.8 to 0.9
+  and from 3.6 to 0.8. It's off by default. A blocked worker lets its runtime run every 10ms, so a
+  task there that isn't tied to a request can run up to 10ms late, 4 jobs get a p99.9 latency of
+  150 to 190us instead of 30 to 55us, and 32 jobs on tokio-uring lose 2% of their IOPS.
+  `AsyncServingConfig` has a new field, and the benchmark daemon a `--async-block-idle` flag.
 - [304](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/304): Give FreeBSD a verification path. The Linux wire-format ABI
   body moves out of `fuse_abi_linux.rs` into a shared `fuse_abi_wire.rs`
   (each per-OS prelude re-exports the libc names the body uses), and a new
