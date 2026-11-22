@@ -34,11 +34,11 @@ use std::ptr::NonNull;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Sender};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
-#[cfg(feature = "async-io")]
-use std::task::Poll;
 use std::task::Waker;
 use std::thread;
 use std::time::{Duration, Instant};
+#[cfg(feature = "async-io")]
+use std::{future::Future, pin::Pin, task::Poll};
 
 use io_uring::{cqueue, opcode, squeue, types, IoUring};
 use nix::sched::{sched_getaffinity, sched_setaffinity, CpuSet};
@@ -1225,6 +1225,11 @@ static ZERO_COPY_REQUESTS: std::sync::atomic::AtomicUsize = std::sync::atomic::A
 /// The number of copies of zero-copy data through memory, for the tests.
 #[cfg(test)]
 static ZERO_COPY_BOUNCES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// The number of requests of async workers done in their first poll, for
+/// the tests.
+#[cfg(all(test, feature = "async-io"))]
+static FIRST_POLLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 /// Set in the `user_data` of a zero-copy fixed-buffer operation. Its low 32
 /// bits are the index of the entry whose request runs it, and bits 32 to 62
@@ -2765,8 +2770,9 @@ impl<F: AsyncFileSystem + Send + Sync + 'static> UringWorker<F> {
         exit: &StopSignal,
         panic: &mut Option<Box<dyn std::any::Any + Send>>,
     ) -> io::Result<()> {
-        let fd = self.fd.as_raw_fd();
         let mut inflight = FuturesUnordered::new();
+        // The boxes of finished request futures, for the next requests.
+        let mut spare = Vec::new();
         let mut completed = VecDeque::new();
         // When an idle loop next sleeps in the runtime instead of the ring.
         let mut runtime_due = Instant::now() + IDLE_WAIT;
@@ -2783,24 +2789,50 @@ impl<F: AsyncFileSystem + Send + Sync + 'static> UringWorker<F> {
                 std::mem::swap(&mut state.completions.queue, &mut completed);
                 state.completions.stopped
             };
+            let mut failed = None;
             while let Some((idx, res)) = completed.pop_front() {
                 let Some(mut entry) = entries[idx].take() else {
-                    break 'serve Err(io::Error::other(format!(
-                        "completion for entry {idx}, which a handler holds"
-                    )));
+                    break 'serve Err(failed.unwrap_or_else(|| {
+                        io::Error::other(format!(
+                            "completion for entry {idx}, which a handler holds"
+                        ))
+                    }));
                 };
                 if res < 0 {
                     entries[idx] = Some(entry);
-                    break 'serve stop_result(exit, res);
+                    // A request of this round that failed before keeps its
+                    // error, even when the stop fails the command.
+                    break 'serve failed.map_or_else(|| stop_result(exit, res), Err);
                 }
-                inflight.push(async move {
+                let request = async move {
                     let served =
                         std::panic::AssertUnwindSafe(self.process_async(&mut entry, idx, state))
                             .catch_unwind()
                             .await;
                     let caught = settle(&mut entry, served);
                     (idx, entry, caught)
-                });
+                };
+                // Many requests are done in their first poll, such as cache
+                // hits, so the loop polls each one once itself. Only those
+                // that wait go to `inflight`, which polls them again with
+                // wakers of their own.
+                let mut request = Recycled::new(&mut spare, request);
+                match (&mut request).now_or_never() {
+                    Some((served, slot)) => {
+                        #[cfg(test)]
+                        FIRST_POLLS.fetch_add(1, Ordering::Relaxed);
+                        spare.push(slot);
+                        // The other delivered requests still run, and the
+                        // drain below finishes them, as when this one waits.
+                        if let Err(e) = self.finish(state, entries, panic, served) {
+                            failed.get_or_insert(e);
+                        }
+                    }
+                    None => inflight.push(request),
+                }
+            }
+            if let Some(e) = failed {
+                break 'serve Err(e);
             }
             let now = Instant::now();
             // Whether a busy loop lets the runtime park below.
@@ -2852,21 +2884,11 @@ impl<F: AsyncFileSystem + Send + Sync + 'static> UringWorker<F> {
                 biased;
                 Some(done) = inflight.next(), if !inflight.is_empty() => {
                     let mut done = Some(done);
-                    while let Some((idx, entry, caught)) = done {
-                        if let Some(payload) = caught {
-                            // The handler may have left a read into the
-                            // entry running, so leak the entry. The kernel
-                            // doesn't hold it.
-                            std::mem::forget(entry);
-                            *panic = Some(payload);
-                            break 'serve Err(io::Error::other("a request handler panicked"));
-                        }
-                        let committed = lock(state).commit(fd, &entry, idx);
-                        entries[idx] = Some(entry);
-                        if let Err(e) = committed {
+                    while let Some((served, slot)) = done {
+                        spare.push(slot);
+                        if let Err(e) = self.finish(state, entries, panic, served) {
                             break 'serve Err(e);
                         }
-                        // Polling the other requests takes the lock too.
                         done = inflight.next().now_or_never().flatten();
                     }
                 }
@@ -2888,6 +2910,12 @@ impl<F: AsyncFileSystem + Send + Sync + 'static> UringWorker<F> {
             }
         };
 
+        // What the loop queued before it broke, such as the commits of the
+        // requests done in their first poll, goes out before the last
+        // worker to leave ends the connection. The drain ends at once if no
+        // request waits, so it may not submit anything.
+        let result = result.and(submit_queued(&mut lock(state).ring));
+
         // A failed worker ends the connection now, so the requests on its
         // queues don't wait for it, and the kernel gives its entries back.
         if failed_while_connected(&result, exit) {
@@ -2905,17 +2933,10 @@ impl<F: AsyncFileSystem + Send + Sync + 'static> UringWorker<F> {
                 tokio::select! {
                     biased;
                     done = inflight.next() => {
-                        let Some((idx, entry, caught)) = done else { break };
-                        if let Some(payload) = caught {
-                            std::mem::forget(entry);
-                            panic.get_or_insert(payload);
-                            continue;
+                        let Some((served, _)) = done else { break };
+                        if self.finish(state, entries, panic, served).is_ok() {
+                            let _ = submit(&mut lock(state).ring);
                         }
-                        let mut state = lock(state);
-                        if state.commit(fd, &entry, idx).is_ok() {
-                            let _ = submit(&mut state.ring);
-                        }
-                        entries[idx] = Some(entry);
                     }
                     // Zero-copy operations that requests queued.
                     () = queued(state, false) => {
@@ -2945,6 +2966,28 @@ impl<F: AsyncFileSystem + Send + Sync + 'static> UringWorker<F> {
             std::mem::forget(inflight);
         }
         result
+    }
+
+    /// Stage the commit of the entry that a request future handed back with
+    /// its index, and keep the entry for the next request. If the handler
+    /// panicked, keep the first panic in `panic` and fail.
+    fn finish(
+        &self,
+        state: &Mutex<RingState>,
+        entries: &mut [Option<UringEntry>],
+        panic: &mut Option<Box<dyn std::any::Any + Send>>,
+        (idx, entry, caught): Served,
+    ) -> io::Result<()> {
+        if let Some(payload) = caught {
+            // The handler may have left a read into the entry running, so
+            // leak the entry. The kernel doesn't hold it.
+            std::mem::forget(entry);
+            panic.get_or_insert(payload);
+            return Err(io::Error::other("a request handler panicked"));
+        }
+        let committed = lock(state).commit(self.fd.as_raw_fd(), &entry, idx);
+        entries[idx] = Some(entry);
+        committed
     }
 
     /// Serve the request delivered into `entry`, at index `idx`, with the
@@ -3014,6 +3057,45 @@ fn wait_in_ring(state: &mut RingState, timeout: Duration) -> io::Result<bool> {
     // timed out, and an enter that submits only part of the queue returns
     // before it waits.
     Ok(!state.ring.completion().is_empty() || !state.ring.submission().is_empty())
+}
+
+/// What a request future of the async worker loop hands back: the index of
+/// its entry, the entry with the reply staged, and the panic of the handler
+/// if it panicked.
+#[cfg(feature = "async-io")]
+type Served = (usize, UringEntry, Option<Box<dyn std::any::Any + Send>>);
+
+/// A request future in a box that the async worker loop reuses. It hands
+/// the box back with its output, once the future is done and dropped.
+#[cfg(feature = "async-io")]
+struct Recycled<F>(Option<Pin<Box<F>>>);
+
+#[cfg(feature = "async-io")]
+impl<F: Future> Recycled<F> {
+    /// `request` in one of the boxes in `spare`, or in a new one.
+    fn new(spare: &mut Vec<Pin<Box<F>>>, request: F) -> Self {
+        let slot = match spare.pop() {
+            // The future in the box is done, and dropping it is all that
+            // is left to do with it.
+            Some(mut slot) => {
+                slot.as_mut().set(request);
+                slot
+            }
+            None => Box::pin(request),
+        };
+        Recycled(Some(slot))
+    }
+}
+
+#[cfg(feature = "async-io")]
+impl<F: Future> Future for Recycled<F> {
+    type Output = (F::Output, Pin<Box<F>>);
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<Self::Output> {
+        let slot = self.0.as_mut().expect("polled after completion");
+        let output = std::task::ready!(slot.as_mut().poll(cx));
+        Poll::Ready((output, self.0.take().unwrap()))
+    }
 }
 
 /// Wait until the ring in `state` has operations to submit, or while
@@ -4566,7 +4648,11 @@ mod tests {
         /// is a request. Every lookup fails. A lookup of `slow` first waits
         /// for a 1 ms tokio timer and opens `/dev/null`, which tokio-uring
         /// does with io_uring.
-        pub(super) struct SlowLookupFs;
+        pub(super) struct SlowLookupFs {
+            /// Whether each GETATTR yields once before it replies, so that
+            /// it isn't done in its first poll.
+            pub(super) yield_getattr: bool,
+        }
 
         use std::ffi::CStr;
         use std::io;
@@ -4614,6 +4700,18 @@ mod tests {
                 }
                 Err(io::Error::from_raw_os_error(libc::ENOENT))
             }
+
+            async fn async_getattr(
+                &self,
+                ctx: &Context,
+                inode: u64,
+                handle: Option<u64>,
+            ) -> io::Result<(stat64, Duration)> {
+                if self.yield_getattr {
+                    tokio::task::yield_now().await;
+                }
+                self.getattr(ctx, inode, handle)
+            }
         }
     }
 
@@ -4622,13 +4720,29 @@ mod tests {
     #[cfg(feature = "async-io")]
     #[test]
     fn test_uring_async_serving_busy_worker_lets_runtime_park() {
+        check_busy_worker_lets_runtime_park(false);
+    }
+
+    /// Like `test_uring_async_serving_busy_worker_lets_runtime_park()`, but
+    /// each GETATTR yields once, so it waits in `inflight` and the loop
+    /// doesn't go idle between them. A yield doesn't park the runtime, so
+    /// on tokio-uring only the loop's own park lets it submit. On tokio,
+    /// where a park is a yield, this passes either way.
+    #[cfg(feature = "async-io")]
+    #[test]
+    fn test_uring_async_serving_busy_worker_lets_runtime_park_for_waiting_requests() {
+        check_busy_worker_lets_runtime_park(true);
+    }
+
+    #[cfg(feature = "async-io")]
+    fn check_busy_worker_lets_runtime_park(yield_getattr: bool) {
         let mnt = TempDir::new().unwrap();
         let cfg = UringConfig {
             workers: 1,
             ..Default::default()
         };
         let Some(serving) = mount_uring(
-            Arc::new(Server::new(slow_lookup_fs::SlowLookupFs)),
+            Arc::new(Server::new(slow_lookup_fs::SlowLookupFs { yield_getattr })),
             mnt.as_path(),
             cfg,
             UringFuseServing::new_async,
@@ -5465,8 +5579,15 @@ mod tests {
     #[cfg(feature = "async-io")]
     #[test]
     fn test_uring_async_serving_mount() {
+        let first_polls = FIRST_POLLS.load(Ordering::Relaxed);
+        let mounted =
+            check_passthrough_mount(UringFuseServing::new_async, 2, 0, false, false, 0).is_some();
+        // The handlers of PassthroughFs that don't read through io_uring
+        // are done in their first poll.
+        if mounted {
+            assert!(FIRST_POLLS.load(Ordering::Relaxed) > first_polls);
+        }
         // A pool gets a buffer per entry, even when the config asks for 1.
-        check_passthrough_mount(UringFuseServing::new_async, 2, 0, false, false, 0);
         check_passthrough_mount(UringFuseServing::new_async, 2, 1, true, false, 2);
         // The workers defer their task work only where epoll wakes for it.
         // On Linux 7.3.1, a worker that did never answered the first request.

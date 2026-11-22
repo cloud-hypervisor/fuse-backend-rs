@@ -464,6 +464,32 @@ deferred task work, 4 KiB reads at depth 16 gained 3%, 7% in the earlier
 run, with 40% of the `io_uring_enter()` calls, and the other rows
 stayed within the spread of the runs.
 
+The loop also polls each new request once itself, before it hands the
+request to its `FuturesUnordered`, and stages the commit right away when
+the request is done. Cache hits, LOOKUP and GETATTR are done then, and
+skip the task, waker and ready queue of `FuturesUnordered`. The request
+futures live in boxes that the loop reuses. On the 96-core machine of
+the table above, no row moved beyond the spread of the runs. With the
+wait in the ring of "Latency of the async workers" below, in the 4-vCPU
+guest and setup of that section, before and after, also with
+`UringConfig::pin_workers`, medians of 3 passes in one boot:
+
+| Workload | Before | After | Pinned, before | After |
+|----------|------|-----|--------------|-----|
+| Walk with opens | 45.0k/s | 45.3k/s | 50.8k/s | 51.8k/s |
+| 2 KiB files, 1 thread | 28.4k/s | 29.0k/s | 32.2k/s | 32.9k/s |
+| 2 KiB files, 4 threads | 75.9k/s | 76.7k/s | 90.4k/s | 86.7k/s |
+| 4 KiB, 1 job, depth 1 | 122k IOPS | 124k IOPS | 161k IOPS | 170k IOPS |
+| 4 KiB, 4 jobs, depth 1 | 603k IOPS | 613k IOPS | 608k IOPS | 613k IOPS |
+| 4 KiB, 4 jobs, depth 16 | 707k IOPS | 750k IOPS | 708k IOPS | 750k IOPS |
+
+Small files got 1% to 2% faster and 4 KiB reads at depth 16 6%,
+beyond the spread of the passes. The pinned rows spread by up to 35%.
+In another boot, pinned 4 KiB reads at depth 1 went from 161k-165k to
+170k-177k IOPS. No buffered read goes through `FuturesUnordered`
+anymore. A zero-copy request still waits for its operation, so it still
+goes there.
+
 ## Latency of the async workers
 
 A client that waits for each reply, such as a walk of a directory tree

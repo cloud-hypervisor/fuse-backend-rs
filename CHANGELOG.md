@@ -258,6 +258,9 @@
   `io_uring_enter()` instead of epoll, which saves a trip through the runtime per request. They
   let their runtime park at least every millisecond, so tasks, timers and tokio-uring IO on a
   worker's runtime run up to about 1 ms late.
+- [NNN](link): The async workers of `UringFuseServing::new_async()` poll each new request once
+  before they hand it to their `FuturesUnordered`, so a request that its handler finishes at
+  once, such as a cache hit, costs no task of its own.
 - [325](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/325): The `fuse-backend-fusedev` `uring` transport uses io-uring 0.6 instead of 0.5,
   and depends on it only on Linux.
 - [324](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/324): `fuse-backend-core` uses bitflags 2 instead of 1. The flag types (`FsOptions`,
