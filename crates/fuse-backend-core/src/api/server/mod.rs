@@ -287,6 +287,10 @@ impl<W: Writer> ZeroCopyWriter for ZcWriter<W> {
         self.0.write_from_at(f, count, off)
     }
 
+    fn prefers_fd(&self) -> bool {
+        self.0.prefers_fd()
+    }
+
     fn available_bytes(&self) -> usize {
         self.0.available_bytes()
     }

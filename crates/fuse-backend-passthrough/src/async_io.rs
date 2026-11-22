@@ -892,6 +892,14 @@ impl<S: BitmapSlice + Send + Sync + 'static> AsyncFileSystem for PassthroughFs<S
             };
         }
 
+        // A writer that prefers a file descriptor, such as a zero-copy reply
+        // over io_uring, would copy what the inline read below or the thread
+        // pool reads through memory, so it gets the file right away.
+        if w.prefers_fd() {
+            let file = self.async_file_from_data(&data, flags)?;
+            return SendZeroCopyFuture(w.async_write_from(file, size as usize, offset)).await;
+        }
+
         // Buffered requests first try an inline non-blocking read: the
         // page cache serves them without a round trip through the
         // asynchronous IO engine.
@@ -1642,6 +1650,8 @@ mod tests {
         data: Vec<u8>,
         /// (`inline`/`inline-eagain`/`inline-eof`/`async`, count, offset) per call.
         events: Vec<(&'static str, usize, u64)>,
+        /// What `prefers_fd()` returns.
+        prefers_fd: bool,
     }
 
     impl PathRecorder {
@@ -1652,6 +1662,7 @@ mod tests {
                 inline_served: 0,
                 data: Vec::new(),
                 events: Vec::new(),
+                prefers_fd: false,
             }
         }
     }
@@ -1692,6 +1703,10 @@ mod tests {
             self.events.push(("inline", n, off));
             self.data.extend_from_slice(&self.source[start..start + n]);
             Ok(n)
+        }
+
+        fn prefers_fd(&self) -> bool {
+            self.prefers_fd
         }
 
         fn available_bytes(&self) -> usize {
@@ -1895,6 +1910,42 @@ mod tests {
             assert_eq!(n, 10);
             assert_eq!(w.data, b"abcdefghij");
             assert_eq!(w.events, [("inline-eagain", 10, 0), ("async", 10, 0)]);
+        });
+    }
+
+    /// A writer that prefers a file descriptor skips the inline read, which
+    /// would hand it a file without one.
+    #[test]
+    fn test_async_read_prefers_fd_writer() {
+        let (fs, source) = prepare_async_fs();
+        let ctx = prepare_context();
+        std::fs::write(source.as_path().join("testfile"), b"abcdefghij").unwrap();
+        let name = CString::new("testfile").unwrap();
+
+        async_runtime::block_on(async {
+            let entry = fs.async_lookup(&ctx, ROOT_ID, &name).await.unwrap();
+            let (handle, _opts, _) = fs
+                .async_open(&ctx, entry.inode, libc::O_RDONLY as u32, 0)
+                .await
+                .unwrap();
+            let mut w = PathRecorder::new(b"abcdefghij", usize::MAX);
+            w.prefers_fd = true;
+            let n = fs
+                .async_read(
+                    &ctx,
+                    entry.inode,
+                    handle.unwrap(),
+                    &mut w,
+                    10,
+                    0,
+                    None,
+                    libc::O_RDONLY as u32,
+                )
+                .await
+                .unwrap();
+            assert_eq!(n, 10);
+            assert_eq!(w.data, b"abcdefghij");
+            assert_eq!(w.events, [("async", 10, 0)]);
         });
     }
 

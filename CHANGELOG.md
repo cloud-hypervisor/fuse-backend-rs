@@ -451,6 +451,11 @@
   disabled answers `ENOSYS`).
 - [269](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/269): For a session mounted with `set_target_mntns()`,
   `FuseSession::umount()` unmounts in that mount namespace. It no longer follows a symlink at the mountpoint.
+- [381](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/381): With `UringFuseServing::new_async()`, `PassthroughFs` no longer reads the
+  reply of a zero-copy READ inline with `RWF_NOWAIT`. That read has no file descriptor to give
+  the transport, so its data went through the worker's memory file and a fixed-buffer read
+  that blocked the worker. The new `ZeroCopyWriter::prefers_fd()` and `Writer::prefers_fd()`
+  tell a file system when a writer is faster with a file that has a descriptor.
 
 ### Removed
 - [254](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/254): Drop the vestigial `vhost` and `virtio-bindings` dependencies that the

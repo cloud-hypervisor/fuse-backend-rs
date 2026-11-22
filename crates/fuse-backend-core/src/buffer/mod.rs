@@ -775,6 +775,15 @@ pub trait Writer: io::Write + Sized {
         off: u64,
     ) -> io::Result<usize>;
 
+    /// Whether `write_from_at()` is faster with a file that has a descriptor
+    /// (`FileReadWriteVolatile::raw_fd()`). Such a writer copies the data of
+    /// a file without one through memory first. The replies of
+    /// FUSE-over-io_uring zero-copy READs work this way, so a file system
+    /// should give such a writer its file instead of reading into memory.
+    fn prefers_fd(&self) -> bool {
+        false
+    }
+
     /// Split this `Writer` into two at the given offset in the reply buffer.
     ///
     /// After the split, `self` will be able to write up to `offset` bytes while the returned

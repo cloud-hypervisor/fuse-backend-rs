@@ -421,6 +421,12 @@ pub trait ZeroCopyWriter: io::Write {
         off: u64,
     ) -> io::Result<usize>;
 
+    /// Whether `write_from()` is faster with a file that has a descriptor,
+    /// see `Writer::prefers_fd()`.
+    fn prefers_fd(&self) -> bool {
+        false
+    }
+
     /// Copies exactly `count` bytes of data from `f` at offset `off` into `self`. `off + count`
     /// must be less than `u64::MAX`.
     ///

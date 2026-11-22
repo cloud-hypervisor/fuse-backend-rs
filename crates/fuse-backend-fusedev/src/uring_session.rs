@@ -760,6 +760,10 @@ impl<'a, S: BitmapSlice> Writer for UringWriter<'a, S> {
         UringWriter::write_from_at(self, src, count, off)
     }
 
+    fn prefers_fd(&self) -> bool {
+        self.zero_copy.is_some()
+    }
+
     fn split_at(&mut self, offset: usize) -> Result<Self> {
         UringWriter::split_at(self, offset)
     }
@@ -1013,13 +1017,14 @@ fn cmd_sqe(
 /// 128-byte SQEs.
 type FuseRing = IoUring<squeue::Entry128, cqueue::Entry>;
 
-/// The number of zero-copy requests served, for the tests.
+/// Counts of a serving layer's zero-copy requests and of its copies through
+/// memory, for the tests.
 #[cfg(test)]
-static ZERO_COPY_REQUESTS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-
-/// The number of copies of zero-copy data through memory, for the tests.
-#[cfg(test)]
-static ZERO_COPY_BOUNCES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+#[derive(Default)]
+struct ZeroCopyCounts {
+    requests: std::sync::atomic::AtomicUsize,
+    bounces: std::sync::atomic::AtomicUsize,
+}
 
 /// Set in the `user_data` of a zero-copy fixed-buffer operation. Its low 32
 /// bits are the index of the entry whose request runs it, and bits 32 to 62
@@ -1190,6 +1195,9 @@ struct ZeroCopyIo<'r> {
     /// The worker's memory file, which the copies through memory go
     /// through. The lock keeps two copies from using it at once.
     bounce: &'r Mutex<BounceBuf>,
+    /// The serving layer's counts, for the copies through memory.
+    #[cfg(test)]
+    counts: &'r ZeroCopyCounts,
 }
 
 /// The memory file that a worker's copies of zero-copy data through memory
@@ -1406,7 +1414,7 @@ impl ZeroCopySink for ZeroCopyIo<'_> {
         fill: &mut dyn FnMut(&mut [u8]) -> io::Result<usize>,
     ) -> io::Result<usize> {
         #[cfg(test)]
-        ZERO_COPY_BOUNCES.fetch_add(1, Ordering::Relaxed);
+        self.counts.bounces.fetch_add(1, Ordering::Relaxed);
         // Through the memory file into the client pages, which only
         // fixed-buffer operations reach.
         let bounce = lock(self.bounce);
@@ -1449,7 +1457,7 @@ impl ZeroCopySource for ZeroCopyIo<'_> {
         take: &mut dyn FnMut(&[u8]) -> io::Result<usize>,
     ) -> io::Result<usize> {
         #[cfg(test)]
-        ZERO_COPY_BOUNCES.fetch_add(1, Ordering::Relaxed);
+        self.counts.bounces.fetch_add(1, Ordering::Relaxed);
         // From the client pages into the memory file, then to `take`
         // through the mapping.
         let bounce = lock(self.bounce);
@@ -1841,6 +1849,9 @@ struct UringWorker<F: FileSystem + Send + Sync + 'static> {
     abort: Arc<ConnectionAbort>,
     /// Lets the workers end the connection once all have stopped.
     barrier: Arc<StopBarrier>,
+    /// The zero-copy counts that all workers of the connection add to.
+    #[cfg(test)]
+    zero_copy_counts: Arc<ZeroCopyCounts>,
 }
 
 /// Lets the workers register their entries in rounds, see
@@ -2305,12 +2316,16 @@ impl<F: FileSystem + Send + Sync + 'static> UringWorker<F> {
             ));
         };
         #[cfg(test)]
-        ZERO_COPY_REQUESTS.fetch_add(1, Ordering::Relaxed);
+        self.zero_copy_counts
+            .requests
+            .fetch_add(1, Ordering::Relaxed);
         Ok(ZeroCopyIo {
             state,
             idx,
             slot,
             bounce,
+            #[cfg(test)]
+            counts: &self.zero_copy_counts,
         })
     }
 
@@ -2762,6 +2777,9 @@ pub struct UringFuseServing<F: FileSystem + Send + Sync + 'static> {
     /// Whether the queues have zero-copy.
     #[cfg(test)]
     zero_copy: bool,
+    /// The zero-copy counts of the workers.
+    #[cfg(test)]
+    zero_copy_counts: Arc<ZeroCopyCounts>,
     _fs: std::marker::PhantomData<F>,
 }
 
@@ -2872,6 +2890,8 @@ impl<F: FileSystem + Send + Sync + 'static> UringFuseServing<F> {
         let barrier = Arc::new(StopBarrier::new(workers));
         let nr_rounds = spread.iter().flatten().map(|&(_, round)| round + 1).max();
         let rounds = Arc::new(RegisterRounds::new(workers, nr_rounds.unwrap_or(1)));
+        #[cfg(test)]
+        let zero_copy_counts = Arc::new(ZeroCopyCounts::default());
         let mut worker_list = Vec::with_capacity(workers);
         for entries in spread {
             worker_list.push(UringWorker {
@@ -2896,6 +2916,8 @@ impl<F: FileSystem + Send + Sync + 'static> UringFuseServing<F> {
                 server: server.clone(),
                 abort: abort.clone(),
                 barrier: barrier.clone(),
+                #[cfg(test)]
+                zero_copy_counts: zero_copy_counts.clone(),
             });
         }
 
@@ -2990,6 +3012,8 @@ impl<F: FileSystem + Send + Sync + 'static> UringFuseServing<F> {
             pool_bufs: if pools.is_some() { bufs_per_queue } else { 0 },
             #[cfg(test)]
             zero_copy,
+            #[cfg(test)]
+            zero_copy_counts,
             _fs: std::marker::PhantomData,
         })
     }
@@ -3896,6 +3920,7 @@ mod tests {
                 done: AtomicBool::new(false),
             }),
             barrier: Arc::new(StopBarrier::new(1)),
+            zero_copy_counts: Arc::default(),
         };
         (worker, source)
     }
@@ -4178,6 +4203,9 @@ mod tests {
         let mut data = w.split_at(OUT_HEADER_SIZE).unwrap();
         assert_eq!(w.available_bytes(), OUT_HEADER_SIZE);
         assert_eq!(data.available_bytes(), 4096);
+        // The data part prefers a file with a descriptor.
+        assert!(data.prefers_fd());
+        assert!(!w.prefers_fd());
 
         let mut file = File::open("/dev/null").unwrap();
         let fd = file.as_raw_fd();
@@ -4385,12 +4413,12 @@ mod tests {
 
         // With zero-copy, the reads and writes above went through it.
         if serving.zero_copy {
-            assert!(ZERO_COPY_REQUESTS.load(Ordering::Relaxed) > 0);
+            assert!(serving.zero_copy_counts.requests.load(Ordering::Relaxed) > 0);
         }
         // A late O_DIRECT sends the data of zero-copy requests through
         // memory.
         if check_late_direct_io(src.as_path(), mnt.as_path()) && serving.zero_copy {
-            assert!(ZERO_COPY_BOUNCES.load(Ordering::Relaxed) > 0);
+            assert!(serving.zero_copy_counts.bounces.load(Ordering::Relaxed) > 0);
         }
 
         // Tearing the connection down completes the commands of all armed
@@ -4426,6 +4454,57 @@ mod tests {
         check_passthrough_mount(UringFuseServing::new_async, 2, 0, false, 0);
         check_passthrough_mount(UringFuseServing::new_async, 2, 1, false, 2);
         check_passthrough_mount(UringFuseServing::new_async, 2, 1, true, 2);
+    }
+
+    /// Read a file through a zero-copy mount served with `start`. Its reads
+    /// are zero-copy requests, and none copies the data through memory, also
+    /// where `PassthroughFs` reads page-cache hits inline with `RWF_NOWAIT`.
+    fn check_zero_copy_reads(start: StartFn<PassthroughFs<()>>) {
+        if !real_root() {
+            eprintln!("zero-copy needs root, skipping");
+            return;
+        }
+        let src = TempDir::new().unwrap();
+        let data: Vec<u8> = (0..1 << 20).map(|n| (n % 251) as u8).collect();
+        std::fs::write(src.as_path().join("file"), &data).unwrap();
+        let mnt = TempDir::new().unwrap();
+        // With `do_import`, init doesn't negotiate opens away as it does
+        // behind a Vfs, so the kernel sends OPEN.
+        let fs = PassthroughFs::<()>::new(Config {
+            root_dir: src.as_path().to_string_lossy().to_string(),
+            uring_zero_copy: true,
+            ..Default::default()
+        })
+        .unwrap();
+        let server = Arc::new(Server::new(fs));
+        let cfg = UringConfig {
+            workers: 2,
+            entries_per_queue: 2,
+            zero_copy: true,
+            ..Default::default()
+        };
+        let Some(serving) = mount_uring(server, mnt.as_path(), cfg, start) else {
+            return;
+        };
+        if !serving.zero_copy {
+            eprintln!("the kernel serves without zero-copy, skipping");
+            return;
+        }
+        let counts = &serving.zero_copy_counts;
+        assert!(std::fs::read(mnt.as_path().join("file")).unwrap() == data);
+        assert!(counts.requests.load(Ordering::Relaxed) > 0);
+        assert_eq!(counts.bounces.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn test_uring_serving_zero_copy_reads() {
+        check_zero_copy_reads(UringFuseServing::new);
+    }
+
+    #[cfg(feature = "async-io")]
+    #[test]
+    fn test_uring_async_serving_zero_copy_reads() {
+        check_zero_copy_reads(UringFuseServing::new_async);
     }
 
     /// With more workers than queues, every queue's entries are spread over
