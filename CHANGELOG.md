@@ -243,6 +243,11 @@
   it only on kernels that wake epoll for deferred task work, 7.4, 7.3.2, 7.2.14, 6.18.60 and
   later releases of those branches. With it, zero-copy IO from a thread other than the worker
   fails with EEXIST. `UringConfig` has a new field.
+- [NNN](link): `UringConfig::pin_workers` runs each worker of `UringFuseServing` only on the CPUs
+  of the queues whose last ring entry it registers, so that a client that waits for each reply
+  and its worker share a CPU. It is off by default, because the link holds only until a queue
+  has several requests at once, and threads that a worker starts inherit its CPUs. `UringConfig`
+  has a new field.
 
 ### Changed
 - [384](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/384): The async workers of `UringFuseServing::new_async()` submit the fixed-buffer

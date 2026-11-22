@@ -41,6 +41,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use io_uring::{cqueue, opcode, squeue, types, IoUring};
+use nix::sched::{sched_getaffinity, sched_setaffinity, CpuSet};
+use nix::unistd::Pid;
 use vm_memory::ByteValued;
 
 use fuse_backend_core::abi::fuse_abi::{InHeader, Opcode, OutHeader, ReadIn};
@@ -148,6 +150,25 @@ pub struct UringConfig {
     /// its threads waits for a request on such a ring, can't exit, see
     /// `docs/fuse-uring-performance.md`.
     pub defer_taskrun: bool,
+    /// Run each worker only on the CPUs of the queues whose last entry it
+    /// registers, of those that the thread creating the serving layer may
+    /// run on, which the workers inherit. A queue belongs to a CPU, and the
+    /// kernel hands its requests to the entry that became free last, which
+    /// is the one that registered last until the queue first has several
+    /// requests at once, see `spread_entries()`. A client that waits for
+    /// each reply and the worker that serves it then share the client's
+    /// CPU, so neither wakes the other across CPUs, which costs most in a
+    /// virtual machine. With a worker per CPU, as by default, each worker
+    /// gets one CPU. A worker that may run on none of its queues' CPUs stays
+    /// unpinned.
+    ///
+    /// It is off by default for two reasons. Once a queue had several
+    /// requests at once, the entry that became free last can belong to any
+    /// of its workers, and a pinned worker on another CPU can't follow the
+    /// client. And the threads that a worker starts, such as the blocking
+    /// pool of its async runtime, inherit its CPUs, so with a worker per CPU
+    /// they share one. `docs/fuse-uring-performance.md` has the numbers.
+    pub pin_workers: bool,
 }
 
 impl Default for UringConfig {
@@ -158,6 +179,7 @@ impl Default for UringConfig {
             bufs_per_queue: 4,
             zero_copy: false,
             defer_taskrun: false,
+            pin_workers: false,
         }
     }
 }
@@ -239,12 +261,13 @@ fn possible_cpu_count() -> Result<usize> {
 ///
 /// The kernel also hands a request to the entry of its queue that became
 /// free last, see `UringWorker::register()`. So each queue registers one
-/// entry of each of its workers last, one per round. A queue with an entry
-/// on every worker registers the one on worker `qid % workers`, which
-/// would own it with whole queues, last, so its requests go there while it
-/// has one at a time. Queues 0 to `workers - 1` end on different workers,
-/// and so do the next `workers` queues and so on. The other entries
-/// register before them, in round 0.
+/// entry of each of its workers last, one per round, and every queue's last
+/// entry in the last round. A queue with an entry on every worker
+/// registers the one on worker `qid % workers`, which would own it with
+/// whole queues, last, so its requests go there while it has one at a
+/// time. Queues 0 to `workers - 1` end on different workers, and so do the
+/// next `workers` queues and so on. The other entries register before
+/// them, in round 0.
 fn spread_entries(
     nr_queues: usize,
     entries_per_queue: usize,
@@ -296,6 +319,38 @@ fn spread_entries(
         }
     }
     entries
+}
+
+/// The CPUs that each worker of `spread` runs on with
+/// `UringConfig::pin_workers`: the CPUs of the queues whose entry on the
+/// worker registers last, which `allowed` includes. A queue's id is its
+/// CPU's number. `None` leaves a worker free, because it has no such queue
+/// or `allowed` has none of their CPUs.
+fn home_cpus(spread: &[Vec<(u16, usize)>], allowed: &CpuSet) -> Vec<Option<CpuSet>> {
+    // Every queue registers its last entry in the last round.
+    let last = spread.iter().flatten().map(|&(_, round)| round).max();
+    spread
+        .iter()
+        .map(|entries| {
+            let mut cpus = CpuSet::new();
+            let mut any = false;
+            for &(qid, round) in entries {
+                let cpu = qid as usize;
+                if Some(round) == last && allowed.is_set(cpu) == Ok(true) {
+                    any |= cpus.set(cpu).is_ok();
+                }
+            }
+            any.then_some(cpus)
+        })
+        .collect()
+}
+
+/// Let the calling thread run only on `cpus`. A worker that can't be pinned
+/// serves anyway.
+fn pin_thread(cpus: &CpuSet) {
+    if let Err(e) = sched_setaffinity(Pid::from_raw(0), cpus) {
+        warn!("uring worker: can't pin the worker to the CPUs of its queues: {e}");
+    }
 }
 
 /// What the transport needs to know about a request with this opcode: the
@@ -3177,6 +3232,14 @@ impl<F: FileSystem + Send + Sync + 'static> UringFuseServing<F> {
         let bufs_per_queue = cfg.bufs_per_queue.min(entries_per_queue);
         let spread = spread_entries(nr_queues, entries_per_queue, workers, bufs_per_queue);
         let workers = spread.len();
+        let pins = match cfg.pin_workers.then(|| sched_getaffinity(Pid::from_raw(0))) {
+            Some(Ok(allowed)) => home_cpus(&spread, &allowed),
+            Some(Err(e)) => {
+                warn!("uring: can't read the CPUs of this thread, the workers run unpinned: {e}");
+                vec![None; workers]
+            }
+            None => vec![None; workers],
+        };
         // The kernel takes a 16-bit buffer table slot per entry, and each
         // entry of a worker gets its own slot.
         let worker_entries = spread.iter().map(Vec::len).max().unwrap_or(0);
@@ -3254,12 +3317,15 @@ impl<F: FileSystem + Send + Sync + 'static> UringFuseServing<F> {
         let exit = set.stop_signal()?;
         let tracker = set.tracker();
         let (ready_tx, ready_rx) = channel();
-        for (id, worker) in worker_list.into_iter().enumerate() {
+        for (id, (worker, cpus)) in worker_list.into_iter().zip(pins).enumerate() {
             let handle = thread::Builder::new().name(format!("uring-{id}")).spawn({
                 let exit = exit.clone();
                 let tracker = tracker.clone();
                 let ready_tx = ready_tx.clone();
                 move || {
+                    if let Some(cpus) = cpus {
+                        pin_thread(&cpus);
+                    }
                     // Report the thread exit to the serving layer's wait().
                     let _exited = tracker.exit_guard();
                     // Registration failures are reported through
@@ -3599,6 +3665,10 @@ mod tests {
             // Queues 0 to workers - 1 end their registration on different
             // workers, and so do the next workers queues and so on.
             let tops: Vec<usize> = by_queue.iter().map(|q| q.last().unwrap().1).collect();
+            // Every queue's last entry registers in the last round, which
+            // home_cpus() relies on.
+            let last = spread.iter().flatten().map(|&(_, round)| round).max();
+            assert!(by_queue.iter().all(|q| q.last().map(|&(r, _)| r) == last));
             for chunk in tops.chunks(workers) {
                 assert_eq!(chunk.iter().collect::<HashSet<_>>().len(), chunk.len());
             }
@@ -3620,6 +3690,70 @@ mod tests {
         }
         // Zero workers count as 1.
         assert_eq!(spread_entries(2, 1, 0, 0), vec![vec![(0, 0), (1, 0)]]);
+    }
+
+    /// A set of `cpus`.
+    fn cpu_set(cpus: impl IntoIterator<Item = usize>) -> CpuSet {
+        let mut set = CpuSet::new();
+        for cpu in cpus {
+            set.set(cpu).unwrap();
+        }
+        set
+    }
+
+    /// The CPUs in `set`.
+    fn cpu_list(set: &CpuSet) -> Vec<usize> {
+        (0..CpuSet::count())
+            .filter(|&cpu| set.is_set(cpu).unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn test_home_cpus() {
+        fn homes(spread: &[Vec<(u16, usize)>], allowed: &CpuSet) -> Vec<Option<Vec<usize>>> {
+            home_cpus(spread, allowed)
+                .iter()
+                .map(|set| set.as_ref().map(cpu_list))
+                .collect()
+        }
+        let all = cpu_set(0..CpuSet::count());
+
+        // A worker per CPU runs on its CPU.
+        let one_each: Vec<_> = (0..4).map(|cpu| Some(vec![cpu])).collect();
+        assert_eq!(homes(&spread_entries(4, 16, 4, 16), &all), one_each);
+        // With fewer workers, each runs on every workers-th CPU.
+        let every_8th: Vec<_> = (0..8).map(|w| Some((w..96).step_by(8).collect())).collect();
+        assert_eq!(homes(&spread_entries(96, 16, 8, 4), &all), every_8th);
+        // With fewer entries per queue than workers, too, every worker runs
+        // on a CPU of its own.
+        let mut seen: Vec<_> = homes(&spread_entries(96, 4, 96, 4), &all)
+            .into_iter()
+            .map(|home| home.unwrap())
+            .collect();
+        assert!(seen.iter().all(|home| home.len() == 1));
+        seen.sort();
+        seen.dedup();
+        assert_eq!(seen.len(), 96);
+        // The process's CPUs bound the pins, and a worker without its CPUs
+        // or without a queue of its own stays free.
+        assert_eq!(
+            homes(&spread_entries(4, 16, 4, 16), &cpu_set([1, 9])),
+            [None, Some(vec![1]), None, None]
+        );
+        assert_eq!(
+            homes(&spread_entries(2, 4, 4, 4), &all),
+            [Some(vec![0]), Some(vec![1]), None, None]
+        );
+    }
+
+    #[test]
+    fn test_pin_thread() {
+        let cpu = cpu_list(&sched_getaffinity(Pid::from_raw(0)).unwrap())[0];
+        let pinned = std::thread::spawn(move || {
+            pin_thread(&cpu_set([cpu]));
+            cpu_list(&sched_getaffinity(Pid::from_raw(0)).unwrap())
+        });
+        assert_eq!(pinned.join().unwrap(), [cpu]);
     }
 
     #[test]
@@ -5262,6 +5396,7 @@ mod tests {
             bufs_per_queue,
             zero_copy,
             defer_taskrun,
+            pin_workers: true,
         };
         let serving = mount_uring(server.clone(), mnt.as_path(), cfg, start)?;
         // Kernels with buffer pools must get them when the config asks, and

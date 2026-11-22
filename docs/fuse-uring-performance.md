@@ -573,6 +573,54 @@ or without the change, ran up to twice as fast as the others, which the
 medians hide. The rows at depth 16 and of 4 x 32 MiB spread by 25% to
 45% between passes, and the change stayed within that.
 
+### Pinning the workers
+
+`UringConfig::pin_workers` runs each worker only on the CPUs of the
+queues whose last entry it registers. While a queue has one request at
+a time, its requests go to the entry that registered last, so the
+client and its worker share the client's CPU and wake each other there.
+In the guest, with 4 workers, each worker gets one vCPU. The rows
+"after a burst" ran right after the 4 jobs at depth 16 on the same
+mount. Medians of 3 passes, all of this section's modes in one boot of
+the guest:
+
+| Workload | Copy | Pinned | Passthrough | Pinned |
+|----------|----|------|-----------|------|
+| Walk with opens | 45.3k/s | 51.8k/s | 43.1k/s | 48.2k/s |
+| 2 KiB files, 1 thread | 29.0k/s | 32.9k/s | 37.2k/s | 41.6k/s |
+| 2 KiB files, 4 threads | 76.7k/s | 86.7k/s | 101k/s | 117k/s |
+| 4 KiB, 1 job, depth 1 | 124k IOPS | 170k IOPS | 1.06M IOPS | 1.08M IOPS |
+| 4 KiB, 4 jobs, depth 1 | 613k IOPS | 613k IOPS | 3.80M IOPS | 3.79M IOPS |
+| 4 KiB, 1 job, after a burst | 122k IOPS | 122k IOPS | 1.05M IOPS | 1.05M IOPS |
+| 2 KiB files, 1 thread, after a burst | 29.0k/s | 29.0k/s | 36.8k/s | 41.3k/s |
+| 4 x 32 MiB | 12578 MiB/s | 20135 MiB/s | 44693 MiB/s | 44626 MiB/s |
+
+On a fresh mount, small files got 12% to 16% faster, and the copied
+4 KiB reads at depth 1 37%. In other boots of the guest those reads
+measured 119k to 124k IOPS pinned, so that row depends on where the
+host runs the vCPUs. After the burst, the copied small files and reads
+lost the gain. The entry that became free last can then belong to any
+of the queue's workers, and a pinned worker on another CPU can't move to
+the client. With kernel passthrough, the small files kept it. On the
+96-core machine with 8 workers, each worker gets every eighth CPU.
+Medians of 2 passes pinned, 4 not:
+
+| Workload | Copy | Pinned |
+|----------|----|------|
+| Walk with opens | 37.1k/s | 41.0k/s |
+| 2 KiB files, 1 thread | 23.9k/s | 26.0k/s |
+| 2 KiB files, 4 threads | 84.5k/s | 80.3k/s |
+| 4 KiB, 1 job, depth 1 | 104k IOPS | 140k IOPS |
+| 4 KiB, 4 jobs, depth 1 | 377k IOPS | 387k IOPS |
+| 4 KiB, 1 job, after a burst | 103k IOPS | 103k IOPS |
+| 4 x 32 MiB | 17998 MiB/s | 15712 MiB/s |
+| 1 MiB, 8 jobs, depth 16 | 35853 MiB/s | 29682 MiB/s |
+
+Reads that keep many requests in flight lost 13% to 17% there.
+Threads that a worker starts, such as the blocking pool of its async
+runtime, inherit its CPUs too, which with a worker per CPU is one CPU
+for all of them. So the option is off by default.
+
 ### What didn't pay
 
 - Fewer workers. With 2 workers instead of 4 in the 4-vCPU guest, one
@@ -632,6 +680,12 @@ and uses the buffer pools of protocol 7.46 (kernel 7.3) when the kernel has them
   Each worker is a thread with its own ring, and with zero-copy also a
   memory file of one payload buffer. Half as many workers measured no better,
   see "What didn't pay" above.
+
+- `pin_workers`: Default is off. It runs each worker on the CPUs of the
+  queues whose last entry it registers, which makes requests that a
+  client sends one at a time faster, most in a virtual machine, until a
+  queue has several requests at once. "Pinning the workers" above has
+  the numbers.
 
 - `defer_taskrun`: Default is off, because some kernels lose wake-ups
   with it. It speeds up requests that a client sends one at a time with

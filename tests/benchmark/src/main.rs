@@ -8,8 +8,8 @@
 //!
 //! Usage: `fuse-backend-rs-benchmark <src> <mountpoint> [--async] [--uring] [--threads N]
 //! [--sync-blocking] [--thread-pool] [--uring-bufs N] [--uring-zero-copy]
-//! [--uring-defer-taskrun] [--no-backing-direct-io] [--kernel-passthrough]
-//! [--no-writeback] [--delay-us N] [--splice]`
+//! [--uring-defer-taskrun] [--uring-pin] [--no-backing-direct-io]
+//! [--kernel-passthrough] [--no-writeback] [--delay-us N] [--splice]`
 //!
 //! - default (sync) mode: requests are served by `N` worker threads of the
 //!   `SyncFuseServing` serving layer, each reading from its own fuse channel
@@ -31,7 +31,8 @@
 //!   `Config::uring_zero_copy`), which needs CAP_SYS_ADMIN.
 //!   `--uring-defer-taskrun` defers the task work of the workers' rings
 //!   (`UringConfig::defer_taskrun`), with `--async` only on the kernels it
-//!   names.
+//!   names. `--uring-pin` runs each worker on the CPUs of its queues
+//!   (`UringConfig::pin_workers`).
 //! - `--uring --async` mode: requests are served through FUSE-over-io_uring
 //!   with the asynchronous handlers (`UringFuseServing::new_async`), and
 //!   each of the `N` workers keeps several requests in flight.
@@ -101,6 +102,7 @@ mod daemon {
         uring_bufs: usize,
         uring_zero_copy: bool,
         uring_defer_taskrun: bool,
+        uring_pin: bool,
         backing_direct_io: bool,
         delay: Duration,
     }
@@ -137,7 +139,7 @@ mod daemon {
 
     fn help() {
         println!(
-            "Usage:\n   fuse-backend-rs-benchmark <src> <mountpoint> [--async] [--uring] [--threads N] [--sync-blocking] [--thread-pool] [--uring-bufs N] [--uring-zero-copy] [--uring-defer-taskrun] [--no-backing-direct-io] [--kernel-passthrough] [--no-writeback] [--delay-us N] [--splice]\n"
+            "Usage:\n   fuse-backend-rs-benchmark <src> <mountpoint> [--async] [--uring] [--threads N] [--sync-blocking] [--thread-pool] [--uring-bufs N] [--uring-zero-copy] [--uring-defer-taskrun] [--uring-pin] [--no-backing-direct-io] [--kernel-passthrough] [--no-writeback] [--delay-us N] [--splice]\n"
         );
     }
 
@@ -169,6 +171,7 @@ mod daemon {
             uring_bufs: UringConfig::default().bufs_per_queue,
             uring_zero_copy: false,
             uring_defer_taskrun: false,
+            uring_pin: false,
             backing_direct_io: true,
             delay: Duration::ZERO,
         };
@@ -192,6 +195,7 @@ mod daemon {
                 }
                 "--uring-zero-copy" => res.uring_zero_copy = true,
                 "--uring-defer-taskrun" => res.uring_defer_taskrun = true,
+                "--uring-pin" => res.uring_pin = true,
                 "--no-backing-direct-io" => res.backing_direct_io = false,
                 "--uring-bufs" => {
                     idx += 1;
@@ -213,8 +217,8 @@ mod daemon {
             help();
             return Err(Error::from_raw_os_error(libc::EINVAL));
         }
-        // Only the uring workers defer their task work.
-        if res.uring_defer_taskrun && !res.as_uring {
+        // Only the uring workers defer their task work or run pinned.
+        if (res.uring_defer_taskrun || res.uring_pin) && !res.as_uring {
             help();
             return Err(Error::from_raw_os_error(libc::EINVAL));
         }
@@ -305,6 +309,7 @@ mod daemon {
                 bufs_per_queue: args.uring_bufs,
                 zero_copy: args.uring_zero_copy,
                 defer_taskrun: args.uring_defer_taskrun,
+                pin_workers: args.uring_pin,
             };
             let serving = if args.as_async {
                 UringFuseServing::new_async(se, server, cfg)
