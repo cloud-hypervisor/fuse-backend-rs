@@ -2,13 +2,17 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::ffi::CStr;
+use std::future::Future;
 use std::io;
 use std::mem::size_of;
+use std::os::unix::io::RawFd;
+use std::pin::Pin;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
+use std::task::Poll;
+use std::thread::{self, ThreadId};
 use std::time::Duration;
 
-use async_trait::async_trait;
 use vm_memory::ByteValued;
 
 use super::sync_io::{
@@ -31,26 +35,269 @@ use crate::api::server::{
     decode_version, takes_reply, InitParams, MetricsHook, Server, ServerUtil, SrvContext,
     BUFFER_HEADER_SIZE, MAX_BUFFER_SIZE,
 };
-use crate::buffer::{Reader, Writer};
-use crate::file_traits::{AsyncFileReadWriteVolatile, FileReadWriteVolatile};
+use crate::buffer::{Reader, SendIo, Writer};
+use crate::file_traits::{AsyncFileReadWriteVolatile, FileReadWriteVolatile, RawFdFile};
 use crate::{bytes_to_cstr, encode_io_error_kind, BitmapSlice, Error, Result};
 
-struct AsyncZcReader<'a, S: BitmapSlice = ()>(Reader<'a, S>);
+/// The id of the current thread, cached, because `thread::current()` clones an `Arc`.
+fn current_thread() -> ThreadId {
+    thread_local! {
+        static ID: ThreadId = thread::current().id();
+    }
+    ID.with(|id| *id)
+}
 
-// The underlying VolatileSlice contains "*mut u8", which is just a pointer to a u8 array.
-// Actually we rely on the AsyncExecutor is a single-threaded worker, and we do not really send
-// 'Reader' to other threads.
+/// The file of a request's last `async_write_from()` or `async_read_to()`, which keeps it open
+/// until the request's next copy or its end. Only the thread serving the request may use and
+/// drop it, because tokio-uring files and their operations are bound to that thread.
+struct ServingFile {
+    thread: ThreadId,
+    file: Option<Arc<dyn AsyncFileReadWriteVolatile>>,
+}
+
+impl ServingFile {
+    /// A request served by this thread.
+    fn new() -> Self {
+        ServingFile {
+            thread: current_thread(),
+            file: None,
+        }
+    }
+
+    /// Keep `f`, and return it, if this is the serving thread. Otherwise give it back, because
+    /// it belongs to this thread.
+    fn keep(
+        &mut self,
+        f: Arc<dyn AsyncFileReadWriteVolatile>,
+    ) -> std::result::Result<&dyn AsyncFileReadWriteVolatile, Arc<dyn AsyncFileReadWriteVolatile>>
+    {
+        if current_thread() != self.thread {
+            return Err(f);
+        }
+        Ok(&**self.file.insert(f))
+    }
+}
+
+impl Drop for ServingFile {
+    fn drop(&mut self) {
+        // Leak a file rather than drop it off its thread.
+        if self.file.is_some() && current_thread() != self.thread {
+            std::mem::forget(self.file.take());
+        }
+    }
+}
+
+/// The future of a copy through the file's own asynchronous IO.
+type LocalIo<'a> = Pin<Box<dyn Future<Output = io::Result<usize>> + 'a>>;
+
+/// A copy through the file's own asynchronous IO, which `start(true)` starts on the serving
+/// thread, see [`ServingFile`]. If the future is first polled on another thread,
+/// `start(false)` copies with blocking IO there instead.
+struct ServingThreadIo<'a, F> {
+    thread: ThreadId,
+    start: Option<F>,
+    /// The IO that `start()` started, until it completes.
+    io: Option<LocalIo<'a>>,
+}
+
+impl<'a, F: FnOnce(bool) -> LocalIo<'a>> ServingThreadIo<'a, F> {
+    /// The IO of a request served by this thread.
+    fn new(start: F) -> Self {
+        ServingThreadIo {
+            thread: current_thread(),
+            start: Some(start),
+            io: None,
+        }
+    }
+}
+
+// Safe because nothing bound to the serving thread is used or dropped off it. Off it, `poll()`
+// only runs `start(false)`, which copies through the descriptor and the transport's writer or
+// reader, which may move like `AsyncZcWriter`. `poll()` and `drop()` abort the process there
+// before they touch an IO that `start(true)` started, see `abort_moved_io()`. The `start` of
+// `copy_zero_copy()` holds only references and copies, so dropping it does nothing.
+unsafe impl<F> Send for ServingThreadIo<'_, F> {}
+
+impl<'a, F: FnOnce(bool) -> LocalIo<'a> + Unpin> Future for ServingThreadIo<'a, F> {
+    type Output = io::Result<usize>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<Self::Output> {
+        let this = self.get_mut();
+        let serving = current_thread() == this.thread;
+        let io = match this.start.take() {
+            Some(start) => this.io.insert(start(serving)),
+            None => {
+                let io = this
+                    .io
+                    .as_mut()
+                    .expect("async_write_from() or async_read_to() polled after it completed");
+                if !serving {
+                    abort_moved_io("polled");
+                }
+                io
+            }
+        };
+        let res = std::task::ready!(io.as_mut().poll(cx));
+        this.io = None;
+        Poll::Ready(res)
+    }
+}
+
+impl<F> Drop for ServingThreadIo<'_, F> {
+    fn drop(&mut self) {
+        if self.io.is_some() && current_thread() != self.thread {
+            abort_moved_io("dropped");
+        }
+    }
+}
+
+/// Abort the process, because a `ServingThreadIo` was polled or dropped, as `what` says, off
+/// the serving thread while its IO was in flight. Only the serving thread can complete or drop
+/// that IO, and it waits for this thread. The IO may still write into the request's buffer, so
+/// a panic or a return would let the request free or reuse the buffer while the IO goes on.
+#[cold]
+fn abort_moved_io(what: &str) -> ! {
+    error!(
+        "async_write_from() or async_read_to() {} off the serving thread while the file's \
+         asynchronous IO that it started there was in flight. Poll it to the end on the serving \
+         thread, or move it before its first poll",
+        what
+    );
+    std::process::abort()
+}
+
+/// What the asynchronous zero-copy traits copy to or from: a transport's writer of a READ reply
+/// or its reader of a WRITE request.
+trait ZeroCopyTarget {
+    /// Copy with blocking IO.
+    fn copy_blocking(&mut self, fd: RawFdFile, count: usize, off: u64) -> io::Result<usize>;
+
+    /// The transport's copy that needs only the descriptor, or `self` if it has none.
+    fn copy_fd(
+        &mut self,
+        fd: RawFd,
+        count: usize,
+        off: u64,
+    ) -> std::result::Result<SendIo<'_>, &mut Self>;
+
+    /// The copy through the file's own asynchronous IO.
+    fn copy_local<'a>(
+        &'a mut self,
+        file: &'a dyn AsyncFileReadWriteVolatile,
+        count: usize,
+        off: u64,
+    ) -> LocalIo<'a>;
+}
+
+impl<S: BitmapSlice> ZeroCopyTarget for Reader<'_, S> {
+    fn copy_blocking(&mut self, fd: RawFdFile, count: usize, off: u64) -> io::Result<usize> {
+        self.read_to_at(fd, count, off)
+    }
+
+    fn copy_fd(
+        &mut self,
+        fd: RawFd,
+        count: usize,
+        off: u64,
+    ) -> std::result::Result<SendIo<'_>, &mut Self> {
+        self.async_read_zero_copy_to(fd, count, off)
+    }
+
+    fn copy_local<'a>(
+        &'a mut self,
+        file: &'a dyn AsyncFileReadWriteVolatile,
+        count: usize,
+        off: u64,
+    ) -> LocalIo<'a> {
+        Box::pin(self.async_read_to_at(file, count, off))
+    }
+}
+
+impl<W: Writer> ZeroCopyTarget for W {
+    fn copy_blocking(&mut self, fd: RawFdFile, count: usize, off: u64) -> io::Result<usize> {
+        self.write_from_at(fd, count, off)
+    }
+
+    fn copy_fd(
+        &mut self,
+        fd: RawFd,
+        count: usize,
+        off: u64,
+    ) -> std::result::Result<SendIo<'_>, &mut Self> {
+        self.async_write_from_fd(fd, count, off)
+    }
+
+    fn copy_local<'a>(
+        &'a mut self,
+        file: &'a dyn AsyncFileReadWriteVolatile,
+        count: usize,
+        off: u64,
+    ) -> LocalIo<'a> {
+        Box::pin(self.async_write_from_at(file, count, off))
+    }
+}
+
+/// Copy `count` bytes between `target` and `f` at `off`, in a `Send` future, see
+/// `AsyncZeroCopyWriter`. `serving` keeps `f` on the serving thread.
+fn copy_zero_copy<'a, T: ZeroCopyTarget>(
+    target: &'a mut T,
+    serving: &'a mut ServingFile,
+    f: Arc<dyn AsyncFileReadWriteVolatile>,
+    count: usize,
+    off: u64,
+) -> SendIo<'a> {
+    let fd = f.raw_fd();
+    let blocking = move |target: &mut T| {
+        RawFdFile::new(fd).and_then(|fd| target.copy_blocking(fd, count, off))
+    };
+    let file = match serving.keep(f) {
+        Ok(file) => file,
+        // `f` belongs to this thread, so copy now, while `_f` keeps its descriptor open.
+        Err(_f) => return Box::pin(std::future::ready(blocking(target))),
+    };
+    let target = match fd {
+        Some(fd) => match target.copy_fd(fd, count, off) {
+            Ok(io) => return io,
+            Err(target) => target,
+        },
+        None => target,
+    };
+    Box::pin(ServingThreadIo::new(move |serving| {
+        if serving {
+            target.copy_local(file, count, off)
+        } else {
+            Box::pin(std::future::ready(blocking(target)))
+        }
+    }))
+}
+
+struct AsyncZcReader<'a, S: BitmapSlice = ()> {
+    r: Reader<'a, S>,
+    file: ServingFile,
+}
+
+// Safe because the buffers that the VolatileSlices point to stay valid for the whole request,
+// and `&mut` access keeps one thread at a time on them. `ServingFile` keeps the file on its
+// thread.
 unsafe impl<'a, S: BitmapSlice> Send for AsyncZcReader<'a, S> {}
 
-#[async_trait(?Send)]
+impl<'a, S: BitmapSlice> AsyncZcReader<'a, S> {
+    fn new(r: Reader<'a, S>) -> Self {
+        AsyncZcReader {
+            r,
+            file: ServingFile::new(),
+        }
+    }
+}
+
 impl<'a, S: BitmapSlice> AsyncZeroCopyReader for AsyncZcReader<'a, S> {
-    async fn async_read_to(
+    fn async_read_to(
         &mut self,
         f: Arc<dyn AsyncFileReadWriteVolatile>,
         count: usize,
         off: u64,
-    ) -> io::Result<usize> {
-        self.0.async_read_to_at(&*f, count, off).await
+    ) -> SendIo<'_> {
+        copy_zero_copy(&mut self.r, &mut self.file, f, count, off)
     }
 }
 
@@ -61,32 +308,34 @@ impl<'a, S: BitmapSlice> ZeroCopyReader for AsyncZcReader<'a, S> {
         count: usize,
         off: u64,
     ) -> io::Result<usize> {
-        self.0.read_to_at(f, count, off)
+        self.r.read_to_at(f, count, off)
     }
 }
 
 impl<'a, S: BitmapSlice> io::Read for AsyncZcReader<'a, S> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        self.0.read(buf)
+        self.r.read(buf)
     }
 }
 
-struct AsyncZcWriter<W>(W);
+struct AsyncZcWriter<W> {
+    w: W,
+    file: ServingFile,
+}
 
-// The underlying VolatileSlice contains "*mut u8", which is just a pointer to a u8 array.
-// Actually we rely on the AsyncExecutor is a single-threaded worker, and we do not really send
-// 'Reader' to other threads.
+// Safe because the buffers that the VolatileSlices point to stay valid for the whole request,
+// and `&mut` access keeps one thread at a time on them. `ServingFile` keeps the file on its
+// thread.
 unsafe impl<W: Writer> Send for AsyncZcWriter<W> {}
 
-#[async_trait(?Send)]
 impl<W: Writer> AsyncZeroCopyWriter for AsyncZcWriter<W> {
-    async fn async_write_from(
+    fn async_write_from(
         &mut self,
         f: Arc<dyn AsyncFileReadWriteVolatile>,
         count: usize,
         off: u64,
-    ) -> io::Result<usize> {
-        self.0.async_write_from_at(&*f, count, off).await
+    ) -> SendIo<'_> {
+        copy_zero_copy(&mut self.w, &mut self.file, f, count, off)
     }
 }
 
@@ -97,33 +346,40 @@ impl<W: Writer> ZeroCopyWriter for AsyncZcWriter<W> {
         count: usize,
         off: u64,
     ) -> io::Result<usize> {
-        self.0.write_from_at(f, count, off)
+        self.w.write_from_at(f, count, off)
     }
 
     fn prefers_fd(&self) -> bool {
-        self.0.prefers_fd()
+        self.w.prefers_fd()
     }
 
     fn available_bytes(&self) -> usize {
-        self.0.available_bytes()
+        self.w.available_bytes()
     }
 }
 
 impl<W: Writer> io::Write for AsyncZcWriter<W> {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        self.0.write(buf)
+        self.w.write(buf)
     }
 
     fn flush(&mut self) -> io::Result<()> {
-        self.0.flush()
+        self.w.flush()
     }
 }
 
 impl<W: Writer> AsyncZcWriter<W> {
+    fn new(w: W) -> Self {
+        AsyncZcWriter {
+            w,
+            file: ServingFile::new(),
+        }
+    }
+
     /// Adds a directory entry to a READDIR or READDIRPLUS reply. A closure that calls this
     /// captures the whole writer, so it is `Send` like the writer.
     fn add_dirent(&mut self, max: u32, d: DirEntry, entry: Option<Entry>) -> io::Result<usize> {
-        add_dirent(&mut self.0, max, d, entry)
+        add_dirent(&mut self.w, max, d, entry)
     }
 }
 
@@ -382,7 +638,7 @@ impl<F: AsyncFileSystem + Sync> Server<F> {
             Ok(v) => v,
             Err(e) => return Err(Error::FailedToSplitWriter(e)),
         };
-        let mut data_writer = AsyncZcWriter(w2);
+        let mut data_writer = AsyncZcWriter::new(w2);
         let result = self
             .fs
             .async_read(
@@ -398,7 +654,7 @@ impl<F: AsyncFileSystem + Sync> Server<F> {
             .await;
 
         match result {
-            Ok(count) => ctx.async_reply_with_data(&data_writer.0, count).await,
+            Ok(count) => ctx.async_reply_with_data(&data_writer.w, count).await,
             Err(e) => ctx.async_reply_error_explicit(e).await,
         }
     }
@@ -429,7 +685,7 @@ impl<F: AsyncFileSystem + Sync> Server<F> {
             None
         };
         let delayed_write = fuse_flags & WRITE_CACHE != 0;
-        let mut data_reader = AsyncZcReader(ctx.take_reader());
+        let mut data_reader = AsyncZcReader::new(ctx.take_reader());
         let result = self
             .fs
             .async_write(
@@ -513,7 +769,7 @@ impl<F: AsyncFileSystem + Sync> Server<F> {
         // The file system's future holds `add_entry`, so the closure has to be `Send`. Wrap
         // the cursor in `AsyncZcWriter`, which is `Send`, as READ does with its data writer.
         let mut cursor = match ctx.dirent_cursor(size)? {
-            Some(cursor) => AsyncZcWriter(cursor),
+            Some(cursor) => AsyncZcWriter::new(cursor),
             None => {
                 return ctx
                     .async_reply_error(io::Error::from_raw_os_error(libc::ENOMEM))
@@ -546,7 +802,7 @@ impl<F: AsyncFileSystem + Sync> Server<F> {
 
         match result {
             Ok(()) => {
-                ctx.async_reply_with_data(&cursor.0, cursor.0.bytes_written())
+                ctx.async_reply_with_data(&cursor.w, cursor.w.bytes_written())
                     .await
             }
             Err(e) => ctx.async_reply_error_explicit(e).await,
@@ -1201,6 +1457,7 @@ mod tests {
     use crate::abi::fuse_abi::{statvfs64, Dirent, InHeader, RENAME_NOREPLACE, S_IFCHR};
     use crate::api::filesystem::{Context, FileSystem, GetxattrReply, ListxattrReply, OpenOptions};
     use crate::async_runtime;
+    use async_trait::async_trait;
 
     const DIR_HANDLE: u64 = 7;
 

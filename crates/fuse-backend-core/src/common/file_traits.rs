@@ -466,6 +466,8 @@ volatile_impl!(File);
 
 #[cfg(feature = "async-io")]
 pub use async_io::AsyncFileReadWriteVolatile;
+#[cfg(feature = "async-io")]
+pub(crate) use async_io::RawFdFile;
 
 #[cfg(feature = "async-io")]
 mod async_io {
@@ -476,6 +478,27 @@ mod async_io {
     use super::*;
     use crate::async_file::File;
     use crate::file_buf::FileVolatileBuf;
+
+    /// A file descriptor that the caller keeps open, for the blocking copies of the asynchronous
+    /// zero-copy traits. It reads and writes with plain syscalls, so a closed descriptor only
+    /// fails them.
+    pub(crate) struct RawFdFile(RawFd);
+
+    impl RawFdFile {
+        /// The descriptor `fd` of a file, or `EOPNOTSUPP` if the file has none.
+        pub(crate) fn new(fd: Option<RawFd>) -> Result<Self> {
+            fd.map(RawFdFile)
+                .ok_or_else(|| Error::from_raw_os_error(libc::EOPNOTSUPP))
+        }
+    }
+
+    impl AsRawFd for RawFdFile {
+        fn as_raw_fd(&self) -> RawFd {
+            self.0
+        }
+    }
+
+    volatile_impl!(RawFdFile);
 
     /// Extension of [FileReadWriteVolatile] to support io-uring based asynchronous IO.
     ///

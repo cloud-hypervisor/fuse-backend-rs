@@ -42,9 +42,7 @@
 //! Its `preadv`/`pwritev` calls work in any runtime context, but block the
 //! runtime thread on cache misses unless the thread pool is enabled.
 
-use std::future::Future;
 use std::io;
-use std::pin::Pin;
 
 use async_trait::async_trait;
 
@@ -380,32 +378,6 @@ impl<T, U: FnOnce(T)> Drop for Unclaimed<T, U> {
         if let Some((value, undo)) = self.0.take() {
             undo(value);
         }
-    }
-}
-
-/// The asynchronous zero-copy traits (`AsyncZeroCopyReader`/`AsyncZeroCopyWriter`)
-/// return `!Send` futures, but `AsyncFileSystem` requires `Send` futures. The
-/// zero-copy buffers borrow transport memory and the asynchronous IO engines
-/// (io_uring) are bound to the thread polling them, so the data path relies
-/// on the async runtime being a single-threaded worker anyway, cf. the
-/// `unsafe impl Send` for the transport adapters in `api/server/async_io.rs`.
-/// Mark the zero-copy futures as `Send` on the same grounds.
-#[repr(transparent)]
-struct SendZeroCopyFuture<F>(F);
-
-// Safe because the async runtime executing the zero-copy path is a
-// single-threaded worker, so the future is never moved between threads.
-unsafe impl<F> Send for SendZeroCopyFuture<F> {}
-
-impl<F: Future> Future for SendZeroCopyFuture<F> {
-    type Output = F::Output;
-
-    fn poll(
-        self: Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Self::Output> {
-        // Safe because `SendZeroCopyFuture` is `repr(transparent)`.
-        unsafe { self.map_unchecked_mut(|s: &mut Self| &mut s.0) }.poll(cx)
     }
 }
 
@@ -897,7 +869,7 @@ impl<S: BitmapSlice + Send + Sync + 'static> AsyncFileSystem for PassthroughFs<S
         // pool reads through memory, so it gets the file right away.
         if w.prefers_fd() {
             let file = self.async_file_from_data(&data, flags)?;
-            return SendZeroCopyFuture(w.async_write_from(file, size as usize, offset)).await;
+            return w.async_write_from(file, size as usize, offset).await;
         }
 
         // Buffered requests first try an inline non-blocking read: the
@@ -931,12 +903,9 @@ impl<S: BitmapSlice + Send + Sync + 'static> AsyncFileSystem for PassthroughFs<S
         // continuing at the writer's position and the file offset where
         // the inline attempt stopped.
         let file = self.async_file_from_data(&data, flags)?;
-        let n = SendZeroCopyFuture(w.async_write_from(
-            file,
-            size as usize - served,
-            offset + served as u64,
-        ))
-        .await?;
+        let n = w
+            .async_write_from(file, size as usize - served, offset + served as u64)
+            .await?;
         Ok(served + n)
     }
 
@@ -1008,7 +977,7 @@ impl<S: BitmapSlice + Send + Sync + 'static> AsyncFileSystem for PassthroughFs<S
 
         // Serve the request with native asynchronous IO: the transport
         // transfers the data directly between its buffer and the file.
-        SendZeroCopyFuture(r.async_read_to(file, size as usize, offset)).await
+        r.async_read_to(file, size as usize, offset).await
     }
 
     async fn async_fsync(
@@ -1411,6 +1380,8 @@ impl<S: BitmapSlice + Send + Sync + 'static> AsyncFileSystem for PassthroughFs<S
 // on macOS is not part of this framework.
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
+    use std::future::Future;
+    use std::pin::Pin;
     use std::sync::atomic::Ordering;
     use std::sync::Arc;
 
@@ -1465,25 +1436,36 @@ mod tests {
         }
     }
 
-    #[async_trait(?Send)]
+    /// Run the file's own asynchronous IO as a task of this thread's
+    /// runtime, which it is bound to, so that a `Send` future can wait for
+    /// it. The task's buffer must outlive it.
+    fn local_io(
+        io: impl Future<Output = io::Result<usize>> + 'static,
+    ) -> impl Future<Output = io::Result<usize>> + Send {
+        let task = async_runtime::spawn(io);
+        async move { task.await.unwrap() }
+    }
+
     impl AsyncZeroCopyWriter for MemWriter {
-        async fn async_write_from(
+        fn async_write_from(
             &mut self,
             f: Arc<dyn AsyncFileReadWriteVolatile>,
             count: usize,
             off: u64,
-        ) -> io::Result<usize> {
+        ) -> Pin<Box<dyn Future<Output = io::Result<usize>> + Send + '_>> {
             if self.0.len() < count {
                 self.0.resize(count, 0);
             }
-            // Safe because the buffer points into `self.0` and doesn't out-live it.
+            // Safe because the buffer points into `self.0`, which the future
+            // borrows, and the tests await the future.
             let buf = unsafe { FileVolatileBuf::from_raw_ptr(self.0.as_mut_ptr(), 0, count) };
-            let (res, _) = f.async_read_at_volatile(buf, off).await;
-            // Received data is always placed at the start of the buffer.
-            if let Ok(n) = &res {
-                self.0.truncate(*n);
-            }
-            res
+            let read = local_io(async move { f.async_read_at_volatile(buf, off).await.0 });
+            Box::pin(async move {
+                let n = read.await?;
+                // Received data is always placed at the start of the buffer.
+                self.0.truncate(n);
+                Ok(n)
+            })
         }
     }
 
@@ -1521,26 +1503,26 @@ mod tests {
         }
     }
 
-    #[async_trait(?Send)]
     impl AsyncZeroCopyReader for MemReader {
-        async fn async_read_to(
+        fn async_read_to(
             &mut self,
             f: Arc<dyn AsyncFileReadWriteVolatile>,
             count: usize,
             off: u64,
-        ) -> io::Result<usize> {
+        ) -> Pin<Box<dyn Future<Output = io::Result<usize>> + Send + '_>> {
             let start = off as usize;
             if start >= self.0.len() {
-                return Ok(0);
+                return Box::pin(std::future::ready(Ok(0)));
             }
             let n = std::cmp::min(count, self.0.len() - start);
-            // Safe because the buffer is only read from and doesn't out-live
-            // `self.0`.
+            // Safe because the buffer is only read from and points into
+            // `self.0`, which the future borrows, and the tests await it.
             let buf = unsafe {
                 FileVolatileBuf::from_raw_ptr(self.0.as_ptr().add(start) as *mut u8, n, n)
             };
-            let (res, _) = f.async_write_at_volatile(buf, off).await;
-            res
+            Box::pin(local_io(async move {
+                f.async_write_at_volatile(buf, off).await.0
+            }))
         }
     }
 
@@ -1714,23 +1696,24 @@ mod tests {
         }
     }
 
-    #[async_trait(?Send)]
     impl AsyncZeroCopyWriter for PathRecorder {
-        async fn async_write_from(
+        fn async_write_from(
             &mut self,
             f: Arc<dyn AsyncFileReadWriteVolatile>,
             count: usize,
             off: u64,
-        ) -> io::Result<usize> {
+        ) -> Pin<Box<dyn Future<Output = io::Result<usize>> + Send + '_>> {
             // Read the file, so the tests see the data the native path reads.
             let mut buf = vec![0u8; count];
-            // Safe because `vbuf` doesn't outlive `buf`.
+            // Safe because the future owns `buf`, and the tests await it.
             let vbuf = unsafe { FileVolatileBuf::from_raw_ptr(buf.as_mut_ptr(), 0, count) };
-            let (res, _) = f.async_read_at_volatile(vbuf, off).await;
-            let n = res?;
-            self.events.push(("async", n, off));
-            self.data.extend_from_slice(&buf[..n]);
-            Ok(n)
+            let read = local_io(async move { f.async_read_at_volatile(vbuf, off).await.0 });
+            Box::pin(async move {
+                let n = read.await?;
+                self.events.push(("async", n, off));
+                self.data.extend_from_slice(&buf[..n]);
+                Ok(n)
+            })
         }
     }
 

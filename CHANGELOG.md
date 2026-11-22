@@ -237,6 +237,24 @@
   no longer wake 10 times a second.
 
 ### Changed
+- [386](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/386): `AsyncZeroCopyWriter::async_write_from()` and
+  `AsyncZeroCopyReader::async_read_to()` return `Send` futures, so `AsyncFileSystem` handlers
+  can await them without `unsafe`. `PassthroughFs` drops its `unsafe` wrapper
+  `SendZeroCopyFuture`, and the `unsafe` moves into the server, as a new `unsafe impl Send` for
+  the future of a copy through the file's own asynchronous IO. Off the serving thread, that
+  future only copies through the descriptor, and it aborts the process if it's polled or
+  dropped there while IO that it started on the serving thread is in flight. Implementations of
+  the traits replace `#[async_trait(?Send)]` and the `async fn` with a plain `fn` that returns
+  `Pin<Box<dyn Future<Output = io::Result<usize>> + Send + '_>>`. `#[async_trait]` can't
+  implement that signature (E0195), and the future can't hold the file, which isn't `Send`. Or
+  they use the new defaults, which copy with `write_from()` or `read_to()` through the file's
+  descriptor, blocking the thread, and fail with `EOPNOTSUPP` for a file without one. The
+  server's copies do the same when called or first polled off the serving thread. Off the
+  serving thread, zero-copy IO over a FUSE-over-io_uring ring with `IORING_SETUP_SINGLE_ISSUER`
+  fails with `EEXIST`, and zero-copy IO that moved there after it started aborts the process if
+  the ring refuses that thread's wait for it. `ZeroCopySource` uses `#[async_trait]` instead of
+  `#[async_trait(?Send)]`, so its `async_write_to_file()` future is `Send`, and transports can
+  implement the new `Writer::async_write_from_fd()`.
 - [325](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/325): The `fuse-backend-fusedev` `uring` transport uses io-uring 0.6 instead of 0.5,
   and depends on it only on Linux.
 - [324](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/324): `fuse-backend-core` uses bitflags 2 instead of 1. The flag types (`FsOptions`,

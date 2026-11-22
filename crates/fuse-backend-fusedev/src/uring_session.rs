@@ -63,6 +63,7 @@ use fuse_backend_core::{
 };
 #[cfg(feature = "async-io")]
 use futures_util::{
+    future::BoxFuture,
     stream::{FuturesUnordered, StreamExt},
     FutureExt,
 };
@@ -353,7 +354,7 @@ pub struct UringWriter<'a, S: BitmapSlice = ()> {
 }
 
 /// Reads a file into the client pages of a zero-copy READ.
-#[cfg_attr(feature = "async-io", async_trait::async_trait(?Send))]
+#[cfg_attr(feature = "async-io", async_trait::async_trait)]
 trait ZeroCopySink: Sync {
     /// Read `count` bytes from the file `fd` at offset `off` into the client
     /// pages, starting `pos` bytes into them. Returns how many it read.
@@ -810,6 +811,24 @@ impl<'a, S: BitmapSlice> Writer for UringWriter<'a, S> {
         UringWriter::async_write_from_at(self, src, count, off).await
     }
 
+    /// The reply of a zero-copy READ reads the file into the client pages on
+    /// the worker's ring, see `ZeroCopyIo::run_async()`.
+    #[cfg(feature = "async-io")]
+    fn async_write_from_fd(
+        &mut self,
+        fd: RawFd,
+        count: usize,
+        off: u64,
+    ) -> std::result::Result<BoxFuture<'_, io::Result<usize>>, &mut Self> {
+        match self.zero_copy {
+            Some(ref mut zc) => Ok(Box::pin(async move {
+                check_space(zc.cap - zc.len, count)?;
+                zc.async_read_from_file(fd, count, off).await
+            })),
+            None => Err(self),
+        }
+    }
+
     #[cfg(feature = "async-io")]
     async fn async_commit(&mut self, other: Option<&Self>) -> io::Result<usize> {
         UringWriter::commit(self, other)
@@ -1035,6 +1054,15 @@ const ZERO_COPY_FLAG: u64 = 1 << 63;
 /// signal stops. Entry indexes never reach it.
 const STOP_USER_DATA: u64 = ZERO_COPY_FLAG - 1;
 
+/// The id of the current thread, cached, because `thread::current()` clones
+/// an `Arc`.
+fn current_thread() -> thread::ThreadId {
+    thread_local! {
+        static ID: thread::ThreadId = thread::current().id();
+    }
+    ID.with(|id| *id)
+}
+
 /// Lock `mutex`, also if a thread panicked while it held the lock.
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
@@ -1045,6 +1073,13 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 struct RingState {
     ring: FuseRing,
     completions: Completions,
+    /// The commits that the worker queued. They stay out of the submission
+    /// queue until the worker submits, or a zero-copy request that submits
+    /// from another thread would send them too. The kernel runs a command's
+    /// task work on the thread that submitted it. Once that thread has
+    /// exited, the request that arrives for the entry fails with ECANCELED,
+    /// and the kernel frees the entry.
+    commits: Vec<squeue::Entry128>,
 }
 
 impl RingState {
@@ -1054,6 +1089,7 @@ impl RingState {
         Mutex::new(RingState {
             ring,
             completions: Completions::new(nr_entries),
+            commits: Vec::with_capacity(nr_entries),
         })
     }
 
@@ -1062,18 +1098,70 @@ impl RingState {
         self.completions.receive(&mut self.ring);
     }
 
-    /// Queue the commit of `entry`, at index `idx`, and count the entry as
-    /// armed, because release_entries() submits anything still queued.
-    fn commit(&mut self, fd: RawFd, entry: &UringEntry, idx: usize) -> io::Result<()> {
-        push_commit(&mut self.ring, fd, entry, idx)?;
-        self.completions.armed += 1;
+    /// Queue the `COMMIT_AND_FETCH` of `entry`, at index `idx`, which hands
+    /// its staged reply to the kernel and registers it for the next
+    /// request.
+    fn commit(&mut self, fd: RawFd, entry: &UringEntry, idx: usize) {
+        let commit_id = entry.header().ring_ent_in_out.commit_id;
+        self.commits.push(entry.cmd_sqe(
+            fd,
+            FUSE_IO_URING_CMD_COMMIT_AND_FETCH,
+            commit_id,
+            idx as u64,
+        ));
+    }
+
+    /// Move the queued commits to the submission queue, submitting when it
+    /// is full. It never holds more commits than completed entries, so
+    /// submitting must eventually make room.
+    fn queue_commits(&mut self) -> io::Result<()> {
+        while !self.commits.is_empty() {
+            let mut sq = self.ring.submission();
+            let n = self.commits.len().min(sq.capacity() - sq.len());
+            // Safe because release_entries() keeps the entries alive while
+            // the kernel holds them. The queue has room for all n.
+            let pushed = unsafe { sq.push_multiple(&self.commits[..n]) };
+            debug_assert!(pushed.is_ok());
+            drop(sq);
+            self.commits.drain(..n);
+            // Their entries count as armed, because release_entries()
+            // submits anything still queued.
+            self.completions.armed += n;
+            if !self.commits.is_empty() {
+                submit(&mut self.ring)?;
+            }
+        }
         Ok(())
     }
 
-    /// The ring of `state`, and its completions, which count the entries
-    /// the kernel holds.
+    /// Submit the commits and the rest of the queue. Only the worker may
+    /// call this.
+    fn submit_all(&mut self) -> io::Result<()> {
+        self.queue_commits()?;
+        submit(&mut self.ring)
+    }
+
+    /// Submit the commits and the rest of the queue, and wait for `want`
+    /// completions. Only the worker may call this.
+    fn submit_all_and_wait(&mut self, want: usize) -> io::Result<()> {
+        self.queue_commits()?;
+        submit_and_wait(&mut self.ring, want)
+    }
+
+    /// Whether anything waits for the worker to submit it.
+    #[cfg(feature = "async-io")]
+    fn has_queued(&mut self) -> bool {
+        !self.commits.is_empty() || !self.ring.submission().is_empty()
+    }
+
+    /// The ring of `state`, with the queued commits in its submission
+    /// queue, and its completions, which count the entries the kernel
+    /// holds.
     fn into_parts(state: Mutex<RingState>) -> (FuseRing, Completions) {
-        let state = state.into_inner().unwrap_or_else(PoisonError::into_inner);
+        let mut state = state.into_inner().unwrap_or_else(PoisonError::into_inner);
+        // Commits that a failed submit kept out of the queue never reach the
+        // kernel, and their entries don't count as armed.
+        let _ = state.queue_commits();
         (state.ring, state.completions)
     }
 }
@@ -1098,9 +1186,9 @@ struct Completions {
 #[derive(Clone, Default)]
 struct ZeroCopyOp {
     /// How many operations the entry's requests started, modulo 2^31. A
-    /// request that stops waiting for its operation, because the wait
-    /// failed or the handler dropped the future, leaves it running, and the
-    /// count tells its late completion from that of the next operation.
+    /// request whose wait for its operation fails on the worker leaves it
+    /// running, and the count tells its late completion from that of the
+    /// next operation.
     started: u32,
     result: Option<i32>,
     /// The request future that waits for the result.
@@ -1189,6 +1277,8 @@ enum ZeroCopyKind {
 /// worker's queue.
 struct ZeroCopyIo<'r> {
     state: &'r Mutex<RingState>,
+    /// The worker whose ring this is.
+    worker: thread::ThreadId,
     /// The index of the entry that holds the request.
     idx: usize,
     slot: u16,
@@ -1240,7 +1330,23 @@ impl BounceBuf {
 
 impl ZeroCopyIo<'_> {
     /// Queue `sqe` on the ring as the next operation of the entry.
+    ///
+    /// A ring with `IORING_SETUP_SINGLE_ISSUER` refuses submissions from
+    /// other threads with EEXIST, and an operation queued there would wait
+    /// for the worker's next submit, after the request is done. So off the
+    /// worker, this fails with EEXIST before it queues `sqe`. It also fails
+    /// with EBUSY if the submission queue holds anything, because a submit
+    /// from this thread would send that too, see `RingState::commits`. Only
+    /// a failed or interrupted enter of the worker leaves entries there.
     fn start(&self, state: &mut RingState, sqe: squeue::Entry) -> io::Result<()> {
+        if !self.on_worker() {
+            if state.ring.params().is_setup_single_issuer() {
+                return Err(io::Error::from_raw_os_error(libc::EEXIST));
+            }
+            if !state.ring.submission().is_empty() {
+                return Err(io::Error::from_raw_os_error(libc::EBUSY));
+            }
+        }
         let op = &mut state.completions.ops[self.idx];
         op.started = op.started.wrapping_add(1) & 0x7fff_ffff;
         op.result = None;
@@ -1260,25 +1366,67 @@ impl ZeroCopyIo<'_> {
     fn run(&self, sqe: squeue::Entry) -> io::Result<usize> {
         let mut state = lock(self.state);
         self.start(&mut state, sqe)?;
+        fixed_result(self.wait(&mut state)?)
+    }
+
+    /// Wait for the result of the entry's operation, taking completions
+    /// off the ring, and blocking the thread.
+    ///
+    /// Off the worker, this submits only the operation, not the worker's
+    /// commits, see `RingState::commits`. Only a failed or interrupted
+    /// enter of the worker leaves commits in the queue, and after a failed
+    /// one the loop stops serving. A failed wait off the worker aborts the
+    /// process. The worker waits for this thread, so it can't take the
+    /// result off the ring either, and the request would end while the
+    /// operation still uses the client pages. A ring with
+    /// `IORING_SETUP_DEFER_TASKRUN` fails every wait off the worker with
+    /// EEXIST.
+    fn wait(&self, state: &mut RingState) -> io::Result<i32> {
+        let on_worker = self.on_worker();
         loop {
-            submit_and_wait(&mut state.ring, 1)?;
-            state.receive();
             if let Some(res) = state.completions.ops[self.idx].result.take() {
-                return fixed_result(res);
+                return Ok(res);
             }
+            let res = if on_worker {
+                state.submit_all_and_wait(1)
+            } else {
+                submit_and_wait(&mut state.ring, 1)
+            };
+            match res {
+                Ok(()) => {}
+                // A full completion queue, or memory that the kernel lacked
+                // for a moment, doesn't stop the next try.
+                Err(e) if matches!(e.raw_os_error(), Some(libc::EBUSY | libc::EAGAIN)) => {}
+                Err(e) if !on_worker => {
+                    error!(
+                        "uring worker: a zero-copy operation can't be waited for off the worker: {e}"
+                    );
+                    std::process::abort();
+                }
+                Err(e) => return Err(e),
+            }
+            state.receive();
         }
     }
 
     /// Run `sqe` on the ring and wait for its result. The async worker loop
-    /// takes the result off the ring.
+    /// takes the result off the ring. On another thread, which the worker
+    /// waits for, this runs like `run()` and blocks that thread. Moved there
+    /// after the operation started, it waits for the result like `run()`,
+    /// see `wait()`. See `AsyncZeroCopyWriter`.
     #[cfg(feature = "async-io")]
     async fn run_async(&self, sqe: squeue::Entry) -> io::Result<usize> {
+        if !self.on_worker() {
+            return self.run(sqe);
+        }
         {
             let mut state = lock(self.state);
             self.start(&mut state, sqe)?;
             // Once queued, the operation runs on the client pages whether or
             // not this submits it, so wait for it either way. The worker
-            // loop submits what is still queued, or stops on the error.
+            // loop submits what is still queued, or stops on the error. The
+            // commits wait for the loop, so a failed enter here can't leave
+            // them where a scoped thread would send them.
             if let Err(e) = submit(&mut state.ring) {
                 warn!("uring worker: submitting a zero-copy operation: {e}");
                 if let Some(waker) = state.completions.waker.take() {
@@ -1289,18 +1437,23 @@ impl ZeroCopyIo<'_> {
         let pending = PendingOp(self);
         let res = std::future::poll_fn(|cx| {
             let mut state = lock(self.state);
-            let op = &mut state.completions.ops[self.idx];
-            match op.result.take() {
-                Some(res) => Poll::Ready(res),
-                None => {
-                    op.waker = Some(cx.waker().clone());
-                    Poll::Pending
-                }
+            if let Some(res) = state.completions.ops[self.idx].result.take() {
+                return Poll::Ready(Ok(res));
             }
+            // Moved to another thread while the operation runs.
+            if !self.on_worker() {
+                return Poll::Ready(self.wait(&mut state));
+            }
+            state.completions.ops[self.idx].waker = Some(cx.waker().clone());
+            Poll::Pending
         })
         .await;
         std::mem::forget(pending);
-        fixed_result(res)
+        fixed_result(res?)
+    }
+
+    fn on_worker(&self) -> bool {
+        current_thread() == self.worker
     }
 }
 
@@ -1316,14 +1469,9 @@ struct PendingOp<'a, 'r>(&'a ZeroCopyIo<'r>);
 #[cfg(feature = "async-io")]
 impl Drop for PendingOp<'_, '_> {
     fn drop(&mut self) {
-        let mut state = lock(self.0.state);
-        while state.completions.ops[self.0.idx].result.take().is_none() {
-            // Without the ring, the connection is going away anyway.
-            if submit_and_wait(&mut state.ring, 1).is_err() {
-                return;
-            }
-            state.receive();
-        }
+        // A failed wait leaves the operation running on the worker, and
+        // aborts off it.
+        let _ = self.0.wait(&mut lock(self.0.state));
     }
 }
 
@@ -1378,7 +1526,7 @@ impl ZeroCopyIo<'_> {
     }
 }
 
-#[cfg_attr(feature = "async-io", async_trait::async_trait(?Send))]
+#[cfg_attr(feature = "async-io", async_trait::async_trait)]
 impl ZeroCopySink for ZeroCopyIo<'_> {
     fn read_from_file(&self, pos: usize, fd: RawFd, count: usize, off: u64) -> io::Result<usize> {
         self.run(self.read_fixed(pos, fd, count, off))
@@ -1427,7 +1575,7 @@ impl ZeroCopySink for ZeroCopyIo<'_> {
     }
 }
 
-#[cfg_attr(feature = "async-io", async_trait::async_trait(?Send))]
+#[cfg_attr(feature = "async-io", async_trait::async_trait)]
 impl ZeroCopySource for ZeroCopyIo<'_> {
     fn write_to_file(
         &self,
@@ -2249,7 +2397,7 @@ impl<F: FileSystem + Send + Sync + 'static> UringWorker<F> {
         let result = 'serve: loop {
             {
                 let mut state = lock(&state);
-                if let Err(e) = submit_and_wait(&mut state.ring, 1) {
+                if let Err(e) = state.submit_all_and_wait(1) {
                     break 'serve Err(e);
                 }
                 state.receive();
@@ -2265,7 +2413,7 @@ impl<F: FileSystem + Send + Sync + 'static> UringWorker<F> {
                         Some(next) => next,
                         // Once stopped, the worker has served the requests
                         // it took.
-                        None if state.completions.stopped => break 'serve submit(&mut state.ring),
+                        None if state.completions.stopped => break 'serve state.submit_all(),
                         // The wait at the top of the loop submits the
                         // commits.
                         None => break,
@@ -2283,9 +2431,7 @@ impl<F: FileSystem + Send + Sync + 'static> UringWorker<F> {
                     panic = Some(payload);
                     break 'serve Err(io::Error::other("a request handler panicked"));
                 }
-                if let Err(e) = lock(&state).commit(fd, entry, idx) {
-                    break 'serve Err(e);
-                }
+                lock(&state).commit(fd, entry, idx);
             }
         };
         // The kernel gives the entries back once the connection ends.
@@ -2321,6 +2467,7 @@ impl<F: FileSystem + Send + Sync + 'static> UringWorker<F> {
             .fetch_add(1, Ordering::Relaxed);
         Ok(ZeroCopyIo {
             state,
+            worker: current_thread(),
             idx,
             slot,
             bounce,
@@ -2492,8 +2639,8 @@ impl<F: AsyncFileSystem + Send + Sync + 'static> UringWorker<F> {
             }
             {
                 let mut state = lock(state);
-                if !state.ring.submission().is_empty() {
-                    if let Err(e) = submit(&mut state.ring) {
+                if state.has_queued() {
+                    if let Err(e) = state.submit_all() {
                         break 'serve Err(e);
                     }
                 }
@@ -2521,11 +2668,8 @@ impl<F: AsyncFileSystem + Send + Sync + 'static> UringWorker<F> {
                             *panic = Some(payload);
                             break 'serve Err(io::Error::other("a request handler panicked"));
                         }
-                        let committed = lock(state).commit(fd, &entry, idx);
+                        lock(state).commit(fd, &entry, idx);
                         entries[idx] = Some(entry);
-                        if let Err(e) = committed {
-                            break 'serve Err(e);
-                        }
                         // Polling the other requests takes the lock too.
                         done = inflight.next().now_or_never().flatten();
                     }
@@ -2568,9 +2712,8 @@ impl<F: AsyncFileSystem + Send + Sync + 'static> UringWorker<F> {
                             continue;
                         }
                         let mut state = lock(state);
-                        if state.commit(fd, &entry, idx).is_ok() {
-                            let _ = submit(&mut state.ring);
-                        }
+                        state.commit(fd, &entry, idx);
+                        let _ = state.submit_all();
                         entries[idx] = Some(entry);
                     }
                     ready = ring_ready.readable() => {
@@ -2630,10 +2773,7 @@ impl<F: AsyncFileSystem + Send + Sync + 'static> UringWorker<F> {
 async fn queued(state: &Mutex<RingState>) {
     std::future::poll_fn(|cx| {
         let mut state = lock(state);
-        if state.completions.queue.is_empty()
-            && state.ring.submission().is_empty()
-            && !state.completions.stopped
-        {
+        if state.completions.queue.is_empty() && !state.has_queued() && !state.completions.stopped {
             state.completions.waker = Some(cx.waker().clone());
             Poll::Pending
         } else {
@@ -2684,28 +2824,6 @@ fn stop_result(exit: &StopSignal, res: i32) -> io::Result<()> {
         Ok(())
     } else {
         Err(io::Error::from_raw_os_error(-res))
-    }
-}
-
-/// Queue the `COMMIT_AND_FETCH` for the entry at `idx`, which hands its
-/// staged reply to the kernel and registers it for the next request.
-fn push_commit(ring: &mut FuseRing, fd: RawFd, entry: &UringEntry, idx: usize) -> io::Result<()> {
-    let commit_id = entry.header().ring_ent_in_out.commit_id;
-    let sqe = entry.cmd_sqe(
-        fd,
-        FUSE_IO_URING_CMD_COMMIT_AND_FETCH,
-        commit_id,
-        idx as u64,
-    );
-    loop {
-        // Safe because release_entries() keeps the entries alive while the
-        // kernel holds them.
-        if unsafe { ring.submission().push(&sqe) }.is_ok() {
-            return Ok(());
-        }
-        // The submission queue can never hold more outstanding commits than
-        // completed entries, so submitting must eventually make room.
-        submit(ring)?;
     }
 }
 
@@ -4225,6 +4343,118 @@ mod tests {
         assert_eq!(w.commit(Some(&data)).unwrap(), OUT_HEADER_SIZE + 1099);
     }
 
+    /// The errors of the zero-copy operations of `io` on another thread than
+    /// the worker, where they all fail.
+    fn off_worker_errors(io: &ZeroCopyIo<'_>) -> Vec<Option<i32>> {
+        let file = File::open("/dev/null").unwrap();
+        let fd = file.as_raw_fd();
+        let results = thread::scope(|s| {
+            s.spawn(|| {
+                vec![
+                    io.read_from_file(0, fd, 4096, 0),
+                    io.write_to_file(0, fd, 4096, Some(0)),
+                    #[cfg(feature = "async-io")]
+                    io.async_read_from_file(0, fd, 4096, 0)
+                        .now_or_never()
+                        .unwrap(),
+                ]
+            })
+            .join()
+            .unwrap()
+        });
+        results
+            .into_iter()
+            .map(|res| res.unwrap_err().raw_os_error())
+            .collect()
+    }
+
+    /// Off the worker, a ring with `IORING_SETUP_SINGLE_ISSUER` fails a
+    /// zero-copy operation before it queues it, see `ZeroCopyIo::start()`.
+    #[test]
+    fn test_zero_copy_io_single_issuer_off_worker() {
+        let ring = match FuseRing::builder()
+            .setup_single_issuer()
+            .setup_defer_taskrun()
+            .build(8)
+        {
+            Ok(ring) => ring,
+            Err(e) => {
+                eprintln!("the kernel refuses a ring that defers its task work ({e}), skipping");
+                return;
+            }
+        };
+        let state = RingState::new(ring, 1);
+        let bounce = Mutex::new(BounceBuf::new(4096).unwrap());
+        // This thread built the ring, so it is the worker.
+        let io = ZeroCopyIo {
+            state: &state,
+            worker: current_thread(),
+            idx: 0,
+            slot: 0,
+            bounce: &bounce,
+            counts: &ZeroCopyCounts::default(),
+        };
+        for errno in off_worker_errors(&io) {
+            assert_eq!(errno, Some(libc::EEXIST));
+        }
+        {
+            let mut state = lock(&state);
+            assert!(state.ring.submission().is_empty());
+            assert_eq!(state.completions.ops[0].started, 0);
+        }
+        // The worker still runs operations.
+        assert_eq!(io.run(opcode::Nop::new().build()).unwrap(), 0);
+    }
+
+    /// A failed submit of the worker leaves commits in the submission queue.
+    /// Off the worker, zero-copy operations then fail with EBUSY, because
+    /// their submit would send the commits too. Commits that never reached
+    /// the queue don't count as armed, see `RingState::into_parts()`.
+    #[test]
+    fn test_zero_copy_io_stranded_commits_off_worker() {
+        // A disabled ring fails every submit with EBADFD.
+        let ring = match FuseRing::builder().setup_r_disabled().build(2) {
+            Ok(ring) => ring,
+            Err(e) => {
+                eprintln!("can't create a ring ({e}), skipping");
+                return;
+            }
+        };
+        let state = RingState::new(ring, 4);
+        let bounce = Mutex::new(BounceBuf::new(4096).unwrap());
+        {
+            let mut state = lock(&state);
+            // The kernel completed the commands of all four entries.
+            state.completions.armed = 0;
+            let entry = UringEntry::new(0, Payload::Own(4096));
+            for idx in 0..4 {
+                state.commit(-1, &entry, idx);
+            }
+            let err = state.submit_all().unwrap_err();
+            assert_eq!(err.raw_os_error(), Some(libc::EBADFD));
+            // Two commits fill the queue, and two wait for room.
+            assert_eq!(state.ring.submission().len(), 2);
+            assert_eq!(state.commits.len(), 2);
+        }
+        // This thread built the ring, so it is the worker.
+        let io = ZeroCopyIo {
+            state: &state,
+            worker: current_thread(),
+            idx: 0,
+            slot: 0,
+            bounce: &bounce,
+            counts: &ZeroCopyCounts::default(),
+        };
+        for errno in off_worker_errors(&io) {
+            assert_eq!(errno, Some(libc::EBUSY));
+        }
+        assert_eq!(lock(&state).completions.ops[0].started, 0);
+        let (mut ring, completions) = RingState::into_parts(state);
+        // The two in the queue go out with release_entries().
+        assert_eq!(ring.submission().len(), 2);
+        assert_eq!(completions.armed, 2);
+    }
+
     #[test]
     fn test_uring_writer_split_at_zero() {
         let mut hdr = vec![0u8; OUT_HEADER_SIZE];
@@ -4835,5 +5065,556 @@ mod tests {
         rx.recv_timeout(Duration::from_secs(5))
             .expect("the workers didn't stop after the connection ended");
         assert!(std::fs::read_dir(mnt.as_path()).is_err());
+    }
+
+    /// `SendZcFs`, a file system whose `Send` READ and WRITE handlers await
+    /// the asynchronous zero-copy traits, served with
+    /// `UringFuseServing::new_async()`.
+    #[cfg(feature = "async-io")]
+    mod send_zc {
+        use super::*;
+
+        mod fs {
+            //! The file system, without `unsafe`.
+            #![deny(unsafe_code)]
+
+            use std::ffi::CStr;
+            use std::future::Future;
+            use std::io;
+            use std::os::unix::io::AsRawFd;
+            use std::sync::mpsc::Sender;
+            use std::sync::Arc;
+            use std::task::{Context as TaskContext, Poll, Wake};
+            use std::thread;
+            use std::time::Duration;
+
+            use async_trait::async_trait;
+            use fuse_backend_core::abi::fuse_abi::{stat64, Attr, ROOT_ID};
+            use fuse_backend_core::api::filesystem::{
+                AsyncFileSystem, AsyncZeroCopyReader, AsyncZeroCopyWriter, Context, Entry,
+                FileSystem, OpenOptions,
+            };
+            use fuse_backend_core::async_file::File as AsyncFile;
+            use fuse_backend_core::file_traits::AsyncFileReadWriteVolatile;
+            use futures_util::future::poll_immediate;
+            use tokio::sync::Notify;
+
+            /// The size of the files that read the pipe.
+            pub(super) const PIPE_SIZE: usize = 4096;
+
+            /// The files in the root, from inode 2 on. Reads of `data` serve
+            /// the data file. Those of `scoped` too, awaiting the copy on a
+            /// scoped thread, and those of `scoped-call` also make the call
+            /// there. Those of `scoped-kicked` await the copy on a scoped
+            /// thread once a lookup of `kick` wakes them. Reads of `slow`,
+            /// `slow-2` and `slow-3` read the pipe. Those of `moved` too,
+            /// starting on the worker and finishing on a scoped thread. Reads
+            /// of `dropped`, `dropped-moved` and `dropped-done` drop copies
+            /// at each stage, see `drop_copies()`, and then serve the data
+            /// file. Writes to `out` go to the out file.
+            const FILES: &[&str] = &[
+                "data",
+                "scoped",
+                "scoped-call",
+                "scoped-kicked",
+                "slow",
+                "slow-2",
+                "slow-3",
+                "moved",
+                "dropped",
+                "dropped-moved",
+                "dropped-done",
+                "out",
+            ];
+
+            pub(super) fn inode(name: &str) -> Option<u64> {
+                FILES.iter().position(|f| *f == name).map(|i| i as u64 + 2)
+            }
+
+            pub(super) struct SendZcFs {
+                pub(super) data: Arc<std::fs::File>,
+                pub(super) out: Arc<std::fs::File>,
+                pub(super) pipe: Arc<std::fs::File>,
+                /// Gets the inode of a read once it waits for the pipe.
+                pub(super) waiting: Sender<u64>,
+                /// Notified by a lookup of `kick`.
+                pub(super) kick: Notify,
+            }
+
+            /// Run `fut` to completion on a scoped thread.
+            fn block_on_scoped<F: Future + Send>(fut: F) -> F::Output
+            where
+                F::Output: Send,
+            {
+                struct Unpark(thread::Thread);
+                impl Wake for Unpark {
+                    fn wake(self: Arc<Self>) {
+                        self.0.unpark();
+                    }
+                }
+                thread::scope(|s| {
+                    s.spawn(move || {
+                        let waker = Arc::new(Unpark(thread::current())).into();
+                        let mut cx = TaskContext::from_waker(&waker);
+                        let mut fut = std::pin::pin!(fut);
+                        loop {
+                            if let Poll::Ready(out) = fut.as_mut().poll(&mut cx) {
+                                return out;
+                            }
+                            thread::park();
+                        }
+                    })
+                    .join()
+                    .unwrap()
+                })
+            }
+
+            // The zero-copy traits take files that aren't `Send`.
+            #[allow(clippy::arc_with_non_send_sync)]
+            fn async_file(f: &Arc<std::fs::File>) -> Arc<dyn AsyncFileReadWriteVolatile> {
+                Arc::new(AsyncFile::borrow_fd(f.as_raw_fd(), f.clone()))
+            }
+
+            impl SendZcFs {
+                fn name(inode: u64) -> &'static str {
+                    FILES[inode as usize - 2]
+                }
+
+                /// Drop copies of the pipe before their first poll, here and
+                /// on a scoped thread. With zero-copy, also drop one whose
+                /// read waits for the pipe, here (`dropped`) or on a scoped
+                /// thread (`dropped-moved`), or after the pipe filled
+                /// (`dropped-done`), and report on `waiting` before and after
+                /// the drop.
+                async fn drop_copies(&self, inode: u64, w: &mut (dyn AsyncZeroCopyWriter + Send)) {
+                    drop(w.async_write_from(async_file(&self.pipe), PIPE_SIZE, 0));
+                    let copy = w.async_write_from(async_file(&self.pipe), PIPE_SIZE, 0);
+                    thread::scope(|s| {
+                        s.spawn(move || drop(copy));
+                    });
+                    if !w.prefers_fd() {
+                        return;
+                    }
+                    let mut copy = w.async_write_from(async_file(&self.pipe), PIPE_SIZE, 0);
+                    assert!(poll_immediate(&mut copy).await.is_none());
+                    self.waiting.send(inode).unwrap();
+                    match Self::name(inode) {
+                        "dropped-moved" => thread::scope(|s| {
+                            s.spawn(move || drop(copy));
+                        }),
+                        "dropped-done" => {
+                            // The test fills the pipe meanwhile.
+                            thread::sleep(Duration::from_millis(200));
+                            drop(copy);
+                        }
+                        _ => drop(copy),
+                    }
+                    self.waiting.send(inode).unwrap();
+                }
+
+                fn attr(&self, inode: u64) -> io::Result<stat64> {
+                    let (mode, size) = match inode {
+                        ROOT_ID => (libc::S_IFDIR | 0o755, 0),
+                        _ => {
+                            let size = match Self::name(inode) {
+                                "out" => self.out.metadata()?.len(),
+                                "data" | "scoped" | "scoped-call" => self.data.metadata()?.len(),
+                                _ => PIPE_SIZE as u64,
+                            };
+                            (libc::S_IFREG | 0o644, size)
+                        }
+                    };
+                    Ok(stat64::from(Attr {
+                        ino: inode,
+                        size,
+                        mode,
+                        nlink: 1,
+                        blksize: 4096,
+                        ..Default::default()
+                    }))
+                }
+            }
+
+            impl FileSystem for SendZcFs {
+                type Inode = u64;
+                type Handle = u64;
+
+                fn lookup(&self, _ctx: &Context, parent: u64, name: &CStr) -> io::Result<Entry> {
+                    // Fails with ENOENT, so the client sends nothing more.
+                    if parent == ROOT_ID && name.to_bytes() == b"kick" {
+                        self.kick.notify_one();
+                    }
+                    let inode = name
+                        .to_str()
+                        .ok()
+                        .and_then(inode)
+                        .filter(|_| parent == ROOT_ID)
+                        .ok_or_else(|| io::Error::from_raw_os_error(libc::ENOENT))?;
+                    Ok(Entry {
+                        inode,
+                        generation: 0,
+                        attr: self.attr(inode)?,
+                        attr_flags: 0,
+                        attr_timeout: Duration::ZERO,
+                        entry_timeout: Duration::ZERO,
+                    })
+                }
+
+                fn getattr(
+                    &self,
+                    _ctx: &Context,
+                    inode: u64,
+                    _handle: Option<u64>,
+                ) -> io::Result<(stat64, Duration)> {
+                    Ok((self.attr(inode)?, Duration::ZERO))
+                }
+
+                fn open(
+                    &self,
+                    _ctx: &Context,
+                    inode: u64,
+                    _flags: u32,
+                    _fuse_flags: u32,
+                ) -> io::Result<(Option<u64>, OpenOptions, Option<u32>)> {
+                    Ok((Some(inode), OpenOptions::IO_URING_ZERO_COPY, None))
+                }
+            }
+
+            #[async_trait]
+            impl AsyncFileSystem for SendZcFs {
+                async fn async_read(
+                    &self,
+                    _ctx: &Context,
+                    inode: u64,
+                    _handle: u64,
+                    w: &mut (dyn AsyncZeroCopyWriter + Send),
+                    size: u32,
+                    offset: u64,
+                    _lock_owner: Option<u64>,
+                    _flags: u32,
+                ) -> io::Result<usize> {
+                    let size = size as usize;
+                    match Self::name(inode) {
+                        "data" => {
+                            w.async_write_from(async_file(&self.data), size, offset)
+                                .await
+                        }
+                        "scoped" => block_on_scoped(w.async_write_from(
+                            async_file(&self.data),
+                            size,
+                            offset,
+                        )),
+                        "scoped-call" => block_on_scoped(async {
+                            w.async_write_from(async_file(&self.data), size, offset)
+                                .await
+                        }),
+                        "scoped-kicked" => {
+                            self.waiting.send(inode).unwrap();
+                            self.kick.notified().await;
+                            let size = size.min(PIPE_SIZE);
+                            block_on_scoped(w.async_write_from(
+                                async_file(&self.data),
+                                size,
+                                offset,
+                            ))
+                        }
+                        "slow" | "slow-2" | "slow-3" => {
+                            self.waiting.send(inode).unwrap();
+                            w.async_write_from(async_file(&self.pipe), size, 0).await
+                        }
+                        "moved" => {
+                            let mut copy = w.async_write_from(async_file(&self.pipe), size, 0);
+                            assert!(poll_immediate(&mut copy).await.is_none());
+                            self.waiting.send(inode).unwrap();
+                            block_on_scoped(copy)
+                        }
+                        "dropped" | "dropped-moved" | "dropped-done" => {
+                            self.drop_copies(inode, w).await;
+                            let size = size.min(PIPE_SIZE);
+                            w.async_write_from(async_file(&self.data), size, offset)
+                                .await
+                        }
+                        _ => Err(io::Error::from_raw_os_error(libc::EBADF)),
+                    }
+                }
+
+                async fn async_write(
+                    &self,
+                    _ctx: &Context,
+                    inode: u64,
+                    _handle: u64,
+                    r: &mut (dyn AsyncZeroCopyReader + Send),
+                    size: u32,
+                    offset: u64,
+                    _lock_owner: Option<u64>,
+                    _delayed_write: bool,
+                    _flags: u32,
+                    _fuse_flags: u32,
+                ) -> io::Result<usize> {
+                    if Self::name(inode) != "out" {
+                        return Err(io::Error::from_raw_os_error(libc::EBADF));
+                    }
+                    r.async_read_to(async_file(&self.out), size as usize, offset)
+                        .await
+                }
+            }
+        }
+
+        use fs::{SendZcFs, PIPE_SIZE};
+
+        /// How long the tests wait for a request.
+        const TIMEOUT: Duration = Duration::from_secs(10);
+
+        /// `SendZcFs` mounted with one worker, and the write end of its pipe.
+        struct SendZcMount {
+            /// Dropped first, which ends the reads that wait for the pipe.
+            pipe: File,
+            serving: UringFuseServing<SendZcFs>,
+            waiting: std::sync::mpsc::Receiver<u64>,
+            data: Vec<u8>,
+            src: TempDir,
+            mnt: TempDir,
+        }
+
+        impl SendZcMount {
+            /// Mount `SendZcFs`, or return None if the kernel can't serve it
+            /// with zero-copy as `zero_copy` asks.
+            fn new(zero_copy: bool) -> Option<SendZcMount> {
+                let src = TempDir::new().unwrap();
+                let data: Vec<u8> = (0..1u32 << 20).map(|n| (n % 251) as u8).collect();
+                std::fs::write(src.as_path().join("data"), &data).unwrap();
+                let open = |name: &str| {
+                    let f = std::fs::OpenOptions::new()
+                        .read(true)
+                        .write(true)
+                        .create(true)
+                        .truncate(false)
+                        .open(src.as_path().join(name))
+                        .unwrap();
+                    Arc::new(f)
+                };
+                let (pipe_rx, pipe) = nix::unistd::pipe().unwrap();
+                let (waiting_tx, waiting) = channel();
+                let fs = SendZcFs {
+                    data: open("data"),
+                    out: open("out"),
+                    pipe: Arc::new(File::from(pipe_rx)),
+                    waiting: waiting_tx,
+                    kick: Default::default(),
+                };
+                let mnt = TempDir::new().unwrap();
+                // One worker serves all queues, so concurrent requests share it.
+                let cfg = UringConfig {
+                    workers: 1,
+                    entries_per_queue: 4,
+                    zero_copy,
+                    ..Default::default()
+                };
+                let serving = mount_uring(
+                    Arc::new(Server::new(fs)),
+                    mnt.as_path(),
+                    cfg,
+                    UringFuseServing::new_async,
+                )?;
+                if serving.zero_copy != zero_copy {
+                    eprintln!("the kernel doesn't serve with zero-copy {zero_copy}, skipping");
+                    return None;
+                }
+                Some(SendZcMount {
+                    pipe: File::from(pipe),
+                    serving,
+                    waiting,
+                    data,
+                    src,
+                    mnt,
+                })
+            }
+
+            fn path(&self, name: &str) -> std::path::PathBuf {
+                self.mnt.as_path().join(name)
+            }
+
+            /// Read `name` from the mount on another thread.
+            fn read(&self, name: &str) -> std::sync::mpsc::Receiver<io::Result<Vec<u8>>> {
+                let (tx, rx) = channel();
+                let path = self.path(name);
+                thread::spawn(move || tx.send(std::fs::read(path)));
+                rx
+            }
+
+            /// Look `name` up in the mount on another thread.
+            fn look_up(&self, name: &str) -> io::Result<()> {
+                let (tx, rx) = channel();
+                let path = self.path(name);
+                thread::spawn(move || tx.send(std::fs::metadata(path).map(|_| ())));
+                rx.recv_timeout(TIMEOUT).unwrap()
+            }
+
+            /// Wait until a read of `name` waits for the pipe.
+            fn wait_for_pipe(&self, name: &str) {
+                let inode = self.waiting.recv_timeout(TIMEOUT).unwrap();
+                assert_eq!(Some(inode), fs::inode(name));
+            }
+        }
+
+        /// Read and write through `SendZcFs`, whose handlers await the
+        /// zero-copy traits on the worker and on scoped threads. With
+        /// zero-copy, every request is a zero-copy one, and none copies the
+        /// data through memory.
+        fn check_send_zero_copy(zero_copy: bool) {
+            if zero_copy && !real_root() {
+                eprintln!("zero-copy needs root, skipping");
+                return;
+            }
+            let Some(mut mount) = SendZcMount::new(zero_copy) else {
+                return;
+            };
+            for name in ["data", "scoped", "scoped-call"] {
+                let read = mount.read(name).recv_timeout(TIMEOUT).unwrap();
+                assert!(read.unwrap() == mount.data, "{}", name);
+            }
+            let written: Vec<u8> = (0..256u32 << 10).map(|n| (n % 241) as u8).collect();
+            let mut out = std::fs::OpenOptions::new()
+                .write(true)
+                .open(mount.path("out"))
+                .unwrap();
+            out.write_all(&written).unwrap();
+            drop(out);
+            assert!(std::fs::read(mount.src.as_path().join("out")).unwrap() == written);
+
+            if zero_copy {
+                // A zero-copy read that a scoped thread finishes after it
+                // started on the worker.
+                let moved = mount.read("moved");
+                mount.wait_for_pipe("moved");
+                mount.pipe.write_all(&[7; PIPE_SIZE]).unwrap();
+                let read = moved.recv_timeout(TIMEOUT).unwrap();
+                assert_eq!(read.unwrap(), [7; PIPE_SIZE]);
+
+                let counts = &mount.serving.zero_copy_counts;
+                assert!(counts.requests.load(Ordering::Relaxed) > 0);
+                assert_eq!(counts.bounces.load(Ordering::Relaxed), 0);
+            }
+        }
+
+        #[test]
+        fn test_uring_async_serving_send_zero_copy() {
+            check_send_zero_copy(true);
+        }
+
+        #[test]
+        fn test_uring_async_serving_send_buffered() {
+            check_send_zero_copy(false);
+        }
+
+        /// A zero-copy READ_FIXED that waits, here for a pipe, doesn't hold
+        /// up the other requests of its worker.
+        #[test]
+        fn test_uring_async_serving_zero_copy_wait() {
+            if !real_root() {
+                eprintln!("zero-copy needs root, skipping");
+                return;
+            }
+            let Some(mut mount) = SendZcMount::new(true) else {
+                return;
+            };
+            let slow = mount.read("slow");
+            mount.wait_for_pipe("slow");
+            let read = mount.read("data").recv_timeout(TIMEOUT).unwrap();
+            assert!(read.unwrap() == mount.data);
+            assert!(slow.try_recv().is_err());
+            mount.pipe.write_all(&[9; PIPE_SIZE]).unwrap();
+            let read = slow.recv_timeout(TIMEOUT).unwrap();
+            assert_eq!(read.unwrap(), [9; PIPE_SIZE]);
+        }
+
+        /// Dropping a copy before its first poll starts nothing, on the
+        /// worker or on a scoped thread. With zero-copy, dropping one whose
+        /// READ_FIXED waits, here for a pipe, waits for the read, so the
+        /// kernel doesn't write to the client pages once the request is
+        /// done. The read that runs after the drops gets the reply.
+        #[test]
+        fn test_uring_async_serving_drop_copy() {
+            for zero_copy in [false, true] {
+                if zero_copy && !real_root() {
+                    eprintln!("zero-copy needs root, skipping");
+                    continue;
+                }
+                let Some(mut mount) = SendZcMount::new(zero_copy) else {
+                    continue;
+                };
+                for name in ["dropped", "dropped-moved", "dropped-done"] {
+                    let read = mount.read(name);
+                    if zero_copy {
+                        mount.wait_for_pipe(name);
+                        if name != "dropped-done" {
+                            let dropped = mount.waiting.recv_timeout(Duration::from_millis(200));
+                            assert!(dropped.is_err(), "{} didn't wait for the pipe", name);
+                        }
+                        mount.pipe.write_all(&[5; PIPE_SIZE]).unwrap();
+                        mount.wait_for_pipe(name);
+                    }
+                    let read = read.recv_timeout(TIMEOUT).unwrap();
+                    assert!(read.unwrap() == mount.data[..PIPE_SIZE], "{}", name);
+                }
+            }
+        }
+
+        /// A copy on a scoped thread submits only its own operation, not the
+        /// commits that the worker queued, see `RingState::commits`.
+        ///
+        /// A lookup of `kick` wakes a read that waits for it and completes in
+        /// the same poll, so the worker queues its commit before the read
+        /// copies on a scoped thread. Then every entry of the CPU's queue
+        /// serves a request.
+        #[test]
+        fn test_uring_async_serving_scoped_copy_commit() {
+            if !real_root() {
+                eprintln!("zero-copy needs root, skipping");
+                return;
+            }
+            let Some(mut mount) = SendZcMount::new(true) else {
+                return;
+            };
+            // Threads inherit their CPU affinity, so from here on the requests
+            // of this thread and its children go to one CPU's queue. The
+            // worker's threads started earlier and aren't pinned.
+            // Safe because the set outlives the call.
+            unsafe {
+                let mut set: libc::cpu_set_t = std::mem::zeroed();
+                let cpu = libc::sched_getcpu();
+                assert!(cpu >= 0, "{}", io::Error::last_os_error());
+                libc::CPU_SET(cpu as usize, &mut set);
+                assert_eq!(
+                    libc::sched_setaffinity(0, std::mem::size_of_val(&set), &set),
+                    0
+                );
+            }
+            let kicked = mount.read("scoped-kicked");
+            mount.wait_for_pipe("scoped-kicked");
+            let err = mount.look_up("kick").unwrap_err();
+            assert_eq!(err.raw_os_error(), Some(libc::ENOENT));
+            let read = kicked.recv_timeout(TIMEOUT).unwrap();
+            assert!(read.unwrap() == mount.data[..PIPE_SIZE]);
+
+            // Reads of the pipe hold all entries but one, which serves a
+            // lookup. Each reads its own file, or the page cache would hold
+            // the second read back until the first is done.
+            let look_up = |held: usize| {
+                let res = mount.look_up("data");
+                assert!(res.is_ok(), "lookup with {} entries held: {:?}", held, res);
+            };
+            let mut slow = Vec::new();
+            for name in ["slow", "slow-2", "slow-3"] {
+                look_up(slow.len());
+                slow.push(mount.read(name));
+                mount.wait_for_pipe(name);
+            }
+            look_up(slow.len());
+            mount.pipe.write_all(&[3; 3 * PIPE_SIZE]).unwrap();
+            for read in slow {
+                assert_eq!(read.recv_timeout(TIMEOUT).unwrap().unwrap(), [3; PIPE_SIZE]);
+            }
+        }
     }
 }

@@ -16,9 +16,13 @@
 
 use std::any::Any;
 use std::collections::VecDeque;
+#[cfg(feature = "async-io")]
+use std::future::Future;
 use std::io::{self, Read};
 use std::mem::{size_of, MaybeUninit};
 use std::os::unix::io::RawFd;
+#[cfg(feature = "async-io")]
+use std::pin::Pin;
 use std::ptr::copy_nonoverlapping;
 use std::sync::LazyLock;
 use std::{cmp, fmt};
@@ -429,7 +433,7 @@ impl<S: Clone> Clone for Reader<'_, S> {
 /// the client pages that FUSE-over-io_uring zero-copy lends a server. Only
 /// the transport can move it, straight into a file. See
 /// `Reader::with_zero_copy()`.
-#[cfg_attr(feature = "async-io", async_trait::async_trait(?Send))]
+#[cfg_attr(feature = "async-io", async_trait::async_trait)]
 pub trait ZeroCopySource: Sync {
     /// Write `count` bytes of the data, starting `pos` bytes into it, to
     /// the file `fd`, at offset `off`, or at the file's position if `off`
@@ -753,6 +757,11 @@ impl<S: BitmapSlice> io::Read for Reader<'_, S> {
     }
 }
 
+/// The `Send` future of a copy that only needs a file's descriptor, see
+/// `Writer::async_write_from_fd()`.
+#[cfg(feature = "async-io")]
+pub(crate) type SendIo<'a> = Pin<Box<dyn Future<Output = io::Result<usize>> + Send + 'a>>;
+
 /// Trait for sending FUSE reply messages back to the client, implemented by
 /// each transport's concrete writer type.
 ///
@@ -762,7 +771,7 @@ impl<S: BitmapSlice> io::Read for Reader<'_, S> {
 /// `transport::Writer` import path keeps resolving.
 ///
 /// The futures of the async methods have no `Send` bound, like the server's
-/// futures that await them.
+/// futures that await them. `async_write_from_fd()` returns a `Send` one.
 #[allow(async_fn_in_trait)]
 pub trait Writer: io::Write + Sized {
     /// Write data to the reply buffer from a File at offset `off`.
@@ -782,6 +791,20 @@ pub trait Writer: io::Write + Sized {
     /// should give such a writer its file instead of reading into memory.
     fn prefers_fd(&self) -> bool {
         false
+    }
+
+    /// Like `async_write_from_at()`, for a writer that can copy from the
+    /// descriptor `fd` alone, in a future that may be polled on any thread.
+    /// The caller keeps `fd` open until the future is done. A writer without
+    /// such a copy returns itself, as the default does.
+    #[cfg(feature = "async-io")]
+    fn async_write_from_fd(
+        &mut self,
+        _fd: RawFd,
+        _count: usize,
+        _off: u64,
+    ) -> std::result::Result<SendIo<'_>, &mut Self> {
+        Err(self)
     }
 
     /// Split this `Writer` into two at the given offset in the reply buffer.
@@ -876,6 +899,25 @@ mod async_io {
     use super::*;
 
     impl<'a, S: BitmapSlice> Reader<'a, S> {
+        /// Like `async_read_to_at()` for the file with the descriptor `fd`,
+        /// in a future that may be polled on any thread, if the next read
+        /// gets zero-copy data. The caller keeps `fd` open until the future
+        /// is done. Otherwise the reader returns itself.
+        pub(crate) fn async_read_zero_copy_to(
+            &mut self,
+            fd: RawFd,
+            count: usize,
+            off: u64,
+        ) -> std::result::Result<SendIo<'_>, &mut Self> {
+            if self.zero_copy_left().is_none() {
+                return Err(self);
+            }
+            match self.zero_copy {
+                Some(ref mut zc) => Ok(Box::pin(zc.async_write_to_file(fd, count, Some(off)))),
+                None => Err(self),
+            }
+        }
+
         /// Read data from the data buffer into a File at offset `off` in asynchronous mode.
         ///
         /// Return the number of bytes read from the data buffer. The number of bytes read can

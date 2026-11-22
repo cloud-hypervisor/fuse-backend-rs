@@ -260,8 +260,12 @@ registered the pages in that ring's table. A synchronous handler waits
 for the result on the ring. With `UringFuseServing::new_async()`, the
 asynchronous handlers call `async_write_from()` and `async_read_to()`,
 whose operations carry the index of the request's entry, and the worker
-loop wakes the request when the result comes off the ring. If the kernel
-refuses zero-copy, `UringFuseServing` adds the queues without it.
+loop wakes the request when the result comes off the ring. Their futures
+are `Send`, so a handler awaits them without `unsafe`. A future that a
+scoped thread polls takes its own result off the ring, or fails with
+EEXIST on a ring with `IORING_SETUP_SINGLE_ISSUER`, which only the worker
+may submit to. If the kernel refuses zero-copy, `UringFuseServing` adds
+the queues without it.
 
 A file system that reads or writes zero-copy data through memory, or
 with a file that has no descriptor, still works, but slower. The worker
@@ -285,6 +289,32 @@ seconds, and the two settings alternated three times:
 
 Zero-copy saves the copy of the payload, which matters for large
 requests. At 128 KiB the two runs overlap.
+
+An asynchronous handler that calls the synchronous `write_from()`
+instead blocks the worker until READ_FIXED completes, and the worker's
+other requests wait. The table compares `PassthroughFs` awaiting
+`async_write_from()` with a copy of it that calls `write_from()` for
+the zero-copy reply. The benchmark daemon ran with `--uring --async
+--uring-zero-copy --no-backing-direct-io`, 8 workers and 16 entries per
+queue, on a 96-CPU machine with Linux 7.3.4, serving 4 files of 1 GiB
+as root, from a tmpfs or from XFS with a warm page cache. fio ran direct
+random reads with libaio, 4 jobs at depth 16, for 8 seconds, and the
+table shows the medians of 3 runs:
+
+| Workload | `async_write_from()` | `write_from()` |
+|----------|----------------------|----------------|
+| tmpfs, 4 KiB reads | 696k IOPS, p99 122 µs | 632k IOPS, p99 1171 µs |
+| tmpfs, 64 KiB reads | 703k IOPS, p99 116 µs | 446k IOPS, p99 173 µs |
+| XFS, 4 KiB reads | 720k IOPS, p99 113 µs | 739k IOPS, p99 109 µs |
+| XFS, 64 KiB reads | 638k IOPS, p99 126 µs | 649k IOPS, p99 930 µs |
+
+On tmpfs, io_uring hands READ_FIXED to its worker threads, so
+`write_from()` blocks the worker for every read. On XFS a page-cache
+hit completes inline, so the throughput is close. The p99 of
+`write_from()` went to between 0.4 and 1.9 ms in 6 of its 12 runs,
+and that of `async_write_from()` stayed under 128 µs. At depth 1,
+`write_from()` reads up to 10% more on XFS, because no request waits
+behind it and it skips the worker loop's wake-up.
 
 ## Implementation Notes
 
