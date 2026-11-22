@@ -59,6 +59,8 @@ vmm-sys-util = { workspace = true }
 
 [dev-dependencies]
 async-trait = "0.1.42"
+# tests/async_serving_load.rs waits for a tokio timer in a handler.
+tokio = { version = "1.53.3", features = ["time"] }
 vmm-sys-util = { workspace = true }
 
 # The tests exercising a live session against a real filesystem driver use
