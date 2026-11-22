@@ -630,8 +630,8 @@ impl Vfs {
     }
 
     /// Converts an entry a backend file system returned for a lookup in `idata`. The root of a
-    /// file system mounted at "/" is the FUSE root, which the kernel knows only as `ROOT_ID`
-    /// with generation 0, so a lookup of "." or ".." that reaches it must answer with that.
+    /// file system mounted at "/" is the FUSE root, which the kernel knows only as `ROOT_ID` with
+    /// generation 0, so a lookup of "." or ".." that reaches it must answer with that.
     fn convert_lookup_entry(&self, idata: VfsInode, entry: Entry) -> Result<Entry> {
         let fuse_root = self
             .mountpoints
@@ -646,9 +646,9 @@ impl Vfs {
         Ok(entry)
     }
 
-    /// Answers a lookup of ".." in the root of a file system mounted below "/" with the parent
-    /// of its mountpoint, which the file system itself cannot know. Returns `None` for any
-    /// other lookup.
+    /// Answers a lookup of ".." in the root of a file system mounted below "/" with the parent of
+    /// its mountpoint, which the file system itself cannot know. Returns `None` for any other
+    /// lookup.
     fn lookup_mount_root_parent(
         &self,
         ctx: &Context,
@@ -1816,7 +1816,7 @@ mod tests {
     pub(crate) struct TreeFs;
 
     impl TreeFs {
-        /// (inode, parent, name)
+        /// Each node as (inode, parent, name).
         const NODES: [(u64, u64, &'static str); 4] =
             [(1, 1, ""), (2, 1, "d"), (3, 2, "e"), (4, 2, "f")];
 
@@ -1879,7 +1879,7 @@ mod tests {
         let idx = vfs.mount(Box::new(TreeFs), path).unwrap();
         let generation = vfs.generation(idx);
         let node = |ino| (u64::from(VfsInode::new(idx, ino)), generation);
-        // The kernel has the FUSE root as ROOT_ID with generation 0.
+        // The kernel has the FUSE root as `ROOT_ID` with generation 0.
         let (root, root_parent) = if path == "/" {
             ((ROOT_ID, 0), (ROOT_ID, 0))
         } else {
@@ -1914,7 +1914,7 @@ mod tests {
             }
         }
 
-        // A lookup of the root reports the st_ino getattr does.
+        // A lookup of the root reports the `st_ino` that `getattr()` does.
         let (vfs, _) = dot_lookup_cases("/");
         let dot = CString::new(".").unwrap();
         let entry = vfs.lookup(&ctx, ROOT_ID.into(), &dot).unwrap();
