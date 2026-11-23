@@ -170,12 +170,12 @@ three times:
 | own per entry | 1492 MiB | 393 MiB | 1518-1728 MiB/s |
 | 4 | 431 MiB | 106 MiB | 1588-1709 MiB/s |
 
-VmSize also counts the request and reply scratch areas of each entry,
-which are as large as its own payload buffer, so a pooled entry saves
-those too. Random 4 KiB reads in the same setup ran at 44.5k to 46.8k
-IOPS with and without pools. VmRSS counts only the pages that requests
-touched, so workloads with fewer requests in flight use far less memory
-than this.
+When this was measured, each entry also had request and reply scratch
+areas as large as its own payload buffer, which VmSize counts. Entries now
+keep 168 bytes of scratch. Random 4 KiB reads in the same setup ran at
+44.5k to 46.8k IOPS with and without pools. VmRSS counts only the pages
+that requests touched, so workloads with fewer requests in flight use far
+less memory than this.
 
 The kernel hands a request to the entry of its queue that became free last,
 and once its buffers are busy, an entry that commits takes the next waiting
@@ -312,7 +312,12 @@ and uses the buffer pools of protocol 7.46 (kernel 7.3) when the kernel has them
 
 - `bufs_per_queue`: Default is 4. On Linux 7.3 and later it caps the
   requests with a payload or reply body that one queue serves at once, and
-  with it the memory of the payload buffers.
+  with it the memory of the payload buffers. With `new_async()`, a request
+  keeps its buffer while its handler waits, so `new_async()` gives each
+  queue as many buffers as entries. With 16 entries and 4 buffers
+  per queue, 4 KiB random writes with the async handlers reached 0.82M
+  IOPS, against 1.05M with a buffer per entry. The synchronous handlers
+  showed no difference.
 
 - `workers`: Default is one per CPU. A worker serves the requests of any
   queue it holds entries of, so the count no longer has to match the
