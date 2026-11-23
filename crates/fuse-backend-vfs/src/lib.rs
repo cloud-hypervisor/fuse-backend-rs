@@ -629,6 +629,47 @@ impl Vfs {
         self.convert_entry(idata.fs_idx(), entry.inode, &mut entry)
     }
 
+    /// Converts an entry a backend file system returned for a lookup in `idata`. The root of a
+    /// file system mounted at "/" is the FUSE root, which the kernel knows only as `ROOT_ID` with
+    /// generation 0, so a lookup of "." or ".." that reaches it must answer with that.
+    fn convert_lookup_entry(&self, idata: VfsInode, entry: Entry) -> Result<Entry> {
+        let fuse_root = self
+            .mountpoints
+            .load()
+            .get(&ROOT_ID)
+            .is_some_and(|mnt| mnt.fs_idx == idata.fs_idx() && mnt.ino == entry.inode);
+        let mut entry = self.convert_backend_entry(idata, entry)?;
+        if fuse_root {
+            entry.inode = ROOT_ID;
+            entry.generation = 0;
+        }
+        Ok(entry)
+    }
+
+    /// Answers a lookup of ".." in the root of a file system mounted below "/" with the parent of
+    /// its mountpoint, which the file system itself cannot know. Returns `None` for any other
+    /// lookup.
+    fn lookup_mount_root_parent(
+        &self,
+        ctx: &Context,
+        idata: VfsInode,
+        name: &CStr,
+    ) -> Option<Result<Entry>> {
+        if name.to_bytes() != b".." {
+            return None;
+        }
+        let mountpoints = self.mountpoints.load();
+        let (&mountpoint, _) = mountpoints.iter().find(|(&mountpoint, mnt)| {
+            mountpoint != ROOT_ID && mnt.fs_idx == idata.fs_idx() && mnt.ino == idata.ino()
+        })?;
+        Some(self.lookup_pseudo(
+            &self.root,
+            VfsInode::new(VFS_PSEUDO_FS_IDX, mountpoint),
+            ctx,
+            name,
+        ))
+    }
+
     /// If a mapping is configured, remap the uid/gid in a request context
     /// from external IDs to internal IDs.
     fn remap_ctx_ids(&self, ctx: &mut Context, mapping: Option<(u32, u32, u32)>) -> Result<()> {
@@ -1768,6 +1809,117 @@ mod tests {
             .lookup(&ctx, n.inode.into(), CString::new("z").unwrap().as_c_str())
             .unwrap();
         assert_eq!((missing.inode, missing.generation), (0, 0));
+    }
+
+    /// A backend with stable inode numbers: the root (1) holds directory "d" (2), which holds
+    /// directory "e" (3) and file "f" (4).
+    pub(crate) struct TreeFs;
+
+    impl TreeFs {
+        /// Each node as (inode, parent, name).
+        const NODES: [(u64, u64, &'static str); 4] =
+            [(1, 1, ""), (2, 1, "d"), (3, 2, "e"), (4, 2, "f")];
+
+        fn entry(ino: u64) -> Entry {
+            let attr = Attr {
+                ino,
+                mode: if ino == 4 { 0o100_644 } else { 0o40_755 },
+                ..Default::default()
+            };
+            Entry {
+                inode: ino,
+                attr: attr.into(),
+                ..Default::default()
+            }
+        }
+    }
+
+    impl FileSystem for TreeFs {
+        type Inode = u64;
+        type Handle = u64;
+
+        fn lookup(&self, _: &Context, parent: u64, name: &CStr) -> Result<Entry> {
+            let node = match name.to_bytes() {
+                b"." => Self::NODES.iter().find(|n| n.0 == parent).map(|n| n.0),
+                b".." => Self::NODES.iter().find(|n| n.0 == parent).map(|n| n.1),
+                name => Self::NODES
+                    .iter()
+                    .find(|n| n.0 != 1 && n.1 == parent && n.2.as_bytes() == name)
+                    .map(|n| n.0),
+            };
+            node.map(Self::entry)
+                .ok_or_else(|| Error::from_raw_os_error(libc::ENOENT))
+        }
+
+        fn getattr(&self, _: &Context, inode: u64, _: Option<u64>) -> Result<(stat64, Duration)> {
+            Ok((Self::entry(inode).attr, Duration::from_secs(1)))
+        }
+    }
+
+    #[cfg(feature = "async-io")]
+    impl AsyncFileSystem for TreeFs {}
+
+    impl BackendFileSystem for TreeFs {
+        fn mount(&self) -> Result<(Entry, u64)> {
+            Ok((Self::entry(1), 4))
+        }
+
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+    }
+
+    /// A lookup of a name in a parent node id, and the node id and generation it must answer.
+    pub(crate) type DotLookupCase = (u64, &'static str, (u64, u64));
+
+    /// Mounts `TreeFs` at `path` and lists lookups of "." and ".." with the node id and
+    /// generation each must answer: the ones the kernel already has for that directory.
+    pub(crate) fn dot_lookup_cases(path: &str) -> (Vfs, Vec<DotLookupCase>) {
+        let vfs = Vfs::new(VfsOptions::default());
+        let idx = vfs.mount(Box::new(TreeFs), path).unwrap();
+        let generation = vfs.generation(idx);
+        let node = |ino| (u64::from(VfsInode::new(idx, ino)), generation);
+        // The kernel has the FUSE root as `ROOT_ID` with generation 0.
+        let (root, root_parent) = if path == "/" {
+            ((ROOT_ID, 0), (ROOT_ID, 0))
+        } else {
+            let mountpoint_parent = vfs.root.path_walk(&format!("{path}/..")).unwrap().unwrap();
+            (node(1), (mountpoint_parent, 0))
+        };
+        let (d, e) = (node(2), node(3));
+        let cases = vec![
+            (root.0, ".", root),
+            (root.0, "..", root_parent),
+            (d.0, ".", d),
+            (d.0, "..", root),
+            (e.0, ".", e),
+            (e.0, "..", d),
+        ];
+        (vfs, cases)
+    }
+
+    #[test]
+    fn test_dot_lookups_answer_the_node_ids_the_kernel_knows() {
+        let ctx = Context::new();
+        for path in ["/", "/sub", "/x/sub"] {
+            let (vfs, cases) = dot_lookup_cases(path);
+            for (parent, name, expected) in cases {
+                let name = CString::new(name).unwrap();
+                let entry = vfs.lookup(&ctx, parent.into(), &name).unwrap();
+                assert_eq!(
+                    (entry.inode, entry.generation),
+                    expected,
+                    "mounted at {path}: lookup({parent:#x}, {name:?})"
+                );
+            }
+        }
+
+        // A lookup of the root reports the `st_ino` that `getattr()` does.
+        let (vfs, _) = dot_lookup_cases("/");
+        let dot = CString::new(".").unwrap();
+        let entry = vfs.lookup(&ctx, ROOT_ID.into(), &dot).unwrap();
+        let (attr, _) = vfs.getattr(&ctx, ROOT_ID.into(), None).unwrap();
+        assert_eq!(entry.attr.st_ino, attr.st_ino);
     }
 
     #[test]

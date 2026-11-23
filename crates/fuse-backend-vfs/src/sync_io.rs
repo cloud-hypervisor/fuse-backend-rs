@@ -109,10 +109,13 @@ impl FileSystem for Vfs {
         match self.get_real_rootfs(parent)? {
             (Left(fs), idata) => self.lookup_pseudo(fs, idata, ctx, name),
             (Right(fs), idata) => {
+                if let Some(entry) = self.lookup_mount_root_parent(ctx, idata, name) {
+                    return entry;
+                }
                 // parent is in an underlying rootfs
                 let entry = fs.lookup(ctx, idata.ino(), name)?;
                 // lookup success, hash it to a real fuse inode
-                self.convert_backend_entry(idata, entry)
+                self.convert_lookup_entry(idata, entry)
             }
         }
     }
