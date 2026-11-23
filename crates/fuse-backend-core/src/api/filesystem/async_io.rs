@@ -16,11 +16,13 @@ use super::{
     ZeroCopyWriter,
 };
 use crate::abi::fuse_abi::{stat64, statvfs64, CreateIn, OpenOptions, SetattrValid};
-use crate::file_traits::AsyncFileReadWriteVolatile;
+use crate::file_traits::{AsyncFileReadWriteVolatile, RawFdFile};
 
 /// A trait for directly copying data from the fuse transport into a `File` without first storing it
 /// in an intermediate buffer in asynchronous mode.
-#[async_trait(?Send)]
+///
+/// The future is `Send`, so [`AsyncFileSystem`] handlers can await it. See
+/// [`AsyncZeroCopyWriter`] for which thread does the IO.
 pub trait AsyncZeroCopyReader: ZeroCopyReader {
     /// Copies at most `count` bytes from `self` directly into `f` at offset `off` without storing
     /// it in any intermediate buffers. If the return value is `Ok(n)` then it must be guaranteed
@@ -30,22 +32,109 @@ pub trait AsyncZeroCopyReader: ZeroCopyReader {
     /// 2. There is no more space in `f`.
     /// 3. `count` was `0`.
     ///
+    /// The default copies with `read_to()` through the descriptor of `f`, blocking the thread,
+    /// and fails with `EOPNOTSUPP` if `f` has none.
+    ///
     /// # Errors
     ///
     /// If any error is returned then the implementation must guarantee that no bytes were copied
     /// from `self`. If the underlying write to `f` returns `0` then the implementation must return
     /// an error of the kind `io::ErrorKind::WriteZero`.
-    async fn async_read_to(
+    fn async_read_to(
         &mut self,
         f: Arc<dyn AsyncFileReadWriteVolatile>,
         count: usize,
         off: u64,
-    ) -> io::Result<usize>;
+    ) -> Pin<Box<dyn Future<Output = io::Result<usize>> + Send + '_>> {
+        let res = RawFdFile::new(f.raw_fd()).and_then(|mut fd| self.read_to(&mut fd, count, off));
+        Box::pin(std::future::ready(res))
+    }
 }
 
 /// A trait for directly copying data from a `RawFd` into the fuse transport without first storing
 /// it in an intermediate buffer in asynchronous mode.
-#[async_trait(?Send)]
+///
+/// The future is `Send`, so [`AsyncFileSystem`] handlers can await it. Where the transport can
+/// copy with the file's descriptor alone, as FUSE-over-io_uring zero-copy does, the future may
+/// be polled on any thread, except on a ring set up with `IORING_SETUP_SINGLE_ISSUER`. There it
+/// fails with `EEXIST` off the serving thread, and the client's read or write gets that error
+/// if the handler returns it, so await it on the serving thread. Off that thread, it also fails
+/// with `EBUSY` while a failed submit of the serving thread has left entries on the ring. Other
+/// transports copy with the file's own asynchronous IO on the thread that serves the request.
+/// Called or first polled on another thread, the future copies with blocking IO through the
+/// descriptor there, and fails with `EOPNOTSUPP` if the file has none.
+///
+/// The future borrows the request's writer, so it gets onto another thread only through a
+/// scoped thread, which the serving thread waits for. Polling or dropping it there while the
+/// file's asynchronous IO that it started on the serving thread is in flight aborts the
+/// process. Only the serving thread could complete that IO, and until then the IO may write
+/// into the request's buffer, so the future can neither wait for it nor let the request end. A
+/// zero-copy future that moves there waits for its operation on the ring instead, and aborts
+/// only if the ring refuses that wait, as one with `IORING_SETUP_DEFER_TASKRUN` does.
+///
+/// # Examples
+///
+/// A file system that serves READ and WRITE from one file, without `unsafe`:
+///
+/// ```
+/// #![forbid(unsafe_code)]
+/// use std::io;
+/// use std::os::unix::io::AsRawFd;
+/// use std::sync::Arc;
+///
+/// use async_trait::async_trait;
+/// use fuse_backend_core::api::filesystem::{
+///     AsyncFileSystem, AsyncZeroCopyReader, AsyncZeroCopyWriter, Context, FileSystem,
+/// };
+/// use fuse_backend_core::async_file::File;
+/// use fuse_backend_core::file_traits::AsyncFileReadWriteVolatile;
+///
+/// struct OneFile(Arc<std::fs::File>);
+///
+/// impl OneFile {
+///     fn file(&self) -> Arc<dyn AsyncFileReadWriteVolatile> {
+///         Arc::new(File::borrow_fd(self.0.as_raw_fd(), self.0.clone()))
+///     }
+/// }
+///
+/// impl FileSystem for OneFile {
+///     type Inode = u64;
+///     type Handle = u64;
+/// }
+///
+/// #[async_trait]
+/// impl AsyncFileSystem for OneFile {
+///     async fn async_read(
+///         &self,
+///         _ctx: &Context,
+///         _inode: u64,
+///         _handle: u64,
+///         w: &mut (dyn AsyncZeroCopyWriter + Send),
+///         size: u32,
+///         offset: u64,
+///         _lock_owner: Option<u64>,
+///         _flags: u32,
+///     ) -> io::Result<usize> {
+///         w.async_write_from(self.file(), size as usize, offset).await
+///     }
+///
+///     async fn async_write(
+///         &self,
+///         _ctx: &Context,
+///         _inode: u64,
+///         _handle: u64,
+///         r: &mut (dyn AsyncZeroCopyReader + Send),
+///         size: u32,
+///         offset: u64,
+///         _lock_owner: Option<u64>,
+///         _delayed_write: bool,
+///         _flags: u32,
+///         _fuse_flags: u32,
+///     ) -> io::Result<usize> {
+///         r.async_read_to(self.file(), size as usize, offset).await
+///     }
+/// }
+/// ```
 pub trait AsyncZeroCopyWriter: ZeroCopyWriter {
     /// Copies at most `count` bytes from `f` at offset `off` directly into `self` without storing
     /// it in any intermediate buffers. If the return value is `Ok(n)` then it must be guaranteed
@@ -55,17 +144,24 @@ pub trait AsyncZeroCopyWriter: ZeroCopyWriter {
     /// 2. There is no more space in `self`.
     /// 3. `count` was `0`.
     ///
+    /// The default copies with `write_from()` through the descriptor of `f`, blocking the
+    /// thread, and fails with `EOPNOTSUPP` if `f` has none.
+    ///
     /// # Errors
     ///
     /// If any error is returned then the implementation must guarantee that no bytes were copied
     /// from `f`. If the underlying read from `f` returns `0` then the implementation must return an
     /// error of the kind `io::ErrorKind::UnexpectedEof`.
-    async fn async_write_from(
+    fn async_write_from(
         &mut self,
         f: Arc<dyn AsyncFileReadWriteVolatile>,
         count: usize,
         off: u64,
-    ) -> io::Result<usize>;
+    ) -> Pin<Box<dyn Future<Output = io::Result<usize>> + Send + '_>> {
+        let res =
+            RawFdFile::new(f.raw_fd()).and_then(|mut fd| self.write_from(&mut fd, count, off));
+        Box::pin(std::future::ready(res))
+    }
 }
 
 /// The main trait that connects a file system with a transport with asynchronous IO.
@@ -1737,17 +1833,7 @@ mod tests {
         }
     }
 
-    #[async_trait(?Send)]
-    impl AsyncZeroCopyWriter for VecWriter {
-        async fn async_write_from(
-            &mut self,
-            _f: Arc<dyn AsyncFileReadWriteVolatile>,
-            _count: usize,
-            _off: u64,
-        ) -> io::Result<usize> {
-            Err(io::Error::from_raw_os_error(libc::ENOSYS))
-        }
-    }
+    impl AsyncZeroCopyWriter for VecWriter {}
 
     #[tokio::test]
     async fn test_defaults_call_sync_handlers() {

@@ -22,7 +22,9 @@
 mod common;
 
 use std::ffi::CString;
+use std::future::Future;
 use std::io;
+use std::pin::Pin;
 use std::sync::Arc;
 
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
@@ -40,7 +42,7 @@ use fuse_backend_rs::buffer::Reader;
 use fuse_backend_rs::file_buf::{FileVolatileBuf, FileVolatileSlice};
 use fuse_backend_rs::file_traits::{AsyncFileReadWriteVolatile, FileReadWriteVolatile};
 
-use common::{prepare_context, prepare_fs, TEST_FILE};
+use common::{on_this_thread, prepare_context, prepare_fs, TEST_FILE};
 
 /// Size of each buffer of a vectored operation, a page like virtio-fs uses.
 const SEGMENT: usize = 4096;
@@ -126,22 +128,24 @@ impl ZeroCopyWriter for MissWriter {
     }
 }
 
-#[async_trait::async_trait(?Send)]
 impl AsyncZeroCopyWriter for MissWriter {
-    async fn async_write_from(
+    fn async_write_from(
         &mut self,
         f: Arc<dyn AsyncFileReadWriteVolatile>,
         count: usize,
         off: u64,
-    ) -> io::Result<usize> {
-        let count = std::cmp::min(count, self.buf.len() - self.len);
-        // Safe because the buffer points into `self.buf`, which outlives it.
-        let buf =
-            unsafe { FileVolatileBuf::from_raw_ptr(self.buf.as_mut_ptr().add(self.len), 0, count) };
-        let (res, _) = f.async_read_at_volatile(buf, off).await;
-        let n = res?;
-        self.len += n;
-        Ok(n)
+    ) -> Pin<Box<dyn Future<Output = io::Result<usize>> + Send + '_>> {
+        on_this_thread(async move {
+            let count = std::cmp::min(count, self.buf.len() - self.len);
+            // Safe because the buffer points into `self.buf`, which outlives it.
+            let buf = unsafe {
+                FileVolatileBuf::from_raw_ptr(self.buf.as_mut_ptr().add(self.len), 0, count)
+            };
+            let (res, _) = f.async_read_at_volatile(buf, off).await;
+            let n = res?;
+            self.len += n;
+            Ok(n)
+        })
     }
 }
 
@@ -177,22 +181,24 @@ impl ZeroCopyReader for PayloadReader {
     }
 }
 
-#[async_trait::async_trait(?Send)]
 impl AsyncZeroCopyReader for PayloadReader {
-    async fn async_read_to(
+    fn async_read_to(
         &mut self,
         f: Arc<dyn AsyncFileReadWriteVolatile>,
         count: usize,
         off: u64,
-    ) -> io::Result<usize> {
-        let n = std::cmp::min(count, self.data.len() - self.pos);
-        // Safe because the buffer points into `self.data`, which outlives it.
-        let buf =
-            unsafe { FileVolatileBuf::from_raw_ptr(self.data.as_mut_ptr().add(self.pos), n, n) };
-        let (res, _) = f.async_write_at_volatile(buf, off).await;
-        let n = res?;
-        self.pos += n;
-        Ok(n)
+    ) -> Pin<Box<dyn Future<Output = io::Result<usize>> + Send + '_>> {
+        on_this_thread(async move {
+            let n = std::cmp::min(count, self.data.len() - self.pos);
+            // Safe because the buffer points into `self.data`, which outlives it.
+            let buf = unsafe {
+                FileVolatileBuf::from_raw_ptr(self.data.as_mut_ptr().add(self.pos), n, n)
+            };
+            let (res, _) = f.async_write_at_volatile(buf, off).await;
+            let n = res?;
+            self.pos += n;
+            Ok(n)
+        })
     }
 }
 

@@ -2,7 +2,11 @@
 
 //! Helpers that the micro-benchmarks share.
 
+use std::future::Future;
+use std::io;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context as TaskContext, Poll};
 
 use vmm_sys_util::tempdir::TempDir;
 
@@ -36,4 +40,23 @@ pub fn prepare_context() -> Context {
         pid: unsafe { libc::getpid() },
         ..Default::default()
     }
+}
+
+/// Box `io`, a file's asynchronous IO, as the `Send` future of the
+/// asynchronous zero-copy traits. The benchmarks poll everything on one
+/// thread, like a transport keeps such IO on the serving thread.
+pub fn on_this_thread<'a>(
+    io: impl Future<Output = io::Result<usize>> + 'a,
+) -> Pin<Box<dyn Future<Output = io::Result<usize>> + Send + 'a>> {
+    struct OneThread<F>(F);
+    // Safe because the benchmarks poll and drop it on the thread that made it.
+    unsafe impl<F> Send for OneThread<F> {}
+    impl<F: Future> Future for OneThread<F> {
+        type Output = F::Output;
+        fn poll(self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<F::Output> {
+            // Safe because the future is never moved out of `self`.
+            unsafe { self.map_unchecked_mut(|s| &mut s.0) }.poll(cx)
+        }
+    }
+    Box::pin(OneThread(io))
 }

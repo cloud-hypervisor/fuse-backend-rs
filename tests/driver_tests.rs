@@ -126,10 +126,10 @@ mod vfs_persist {
 ))]
 mod vfs_async {
     use std::ffi::CString;
+    use std::future::Future;
     use std::io;
+    use std::pin::Pin;
     use std::sync::Arc;
-
-    use async_trait::async_trait;
 
     use fuse_backend_rs::api::filesystem::{
         AsyncFileSystem, AsyncZeroCopyWriter, Context, FileSystem, FsOptions, ZeroCopyWriter,
@@ -177,25 +177,30 @@ mod vfs_async {
         }
     }
 
-    #[async_trait(?Send)]
     impl AsyncZeroCopyWriter for MemWriter {
-        async fn async_write_from(
+        fn async_write_from(
             &mut self,
             f: Arc<dyn AsyncFileReadWriteVolatile>,
             count: usize,
             off: u64,
-        ) -> io::Result<usize> {
+        ) -> Pin<Box<dyn Future<Output = io::Result<usize>> + Send + '_>> {
             if self.0.len() < count {
                 self.0.resize(count, 0);
             }
-            // Safe because the buffer points into `self.0` and doesn't out-live it.
+            // Safe because the buffer points into `self.0`, which the future
+            // borrows, and the test awaits the future.
             let buf = unsafe { FileVolatileBuf::from_raw_ptr(self.0.as_mut_ptr(), 0, count) };
-            let (res, _) = f.async_read_at_volatile(buf, off).await;
-            // Received data is always placed at the start of the buffer.
-            if let Ok(n) = &res {
-                self.0.truncate(*n);
-            }
-            res
+            // The file's IO is bound to this thread's runtime, so run it as a
+            // task there, which a `Send` future can wait for.
+            let read = fuse_backend_rs::async_runtime::spawn(async move {
+                f.async_read_at_volatile(buf, off).await.0
+            });
+            Box::pin(async move {
+                let n = read.await.unwrap()?;
+                // Received data is always placed at the start of the buffer.
+                self.0.truncate(n);
+                Ok(n)
+            })
         }
     }
 

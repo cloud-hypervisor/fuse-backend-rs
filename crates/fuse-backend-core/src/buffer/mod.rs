@@ -16,9 +16,13 @@
 
 use std::any::Any;
 use std::collections::VecDeque;
+#[cfg(feature = "async-io")]
+use std::future::Future;
 use std::io::{self, Read};
 use std::mem::{size_of, MaybeUninit};
 use std::os::unix::io::RawFd;
+#[cfg(feature = "async-io")]
+use std::pin::Pin;
 use std::ptr::copy_nonoverlapping;
 use std::sync::LazyLock;
 use std::{cmp, fmt};
@@ -429,6 +433,7 @@ impl<S: Clone> Clone for Reader<'_, S> {
 /// the client pages that FUSE-over-io_uring zero-copy lends a server. Only
 /// the transport can move it, straight into a file. See
 /// `Reader::with_zero_copy()`.
+#[cfg_attr(feature = "async-io", async_trait::async_trait)]
 pub trait ZeroCopySource: Sync {
     /// Write `count` bytes of the data, starting `pos` bytes into it, to
     /// the file `fd`, at offset `off`, or at the file's position if `off`
@@ -451,6 +456,19 @@ pub trait ZeroCopySource: Sync {
         count: usize,
         take: &mut dyn FnMut(&[u8]) -> io::Result<usize>,
     ) -> io::Result<usize>;
+
+    /// Like `write_to_file()`, for asynchronous handlers. The default
+    /// calls `write_to_file()`, which blocks the thread.
+    #[cfg(feature = "async-io")]
+    async fn async_write_to_file(
+        &self,
+        pos: usize,
+        fd: RawFd,
+        count: usize,
+        off: Option<u64>,
+    ) -> io::Result<usize> {
+        self.write_to_file(pos, fd, count, off)
+    }
 }
 
 /// The zero-copy data of a request, and how much of it was read.
@@ -487,6 +505,24 @@ impl ZeroCopyData<'_> {
         Ok(n)
     }
 
+    /// Like `write_to_file()`, without blocking the thread.
+    #[cfg(feature = "async-io")]
+    async fn async_write_to_file(
+        &mut self,
+        fd: RawFd,
+        count: usize,
+        off: Option<u64>,
+    ) -> io::Result<usize> {
+        let count = count.min(self.remaining());
+        let n = self
+            .src
+            .async_write_to_file(self.pos, fd, count, off)
+            .await?
+            .min(count);
+        self.pos += n;
+        Ok(n)
+    }
+
     /// Copy up to `count` bytes into memory and hand them to `write`. Only
     /// the bytes `write` takes count as read.
     fn bounce(
@@ -506,6 +542,30 @@ impl ZeroCopyData<'_> {
                 unsafe { FileVolatileSlice::from_raw_ptr(data.as_ptr() as *mut u8, data.len()) };
             Ok(write(slice)?.min(data.len()))
         })?;
+        self.pos += n;
+        Ok(n)
+    }
+
+    /// Like `bounce()`, writing the copy to `dst` at `off` without
+    /// blocking the thread.
+    #[cfg(feature = "async-io")]
+    async fn async_bounce<F: AsyncFileReadWriteVolatile + ?Sized>(
+        &mut self,
+        dst: &F,
+        count: usize,
+        off: u64,
+    ) -> io::Result<usize> {
+        let count = count.min(self.remaining());
+        let mut data = Vec::with_capacity(count);
+        self.src.read_to_memory(self.pos, count, &mut |src| {
+            let n = src.len().min(count - data.len());
+            data.extend_from_slice(&src[..n]);
+            Ok(n)
+        })?;
+        let len = data.len();
+        // Safe because `data` outlives the write and holds `len` bytes.
+        let buf = unsafe { FileVolatileBuf::from_raw_ptr(data.as_mut_ptr(), len, len) };
+        let n = dst.async_write_at_volatile(buf, off).await.0?.min(len);
         self.pos += n;
         Ok(n)
     }
@@ -549,10 +609,11 @@ impl<'a, S: BitmapSlice> Reader<'a, S> {
     }
 
     /// Append `len` bytes of request data that only `src` can move. Once
-    /// the buffers are read, `read_to_at()` hands this data to `src`, which
-    /// writes it into the destination file if it has a file descriptor (see
-    /// `FileReadWriteVolatile::raw_fd()`). Other reads, and destinations
-    /// without one, get a copy through memory, which is slower.
+    /// the buffers are read, `read_to_at()` and `async_read_to_at()` hand
+    /// this data to `src`, which writes it into the destination file if it
+    /// has a file descriptor (see `raw_fd()` of `FileReadWriteVolatile` and
+    /// `AsyncFileReadWriteVolatile`). Other reads, and destinations without
+    /// one, get a copy through memory, which is slower.
     pub fn with_zero_copy(mut self, src: &'a dyn ZeroCopySource, len: usize) -> Self {
         self.zero_copy = Some(ZeroCopyData { src, len, pos: 0 });
         self
@@ -696,6 +757,11 @@ impl<S: BitmapSlice> io::Read for Reader<'_, S> {
     }
 }
 
+/// The `Send` future of a copy that only needs a file's descriptor, see
+/// `Writer::async_write_from_fd()`.
+#[cfg(feature = "async-io")]
+pub(crate) type SendIo<'a> = Pin<Box<dyn Future<Output = io::Result<usize>> + Send + 'a>>;
+
 /// Trait for sending FUSE reply messages back to the client, implemented by
 /// each transport's concrete writer type.
 ///
@@ -705,7 +771,7 @@ impl<S: BitmapSlice> io::Read for Reader<'_, S> {
 /// `transport::Writer` import path keeps resolving.
 ///
 /// The futures of the async methods have no `Send` bound, like the server's
-/// futures that await them.
+/// futures that await them. `async_write_from_fd()` returns a `Send` one.
 #[allow(async_fn_in_trait)]
 pub trait Writer: io::Write + Sized {
     /// Write data to the reply buffer from a File at offset `off`.
@@ -717,6 +783,29 @@ pub trait Writer: io::Write + Sized {
         count: usize,
         off: u64,
     ) -> io::Result<usize>;
+
+    /// Whether `write_from_at()` is faster with a file that has a descriptor
+    /// (`FileReadWriteVolatile::raw_fd()`). Such a writer copies the data of
+    /// a file without one through memory first. The replies of
+    /// FUSE-over-io_uring zero-copy READs work this way, so a file system
+    /// should give such a writer its file instead of reading into memory.
+    fn prefers_fd(&self) -> bool {
+        false
+    }
+
+    /// Like `async_write_from_at()`, for a writer that can copy from the
+    /// descriptor `fd` alone, in a future that may be polled on any thread.
+    /// The caller keeps `fd` open until the future is done. A writer without
+    /// such a copy returns itself, as the default does.
+    #[cfg(feature = "async-io")]
+    fn async_write_from_fd(
+        &mut self,
+        _fd: RawFd,
+        _count: usize,
+        _off: u64,
+    ) -> std::result::Result<SendIo<'_>, &mut Self> {
+        Err(self)
+    }
 
     /// Split this `Writer` into two at the given offset in the reply buffer.
     ///
@@ -810,6 +899,25 @@ mod async_io {
     use super::*;
 
     impl<'a, S: BitmapSlice> Reader<'a, S> {
+        /// Like `async_read_to_at()` for the file with the descriptor `fd`,
+        /// in a future that may be polled on any thread, if the next read
+        /// gets zero-copy data. The caller keeps `fd` open until the future
+        /// is done. Otherwise the reader returns itself.
+        pub(crate) fn async_read_zero_copy_to(
+            &mut self,
+            fd: RawFd,
+            count: usize,
+            off: u64,
+        ) -> std::result::Result<SendIo<'_>, &mut Self> {
+            if self.zero_copy_left().is_none() {
+                return Err(self);
+            }
+            match self.zero_copy {
+                Some(ref mut zc) => Ok(Box::pin(zc.async_write_to_file(fd, count, Some(off)))),
+                None => Err(self),
+            }
+        }
+
         /// Read data from the data buffer into a File at offset `off` in asynchronous mode.
         ///
         /// Return the number of bytes read from the data buffer. The number of bytes read can
@@ -820,13 +928,11 @@ mod async_io {
             count: usize,
             off: u64,
         ) -> io::Result<usize> {
-            if self.zero_copy_left().is_some() {
-                // The FUSE-over-io_uring transport that moves zero-copy data
-                // serves synchronous handlers only.
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "zero-copy data can't be read asynchronously",
-                ));
+            if let Some(zc) = self.zero_copy_left() {
+                let Some(fd) = dst.raw_fd() else {
+                    return zc.async_bounce(dst, count, off).await;
+                };
+                return zc.async_write_to_file(fd, count, Some(off)).await;
             }
             // Safe because `bufs` doesn't out-live `self`.
             let bufs = unsafe { self.buffers.prepare_io_buf(count) };
@@ -922,6 +1028,30 @@ mod tests {
         let mut file = std::fs::File::open("/dev/null").unwrap();
         assert_eq!(r.read_to(&mut file, 4).unwrap(), 4);
         assert_eq!(*src.0.lock().unwrap(), vec![(0, file.as_raw_fd(), 4, None)]);
+    }
+
+    #[cfg(feature = "async-io")]
+    #[test]
+    fn test_reader_zero_copy_async() {
+        use super::Reader;
+        use crate::async_file::File;
+        use crate::async_runtime::block_on;
+        use std::os::unix::io::AsRawFd;
+
+        // async_read_to_at() hands the zero-copy data to the source, with
+        // the destination's fd.
+        let src = RecordingSource::default();
+        let mut header = vec![0u8; 0];
+        let mut r = Reader::<()>::from_slice(&mut header).with_zero_copy(&src, 8);
+        block_on(async {
+            let file = File::async_open("/dev/null", true, false).await.unwrap();
+            assert_eq!(r.async_read_to_at(&file, 8, 100).await.unwrap(), 5);
+            assert_eq!(
+                *src.0.lock().unwrap(),
+                vec![(0, file.as_raw_fd(), 8, Some(100))]
+            );
+        });
+        assert_eq!(r.available_bytes(), 3);
     }
 
     #[test]

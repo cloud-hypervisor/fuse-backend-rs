@@ -14,19 +14,21 @@
 use std::ffi::CString;
 use std::future::Future;
 use std::io;
+use std::mem::ManuallyDrop;
+use std::os::unix::fs::FileExt;
+use std::os::unix::io::FromRawFd;
 use std::pin::Pin;
 use std::sync::mpsc::channel;
 use std::sync::Arc;
 use std::task::Poll;
 
-use async_trait::async_trait;
 use fuse_backend_core::abi::fuse_abi::{ROOT_ID, WRITE_KILL_PRIV};
 use fuse_backend_core::api::filesystem::{
     AsyncFileSystem, AsyncZeroCopyReader, AsyncZeroCopyWriter, Context, FileSystem, FsOptions,
     ZeroCopyReader, ZeroCopyWriter,
 };
 use fuse_backend_core::async_runtime::{self, RuntimeType};
-use fuse_backend_core::file_buf::{FileVolatileBuf, FileVolatileSlice};
+use fuse_backend_core::file_buf::FileVolatileSlice;
 use fuse_backend_core::file_traits::{AsyncFileReadWriteVolatile, FileReadWriteVolatile};
 use fuse_backend_passthrough::{Config, PassthroughFs};
 use vmm_sys_util::tempdir::TempDir;
@@ -86,22 +88,19 @@ impl ZeroCopyWriter for ReplyBuf {
     }
 }
 
-#[async_trait(?Send)]
 impl AsyncZeroCopyWriter for ReplyBuf {
-    async fn async_write_from(
+    fn async_write_from(
         &mut self,
         f: Arc<dyn AsyncFileReadWriteVolatile>,
         count: usize,
         off: u64,
-    ) -> io::Result<usize> {
+    ) -> Pin<Box<dyn Future<Output = io::Result<usize>> + Send + '_>> {
         self.native = true;
         let mut buf = vec![0u8; count];
-        // Safe because `vbuf` doesn't outlive `buf`.
-        let vbuf = unsafe { FileVolatileBuf::from_raw_ptr(buf.as_mut_ptr(), 0, count) };
-        let (res, _) = f.async_read_at_volatile(vbuf, off).await;
-        let n = res?;
-        self.data.extend_from_slice(&buf[..n]);
-        Ok(n)
+        let res = fd_file(&*f)
+            .read_at(&mut buf, off)
+            .inspect(|&n| self.data.extend_from_slice(&buf[..n]));
+        Box::pin(std::future::ready(res))
     }
 }
 
@@ -148,24 +147,23 @@ impl ZeroCopyReader for Payload {
     }
 }
 
-#[async_trait(?Send)]
 impl AsyncZeroCopyReader for Payload {
-    async fn async_read_to(
+    fn async_read_to(
         &mut self,
         f: Arc<dyn AsyncFileReadWriteVolatile>,
         count: usize,
         off: u64,
-    ) -> io::Result<usize> {
+    ) -> Pin<Box<dyn Future<Output = io::Result<usize>> + Send + '_>> {
         self.native = true;
-        let n = std::cmp::min(count, self.data.len() - self.pos);
-        // Safe because `vbuf` doesn't outlive `self.data`.
-        let vbuf =
-            unsafe { FileVolatileBuf::from_raw_ptr(self.data[self.pos..].as_mut_ptr(), n, n) };
-        let (res, _) = f.async_write_at_volatile(vbuf, off).await;
-        let n = res?;
-        self.pos += n;
-        Ok(n)
+        let res = self.read_to(&mut *fd_file(&*f), count, off);
+        Box::pin(std::future::ready(res))
     }
+}
+
+/// The file behind the descriptor of `f`, which `f` keeps open.
+fn fd_file(f: &dyn AsyncFileReadWriteVolatile) -> ManuallyDrop<std::fs::File> {
+    // Safe because the wrapper never closes the descriptor.
+    ManuallyDrop::new(unsafe { std::fs::File::from_raw_fd(f.raw_fd().unwrap()) })
 }
 
 fn context() -> Context {
