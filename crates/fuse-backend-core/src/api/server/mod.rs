@@ -467,6 +467,33 @@ impl<'a, F: FileSystem, S: BitmapSlice, W: Writer> SrvContext<'a, F, S, W> {
         );
         Some(errno)
     }
+
+    /// Returns `errno` and logs it if a reply of `len` bytes doesn't fit in the reply buffer. A
+    /// reply whose write fails gets no second one, so the servers check before they write.
+    fn reply_too_big(&self, len: usize, errno: i32) -> Option<io::Error> {
+        let room = self.w.available_bytes();
+        if len <= room {
+            return None;
+        }
+        warn!(
+            "fuse: reply of {} bytes to request {:?} doesn't fit in {} bytes, replying errno {}",
+            len, self.in_header, room, errno
+        );
+        Some(io::Error::from_raw_os_error(errno))
+    }
+
+    /// Returns EIO and logs it if the file system read `count` bytes for a READ that asks for
+    /// `size`, more than the kernel takes.
+    fn read_too_long(&self, count: usize, size: u32) -> Option<io::Error> {
+        if count <= size as usize {
+            return None;
+        }
+        warn!(
+            "fuse: read of {} bytes for request {:?} asking for {}, replying EIO",
+            count, self.in_header, size
+        );
+        Some(io::Error::from_raw_os_error(libc::EIO))
+    }
 }
 
 /// Whether the kernel waits for a reply to a request with `opcode`.
