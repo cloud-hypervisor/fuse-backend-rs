@@ -8,6 +8,7 @@
 #
 # For each mode (sync: N worker threads, async: one FuseDevTask on the
 # async runtime, uring: the experimental FUSE-over-io_uring transport,
+# uring_async: the same transport with the asynchronous handlers,
 # nowriteback: sync with the FUSE writeback cache turned off, passthrough:
 # sync with the kernel serving reads, writes and mmap on the backing
 # files itself), the script mounts the benchmark daemon and runs the same
@@ -16,14 +17,14 @@
 # analysis, see tests/scripts/bench_compare.py.
 #
 # Requirements: Linux, fio, jq, python3, permission to mount fuse (root or
-# fusermount). The uring mode additionally requires kernel 6.14+ with
-# FUSE-over-io_uring enabled (the fuse module parameter enable_uring,
-# which the script tries to turn on when it is writable); kernels that
-# reject the transport during the INIT handshake make the mode be
-# skipped with a warning. The passthrough mode additionally requires
-# kernel 6.9+ with CONFIG_FUSE_PASSTHROUGH, and CAP_SYS_ADMIN in the
-# initial user namespace for the backing file ioctls; it is skipped on
-# kernels known to lack the configuration.
+# fusermount). The uring and uring_async modes additionally require kernel
+# 6.14+ with FUSE-over-io_uring enabled (the fuse module parameter enable_uring,
+# which the script tries to turn on when it is writable). The script skips
+# these modes with a warning on kernels that reject the transport during the
+# INIT handshake. The passthrough mode additionally requires kernel 6.9+ with
+# CONFIG_FUSE_PASSTHROUGH, and CAP_SYS_ADMIN in the initial user namespace
+# for the backing file ioctls; it is skipped on kernels known to lack the
+# configuration.
 #
 # Tunables (environment variables):
 #   BENCH_THREADS  number of sync worker threads / fio jobs (default 4)
@@ -51,7 +52,8 @@
 #                  CI pipeline to benchmark different code variants with an
 #                  identical workload definition
 #   BENCH_DAEMON_ARGS extra arguments for the daemon in every mode, such
-#                  as --kernel-passthrough
+#                  as --kernel-passthrough, or "--delay-us 1000" to make
+#                  every LOOKUP and READ wait 1 ms
 #   BENCH_RESULTS_DIR where to store results (default a fresh mktemp
 #                  directory)
 # The names without the BENCH_ prefix still work when the prefixed one isn't
@@ -87,6 +89,28 @@ tunable NRFILES 50000
 tunable MODES "sync async"
 tunable DAEMON_ARGS ""
 tunable RESULTS_DIR ""
+
+# mode_args <mode>: print the daemon arguments of a mode, or fail for an
+# unknown one.
+mode_args() {
+    case "$1" in
+        sync) echo "" ;;
+        async) echo "--async" ;;
+        pool) echo "--async --thread-pool" ;;
+        uring) echo "--uring" ;;
+        uring_async) echo "--uring --async" ;;
+        nowriteback) echo "--no-writeback" ;;
+        passthrough) echo "--kernel-passthrough" ;;
+        *) return 1 ;;
+    esac
+}
+
+# Reject an unknown mode before any mode runs.
+# shellcheck disable=SC2086
+for mode in ${MODES}; do
+    mode_args "${mode}" >/dev/null || { echo "error: unknown mode ${mode}" >&2; exit 1; }
+done
+
 [ -n "${RESULTS_DIR}" ] || RESULTS_DIR=$(mktemp -d /tmp/fuse-bench-results.XXXXXX)
 SRC_DIR="${RESULTS_DIR}/source"
 MNT_DIR="${RESULTS_DIR}/mount"
@@ -302,13 +326,11 @@ run_readdir_workload() {
 
 # shellcheck disable=SC2086
 for mode in ${MODES}; do
-    mode_args=""
-    [ "${mode}" = "async" ] && mode_args="--async"
-    [ "${mode}" = "pool" ] && mode_args="--async --thread-pool"
-    [ "${mode}" = "nowriteback" ] && mode_args="--no-writeback"
-    if [ "${mode}" = "uring" ]; then
+    is_uring=false
+    case "${mode}" in uring*) is_uring=true ;; esac
+    if ${is_uring}; then
         if ! kernel_at_least 6 14; then
-            echo "warning: mode uring requires kernel 6.14+ ($(uname -r)), skipping" >&2
+            echo "warning: mode ${mode} requires kernel 6.14+ ($(uname -r)), skipping" >&2
             continue
         fi
         # Kernels >= 6.14 may still reject FUSE-over-io_uring: the fuse
@@ -319,7 +341,6 @@ for mode in ${MODES}; do
         if [ -e /sys/module/fuse/parameters/enable_uring ]; then
             ( echo 1 > /sys/module/fuse/parameters/enable_uring ) 2>/dev/null || true
         fi
-        mode_args="--uring"
     fi
     if [ "${mode}" = "passthrough" ]; then
         if ! kernel_at_least 6 9; then
@@ -343,16 +364,15 @@ for mode in ${MODES}; do
                 echo "warning: kernel configuration not readable, running mode passthrough unverified" >&2
                 ;;
         esac
-        mode_args="--kernel-passthrough"
     fi
 
     echo ""
     echo "############ mode: ${mode} ############"
-    if ! start_daemon "${mode_args}"; then
+    if ! start_daemon "$(mode_args "${mode}")"; then
         # Drop a possibly stale mount left by the failed daemon.
         umount "${MNT_DIR}" 2>/dev/null || true
-        if [ "${mode}" = "uring" ]; then
-            echo "warning: FUSE-over-io_uring is not available on this kernel, skipping mode uring" >&2
+        if ${is_uring}; then
+            echo "warning: FUSE-over-io_uring is not available on this kernel, skipping mode ${mode}" >&2
             continue
         fi
         echo "error: daemon did not mount ${MNT_DIR}" >&2
