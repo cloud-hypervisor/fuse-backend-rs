@@ -218,8 +218,49 @@
   only READDIR and READDIRPLUS still run on the runtime thread. A MKDIR, MKNOD, SYMLINK, LINK or
   OPENDIR that is dropped while a pool thread serves it gives back the lookup count or handle it
   took.
+- [317](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/317): `UringWriter` implements the asynchronous `Writer` methods, so the async server can reply
+  through the FUSE-over-io_uring transport.
+- [317](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/317): `UringFuseServing::new_async()` serves FUSE-over-io_uring with the `AsyncFileSystem` handlers.
+  Each worker runs an async runtime and keeps up to one request per ring entry in flight, so
+  handlers that wait don't hold up the worker's other requests.
+  Its queues get `entries_per_queue` pool buffers, because a request keeps its buffer
+  while its handler waits.
+- [318](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/318): `UringFuseServing::new_async()` serves zero-copy too. `ZeroCopySource::async_write_to_file()`
+  and `AsyncFileReadWriteVolatile::raw_fd()` let `Reader::async_read_to_at()` move zero-copy
+  data, and the fixed-buffer operations of a request run on the worker's ring while its other
+  requests go on. Copies through memory, for files without a descriptor, still block the worker.
+- [319](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/319): A `StopSignal` sets the stop flag of `FuseDevTask`s and wakes the ones that wait for a request
+  on the tokio runtime. `FuseDevTask::new()` takes one in place of the `Arc<AtomicBool>`, which
+  still works and makes an idle task check the flag every 100ms. `AsyncFuseServing` and the
+  `/dev/fuse` thread of `UringFuseServing::new_async()` stop with a signal, so their idle tasks
+  no longer wake 10 times a second.
+- [372](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/372): `UringConfig::defer_taskrun` makes the uring workers
+  create their rings with `IORING_SETUP_SINGLE_ISSUER` and `IORING_SETUP_DEFER_TASKRUN`, so the
+  kernel copies requests into their entries when they wait for the next one instead of
+  interrupting their handlers. On Linux 7.3, that made stats and 4 KiB reads that a client
+  sends one at a time faster. It is off by default, because Linux 7.2.0-7.2.13 and 7.3.0-7.3.1
+  can miss the wake-up of a worker waiting on such a ring. The workers of `new_async()` take
+  it only on kernels that wake epoll for deferred task work, 7.4, 7.3.2, 7.2.14, 6.18.60 and
+  later releases of those branches. With it, zero-copy IO from a thread other than the worker
+  fails with EEXIST. `UringConfig` has a new field.
+- [NNN](link): `UringConfig::pin_workers` runs each worker of `UringFuseServing` only on the CPUs
+  of the queues whose last ring entry it registers, so that a client that waits for each reply
+  and its worker share a CPU. It is off by default, because the link holds only until a queue
+  has several requests at once, and threads that a worker starts inherit its CPUs. `UringConfig`
+  has a new field.
 
 ### Changed
+- [384](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/384): The async workers of `UringFuseServing::new_async()` submit the fixed-buffer
+  reads and writes of zero-copy requests together with the commits, in one `io_uring_enter()`
+  per round of their loop instead of one per operation.
+- [NNN](link): While none of their requests waits for anything but its zero-copy operation on
+  the ring, the async workers of `UringFuseServing::new_async()` wait for the next request in
+  `io_uring_enter()` instead of epoll, which saves a trip through the runtime per request. They
+  let their runtime park at least every millisecond, so tasks, timers and tokio-uring IO on a
+  worker's runtime run up to about 1 ms late.
+- [NNN](link): The async workers of `UringFuseServing::new_async()` poll each new request once
+  before they hand it to their `FuturesUnordered`, so a request that its handler finishes at
+  once, such as a cache hit, costs no task of its own.
 - [325](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/325): The `fuse-backend-fusedev` `uring` transport uses io-uring 0.6 instead of 0.5,
   and depends on it only on Linux.
 - [324](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/324): `fuse-backend-core` uses bitflags 2 instead of 1. The flag types (`FsOptions`,
@@ -295,6 +336,8 @@
   and reads from 8 CPUs whose queues each had a worker of their own got 11 to 17% slower.
   `UringConfig::workers` can exceed the number of queues, up to `entries_per_queue` times that,
   and an `entries_per_queue` of 0 counts as 1.
+- [317](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/317): A `UringFuseServing` ring entry without a buffer pool allocates about a third of the memory it
+  used to. It kept two scratch regions the size of its payload area, but used 168 bytes of one.
 - [254](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/254): `fuse-backend-rs` is now a thin facade re-exporting the sub-crates. Every
   historical `fuse_backend_rs::{abi, api, buffer, common, transport, passthrough,
   overlayfs}` import path and cargo feature name (`fusedev`, `virtiofs`,
@@ -418,6 +461,11 @@
   them all back, and leaks them if that takes more than a second. A worker that stopped on an
   error while the connection was up freed entries the kernel could still copy requests into. A
   signal that interrupts the worker's `io_uring_enter()` calls no longer stops it.
+- [319](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/319): Dropping a `UringFuseServing` whose mount is busy no longer hangs until the files in the mount
+  close. The unmount leaves such a connection up, and the workers kept waiting for requests. Now
+  the stop signal wakes them through a poll on their rings. Once they have served the requests
+  they took, the last one ends the connection, as closing `/dev/fuse` ends a classic one. An
+  async worker whose entries all wait on handlers no longer checks its stop flag every 100ms.
 - `UringWriter::write_from_at()` fails when the data doesn't fit into the reply body. It counted
   free space in the header slot too, and could read file data past the end of the body.
 - [278](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/278): Treat `EOPNOTSUPP`/`ENOTSUP` and `ENOSYS` from `getxattr` as "not opaque"

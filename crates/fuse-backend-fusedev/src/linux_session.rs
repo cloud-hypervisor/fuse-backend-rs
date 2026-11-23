@@ -876,7 +876,7 @@ fn fuse_fusermount_mount(
 
 /// Whether the file system is unmounted already, or its connection was aborted through
 /// /sys/fs/fuse/connections/NNN/abort. In both cases the fuse fd reports only POLLERR.
-fn is_torn_down(file: &File) -> bool {
+pub(crate) fn is_torn_down(file: &File) -> bool {
     let mut fds = [PollFd::new(file.as_fd(), PollFlags::empty())];
     poll(&mut fds, PollTimeout::from(0u16)).is_ok() && fds[0].revents() == Some(PollFlags::POLLERR)
 }
@@ -1099,13 +1099,74 @@ mod tests {
 pub use asyncio::FuseDevTask;
 
 #[cfg(feature = "async-io")]
+pub use stop_signal::StopSignal;
+// The io_uring workers take one too, but nothing public does without
+// `async-io`.
+#[cfg(all(feature = "uring", not(feature = "async-io")))]
+pub(crate) use stop_signal::StopSignal;
+
+#[cfg(any(feature = "async-io", feature = "uring"))]
+mod stop_signal {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    use vmm_sys_util::eventfd::{EventFd, EFD_CLOEXEC, EFD_NONBLOCK};
+
+    /// A stop flag that, when it stops, wakes the `FuseDevTask`s waiting for
+    /// requests on the tokio runtime. A bare `Arc<AtomicBool>` converts into
+    /// a signal that wakes no one, and an idle task checks it every 100ms.
+    #[derive(Clone, Debug)]
+    pub struct StopSignal {
+        flag: Arc<AtomicBool>,
+        // Becomes readable for good when the signal stops.
+        event: Option<Arc<EventFd>>,
+    }
+
+    impl StopSignal {
+        /// A signal that sets `flag` when it stops. Stop it with `stop()`. An
+        /// idle task with a signal has no timer, so a store to `flag` doesn't
+        /// wake it.
+        pub fn new(flag: Arc<AtomicBool>) -> std::io::Result<Self> {
+            Ok(StopSignal {
+                flag,
+                event: Some(Arc::new(EventFd::new(EFD_NONBLOCK | EFD_CLOEXEC)?)),
+            })
+        }
+
+        /// Set the flag and wake the tasks. The tasks finish the requests in
+        /// flight and return.
+        pub fn stop(&self) {
+            self.flag.store(true, Ordering::Release);
+            if let Some(event) = &self.event {
+                let _ = event.write(1);
+            }
+        }
+
+        pub(crate) fn is_stopped(&self) -> bool {
+            self.flag.load(Ordering::Acquire)
+        }
+
+        /// The eventfd that stays readable once the signal stops, if the
+        /// signal has one.
+        pub(crate) fn event(&self) -> Option<&EventFd> {
+            self.event.as_deref()
+        }
+    }
+
+    impl From<Arc<AtomicBool>> for StopSignal {
+        fn from(flag: Arc<AtomicBool>) -> Self {
+            StopSignal { flag, event: None }
+        }
+    }
+}
+
+#[cfg(feature = "async-io")]
 /// Task context to handle fuse request in asynchronous mode.
 mod asyncio {
     use std::cell::{Cell, RefCell};
     use std::future::Future;
     use std::os::fd::AsFd;
     use std::os::unix::io::{AsRawFd, RawFd};
-    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
     use std::time::Duration;
 
@@ -1115,6 +1176,7 @@ mod asyncio {
     use nix::sys::timerfd::{ClockId, Expiration, TimerFd, TimerFlags, TimerSetTimeFlags};
     use tokio::io::unix::{AsyncFd, AsyncFdReadyGuard};
     use tokio::io::Interest;
+    use vmm_sys_util::eventfd::EventFd;
 
     use fuse_backend_core::api::filesystem::AsyncFileSystem;
     use fuse_backend_core::api::server::Server;
@@ -1123,7 +1185,7 @@ mod asyncio {
     use fuse_backend_core::buffer::Reader;
     use fuse_backend_core::file_buf::FileVolatileBuf;
 
-    use crate::{FuseBuf, FuseDevReaderExt, FuseDevWriter};
+    use crate::{FuseBuf, FuseDevReaderExt, FuseDevWriter, StopSignal};
 
     /// Default limit on the number of concurrently processed requests.
     ///
@@ -1196,13 +1258,14 @@ mod asyncio {
     ///
     /// // Stop the task. It checks `state` before reading a request. An idle task checks it
     /// // every 100ms with the tokio runtime, and with tokio-uring only once a request arrives
-    /// // or the session is torn down.
+    /// // or the session is torn down. A `StopSignal` in place of `state` wakes an idle task on
+    /// // the tokio runtime right away.
     /// state.store(true, Ordering::Relaxed);
     /// session.umount().unwrap();
     /// ```
     pub struct FuseDevTask<F: AsyncFileSystem + Sync> {
         file: AsyncFile,
-        state: Arc<AtomicBool>,
+        state: StopSignal,
         server: Arc<Server<F>>,
         buf_size: usize,
         max_inflight: usize,
@@ -1224,14 +1287,15 @@ mod asyncio {
         ///   this size.
         /// - file: file object for the fuse device, ownership is taken by the task object
         /// - server: `Server` instance to serve requests from the fuse fd
-        /// - state: shared flag to control the task object. Once it's `true`, the task reads no
-        ///   more requests and returns after completing the requests in flight. How soon an idle
-        ///   task notices the flag depends on the runtime, as `poll_handler()` describes.
+        /// - state: shared flag to control the task object, an `Arc<AtomicBool>` or a
+        ///   `StopSignal`. Once it's set, the task reads no more requests and returns after
+        ///   completing the requests in flight. How soon an idle task notices depends on the
+        ///   runtime, as `poll_handler()` describes.
         pub fn new(
             buf_size: usize,
             file: std::fs::File,
             server: Arc<Server<F>>,
-            state: Arc<AtomicBool>,
+            state: impl Into<StopSignal>,
         ) -> Self {
             Self::new_with_max_inflight(buf_size, file, server, state, DEFAULT_MAX_INFLIGHT)
         }
@@ -1249,7 +1313,7 @@ mod asyncio {
             buf_size: usize,
             file: std::fs::File,
             server: Arc<Server<F>>,
-            state: Arc<AtomicBool>,
+            state: impl Into<StopSignal>,
             max_inflight: usize,
         ) -> Self {
             // The fuse device fd is a file description without `O_NONBLOCK`
@@ -1277,7 +1341,7 @@ mod asyncio {
             FuseDevTask {
                 file: AsyncFile::from_std_file(file),
                 server,
-                state,
+                state: state.into(),
                 buf_size,
                 max_inflight: max_inflight.max(1),
             }
@@ -1312,10 +1376,11 @@ mod asyncio {
         /// afterwards would silently lose that request.
         ///
         /// It returns when it finds `state` set, or when the fuse session is torn down (EOF or
-        /// `ENODEV` from the fuse device). With the tokio runtime, an idle task checks `state`
-        /// every 100ms. If it can't create the timer for that, it logs a warning. With
-        /// tokio-uring, a read waiting in the kernel usually completes only when a request
-        /// arrives or the session is torn down, and the task checks `state` then.
+        /// `ENODEV` from the fuse device). With the tokio runtime, a `StopSignal` wakes an idle
+        /// task, and an idle task with a bare flag checks it every 100ms. If it can't wait for
+        /// either, it logs a warning. With tokio-uring, a read waiting in the kernel usually
+        /// completes only when a request arrives or the session is torn down, and the task checks
+        /// `state` then.
         ///
         /// To stop an idle task without tearing the session down, for example for a takeover
         /// with `Server::restore_init()`, drop this future. Do this only with the tokio runtime,
@@ -1353,7 +1418,7 @@ mod asyncio {
             // A task whose `state` is already set returns before it registers the fd.
             // Registering needs a tokio runtime and a file that epoll supports. Without them,
             // the task yields and retries reads instead.
-            if self.state.load(Ordering::Acquire) {
+            if self.state.is_stopped() {
                 return;
             }
             let ready = match &self.file {
@@ -1368,7 +1433,7 @@ mod asyncio {
                         AsyncFd::register_with_interest(fd, Interest::READABLE | Interest::ERROR)
                     };
                     match registered {
-                        Ok(device) => Some(DeviceReadiness::new(device)),
+                        Ok(device) => Some(DeviceReadiness::new(device, &self.state)),
                         Err(e) => {
                             warn!(
                                 "can't wait for the fuse device fd to become readable, retrying reads instead: {}",
@@ -1385,7 +1450,7 @@ mod asyncio {
             // See `PARK_AFTER_READS`.
             let mut reads_without_wait = 0;
 
-            'serve: while !self.state.load(Ordering::Acquire) {
+            'serve: while !self.state.is_stopped() {
                 // Get a buffer for the next request. If the pool is exhausted,
                 // all buffers are held by in-flight requests, so make progress
                 // on those first (back pressure).
@@ -1525,49 +1590,21 @@ mod asyncio {
     /// every 8 requests cost 32 fio jobs 3% of their IOPS on tokio.
     const PARK_AFTER_READS: u32 = 64;
 
-    /// A `TimerFd` that exposes the raw fd tokio's `AsyncFd` needs.
-    ///
-    /// Since nix 0.27, `TimerFd` implements only `AsFd`, while `AsyncFd`
-    /// registers an `AsRawFd` for the reactor. The fd stays owned by the
-    /// wrapped `TimerFd` (and thus by the `AsyncFd` holding this wrapper),
-    /// so the raw fd is only ever borrowed for the registration.
-    struct AsyncTimerFd(TimerFd);
-
-    impl AsRawFd for AsyncTimerFd {
-        fn as_raw_fd(&self) -> RawFd {
-            self.0.as_fd().as_raw_fd()
-        }
+    /// What makes an idle task check whether it should stop.
+    enum Wakeup {
+        /// A copy of the `StopSignal`'s eventfd, which stays readable once
+        /// the signal stops. Each task registers a copy of its own, so tasks
+        /// on one runtime can share a signal.
+        Signal(EventFd),
+        /// A timer that fires every `STATE_CHECK_INTERVAL`.
+        Timer(TimerFd),
     }
 
-    /// Waits for the fuse device to become readable. A periodic timer wakes
-    /// the wait, so an idle task still checks its `state` flag.
-    ///
-    /// The timer is a timerfd on tokio's IO driver, not a tokio timer. So the
-    /// runtime only needs IO enabled, and a runtime shutdown makes the wait
-    /// fail instead of panic.
-    struct DeviceReadiness {
-        device: AsyncFd<RawFd>,
-        // Without a timer, an idle task checks `state` once a request arrives.
-        tick: Option<AsyncFd<AsyncTimerFd>>,
-    }
-
-    impl DeviceReadiness {
-        fn new(device: AsyncFd<RawFd>) -> Self {
-            let tick = match Self::timer() {
-                Ok(tick) => Some(tick),
-                Err(e) => {
-                    warn!(
-                        "can't create a timer for the state checks of an idle task, checking when a request arrives instead: {}",
-                        e
-                    );
-                    None
-                }
-            };
-            DeviceReadiness { device, tick }
-        }
-
-        /// A timer that becomes readable every `STATE_CHECK_INTERVAL`.
-        fn timer() -> std::io::Result<AsyncFd<AsyncTimerFd>> {
+    impl Wakeup {
+        fn new(signal: &StopSignal) -> std::io::Result<Self> {
+            if let Some(event) = signal.event() {
+                return Ok(Wakeup::Signal(event.try_clone()?));
+            }
             let timer = TimerFd::new(
                 ClockId::CLOCK_MONOTONIC,
                 TimerFlags::TFD_NONBLOCK | TimerFlags::TFD_CLOEXEC,
@@ -1576,30 +1613,80 @@ mod asyncio {
                 Expiration::Interval(TimeSpec::from_duration(STATE_CHECK_INTERVAL)),
                 TimerSetTimeFlags::empty(),
             )?;
-            // SAFETY: the `AsyncFd` owns `timer`, so its fd stays open for as
-            // long as the registration.
-            let tick = unsafe {
-                AsyncFd::register_with_interest(AsyncTimerFd(timer), Interest::READABLE)
-            }?;
-            Ok(tick)
+            Ok(Wakeup::Timer(timer))
+        }
+    }
+
+    impl AsRawFd for Wakeup {
+        fn as_raw_fd(&self) -> RawFd {
+            match self {
+                Wakeup::Signal(event) => event.as_raw_fd(),
+                // nix's `TimerFd` implements only `AsFd`.
+                Wakeup::Timer(timer) => timer.as_fd().as_raw_fd(),
+            }
+        }
+    }
+
+    /// Waits for the fuse device to become readable. The task's stop signal,
+    /// or for a bare flag a periodic timer, wakes the wait, so an idle task
+    /// still notices when it should stop.
+    ///
+    /// The timer is a timerfd on tokio's IO driver, not a tokio timer. So the
+    /// runtime only needs IO enabled, and a runtime shutdown makes the wait
+    /// fail instead of panic.
+    struct DeviceReadiness {
+        device: AsyncFd<RawFd>,
+        // Without a wakeup, an idle task checks `state` once a request arrives.
+        wakeup: Option<AsyncFd<Wakeup>>,
+    }
+
+    impl DeviceReadiness {
+        fn new(device: AsyncFd<RawFd>, signal: &StopSignal) -> Self {
+            // SAFETY: the `AsyncFd` owns the wakeup, so its fd stays open for
+            // as long as the registration.
+            let wakeup = Wakeup::new(signal).and_then(|wakeup| {
+                unsafe { AsyncFd::register_with_interest(wakeup, Interest::READABLE) }
+                    .map_err(std::io::Error::from)
+            });
+            let wakeup = wakeup
+                .inspect_err(|e| {
+                    warn!(
+                        "can't wait for the stop signal or timer of an idle task, checking its state when a request arrives instead: {}",
+                        e
+                    )
+                })
+                .ok();
+            DeviceReadiness { device, wakeup }
         }
 
         /// Wait until the device is readable and return its guard, or return
-        /// `None` on the next tick of the timer.
-        async fn wait(&self) -> std::io::Result<Option<AsyncFdReadyGuard<'_, RawFd>>> {
+        /// `None` when the stop signal or the timer wakes the task.
+        async fn wait(
+            &self,
+            state: &StopSignal,
+        ) -> std::io::Result<Option<AsyncFdReadyGuard<'_, RawFd>>> {
             let device = self.device.ready(Interest::READABLE | Interest::ERROR);
-            let Some(tick) = &self.tick else {
+            let Some(wakeup) = &self.wakeup else {
                 return device.await.map(Some);
             };
             tokio::select! {
                 biased;
                 ready = device => ready.map(Some),
-                ready = tick.ready(Interest::READABLE) => {
+                ready = wakeup.ready(Interest::READABLE) => {
                     let mut guard = ready?;
-                    // Consume the expirations, so the next one makes the timer
-                    // readable again. EAGAIN means there were none.
-                    let _ = tick.get_ref().0.wait();
-                    guard.clear_ready();
+                    match wakeup.get_ref() {
+                        // Consume the expirations, so the next one makes the
+                        // timer readable again. EAGAIN means there were none.
+                        Wakeup::Timer(timer) => {
+                            let _ = timer.wait();
+                            guard.clear_ready();
+                        }
+                        // A stopped signal stays readable. If its flag was
+                        // reset since, wait for the next stop() instead of
+                        // spinning on the old one.
+                        Wakeup::Signal(_) if !state.is_stopped() => guard.clear_ready(),
+                        Wakeup::Signal(_) => {}
+                    }
                     Ok(None)
                 }
             }
@@ -1615,7 +1702,7 @@ mod asyncio {
     async fn read_request(
         file: &AsyncFile,
         ready: Option<&DeviceReadiness>,
-        state: &AtomicBool,
+        state: &StopSignal,
         buf: &mut [u8],
         park: bool,
     ) -> std::io::Result<Option<usize>> {
@@ -1625,10 +1712,10 @@ mod asyncio {
         loop {
             let guard = match ready {
                 Some(ready) => loop {
-                    if state.load(Ordering::Acquire) {
+                    if state.is_stopped() {
                         return Ok(None);
                     }
-                    if let Some(guard) = ready.wait().await? {
+                    if let Some(guard) = ready.wait(state).await? {
                         break Some(guard);
                     }
                 },
@@ -1682,6 +1769,8 @@ mod asyncio {
     #[cfg(test)]
     mod tests {
         use super::*;
+        use std::sync::atomic::AtomicBool;
+
         use fuse_backend_core::async_runtime;
         use fuse_backend_passthrough::{Config, PassthroughFs};
         use vmm_sys_util::tempfile::TempFile;
