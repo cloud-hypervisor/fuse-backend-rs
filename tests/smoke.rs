@@ -475,4 +475,61 @@ mod fusedev_tests {
         assert_eq!(requests.0.load(Ordering::Relaxed), 2);
         Ok(())
     }
+
+    #[test]
+    #[ignore] // it depends on privileged mode to pass through /dev/fuse
+    fn integration_test_newer_opcodes_fall_back() -> Result<()> {
+        use nix::errno::Errno;
+        use std::os::fd::AsRawFd;
+
+        // Newer kernels send FUSE_STATX and FUSE_COPY_FILE_RANGE_64. Both get ENOSYS, and the
+        // kernel falls back to GETATTR and COPY_FILE_RANGE.
+        let src_dir = TempDir::new().unwrap();
+        let mnt_dir = TempDir::new().unwrap();
+        let src = src_dir.as_path().to_str().unwrap().to_string();
+        let mnt = mnt_dir.as_path().to_str().unwrap().to_string();
+        let data: Vec<u8> = (0..8192u32).map(|i| i as u8).collect();
+        std::fs::write(src_dir.as_path().join("file"), &data).unwrap();
+
+        let mut daemon = passthroughfs::Daemon::new(&src, &mnt, 1).unwrap();
+        daemon.mount().unwrap();
+
+        let file = mnt_dir.as_path().join("file");
+        let path = CString::new(file.as_os_str().as_bytes()).unwrap();
+        // SAFETY: `statx` is plain old data, so all zeroes is a valid value.
+        let mut stx: libc::statx = unsafe { std::mem::zeroed() };
+        // SAFETY: `path` is NUL-terminated and statx() fills `stx`, both of which outlive the call.
+        let res = unsafe {
+            libc::statx(
+                libc::AT_FDCWD,
+                path.as_ptr(),
+                libc::AT_STATX_FORCE_SYNC,
+                libc::STATX_BASIC_STATS | libc::STATX_BTIME,
+                &mut stx,
+            )
+        };
+        assert_eq!(res, 0, "statx: {}", std::io::Error::last_os_error());
+        assert_eq!(stx.stx_size, data.len() as u64);
+
+        let src_file = std::fs::File::open(&file)?;
+        let dst_file = std::fs::File::create(mnt_dir.as_path().join("copy"))?;
+        // SAFETY: both fds are open, and null offsets use the file offsets.
+        let copied = Errno::result(unsafe {
+            libc::copy_file_range(
+                src_file.as_raw_fd(),
+                std::ptr::null_mut(),
+                dst_file.as_raw_fd(),
+                std::ptr::null_mut(),
+                data.len(),
+                0,
+            )
+        })
+        .unwrap();
+        assert_eq!(copied as usize, data.len());
+        drop(dst_file);
+        assert_eq!(std::fs::read(src_dir.as_path().join("copy"))?, data);
+
+        daemon.umount().unwrap();
+        Ok(())
+    }
 }

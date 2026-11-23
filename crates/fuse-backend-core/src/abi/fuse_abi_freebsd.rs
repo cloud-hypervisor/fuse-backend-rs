@@ -2,7 +2,7 @@
 //
 // SPDX-License-Identifier: BSD-3-Clause
 
-//! FreeBSD Fuse Application Binary Interfaces, Version 7.31.
+//! FreeBSD Fuse Application Binary Interfaces.
 //!
 //! FreeBSD's in-kernel fusefs driver implements the Linux FUSE wire protocol,
 //! so the wire-format structs are shared verbatim with the Linux ABI.  This

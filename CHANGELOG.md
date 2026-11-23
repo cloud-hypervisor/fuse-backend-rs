@@ -227,6 +227,9 @@
   and methods, except that the safe `from_bits_retain()` replaces the unsafe
   `from_bits_unchecked()`. `Debug` now prints the type name, as in
   `FsOptions(ASYNC_READ | POSIX_LOCKS)`, and an empty set prints `FsOptions(0x0)`, not `(empty)`.
+- [341](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/341): The Linux and FreeBSD INIT reply advertises protocol 7.46
+  instead of 7.33. Neither kernel behaves differently above 7.33, and the
+  server answers the newer opcodes it doesn't handle with ENOSYS.
 - [294](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/294): `PassthroughFs` negotiates
   `FsOptions::DIRECT_IO_ALLOW_MMAP` under the `Never` and `Metadata` cache policies only when the
   new `Config::allow_mmap` opts in (default off), so shared mmaps keep failing with `ENODEV` there

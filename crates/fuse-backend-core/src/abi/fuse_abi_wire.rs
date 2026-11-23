@@ -2,11 +2,10 @@
 //
 // SPDX-License-Identifier: BSD-3-Clause
 
-// Shared wire-format body of the Linux-family FUSE ABIs (protocol version
-// 7.31). This file is not compiled standalone: each per-OS arm prelude
-// re-exports the libc names the body uses under that OS's spelling, then
-// pulls this file in with include!(), so the wire structs exist exactly
-// once per target.
+// Shared wire-format body of the Linux-family FUSE ABIs. This file is not
+// compiled standalone: each per-OS arm prelude re-exports the libc names the
+// body uses under that OS's spelling, then pulls this file in with
+// include!(), so the wire structs exist exactly once per target.
 
 use std::fmt::{Debug, Formatter};
 use std::mem;
@@ -17,8 +16,12 @@ use vm_memory::ByteValued;
 
 pub const KERNEL_VERSION: u32 = 7;
 
-/// Minor version number of this interface.
-pub const KERNEL_MINOR_VERSION: u32 = 33;
+/// Minor version number sent in the INIT reply.
+///
+/// Linux checks this minor only for protocols before 7.23, and FreeBSD only up to 7.33. Newer
+/// features need an INIT flag, or are opcodes that the server answers with ENOSYS until it
+/// handles them.
+pub const KERNEL_MINOR_VERSION: u32 = 46;
 
 /// Init reply size is FUSE_COMPAT_INIT_OUT_SIZE
 pub const KERNEL_MINOR_VERSION_INIT_OUT_SIZE: u32 = 5;
