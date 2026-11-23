@@ -743,7 +743,8 @@ impl Vfs {
     }
 
     /// Like `get_real_rootfs()` for two inodes of one request, which have to be on the same file
-    /// system. Fails with EINVAL if they aren't.
+    /// system. Fails with EXDEV if they aren't, like rename(2) and link(2) across file systems.
+    /// mv copies the file on EXDEV.
     fn get_real_rootfs_pair(
         &self,
         a: VfsInode,
@@ -753,7 +754,7 @@ impl Vfs {
         let (_, idata_b) = self.get_real_rootfs(b)?;
 
         if idata_a.fs_idx() != idata_b.fs_idx() {
-            return Err(Error::from_raw_os_error(libc::EINVAL));
+            return Err(Error::from_raw_os_error(libc::EXDEV));
         }
         Ok((root, idata_a, idata_b))
     }

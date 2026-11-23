@@ -937,12 +937,17 @@ mod tests {
             vfs.async_rename(&ctx, MOUNT_ROOT.into(), &a, MOUNT_ROOT.into(), &b, 0)
                 .await
                 .unwrap();
-            // A rename can't leave its file system.
+            // A rename or a link can't leave its file system.
             let err = vfs
                 .async_rename(&ctx, MOUNT_ROOT.into(), &a, ROOT_ID.into(), &b, 0)
                 .await
                 .unwrap_err();
-            assert_eq!(err.raw_os_error(), Some(libc::EINVAL));
+            assert_eq!(err.raw_os_error(), Some(libc::EXDEV));
+            let err = vfs
+                .async_link(&ctx, MOUNT_FILE.into(), ROOT_ID.into(), &b)
+                .await
+                .unwrap_err();
+            assert_eq!(err.raw_os_error(), Some(libc::EXDEV));
         });
         handle.await.unwrap();
     }
