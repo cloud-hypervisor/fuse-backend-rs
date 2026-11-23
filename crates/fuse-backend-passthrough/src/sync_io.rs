@@ -1678,8 +1678,10 @@ impl<S: BitmapSlice + Send + Sync> FileSystem for PassthroughFs<S> {
         offset: u64,
         whence: u32,
     ) -> io::Result<u64> {
-        // Let the Arc<HandleData> in scope, otherwise fd may get invalid.
-        let data = self.handle_map.get(handle, inode)?;
+        // Let the Arc<HandleData> in scope, otherwise fd may get invalid. Under no_open the
+        // kernel sends handle 0, so seek on a new fd. The kernel sends LSEEK only for
+        // SEEK_DATA and SEEK_HOLE, which don't depend on the fd's position.
+        let data = self.get_data(handle, inode, libc::O_RDONLY)?;
 
         // `do_readdir()` seeks and reads the directory under the write lock, so
         // the read lock keeps this seek out of the middle of a readdir. The
@@ -2993,6 +2995,14 @@ mod tests {
             .lseek(&ctx, ROOT_ID, handle, 0, libc::SEEK_SET as u32)
             .unwrap_err();
         assert_eq!(err.raw_os_error(), Some(libc::EBADF));
+
+        // Under no_open the kernel sends handle 0, and the seek goes to a new fd.
+        fs.no_open.store(true, Ordering::Relaxed);
+        assert_eq!(
+            fs.lseek(&ctx, entry.inode, 0, 0, libc::SEEK_DATA as u32)
+                .unwrap(),
+            0
+        );
     }
 }
 

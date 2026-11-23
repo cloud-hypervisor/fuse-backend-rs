@@ -16,6 +16,7 @@ mod fusedev_tests {
     use std::io::Result;
     use std::num::NonZeroUsize;
     use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::FileExt;
     use std::os::unix::fs::MetadataExt;
     use std::os::unix::fs::OpenOptionsExt;
     use std::os::unix::fs::PermissionsExt;
@@ -473,6 +474,94 @@ mod fusedev_tests {
         assert_eq!(std::fs::read(src_b.as_path().join("copy"))?, data);
         assert_eq!(std::fs::read(src_a.as_path().join("copy"))?, data);
         assert_eq!(requests.0.load(Ordering::Relaxed), 2);
+        Ok(())
+    }
+
+    /// Counts the LSEEK requests the server gets.
+    #[derive(Default)]
+    struct LseekRequests(AtomicUsize);
+
+    impl MetricsHook for LseekRequests {
+        fn collect(&self, ih: &InHeader) {
+            if ih.opcode == Opcode::Lseek as u32 {
+                self.0.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+
+        fn release(&self, _oh: Option<&OutHeader>) {}
+    }
+
+    /// Returns where the first data in `path` starts, and the hole after it.
+    fn data_and_hole(path: &Path) -> Result<(i64, i64)> {
+        use nix::unistd::{lseek, Whence};
+
+        let file = File::open(path)?;
+        let data = lseek(&file, 0, Whence::SeekData)?;
+        let hole = lseek(&file, data, Whence::SeekHole)?;
+        Ok((data, hole))
+    }
+
+    #[test]
+    #[ignore] // it depends on privileged mode to pass through /dev/fuse
+    fn integration_test_vfs_lseek() -> Result<()> {
+        // A Vfs with two PassthroughFs mounts, each with a file that starts with a 1 MiB hole.
+        // SEEK_DATA and SEEK_HOLE on either file go to its PassthroughFs, which finds the hole.
+        if !running_as_root() {
+            eprintln!("skipping integration_test_vfs_lseek: not running as root");
+            return Ok(());
+        }
+
+        let src_a = TempDir::new().unwrap();
+        let src_b = TempDir::new().unwrap();
+        let mnt_dir = TempDir::new().unwrap();
+        for src in [&src_a, &src_b] {
+            File::create(src.as_path().join("sparse"))?.write_all_at(&[1; 4096], 1 << 20)?;
+        }
+
+        // Without the writeback cache, which keeps Vfs from forwarding LSEEK. no_open stays on,
+        // so LSEEK comes with handle 0.
+        let vfs = Vfs::new(VfsOptions {
+            no_writeback: true,
+            ..Default::default()
+        });
+        for (src, path) in [(&src_a, "/a"), (&src_b, "/b")] {
+            let fs = PassthroughFs::<()>::new(Config {
+                root_dir: src.as_path().to_str().unwrap().to_string(),
+                do_import: false,
+                ..Default::default()
+            })
+            .unwrap();
+            fs.import().unwrap();
+            vfs.mount(Box::new(fs), path).unwrap();
+        }
+        let server = Server::new(vfs);
+        let requests = Arc::new(LseekRequests::default());
+        let hook = requests.clone();
+
+        let mut se = FuseSession::new(mnt_dir.as_path(), "vfs_lseek", "", false).unwrap();
+        se.mount().unwrap();
+        let mut ch = se.new_channel().unwrap();
+        let handle = std::thread::spawn(move || {
+            while let Ok(Some((reader, writer))) = ch.get_request() {
+                // Serve until the kernel ends the connection. A command that another test forks
+                // can inherit a file here and FLUSH it at exec, after this test is done.
+                if let Err(e) = server.handle_message(reader, writer, None, Some(&*hook)) {
+                    eprintln!("request failed: {e}");
+                }
+            }
+        });
+
+        let mnt = mnt_dir.as_path();
+        let a = data_and_hole(&mnt.join("a/sparse"));
+        let b = data_and_hole(&mnt.join("b/sparse"));
+        se.umount().unwrap();
+        handle.join().unwrap();
+
+        // The host file system's own answer, which depends on how it tracks holes.
+        let expected = data_and_hole(&src_a.as_path().join("sparse"))?;
+        assert_eq!(a?, expected);
+        assert_eq!(b?, expected);
+        assert_eq!(requests.0.load(Ordering::Relaxed), 4);
         Ok(())
     }
 }

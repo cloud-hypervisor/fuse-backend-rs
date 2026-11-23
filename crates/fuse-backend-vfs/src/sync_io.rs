@@ -44,6 +44,35 @@ impl Vfs {
         }
         Ok((fs, idata_in, idata_out))
     }
+
+    /// The backend that serves an LSEEK of `inode`, with the inode in it.
+    pub(super) fn lseek_fs(&self, inode: VfsInode) -> Result<(ArcBackFs, VfsInode)> {
+        // With the writeback cache, written data can sit in the kernel's page cache, and the
+        // kernel doesn't write it back before LSEEK, so the file system would report a hole
+        // there. On ENOSYS the kernel seeks with its own file size instead.
+        // TODO: the fix belongs in fuse_lseek() in fs/fuse/file.c, which should write back
+        // dirty pages before it sends LSEEK, as NFS does before its SEEK. Vfs could forward
+        // here once it can tell that the kernel has that fix.
+        //
+        // macFUSE and fuse-t speak protocol 7.19, which has neither LSEEK nor WRITEBACK_CACHE,
+        // so the flag says nothing about cached writes there. Nothing shows that a later macOS
+        // backend that sends LSEEK would write them back first, so macOS keeps answering ENOSYS.
+        if cfg!(target_os = "macos")
+            || self
+                .opts
+                .load()
+                .out_opts
+                .contains(FsOptions::WRITEBACK_CACHE)
+        {
+            return Err(Error::from_raw_os_error(libc::ENOSYS));
+        }
+        // The pseudo fs has only directories. Linux never sends LSEEK for one, and FreeBSD's
+        // own answer for a directory is EINVAL.
+        let (Right(fs), idata) = self.get_real_rootfs(inode)? else {
+            return Err(Error::from_raw_os_error(libc::EINVAL));
+        };
+        Ok((fs, idata))
+    }
 }
 
 /// The error for a COPY_FILE_RANGE that the backend failed with `e`.
@@ -468,6 +497,25 @@ impl FileSystem for Vfs {
         }
     }
 
+    fn lseek(
+        &self,
+        ctx: &Context,
+        inode: VfsInode,
+        handle: u64,
+        offset: u64,
+        whence: u32,
+    ) -> Result<u64> {
+        let (fs, idata) = self.lseek_fs(inode)?;
+        match fs.lseek(ctx, idata.ino(), handle, offset, whence) {
+            // ENOSYS would turn LSEEK off for every mount. Answer as the kernel would then.
+            Err(e) if e.raw_os_error() == Some(libc::ENOSYS) => {
+                let (attr, _) = fs.getattr(ctx, idata.ino(), Some(handle))?;
+                seek_without_holes(offset, whence, attr.st_size as u64)
+            }
+            result => result,
+        }
+    }
+
     fn release(
         &self,
         ctx: &Context,
@@ -718,6 +766,19 @@ impl FileSystem for Vfs {
             (Left(fs), idata) => fs.removemapping(ctx, idata.ino(), requests, req),
             (Right(fs), idata) => fs.removemapping(ctx, idata.ino(), requests, req),
         }
+    }
+}
+
+/// Answers SEEK_DATA and SEEK_HOLE for a file of `size` bytes without holes, like the kernel's
+/// `generic_file_llseek()`.
+pub(super) fn seek_without_holes(offset: u64, whence: u32, size: u64) -> Result<u64> {
+    match whence as i32 {
+        libc::SEEK_DATA | libc::SEEK_HOLE if offset >= size => {
+            Err(Error::from_raw_os_error(libc::ENXIO))
+        }
+        libc::SEEK_DATA => Ok(offset),
+        libc::SEEK_HOLE => Ok(size),
+        _ => Err(Error::from_raw_os_error(libc::EINVAL)),
     }
 }
 
@@ -1017,5 +1078,176 @@ mod tests {
         assert_eq!(errno(vfs.setxattr(&ctx, inode, &name, b"v", 0)), enosys);
         assert_eq!(errno(vfs.getxattr(&ctx, inode, &name, 0)), enosys);
         assert_eq!(errno(vfs.removexattr(&ctx, inode, &name)), enosys);
+    }
+
+    /// A backend whose files are 8192 bytes long. Its `lseek()` fails with `errno`, or answers
+    /// the offset plus one when `errno` is 0. It records the inode and handle of each call.
+    struct SeekFs {
+        errno: i32,
+        calls: SeekCalls,
+    }
+
+    type SeekCalls = Arc<Mutex<Vec<(&'static str, u64, Option<u64>)>>>;
+
+    impl FileSystem for SeekFs {
+        type Inode = u64;
+        type Handle = u64;
+
+        fn getattr(
+            &self,
+            _ctx: &Context,
+            inode: u64,
+            handle: Option<u64>,
+        ) -> Result<(stat64, Duration)> {
+            self.calls.lock().unwrap().push(("getattr", inode, handle));
+            let attr = Attr {
+                size: 8192,
+                ..Default::default()
+            };
+            Ok((attr.into(), Duration::from_secs(1)))
+        }
+
+        fn lseek(
+            &self,
+            _ctx: &Context,
+            inode: u64,
+            handle: u64,
+            offset: u64,
+            _whence: u32,
+        ) -> Result<u64> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(("lseek", inode, Some(handle)));
+            match self.errno {
+                0 => Ok(offset + 1),
+                errno => Err(Error::from_raw_os_error(errno)),
+            }
+        }
+    }
+
+    #[cfg(feature = "async-io")]
+    impl AsyncFileSystem for SeekFs {}
+
+    impl BackendFileSystem for SeekFs {
+        fn mount(&self) -> Result<(Entry, u64)> {
+            let root = Entry {
+                inode: 1,
+                ..Default::default()
+            };
+            Ok((root, 0))
+        }
+
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
+    /// Mounts a `SeekFs` at `path`, and returns its index and the calls it gets.
+    fn mount_seek_fs(vfs: &Vfs, path: &str, errno: i32) -> (VfsIndex, SeekCalls) {
+        let calls = SeekCalls::default();
+        let fs = SeekFs {
+            errno,
+            calls: calls.clone(),
+        };
+        (vfs.mount(Box::new(fs), path).unwrap(), calls)
+    }
+
+    /// A Vfs that doesn't offer the writeback cache, so it forwards LSEEK except on macOS.
+    fn vfs_without_writeback() -> Vfs {
+        Vfs::new(VfsOptions {
+            out_opts: FsOptions::empty(),
+            ..Default::default()
+        })
+    }
+
+    /// Seeks with handle 10, and returns the offset or the errno.
+    fn seek(vfs: &Vfs, inode: VfsInode, offset: u64, whence: i32) -> std::result::Result<u64, i32> {
+        vfs.lseek(&Context::default(), inode, 10, offset, whence as u32)
+            .map_err(|e| e.raw_os_error().unwrap())
+    }
+
+    #[test]
+    #[cfg(not(target_os = "macos"))]
+    fn test_lseek_forwarded() {
+        let vfs = vfs_without_writeback();
+        mount_seek_fs(&vfs, "/a", 0);
+        let (b, calls) = mount_seek_fs(&vfs, "/b", 0);
+
+        assert_eq!(
+            seek(&vfs, VfsInode::new(b, 5), 100, libc::SEEK_DATA),
+            Ok(101)
+        );
+        assert_eq!(*calls.lock().unwrap(), [("lseek", 5, Some(10))]);
+    }
+
+    /// Checks that `vfs` answers LSEEK with ENOSYS without asking the file system.
+    fn assert_lseek_not_forwarded(vfs: Vfs) {
+        let (idx, calls) = mount_seek_fs(&vfs, "/a", 0);
+
+        assert_eq!(
+            seek(&vfs, VfsInode::new(idx, 5), 0, libc::SEEK_DATA),
+            Err(libc::ENOSYS)
+        );
+        assert!(calls.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_lseek_writeback_cache() {
+        assert_lseek_not_forwarded(Vfs::new(VfsOptions {
+            out_opts: FsOptions::WRITEBACK_CACHE,
+            ..Default::default()
+        }));
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn test_lseek_macos() {
+        // macOS answers ENOSYS without the writeback cache too.
+        assert_lseek_not_forwarded(vfs_without_writeback());
+    }
+
+    #[test]
+    #[cfg(not(target_os = "macos"))]
+    fn test_lseek_backend_errors() {
+        let vfs = vfs_without_writeback();
+        let (idx, _) = mount_seek_fs(&vfs, "/a", libc::ENXIO);
+
+        assert_eq!(
+            seek(&vfs, VfsInode::new(idx, 5), 0, libc::SEEK_DATA),
+            Err(libc::ENXIO)
+        );
+    }
+
+    #[test]
+    #[cfg(not(target_os = "macos"))]
+    fn test_lseek_backend_without_lseek() {
+        let vfs = vfs_without_writeback();
+        let (idx, calls) = mount_seek_fs(&vfs, "/a", libc::ENOSYS);
+        let file = VfsInode::new(idx, 5);
+
+        // The whole file is data, followed by the hole at its end.
+        assert_eq!(seek(&vfs, file, 100, libc::SEEK_DATA), Ok(100));
+        assert_eq!(seek(&vfs, file, 100, libc::SEEK_HOLE), Ok(8192));
+        assert_eq!(seek(&vfs, file, 8192, libc::SEEK_DATA), Err(libc::ENXIO));
+        assert_eq!(seek(&vfs, file, 8192, libc::SEEK_HOLE), Err(libc::ENXIO));
+        assert_eq!(seek(&vfs, file, 0, libc::SEEK_END), Err(libc::EINVAL));
+        // The size comes from the open file, as when the kernel asks for it.
+        assert_eq!(
+            calls.lock().unwrap()[..2],
+            [("lseek", 5, Some(10)), ("getattr", 5, Some(10))]
+        );
+    }
+
+    #[test]
+    #[cfg(not(target_os = "macos"))]
+    fn test_lseek_pseudo_dirs() {
+        let vfs = vfs_without_writeback();
+        mount_seek_fs(&vfs, "/x/y", 0);
+
+        // The root and /x, inode 2, are pseudo fs directories.
+        for dir in [ROOT_ID, 2].map(VfsInode::from) {
+            assert_eq!(seek(&vfs, dir, 0, libc::SEEK_DATA), Err(libc::EINVAL));
+        }
     }
 }
