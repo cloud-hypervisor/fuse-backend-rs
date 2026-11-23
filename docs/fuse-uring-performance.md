@@ -53,6 +53,51 @@ The kernel doesn't know which workers are busy, though. A request can land
 on a free entry of a worker that is still serving a slow request of another
 queue, and wait for it while other workers idle.
 
+With `UringFuseServing::new()`, whose workers serve one request at a time,
+that holds fast requests up behind slow ones. The benchmark daemon served
+PassthroughFs over a tmpfs directory with 8 workers, 16 entries per queue
+and `--no-backing-direct-io`, on a 96-CPU machine with Linux 7.3.1, and
+`--delay-us 1000 --delay-prefix slow` made each read of the files named
+`slow.*` wait 1 ms. Four fio jobs read 4 KiB at random from 64 MiB files
+with psync and O_DIRECT, for 10 seconds after a 2 second ramp: alone, next
+to one job that read a slow file the same way, and next to four. The table
+has the reads of the four fast jobs, medians of 3 runs in alternating
+order:
+
+| Serving | Slow jobs | Fast reads/s | p50 | p99 | p99.9 |
+|---------|-----------|--------------|-----|-----|-------|
+| `SyncFuseServing` | 0 | 379k | 10 µs | 14 µs | 18 µs |
+| | 1 | 381k | 10 µs | 14 µs | 17 µs |
+| | 4 | 377k | 10 µs | 15 µs | 17 µs |
+| `AsyncFuseServing` | 0 | 157k | 25 µs | 38 µs | 45 µs |
+| | 1 | 157k | 24 µs | 38 µs | 46 µs |
+| | 4 | 157k | 24 µs | 40 µs | 49 µs |
+| `UringFuseServing::new()` | 0 | 525k | 9 µs | 11 µs | 14 µs |
+| | 1 | 433k | 8 µs | 11 µs | 1.06 ms |
+| | 4 | 163k | 5 µs | 1.06 ms | 1.07 ms |
+| same, 1 entry per queue | 4 | 284k | 7 µs | 14 µs | 2.11 ms |
+| `UringFuseServing::new_async()` | 0 | 414k | 10 µs | 13 µs | 15 µs |
+| | 1 | 411k | 10 µs | 13 µs | 16 µs |
+| | 4 | 389k | 10 µs | 13 µs | 16 µs |
+
+Each queue keeps going to the worker that served it last, and the queues
+end their registration on different workers, see "Buffer pools" below.
+So a slow read holds up the queues of its worker. Next to one slow job,
+fewer than 1 in 100 fast reads of `new()` waited as long as a slow read.
+Next to four, the fast reads fell to 163k/s, with runs between 92k and
+262k depending on the CPUs the jobs ran on, and the slow jobs read 2.9k
+times a second in all, against 3.8k with the other serving layers. When
+every queue ended its registration on the same worker, as a first
+version of the rounds did, all of them went to that worker, and the fast
+reads fell to 105k/s next to one slow job and to 27k/s next to four.
+With one entry per queue, each queue has a single worker. The fast reads
+then ranged from 145k to 305k reads/s, but each CPU can have only one
+request in flight. `new_async()` takes new requests while handlers wait,
+so the slow reads cost the fast ones nothing, as long as the handlers
+don't block the worker thread while they wait. File systems whose
+requests can take long, such as those of a remote store, should use
+`new_async()`, or `SyncFuseServing` if their handlers are synchronous.
+
 ## Root Cause Analysis
 
 ### What It's NOT
@@ -170,12 +215,12 @@ three times:
 | own per entry | 1492 MiB | 393 MiB | 1518-1728 MiB/s |
 | 4 | 431 MiB | 106 MiB | 1588-1709 MiB/s |
 
-VmSize also counts the request and reply scratch areas of each entry,
-which are as large as its own payload buffer, so a pooled entry saves
-those too. Random 4 KiB reads in the same setup ran at 44.5k to 46.8k
-IOPS with and without pools. VmRSS counts only the pages that requests
-touched, so workloads with fewer requests in flight use far less memory
-than this.
+When this was measured, each entry also had request and reply scratch
+areas as large as its own payload buffer, which VmSize counts. Entries now
+keep 168 bytes of scratch. Random 4 KiB reads in the same setup ran at
+44.5k to 46.8k IOPS with and without pools. VmRSS counts only the pages
+that requests touched, so workloads with fewer requests in flight use far
+less memory than this.
 
 The kernel hands a request to the entry of its queue that became free last,
 and once its buffers are busy, an entry that commits takes the next waiting
@@ -239,6 +284,119 @@ than whole queues did, with one request in flight per queue, or with
 more if each queue has fewer buffers than entries. The default starts a
 worker per online CPU, which is usually one per queue.
 
+### Smaller pools with the async handlers
+
+With `UringFuseServing::new_async()`, a request keeps its buffer while its
+handler waits, so by default each queue gets a buffer per entry. A smaller
+`bufs_per_queue` caps the pools, and requests that need a buffer wait in
+the kernel until a handler of their queue is done.
+
+The benchmark daemon served `--uring --async` with `--no-backing-direct-io`
+in the setup of the rounds table above. One workload was the 4 KiB random
+writes of `bench_sync_async.sh`, 4 jobs with psync through the writeback
+cache. The other was the 1 MiB random reads of the rounds table. Each
+ran for 8 seconds. The table has medians of 3 runs in alternating order,
+and `new()` with its default of 4 buffers for comparison. The writes and
+the reads ran in separate sets of runs, and the reads in another set than
+the rounds table, so their column also gives the range of the runs.
+`new()` with 4 buffers read 40.2 GiB/s here and 39.4 GiB/s in the
+rounds table, inside the range of both:
+
+| Buffers per queue | VmSize | 4 KiB writes | VmRSS | 1 MiB reads | VmRSS |
+|-------------------|--------|--------------|-------|-------------|-------|
+| 16 (default) | 2137 MiB | 2.20M IOPS | 634 MiB | 33.2 GiB/s (33.2-35.0) | 134 MiB |
+| 8 | 1369 MiB | 2.13M IOPS | 392 MiB | 39.6 GiB/s (39.6-41.2) | 70 MiB |
+| 4 | 985 MiB | 2.28M IOPS | 183 MiB | 40.8 GiB/s (40.1-40.9) | 38 MiB |
+| 2 | 793 MiB | 2.39M IOPS | 88 MiB | 42.4 GiB/s (41.9-42.7) | 22 MiB |
+| 1 | 697 MiB | 1.75M IOPS | 174 MiB | 40.8 GiB/s (40.4-41.0) | 14 MiB |
+| `new()`, 4 | 985 MiB | 2.31M IOPS | 116 MiB | 40.2 GiB/s (39.0-40.6) | 37 MiB |
+
+Each buffer more per queue adds 96 MiB of VmSize, a payload buffer for
+each of the 96 queues. The two workloads reach the daemon differently.
+Each read is a READ of 1 MiB from one of the 8 CPUs that fio runs on, and
+fills a whole buffer of one of 8 pools, so VmRSS is 8 pools and 6 MiB.
+fio's writes only dirty the page cache, and the kernel's flusher threads
+write the pages back. In a trace of 7 seconds, the daemon got 334k WRITEs
+from 22 CPUs, 15% of them of 1 MiB and half of them of 8 KiB or less. So
+the writes fill whole buffers of more pools than the reads do. With 16
+buffers, pool pages were 558 of the 587 MiB of VmRSS, the pools of about
+35 queues. With 1 or 2 buffers, the pools held 21 and 32 MiB, and most of
+VmRSS was the daemon's heap, which varied between runs. The writes into
+the page cache keep their pace as long as writeback keeps up, so the
+write column shows the pool only once it slows writeback down, as with a
+single buffer. An earlier measurement on a 24-CPU machine, with an ext4
+directory and 4 workers, had 0.82M IOPS for these writes with 4 buffers
+per queue and 1.07M with 16. Here, with an XFS directory and 4 workers, 4
+buffers gave 2.36M IOPS and 16 gave 2.42M.
+
+The reads are slower with a buffer per entry because larger pools miss
+the caches more. Each busy queue cycles through all of its buffers, so the
+8 pools of the reads hold 128 MiB with 16 buffers, 64 MiB with 8 and 32
+MiB with 4, and the machine has 32 MiB of L3 for each group of 8 cores. A
+1 MiB read writes its whole buffer and then reads it back. perf stat
+counted the daemon's threads in another set of runs of the reads, on
+Linux 7.3.4, for 8 seconds each, medians of 3. This set read faster at
+every pool size than the set of the table above, so compare its rows
+only with each other. The AMD cores count where the fills of their L1
+data cache came from. L3 misses show only in the L3's own counters,
+which this machine doesn't expose:
+
+| Buffers per queue | 1 MiB reads | Cycles per read | Fills per read from DRAM | Fills per read from the L3 |
+|-------------------|-------------|-----------------|--------------------------|----------------------------|
+| 16 (default) | 37.9 GiB/s | 926k | 8.4k | 11.7k |
+| 8 | 49.0 GiB/s | 716k | 6.2k | 17.7k |
+| 4 | 52.7 GiB/s | 666k | 6.0k | 18.4k |
+
+With 16 buffers, a read took 29% more cycles than with 8, with 35% more
+fills from DRAM and a third fewer from the L3. 4 KiB reads at depth 16
+from the same 8 jobs touch one page of a buffer each, and the pool size
+changed them by less than 7%, between 745k and 793k IOPS.
+
+The cost shows when slow requests hold the buffers. Each of 4 CPUs ran two
+fio jobs with O_DIRECT. One kept 8 reads of a slow file in flight, each of
+which waited 1 ms as in "Queue ownership". The other read 4 KiB of a fast
+file, one read at a time. VmRSS stayed under 7 MiB with any pool. The
+rows marked "later" ran with the perf counts above, on Linux 7.3.4:
+
+| Buffers per queue | Fast reads/s | p50 | p99 | Slow reads/s |
+|-------------------|--------------|-----|-----|--------------|
+| 16 (default) | 378k | 10 µs | 16 µs | 31.5k |
+| 16, later | 338k | 11 µs | 18 µs | 31.4k |
+| 8, later | 29.7k | 105 µs | 494 µs | 31.3k |
+| 4 | 3.2k | 1.22 ms | 1.91 ms | 15.8k |
+| 1 | 2.1k | 1.02 ms | 8.09 ms | 3.9k |
+| `AsyncFuseServing` | 138k | 27 µs | 59 µs | 30.1k |
+
+So the default stays a buffer per entry. Fewer buffers than entries,
+such as 8 for 16 entries, read 1 MiB faster from handlers that don't
+wait, but hold up fast requests once a queue has as many waiting
+requests as buffers. With 4 buffers, and most of the time with 8, the
+slow reads of a CPU held all of its queue's buffers, and each fast read
+waited for one of them to finish.
+
+Waiting for a buffer doesn't deadlock a file system whose handlers finish
+on their own. The kernel lends a buffer to an entry only together with a
+request, so a request that waits for a buffer holds no entry, and each
+buffer comes back when the handler of its request is done. The entry that
+commits takes the queue's next request, with its buffer if that request
+needs one. A request without a payload and without a reply body, such as
+FSYNC, FLUSH or RELEASE, takes a free entry without a buffer.
+
+Handlers that wait for other requests of the same mount can deadlock,
+though. If all buffers of a queue belong to handlers that wait for a
+request that needs a buffer too, such as READs of a pipe-like file that
+wait for a WRITE from the same CPU, none comes back. The kernel also
+serves the waiting requests of a queue in order. An entry that commits
+looks only at the first one, so a request that queues behind one that
+waits for a buffer waits as well, even if it needs none. A request queues
+when it finds no free entry, and a background request, such as most
+RELEASEs, always queues. With a buffer per entry, the same happens once
+all entries of a queue wait. Such a file system needs a buffer per queue
+for each request that can wait there at once, and the default has one for
+up to `entries_per_queue` requests. The synchronous handlers of `new()`
+block their worker while they wait, so they can hang a mount with any
+pool.
+
 ## Zero-copy
 
 On Linux 7.3 and later, a queue with a buffer pool can also serve reads
@@ -255,9 +413,13 @@ with a slot per entry. A zero-copy READ gets a reply body that only the
 transport can fill, and `write_from()` runs `READ_FIXED` from the file
 into the slot. A zero-copy WRITE gets a `Reader` whose data only the
 transport can move, and `read_to()` runs `WRITE_FIXED` from the slot
-into the file. Both run on the worker's ring and wait for the result
-there, because the kernel registered the pages in that ring's table. If the
-kernel refuses zero-copy, `UringFuseServing` adds the queues without it.
+into the file. Both run on the worker's ring, because the kernel
+registered the pages in that ring's table. A synchronous handler waits
+for the result on the ring. With `UringFuseServing::new_async()`, the
+asynchronous handlers call `async_write_from()` and `async_read_to()`,
+whose operations carry the index of the request's entry, and the worker
+loop wakes the request when the result comes off the ring. If the kernel
+refuses zero-copy, `UringFuseServing` adds the queues without it.
 
 A file system that reads or writes zero-copy data through memory, or
 with a file that has no descriptor, still works, but slower. The worker
@@ -295,24 +457,25 @@ and uses the buffer pools of protocol 7.46 (kernel 7.3) when the kernel has them
 - Zero-copy for opens that ask for it, see "Zero-copy" above
 - Fallback to classic `/dev/fuse` for notifications/interrupts
 
-### Future Work
-
-1. **Async zero-copy**: `ZeroCopySource` and the zero-copy reply wait
-   synchronously on the worker's ring, which suits the synchronous
-   handlers. Serving `AsyncFileSystem` handlers over io_uring needs
-   asynchronous versions.
-
 ### Tuning Recommendations
 
 - `entries_per_queue`: Default is 4. The entries of each queue are spread
   over the workers, so a busy queue reaches at most this many workers, and
   never more than `workers`. With buffer pools, requests with a payload or
   reply body also need one of the queue's `bufs_per_queue` buffers. Past the
-  worker count, more entries only queue more requests on the same workers.
+  worker count, more entries only queue more requests on the same workers,
+  and with `new_async()` and the default `bufs_per_queue` they also grow
+  the pools.
 
-- `bufs_per_queue`: Default is 4. On Linux 7.3 and later it caps the
-  requests with a payload or reply body that one queue serves at once, and
-  with it the memory of the payload buffers.
+- `bufs_per_queue`: Default is 4 with `new()` and one per entry with
+  `new_async()`. On Linux 7.3 and later it caps the requests with a
+  payload or reply body that one queue serves at once, and with it the
+  memory of the payload buffers. A busy queue reaches only as many
+  workers as it has buffers. With `new_async()`, a request keeps its
+  buffer while its handler waits, so slow requests hold up the others of
+  their queue. A file system whose handlers don't wait can read large
+  requests faster with fewer buffers than entries, because smaller pools
+  miss the caches less. See "Smaller pools with the async handlers" above.
 
 - `workers`: Default is one per CPU. A worker serves the requests of any
   queue it holds entries of, so the count no longer has to match the
