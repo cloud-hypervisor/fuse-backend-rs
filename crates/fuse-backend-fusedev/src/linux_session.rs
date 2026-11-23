@@ -881,6 +881,51 @@ fn is_torn_down(file: &File) -> bool {
     poll(&mut fds, PollTimeout::from(0u16)).is_ok() && fds[0].revents() == Some(PollFlags::POLLERR)
 }
 
+/// The minor device number of the last mount at `mountpoint`, an
+/// absolute path, in `mountinfo`, the format of /proc/self/mountinfo.
+pub(crate) fn mount_minor(mountinfo: &str, mountpoint: &Path) -> Option<u32> {
+    // mountinfo writes space, tab, newline and backslash as octal escapes.
+    let mountpoint: String = mountpoint
+        .to_str()?
+        .chars()
+        .map(|c| match c {
+            ' ' | '\t' | '\n' | '\\' => format!("\\{:03o}", c as u32),
+            c => c.to_string(),
+        })
+        .collect();
+    mountinfo.lines().rev().find_map(|line| {
+        // ID, parent ID, major:minor, root, mount point, ...
+        let mut fields = line.split(' ');
+        let dev = fields.nth(2)?;
+        let point = fields.nth(1)?;
+        if point != mountpoint {
+            return None;
+        }
+        dev.split_once(':')?.1.parse().ok()
+    })
+}
+
+/// Open the `abort` file of the connection of `session` in the fusectl file system.
+/// Writing to it ends the connection, like `umount -f`. Once the connection is gone, writes do
+/// nothing, so the file never ends a later connection that got the same number.
+///
+/// fusectl names connections after the minor number of the mount's device, which comes from
+/// /proc/self/mountinfo, because a stat() of the mountpoint would wait for a FUSE request that
+/// nobody serves yet. `FuseSession` keeps the mountpoint canonical, as mountinfo has it. A
+/// session mounted in another mount namespace is looked up in the mountinfo of that namespace.
+/// The file belongs to the user that mounted the file system.
+pub(crate) fn open_abort_file(session: &FuseSession) -> io::Result<File> {
+    let mountinfo = match session.target_mntns {
+        Some(pid) => std::fs::read_to_string(format!("/proc/{pid}/mountinfo"))?,
+        None => std::fs::read_to_string("/proc/self/mountinfo")?,
+    };
+    let minor = mount_minor(&mountinfo, session.mountpoint())
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "the mount isn't in mountinfo"))?;
+    OpenOptions::new()
+        .write(true)
+        .open(format!("/sys/fs/fuse/connections/{minor}/abort"))
+}
+
 /// Umount a fuse file system
 fn fuse_kern_umount(
     mountpoint: &Path,
@@ -1093,6 +1138,19 @@ mod tests {
         assert_eq!(rx.recv_timeout(std::time::Duration::from_secs(5)), Ok(true));
         thread.join().unwrap();
     }
+
+    #[test]
+    fn test_mount_minor() {
+        let info = "22 1 0:21 / /proc rw - proc proc rw\n\
+                    95 30 0:84 / /tmp/a rw - fuse.x x rw\n\
+                    96 30 0:86 / /tmp/a rw - fuse.x x rw\n";
+        // The last mount at a path is the one in effect.
+        assert_eq!(mount_minor(info, "/tmp/a".as_ref()), Some(86));
+        assert_eq!(mount_minor(info, "/tmp/b".as_ref()), None);
+        // Special characters are octal escapes.
+        let info = "97 30 0:88 / /tmp/a\\040b rw - fuse.x x rw\n";
+        assert_eq!(mount_minor(info, "/tmp/a b".as_ref()), Some(88));
+    }
 }
 
 #[cfg(feature = "async-io")]
@@ -1123,6 +1181,7 @@ mod asyncio {
     use fuse_backend_core::buffer::Reader;
     use fuse_backend_core::file_buf::FileVolatileBuf;
 
+    use crate::serving::WorkerActivity;
     use crate::{FuseBuf, FuseDevReaderExt, FuseDevWriter};
 
     /// Default limit on the number of concurrently processed requests.
@@ -1206,6 +1265,7 @@ mod asyncio {
         server: Arc<Server<F>>,
         buf_size: usize,
         max_inflight: usize,
+        activity: Option<WorkerActivity>,
     }
 
     impl<F: AsyncFileSystem + Sync> FuseDevTask<F> {
@@ -1280,7 +1340,13 @@ mod asyncio {
                 state,
                 buf_size,
                 max_inflight: max_inflight.max(1),
+                activity: None,
             }
+        }
+
+        /// Report whether the task serves requests to its serving layer.
+        pub(crate) fn report_activity(&mut self, activity: WorkerActivity) {
+            self.activity = Some(activity);
         }
 
         /// Handler to process fuse requests in asynchronous mode.
@@ -1421,6 +1487,11 @@ mod asyncio {
                     });
 
                     let result = loop {
+                        if inflight.is_empty() {
+                            if let Some(activity) = &self.activity {
+                                activity.idle();
+                            }
+                        }
                         tokio::select! {
                             biased;
                             // Complete in-flight requests first, see the function doc.
@@ -1454,6 +1525,9 @@ mod asyncio {
                         break 'serve;
                     }
                     Ok(Some(len)) => {
+                        if let Some(activity) = &self.activity {
+                            activity.busy();
+                        }
                         let server = self.server.clone();
                         inflight.push(handle_request(server, fd, buf, len));
                     }

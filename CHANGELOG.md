@@ -351,6 +351,13 @@
   fails, which the default implementation does. The kernel takes no reply to NOTIFY_REPLY, and
   sends it under the unique number that the server picked for NOTIFY_RETRIEVE, so the reply
   could end another request. `handle_message()` returns the error instead.
+- [359](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/359): Dropping a `SyncFuseServing` or `AsyncFuseServing` while files on the mount are
+  open ends the connection through fusectl once the workers have replied to the requests they
+  took, and requests on those files fail with `ENOTCONN`. A child process that inherited a
+  `/dev/fuse` fd kept the connection up after the workers stopped, and an exec that closed a file
+  on the mount before that fd hung the child for good in `fuse_flush()`. With blocking channels
+  or the tokio-uring runtime, the drop no longer waits until the files are closed. Without
+  fusectl, the drop behaves as before.
 - [NNN](link): With `allow_direct_io` off, a create with O_DIRECT no longer opens the new host
   file with O_DIRECT, which made buffered IO on it fail with EINVAL. `PassthroughFs::create()`
   now builds the host open flags with the same helper as `open_inode()`.
