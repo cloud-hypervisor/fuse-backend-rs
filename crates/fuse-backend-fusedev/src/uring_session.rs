@@ -53,7 +53,9 @@ use fuse_backend_core::file_buf::FileVolatileSlice;
 use fuse_backend_core::file_traits::FileReadWriteVolatile;
 #[cfg(feature = "async-io")]
 use fuse_backend_core::{
-    api::filesystem::AsyncFileSystem, async_runtime::Runtime, file_buf::FileVolatileBuf,
+    api::filesystem::AsyncFileSystem,
+    async_runtime::{self, Runtime},
+    file_buf::FileVolatileBuf,
     file_traits::AsyncFileReadWriteVolatile,
 };
 #[cfg(feature = "async-io")]
@@ -2022,7 +2024,8 @@ impl<F: AsyncFileSystem + Send + Sync + 'static> UringWorker<F> {
     /// The ring fd is readable while completions are queued, so the loop
     /// sleeps in the runtime until a completion or a request future is
     /// ready. It commits all requests that are done by then and submits
-    /// the commits in one `io_uring_enter()`.
+    /// the commits in one `io_uring_enter()`. It lets the runtime park every
+    /// `PARK_AFTER_REQUESTS` requests.
     ///
     /// Tearing the connection down fails the commands of the armed entries,
     /// which stops the loop. While no entry is armed, no command can fail,
@@ -2039,6 +2042,8 @@ impl<F: AsyncFileSystem + Send + Sync + 'static> UringWorker<F> {
         let fd = self.fd.as_raw_fd();
         let server = &*self.server;
         let mut inflight = FuturesUnordered::new();
+        // The requests taken since the last park().
+        let mut taken = 0;
 
         let result = 'serve: loop {
             completions.receive(ring);
@@ -2059,11 +2064,16 @@ impl<F: AsyncFileSystem + Send + Sync + 'static> UringWorker<F> {
                     let caught = settle(&mut entry, served);
                     (idx, entry, caught)
                 });
+                taken += 1;
             }
             if !ring.submission().is_empty() {
                 if let Err(e) = submit(ring) {
                     break 'serve Err(e);
                 }
+            }
+            if taken >= PARK_AFTER_REQUESTS {
+                taken = 0;
+                async_runtime::park().await;
             }
 
             tokio::select! {
@@ -2140,6 +2150,17 @@ impl<F: AsyncFileSystem + Send + Sync + 'static> UringWorker<F> {
         result
     }
 }
+
+/// How many requests an async worker takes before it lets its runtime park
+/// with `async_runtime::park()`, whose doc says why that matters.
+///
+/// While requests keep coming, the worker finds them on its ring without
+/// waiting, and its runtime never parks. A return to the runtime isn't
+/// enough, because a runtime with a task to run or a woken `block_on()`
+/// future polls its driver without parking. So unlike `PARK_AFTER_READS` of
+/// `FuseDevTask`, the count doesn't restart when the worker waited.
+#[cfg(feature = "async-io")]
+const PARK_AFTER_REQUESTS: usize = 64;
 
 /// How long a stopping async worker waits for its handlers to finish.
 #[cfg(feature = "async-io")]
@@ -3181,7 +3202,7 @@ mod tests {
         use fuse_backend_core::abi::fuse_abi::{stat64, FsOptions, ROOT_ID};
         use fuse_backend_core::api::filesystem::{AsyncFileSystem, Context, Entry, FileSystem};
 
-        fn stat(inode: u64) -> stat64 {
+        pub(super) fn stat(inode: u64) -> stat64 {
             // Safe because stat64 is plain data.
             let mut st: stat64 = unsafe { std::mem::zeroed() };
             st.st_ino = inode;
@@ -3282,6 +3303,125 @@ mod tests {
             assert_eq!(rx.recv_timeout(Duration::from_secs(10)), Ok(Ok(())));
         }
         drop(serving);
+    }
+
+    #[cfg(feature = "async-io")]
+    mod slow_lookup_fs {
+        /// A root directory whose attributes don't stay cached, so each stat
+        /// is a request. Every lookup fails. A lookup of `slow` first waits
+        /// for a 1 ms tokio timer and opens `/dev/null`, which tokio-uring
+        /// does with io_uring.
+        pub(super) struct SlowLookupFs;
+
+        use std::ffi::CStr;
+        use std::io;
+        use std::time::Duration;
+
+        use async_trait::async_trait;
+        use fuse_backend_core::abi::fuse_abi::stat64;
+        use fuse_backend_core::api::filesystem::{AsyncFileSystem, Context, Entry, FileSystem};
+        use fuse_backend_core::async_file::File as AsyncFile;
+        use fuse_backend_core::async_runtime;
+
+        impl FileSystem for SlowLookupFs {
+            type Inode = u64;
+            type Handle = u64;
+
+            fn getattr(
+                &self,
+                _ctx: &Context,
+                inode: u64,
+                _handle: Option<u64>,
+            ) -> io::Result<(stat64, Duration)> {
+                Ok((super::barrier_fs::stat(inode), Duration::ZERO))
+            }
+        }
+
+        #[async_trait]
+        impl AsyncFileSystem for SlowLookupFs {
+            async fn async_lookup(
+                &self,
+                _ctx: &Context,
+                _parent: u64,
+                name: &CStr,
+            ) -> io::Result<Entry> {
+                if name.to_bytes() == b"slow" {
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                    // A tokio-uring file isn't Send, and the future of a
+                    // handler must be, so the open runs in a task.
+                    async_runtime::spawn(async {
+                        AsyncFile::async_open("/dev/null", false, false)
+                            .await
+                            .map(drop)
+                    })
+                    .await
+                    .unwrap()?;
+                }
+                Err(io::Error::from_raw_os_error(libc::ENOENT))
+            }
+        }
+    }
+
+    /// A worker that keeps finding requests still lets its runtime park, so
+    /// handlers that wait for a timer or for tokio-uring IO finish.
+    #[cfg(feature = "async-io")]
+    #[test]
+    fn test_uring_async_serving_busy_worker_lets_runtime_park() {
+        let mnt = TempDir::new().unwrap();
+        let cfg = UringConfig {
+            workers: 1,
+            ..Default::default()
+        };
+        let Some(serving) = mount_uring(
+            Arc::new(Server::new(slow_lookup_fs::SlowLookupFs)),
+            mnt.as_path(),
+            cfg,
+            UringFuseServing::new_async,
+        ) else {
+            return;
+        };
+
+        // Stats of the root keep the worker finding requests. The kernel
+        // runs lookups in one directory one at a time, but not GETATTR.
+        let stop = Arc::new(AtomicBool::new(false));
+        let load: Vec<_> = (0..16)
+            .map(|_| {
+                let dir = mnt.as_path().to_path_buf();
+                let stop = stop.clone();
+                thread::spawn(move || {
+                    while !stop.load(Ordering::Relaxed) {
+                        std::fs::metadata(&dir).unwrap();
+                    }
+                })
+            })
+            .collect();
+        thread::sleep(Duration::from_millis(100));
+
+        let (tx, rx) = channel();
+        let slow = mnt.as_path().join("slow");
+        let probe = thread::spawn(move || {
+            let start = Instant::now();
+            for _ in 0..20 {
+                assert!(std::fs::metadata(&slow).is_err());
+            }
+            let _ = tx.send(start.elapsed());
+        });
+        let took = rx.recv_timeout(Duration::from_secs(10));
+        // An idle worker parks, which lets a stalled probe finish.
+        stop.store(true, Ordering::Relaxed);
+        for t in load {
+            t.join().unwrap();
+        }
+        probe.join().unwrap();
+        drop(serving);
+
+        let took = took.expect("20 lookups that wait for the runtime took over 10s under load");
+        eprintln!("20 lookups took {:?} under load", took);
+        assert!(
+            took < Duration::from_secs(2),
+            "20 lookups that wait for the runtime took {:?} under load",
+            took
+        );
     }
 
     /// A worker over PassthroughFs, for exercising process() without a
