@@ -6,7 +6,9 @@ edition = "2021"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-fuse-backend-rs = { path = "../../", features = ["fusedev"] }
+# async-io and fusedev-uring bring the serving layers of --serving. The
+# daemon's own service threads don't use them.
+fuse-backend-rs = { path = "../../", features = ["fusedev", "fusedev-uring", "async-io"] }
 log = ">=0.4.6"
 libc = ">=0.2.68"
 simple_logger = ">=1.13.0"

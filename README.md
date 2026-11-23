@@ -154,6 +154,23 @@ impl FuseServer {
 }
 ```
 
+## Testing
+
+`tests/scripts/xfstests_pathr.sh` runs [xfstests](https://git.kernel.org/pub/scm/fs/xfs/xfstests-dev.git)
+as root against the passthrough test daemon in `tests/passthrough`. Its first
+argument picks one of the daemon configurations listed in the script's header,
+and the rest go to xfstests' `check`:
+
+```sh
+cargo build --release -p passthrough
+sudo install -t /usr/sbin/ -m 700 target/release/passthrough
+sudo tests/scripts/xfstests_pathr.sh async-tokio generic/001
+```
+
+On Debian and Ubuntu the script builds xfstests in `/tmp/xfstests-dev`.
+Elsewhere, set `XFSTESTS_CHECK` to an installed xfstests `check`, such as
+nixpkgs' `xfstests-check`.
+
 ## License
 This project is licensed under
 - [Apache License](http://www.apache.org/licenses/LICENSE-2.0), Version 2.0
