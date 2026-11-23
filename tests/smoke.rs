@@ -11,7 +11,7 @@ mod example;
 
 #[cfg(all(feature = "fusedev", target_os = "linux"))]
 mod fusedev_tests {
-    use std::ffi::CString;
+    use std::ffi::{CStr, CString};
     use std::fs::File;
     use std::io::Result;
     use std::num::NonZeroUsize;
@@ -24,12 +24,17 @@ mod fusedev_tests {
     use std::process::Command;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
+    use std::time::Duration;
 
-    use fuse_backend_rs::abi::fuse_abi::{InHeader, Opcode, OutHeader};
+    use fuse_backend_rs::abi::fuse_abi::{
+        stat64, InHeader, Opcode, OutHeader, SetattrValid, ROOT_ID,
+    };
+    use fuse_backend_rs::api::filesystem::{Context, Entry, FileSystem};
     use fuse_backend_rs::api::server::{MetricsHook, Server};
-    use fuse_backend_rs::api::{Vfs, VfsOptions};
+    use fuse_backend_rs::api::{BackendFileSystem, Vfs, VfsOptions};
     use fuse_backend_rs::passthrough::{Config, PassthroughFs};
     use fuse_backend_rs::transport::FuseSession;
+    use nix::errno::Errno;
     use nix::mount::MsFlags;
     use nix::sys::mman::{mmap, munmap, MapFlags, ProtFlags};
     use vmm_sys_util::tempdir::TempDir;
@@ -473,6 +478,180 @@ mod fusedev_tests {
         assert_eq!(std::fs::read(src_b.as_path().join("copy"))?, data);
         assert_eq!(std::fs::read(src_a.as_path().join("copy"))?, data);
         assert_eq!(requests.0.load(Ordering::Relaxed), 2);
+        Ok(())
+    }
+
+    /// A file system with one empty file, "file", and the trait's ENOSYS for FALLOCATE, FSYNC
+    /// and the xattr requests.
+    struct OneFileFs;
+
+    impl OneFileFs {
+        fn entry(&self, inode: u64) -> Result<Entry> {
+            let (attr, timeout) = self.getattr(&Context::default(), inode, None)?;
+            Ok(Entry {
+                inode,
+                generation: 0,
+                attr,
+                attr_flags: 0,
+                attr_timeout: timeout,
+                entry_timeout: timeout,
+            })
+        }
+    }
+
+    impl FileSystem for OneFileFs {
+        type Inode = u64;
+        type Handle = u64;
+
+        fn lookup(&self, _ctx: &Context, parent: u64, name: &CStr) -> Result<Entry> {
+            if parent != ROOT_ID || name.to_bytes() != b"file" {
+                return Err(std::io::Error::from_raw_os_error(libc::ENOENT));
+            }
+            self.entry(2)
+        }
+
+        fn getattr(
+            &self,
+            _ctx: &Context,
+            inode: u64,
+            _: Option<u64>,
+        ) -> Result<(stat64, Duration)> {
+            // SAFETY: stat64 is plain data.
+            let mut st: stat64 = unsafe { std::mem::zeroed() };
+            st.st_ino = inode;
+            st.st_nlink = 1;
+            st.st_mode = match inode {
+                ROOT_ID => libc::S_IFDIR | 0o755,
+                _ => libc::S_IFREG | 0o644,
+            };
+            Ok((st, Duration::from_secs(1)))
+        }
+
+        // With the writeback cache, fsync() sends the file's times first.
+        fn setattr(
+            &self,
+            ctx: &Context,
+            inode: u64,
+            _attr: stat64,
+            handle: Option<u64>,
+            _valid: SetattrValid,
+        ) -> Result<(stat64, Duration)> {
+            self.getattr(ctx, inode, handle)
+        }
+    }
+
+    #[cfg(feature = "async-io")]
+    impl fuse_backend_rs::api::filesystem::AsyncFileSystem for OneFileFs {}
+
+    impl BackendFileSystem for OneFileFs {
+        fn mount(&self) -> Result<(Entry, u64)> {
+            Ok((self.entry(ROOT_ID)?, 2))
+        }
+
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
+    /// Counts the FSYNC requests the server gets.
+    #[derive(Default)]
+    struct FsyncRequests(AtomicUsize);
+
+    impl MetricsHook for FsyncRequests {
+        fn collect(&self, ih: &InHeader) {
+            if ih.opcode == Opcode::Fsync as u32 {
+                self.0.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+
+        fn release(&self, _oh: Option<&OutHeader>) {}
+    }
+
+    /// Allocates 4096 bytes in the file at `path` and syncs it, then sets the xattr "user.test"
+    /// on it and reads it back.
+    fn allocate_sync_and_xattr(
+        path: &Path,
+    ) -> (nix::Result<()>, nix::Result<()>, nix::Result<Vec<u8>>) {
+        use nix::fcntl::{fallocate, FallocateFlags};
+
+        let file = File::options().read(true).write(true).open(path).unwrap();
+        let allocate = fallocate(&file, FallocateFlags::empty(), 0, 4096);
+        let sync = nix::unistd::fsync(&file);
+        let path = CString::new(path.as_os_str().as_bytes()).unwrap();
+        let name = CString::new("user.test").unwrap();
+        let mut value = [0u8; 16];
+        // SAFETY: both strings end in NUL, and the value buffers are as long as given.
+        let xattr = Errno::result(unsafe {
+            libc::setxattr(path.as_ptr(), name.as_ptr(), b"v".as_ptr().cast(), 1, 0)
+        })
+        .and_then(|_| {
+            // SAFETY: as above.
+            Errno::result(unsafe {
+                libc::getxattr(path.as_ptr(), name.as_ptr(), value.as_mut_ptr().cast(), 16)
+            })
+        })
+        .map(|len| value[..len as usize].to_vec());
+        (allocate, sync, xattr)
+    }
+
+    #[test]
+    #[ignore] // it depends on privileged mode to pass through /dev/fuse
+    fn integration_test_vfs_enosys_per_mount() -> Result<()> {
+        // A Vfs with a file system that lacks fallocate(), fsync() and xattrs at /a, and a
+        // PassthroughFs with xattrs at /b. Asking /a first must not turn these requests off
+        // for /b: on ENOSYS the kernel stops sending them on the connection.
+        if !running_as_root() {
+            eprintln!("skipping integration_test_vfs_enosys_per_mount: not running as root");
+            return Ok(());
+        }
+
+        let src = TempDir::new().unwrap();
+        let mnt_dir = TempDir::new().unwrap();
+        File::create(src.as_path().join("file"))?;
+
+        let vfs = Vfs::new(VfsOptions {
+            no_open: false,
+            ..Default::default()
+        });
+        vfs.mount(Box::new(OneFileFs), "/a").unwrap();
+        let fs = PassthroughFs::<()>::new(Config {
+            root_dir: src.as_path().to_str().unwrap().to_string(),
+            do_import: false,
+            xattr: true,
+            ..Default::default()
+        })
+        .unwrap();
+        fs.import().unwrap();
+        vfs.mount(Box::new(fs), "/b").unwrap();
+        let server = Server::new(vfs);
+        let requests = Arc::new(FsyncRequests::default());
+        let hook = requests.clone();
+
+        let mut se = FuseSession::new(mnt_dir.as_path(), "vfs_enosys", "", false).unwrap();
+        se.mount().unwrap();
+        let mut ch = se.new_channel().unwrap();
+        let handle = std::thread::spawn(move || {
+            while let Ok(Some((reader, writer))) = ch.get_request() {
+                // Serve until the kernel ends the connection. A command that another test forks
+                // can inherit a file here and FLUSH it at exec, after this test is done.
+                if let Err(e) = server.handle_message(reader, writer, None, Some(&*hook)) {
+                    eprintln!("request failed: {e}");
+                }
+            }
+        });
+
+        let mnt = mnt_dir.as_path();
+        let a = allocate_sync_and_xattr(&mnt.join("a/file"));
+        let b = allocate_sync_and_xattr(&mnt.join("b/file"));
+        se.umount().unwrap();
+        handle.join().unwrap();
+
+        // /a gets the answers the kernel gives after ENOSYS, and /b still gets its requests.
+        let unsupported = Errno::EOPNOTSUPP;
+        assert_eq!(a, (Err(unsupported), Ok(()), Err(unsupported)));
+        let fsyncs = requests.0.load(Ordering::Relaxed);
+        assert_eq!((b, fsyncs), ((Ok(()), Ok(()), Ok(b"v".to_vec())), 2));
+        assert_eq!(src.as_path().join("file").metadata()?.len(), 4096);
         Ok(())
     }
 }

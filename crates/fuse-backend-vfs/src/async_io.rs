@@ -5,7 +5,7 @@ use std::io;
 
 use async_trait::async_trait;
 
-use super::sync_io::copy_file_range_error;
+use super::sync_io::{copy_file_range_error, getxattr_result, link_result, rename_result};
 use super::*;
 
 #[async_trait]
@@ -176,10 +176,10 @@ impl AsyncFileSystem for Vfs {
         datasync: bool,
         handle: <Self as FileSystem>::Handle,
     ) -> Result<()> {
-        match self.get_real_rootfs(inode)? {
+        ok_for_enosys(match self.get_real_rootfs(inode)? {
             (Left(fs), idata) => fs.fsync(ctx, idata.ino(), datasync, handle),
             (Right(fs), idata) => fs.async_fsync(ctx, idata.ino(), datasync, handle).await,
-        }
+        })
     }
 
     async fn async_fallocate(
@@ -191,13 +191,14 @@ impl AsyncFileSystem for Vfs {
         offset: u64,
         length: u64,
     ) -> Result<()> {
-        match self.get_real_rootfs(inode)? {
+        let result = match self.get_real_rootfs(inode)? {
             (Left(fs), idata) => fs.fallocate(ctx, idata.ino(), handle, mode, offset, length),
             (Right(fs), idata) => {
                 fs.async_fallocate(ctx, idata.ino(), handle, mode, offset, length)
                     .await
             }
-        }
+        };
+        errno_for_enosys(result, UNSUPPORTED)
     }
 
     async fn async_opendir(
@@ -284,10 +285,10 @@ impl AsyncFileSystem for Vfs {
         datasync: bool,
         handle: <Self as FileSystem>::Handle,
     ) -> Result<()> {
-        match self.get_real_rootfs(inode)? {
+        ok_for_enosys(match self.get_real_rootfs(inode)? {
             (Left(fs), idata) => fs.fsyncdir(ctx, idata.ino(), datasync, handle),
             (Right(fs), idata) => fs.async_fsyncdir(ctx, idata.ino(), datasync, handle).await,
-        }
+        })
     }
 
     async fn async_releasedir(
@@ -405,7 +406,7 @@ impl AsyncFileSystem for Vfs {
 
         let (root, idata_old, idata_new) = self.get_real_rootfs_pair(olddir, newdir)?;
 
-        match root {
+        let result = match root {
             Left(fs) => fs.rename(
                 ctx,
                 idata_old.ino(),
@@ -425,7 +426,8 @@ impl AsyncFileSystem for Vfs {
                 )
                 .await
             }
-        }
+        };
+        rename_result(result, flags)
     }
 
     async fn async_link(
@@ -439,13 +441,14 @@ impl AsyncFileSystem for Vfs {
 
         let (root, idata_old, idata_new) = self.get_real_rootfs_pair(inode, newparent)?;
 
-        match root {
+        let result = match root {
             Left(fs) => fs.link(ctx, idata_old.ino(), idata_new.ino(), newname),
             Right(fs) => fs
                 .async_link(ctx, idata_old.ino(), idata_new.ino(), newname)
                 .await
                 .and_then(|e| self.convert_backend_entry(idata_new, e)),
-        }
+        };
+        link_result(result)
     }
 
     async fn async_statfs(&self, ctx: &Context, inode: VfsInode) -> Result<statvfs64> {
@@ -499,13 +502,14 @@ impl AsyncFileSystem for Vfs {
         value: &[u8],
         flags: u32,
     ) -> Result<()> {
-        match self.get_real_rootfs(inode)? {
+        let result = match self.get_real_rootfs(inode)? {
             (Left(fs), idata) => fs.setxattr(ctx, idata.ino(), name, value, flags),
             (Right(fs), idata) => {
                 fs.async_setxattr(ctx, idata.ino(), name, value, flags)
                     .await
             }
-        }
+        };
+        errno_for_enosys(result, UNSUPPORTED)
     }
 
     async fn async_getxattr(
@@ -515,10 +519,11 @@ impl AsyncFileSystem for Vfs {
         name: &CStr,
         size: u32,
     ) -> Result<GetxattrReply> {
-        match self.get_real_rootfs(inode)? {
+        let result = match self.get_real_rootfs(inode)? {
             (Left(fs), idata) => fs.getxattr(ctx, idata.ino(), name, size),
             (Right(fs), idata) => fs.async_getxattr(ctx, idata.ino(), name, size).await,
-        }
+        };
+        getxattr_result(result, name)
     }
 
     async fn async_listxattr(
@@ -527,17 +532,19 @@ impl AsyncFileSystem for Vfs {
         inode: VfsInode,
         size: u32,
     ) -> Result<ListxattrReply> {
-        match self.get_real_rootfs(inode)? {
+        let result = match self.get_real_rootfs(inode)? {
             (Left(fs), idata) => fs.listxattr(ctx, idata.ino(), size),
             (Right(fs), idata) => fs.async_listxattr(ctx, idata.ino(), size).await,
-        }
+        };
+        errno_for_enosys(result, UNSUPPORTED)
     }
 
     async fn async_removexattr(&self, ctx: &Context, inode: VfsInode, name: &CStr) -> Result<()> {
-        match self.get_real_rootfs(inode)? {
+        let result = match self.get_real_rootfs(inode)? {
             (Left(fs), idata) => fs.removexattr(ctx, idata.ino(), name),
             (Right(fs), idata) => fs.async_removexattr(ctx, idata.ino(), name).await,
-        }
+        };
+        errno_for_enosys(result, UNSUPPORTED)
     }
 
     async fn async_flush(
@@ -547,17 +554,18 @@ impl AsyncFileSystem for Vfs {
         handle: u64,
         lock_owner: u64,
     ) -> Result<()> {
-        match self.get_real_rootfs(inode)? {
+        let result = match self.get_real_rootfs(inode)? {
             (Left(fs), idata) => fs.flush(ctx, idata.ino(), handle, lock_owner),
             (Right(fs), idata) => fs.async_flush(ctx, idata.ino(), handle, lock_owner).await,
-        }
+        };
+        self.flush_result(result)
     }
 
     async fn async_access(&self, ctx: &Context, inode: VfsInode, mask: u32) -> Result<()> {
-        match self.get_real_rootfs(inode)? {
+        ok_for_enosys(match self.get_real_rootfs(inode)? {
             (Left(fs), idata) => fs.access(ctx, idata.ino(), mask),
             (Right(fs), idata) => fs.async_access(ctx, idata.ino(), mask).await,
-        }
+        })
     }
 
     // Like `copy_file_range()`.
@@ -947,12 +955,12 @@ mod tests {
         handle.await.unwrap();
     }
 
+    fn raw_errno<T>(result: Result<T>) -> Option<i32> {
+        result.err().and_then(|e| e.raw_os_error())
+    }
+
     #[tokio::test]
     async fn test_vfs_async_xattr_name_with_slash() {
-        fn errno<T>(res: Result<T>) -> Option<i32> {
-            res.err().and_then(|e| e.raw_os_error())
-        }
-
         let vfs = Vfs::new(VfsOptions::default());
         vfs.mount(Box::new(FakeFileSystemOne {}), "/x").unwrap();
         let ctx = Context::new();
@@ -961,15 +969,15 @@ mod tests {
         let inode = x.unwrap().inode.into();
 
         // Linux allows '/' in xattr names, so the requests reach the file system, whose
-        // default handlers answer ENOSYS.
+        // default handlers answer ENOSYS. Vfs turns that into ENOTSUP.
         let name = CString::new("user.a/b").unwrap();
         let set = vfs.async_setxattr(&ctx, inode, &name, b"v", 0).await;
         let get = vfs.async_getxattr(&ctx, inode, &name, 0).await;
         let remove = vfs.async_removexattr(&ctx, inode, &name).await;
-        let enosys = Some(libc::ENOSYS);
-        assert_eq!(errno(set), enosys);
-        assert_eq!(errno(get), enosys);
-        assert_eq!(errno(remove), enosys);
+        let unsupported = Some(UNSUPPORTED);
+        assert_eq!(raw_errno(set), unsupported);
+        assert_eq!(raw_errno(get), unsupported);
+        assert_eq!(raw_errno(remove), unsupported);
     }
 
     #[tokio::test]
@@ -1043,6 +1051,76 @@ mod tests {
         fn commit(&mut self, _other: Option<&Self>) -> io::Result<usize> {
             Ok(0)
         }
+    }
+
+    /// The async handlers answer a mount's ENOSYS like the sync ones.
+    #[tokio::test]
+    async fn test_vfs_async_enosys_per_mount() {
+        let vfs = Vfs::new(VfsOptions {
+            no_open: false,
+            ..Default::default()
+        });
+        // FakeFileSystemOne answers ENOSYS.
+        let idx = vfs.mount(Box::new(FakeFileSystemOne {}), "/x/y").unwrap();
+        let ctx = Context::default();
+        let (a, b) = (CString::new("a").unwrap(), CString::new("b").unwrap());
+        #[cfg(target_os = "linux")]
+        let acl = CString::new("system.posix_acl_access").unwrap();
+
+        // The root and /x, inode 2, are pseudo fs directories.
+        for inode in [VfsInode::new(idx, 5), ROOT_ID.into(), 2.into()] {
+            let errnos = [
+                raw_errno(vfs.async_fallocate(&ctx, inode, 0, 0, 0, 4096).await),
+                raw_errno(vfs.async_setxattr(&ctx, inode, &a, b"v", 0).await),
+                raw_errno(vfs.async_getxattr(&ctx, inode, &a, 0).await),
+                raw_errno(vfs.async_listxattr(&ctx, inode, 0).await),
+                raw_errno(vfs.async_removexattr(&ctx, inode, &a).await),
+            ];
+            assert_eq!(errnos, [Some(UNSUPPORTED); 5]);
+            #[cfg(target_os = "linux")]
+            assert_eq!(
+                raw_errno(vfs.async_getxattr(&ctx, inode, &acl, 0).await),
+                Some(libc::ENODATA)
+            );
+
+            vfs.async_flush(&ctx, inode, 0, 0).await.unwrap();
+            vfs.async_fsync(&ctx, inode, false, 0).await.unwrap();
+            vfs.async_fsyncdir(&ctx, inode, false, 0).await.unwrap();
+            vfs.async_access(&ctx, inode, libc::R_OK as u32)
+                .await
+                .unwrap();
+
+            // Only Linux turns LINK and RENAME2 off.
+            let (eperm, einval) = if cfg!(target_os = "linux") {
+                (libc::EPERM, libc::EINVAL)
+            } else {
+                (libc::ENOSYS, libc::ENOSYS)
+            };
+            let link = vfs.async_link(&ctx, inode, inode, &b).await;
+            assert_eq!(raw_errno(link), Some(eperm));
+            let rename = vfs
+                .async_rename(&ctx, inode, &a, inode, &b, RENAME_NOREPLACE)
+                .await;
+            assert_eq!(raw_errno(rename), Some(einval));
+            // The kernel turns nothing off for a RENAME without flags.
+            let rename = vfs.async_rename(&ctx, inode, &a, inode, &b, 0).await;
+            assert_eq!(raw_errno(rename), Some(libc::ENOSYS));
+        }
+
+        // The pseudo fs can't create files. A mount's ENOSYS for CREATE still goes to the kernel.
+        let args = CreateIn::default();
+        let create = vfs.async_create(&ctx, ROOT_ID.into(), &a, args).await;
+        assert_eq!(raw_errno(create), Some(libc::EACCES));
+        let create = vfs
+            .async_create(&ctx, VfsInode::new(idx, 1), &a, args)
+            .await;
+        assert_eq!(raw_errno(create), Some(libc::ENOSYS));
+
+        // With no_open, FLUSH's ENOSYS goes to the kernel.
+        let vfs = Vfs::default();
+        let idx = vfs.mount(Box::new(FakeFileSystemOne {}), "/x").unwrap();
+        let flush = vfs.async_flush(&ctx, VfsInode::new(idx, 5), 0, 0).await;
+        assert_eq!(raw_errno(flush), Some(libc::ENOSYS));
     }
 
     // Relocated from core's `api::server::async_io` unit tests. It exercises the
