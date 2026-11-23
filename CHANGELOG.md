@@ -218,6 +218,23 @@
   only READDIR and READDIRPLUS still run on the runtime thread. A MKDIR, MKNOD, SYMLINK, LINK or
   OPENDIR that is dropped while a pool thread serves it gives back the lookup count or handle it
   took.
+- [317](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/317): `UringWriter` implements the asynchronous `Writer` methods, so the async server can reply
+  through the FUSE-over-io_uring transport.
+- [317](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/317): `UringFuseServing::new_async()` serves FUSE-over-io_uring with the `AsyncFileSystem` handlers.
+  Each worker runs an async runtime and keeps up to one request per ring entry in flight, so
+  handlers that wait don't hold up the worker's other requests.
+  Its queues get `entries_per_queue` pool buffers, because a request keeps its buffer
+  while its handler waits. A worker lets its runtime park every 64 requests, so the timers and
+  tokio-uring IO that handlers wait for still run while requests keep coming.
+- [318](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/318): `UringFuseServing::new_async()` serves zero-copy too. `ZeroCopySource::async_write_to_file()`
+  and `AsyncFileReadWriteVolatile::raw_fd()` let `Reader::async_read_to_at()` move zero-copy
+  data, and the fixed-buffer operations of a request run on the worker's ring while its other
+  requests go on. Copies through memory, for files without a descriptor, still block the worker.
+- [319](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/319): A `StopSignal` sets the stop flag of `FuseDevTask`s and wakes the ones that wait for a request
+  on the tokio runtime. `FuseDevTask::new()` takes one in place of the `Arc<AtomicBool>`, which
+  still works and makes an idle task check the flag every 100ms. `AsyncFuseServing` and the
+  `/dev/fuse` thread of `UringFuseServing::new_async()` stop with a signal, so their idle tasks
+  no longer wake 10 times a second.
 
 ### Changed
 - [325](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/325): The `fuse-backend-fusedev` `uring` transport uses io-uring 0.6 instead of 0.5,
@@ -295,6 +312,8 @@
   and reads from 8 CPUs whose queues each had a worker of their own got 11 to 17% slower.
   `UringConfig::workers` can exceed the number of queues, up to `entries_per_queue` times that,
   and an `entries_per_queue` of 0 counts as 1.
+- [317](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/317): A `UringFuseServing` ring entry without a buffer pool allocates about a third of the memory it
+  used to. It kept two scratch regions the size of its payload area, but used 168 bytes of one.
 - [254](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/254): `fuse-backend-rs` is now a thin facade re-exporting the sub-crates. Every
   historical `fuse_backend_rs::{abi, api, buffer, common, transport, passthrough,
   overlayfs}` import path and cargo feature name (`fusedev`, `virtiofs`,
@@ -418,6 +437,11 @@
   them all back, and leaks them if that takes more than a second. A worker that stopped on an
   error while the connection was up freed entries the kernel could still copy requests into. A
   signal that interrupts the worker's `io_uring_enter()` calls no longer stops it.
+- [319](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/319): Dropping a `UringFuseServing` whose mount is busy no longer hangs until the files in the mount
+  close. The unmount leaves such a connection up, and the workers kept waiting for requests. Now
+  the stop signal wakes them through a poll on their rings. Once they have served the requests
+  they took, the last one ends the connection, as closing `/dev/fuse` ends a classic one. An
+  async worker whose entries all wait on handlers no longer checks its stop flag every 100ms.
 - `UringWriter::write_from_at()` fails when the data doesn't fit into the reply body. It counted
   free space in the header slot too, and could read file data past the end of the body.
 - [278](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/278): Treat `EOPNOTSUPP`/`ENOTSUP` and `ENOSYS` from `getxattr` as "not opaque"
