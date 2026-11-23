@@ -8,10 +8,12 @@
 //! sequentially. A FUSE session is a connection from a FUSE mountpoint to a FUSE server daemon.
 //! A FUSE session can have multiple FUSE channels so that FUSE requests are handled in parallel.
 
+use std::ffi::{CStr, CString};
 use std::fs::{File, OpenOptions};
 use std::io;
 use std::ops::Deref;
-use std::os::fd::AsFd;
+use std::os::fd::{AsFd, FromRawFd, OwnedFd};
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::os::unix::net::UnixStream;
@@ -21,12 +23,15 @@ use std::sync::{Arc, Mutex, PoisonError};
 use crate::splice::SplicePipes;
 use crate::{FuseChannelExt, FuseDevReaderExt, FuseSessionExt};
 use fuse_backend_core::abi::fuse_abi::BackingMap;
+use libc::c_uint;
 use mio::{Events, Poll, Token, Waker};
 use nix::errno::Errno;
 use nix::fcntl::{fcntl, FcntlArg, FdFlag, OFlag};
 use nix::mount::{mount, umount2, MntFlags, MsFlags};
 use nix::poll::{poll, PollFd, PollFlags, PollTimeout};
+use nix::sched::{setns, unshare, CloneFlags};
 use nix::sys::epoll::{EpollEvent, EpollFlags};
+use nix::sys::stat::Mode;
 use nix::unistd::{getgid, getuid, read};
 
 use super::{
@@ -122,6 +127,10 @@ impl FuseSession {
 
     /// Set the target pid of mount namespace of the fuse session mount, the fuse will be mounted
     /// under the given mnt ns.
+    ///
+    /// A helper thread joins that namespace to mount and unmount there, so the calling thread
+    /// stays in its own. If that fails, for example without the privileges, the session runs
+    /// fusermount through nsenter.
     pub fn set_target_mntns(&mut self, pid: Option<libc::pid_t>) {
         self.target_mntns = pid;
     }
@@ -194,12 +203,7 @@ impl FuseSession {
             ))?
             .as_raw_fd();
 
-        let cloned_file = OpenOptions::new()
-            .create(false)
-            .read(true)
-            .write(true)
-            .open(FUSE_DEVICE)
-            .map_err(|e| SessionFailure(format!("open {FUSE_DEVICE}: {e}")))?;
+        let cloned_file = open_fuse_device()?;
 
         // define the function which invokes "ioctl FUSE_DEV_IOC_CLONE"
         // refer: https://github.com/torvalds/linux/blob/c42d9eeef8e5ba9292eda36fd8e3c11f35ee065c/include/uapi/linux/fuse.h#L1051-L1052
@@ -234,6 +238,11 @@ impl FuseSession {
     }
 
     /// Mount the fuse mountpoint, building connection with the in kernel fuse driver.
+    ///
+    /// On Linux 5.2 and later, it mounts through fsopen(2), fsmount(2) and move_mount(2). If that
+    /// fails, it uses mount(2). fusermount takes over where mount(2) fails with EPERM, or fails for
+    /// any reason in the namespace of `set_target_mntns()`. All of them mount with the same
+    /// options. With `auto_unmount`, it always runs fusermount.
     pub fn mount(&mut self) -> Result<()> {
         let mut flags = self
             .mount_flags
@@ -681,6 +690,15 @@ impl FuseChannelExt for BlockingFuseChannel {
     }
 }
 
+fn open_fuse_device() -> Result<File> {
+    OpenOptions::new()
+        .create(false)
+        .read(true)
+        .write(true)
+        .open(FUSE_DEVICE)
+        .map_err(|e| SessionFailure(format!("open {FUSE_DEVICE}: {e}")))
+}
+
 /// Mount a fuse file system
 #[allow(clippy::too_many_arguments)]
 fn fuse_kern_mount(
@@ -693,12 +711,6 @@ fn fuse_kern_mount(
     target_mntns: Option<libc::pid_t>,
     fusermount: &str,
 ) -> Result<(File, Option<UnixStream>)> {
-    let file = OpenOptions::new()
-        .create(false)
-        .read(true)
-        .write(true)
-        .open(FUSE_DEVICE)
-        .map_err(|e| SessionFailure(format!("open {FUSE_DEVICE}: {e}")))?;
     let meta = mountpoint
         .metadata()
         .map_err(|e| SessionFailure(format!("stat {mountpoint:?}: {e}")))?;
@@ -714,17 +726,46 @@ fn fuse_kern_mount(
     // to fill the response, so we don't need to do any adjustment.
     let max_read = FUSE_KERN_BUF_PAGES * pagesize() + FUSE_HEADER_SIZE;
 
-    let mut opts = format!(
-        "default_permissions,fd={},rootmode={:o},user_id={},group_id={},max_read={}",
-        file.as_raw_fd(),
-        meta.permissions().mode() & libc::S_IFMT,
-        getuid(),
-        getgid(),
-        max_read
-    );
-    if allow_other {
-        opts.push_str(",allow_other");
+    let mount_opts = |file: &File| {
+        let mut opts = format!(
+            "default_permissions,fd={},rootmode={:o},user_id={},group_id={},max_read={}",
+            file.as_raw_fd(),
+            meta.permissions().mode() & libc::S_IFMT,
+            getuid(),
+            getgid(),
+            max_read
+        );
+        if allow_other {
+            opts.push_str(",allow_other");
+        }
+        opts
+    };
+
+    let file = open_fuse_device()?;
+    let opts = mount_opts(&file);
+    // Only fusermount can auto_unmount. It unmounts once the session closes its socket.
+    if auto_unmount {
+        return fuse_fusermount_mount(
+            mountpoint,
+            fsname,
+            subtype,
+            opts,
+            flags,
+            auto_unmount,
+            target_mntns,
+            fusermount,
+        );
     }
+
+    match fuse_fsmount(mountpoint, fsname, subtype, &opts, flags, target_mntns) {
+        Ok(()) => return Ok((file, None)),
+        Err(e) => debug!("can't mount {mountpoint:?} with fsmount(), falling back: {e}"),
+    }
+
+    // The fd may belong to the failed mount's connection by now, so open another one.
+    drop(file);
+    let file = open_fuse_device()?;
+    let opts = mount_opts(&file);
     let mut fstype = String::from(FUSE_FSTYPE);
     if !subtype.is_empty() {
         fstype.push('.');
@@ -742,11 +783,20 @@ fn fuse_kern_mount(
         );
     }
 
-    // mount in another mntns requires mounting with fusermount, which is a new process, as
-    // multithreaded program is not allowed to join to another mntns, and the process running fuse
-    // session might be multithreaded.
-    if auto_unmount || target_mntns.is_some() {
-        fuse_fusermount_mount(
+    let mount2 = || {
+        mount(
+            Some(fsname),
+            mountpoint,
+            Some(fstype.deref()),
+            flags,
+            Some(opts.deref()),
+        )
+    };
+    match in_mntns(target_mntns, mount2) {
+        Ok(()) => Ok((file, None)),
+        // As before, fusermount mounts without the privileges for mount(2). In another mntns, it
+        // takes over on any error.
+        Err(e) if e == Errno::EPERM || target_mntns.is_some() => fuse_fusermount_mount(
             mountpoint,
             fsname,
             subtype,
@@ -755,31 +805,155 @@ fn fuse_kern_mount(
             auto_unmount,
             target_mntns,
             fusermount,
-        )
-    } else {
-        match mount(
-            Some(fsname),
-            mountpoint,
-            Some(fstype.deref()),
-            flags,
-            Some(opts.deref()),
-        ) {
-            Ok(()) => Ok((file, None)),
-            Err(Errno::EPERM) => fuse_fusermount_mount(
-                mountpoint,
-                fsname,
-                subtype,
-                opts,
-                flags,
-                auto_unmount,
-                target_mntns,
-                fusermount,
-            ),
-            Err(e) => Err(SessionFailure(format!(
-                "failed to mount {mountpoint:?}: {e}"
-            ))),
+        ),
+        Err(e) => Err(SessionFailure(format!(
+            "failed to mount {mountpoint:?}: {e}"
+        ))),
+    }
+}
+
+/// Take ownership of the fd that a syscall returned.
+fn owned_fd(ret: libc::c_long) -> nix::Result<OwnedFd> {
+    let fd = Errno::result(ret)?;
+    // SAFETY: the syscall returned a new fd, which nothing else owns.
+    Ok(unsafe { OwnedFd::from_raw_fd(fd as RawFd) })
+}
+
+/// Mount a fuse file system like mount(2) does with `flags` and `opts`, through fsopen(),
+/// fsconfig(), fsmount() and move_mount() of Linux 5.2 and later. With `target_mntns`, a helper
+/// thread moves the mount into that mount namespace. Fails with EINVAL for flags it can't set.
+fn fuse_fsmount(
+    mountpoint: &Path,
+    fsname: &str,
+    subtype: &str,
+    opts: &str,
+    flags: MsFlags,
+    target_mntns: Option<libc::pid_t>,
+) -> nix::Result<()> {
+    // From include/uapi/linux/mount.h, which libc covers only since 0.2.187.
+    const FSOPEN_CLOEXEC: c_uint = 0x1;
+    const FSCONFIG_SET_FLAG: c_uint = 0;
+    const FSCONFIG_SET_STRING: c_uint = 1;
+    const FSCONFIG_CMD_CREATE: c_uint = 6;
+    const FSMOUNT_CLOEXEC: c_uint = 0x1;
+    const MOVE_MOUNT_F_EMPTY_PATH: c_uint = 0x4;
+    const MOVE_MOUNT_T_SYMLINKS: c_uint = 0x10;
+    // mount(2) sets some of these flags on the superblock and the others on the mount. fsconfig()
+    // takes the superblock flags by these names, and fsmount() the mount flags as these
+    // MOUNT_ATTR_* bits. Both APIs default to relatime.
+    const FLAGS: [(MsFlags, Option<&str>, c_uint); 10] = [
+        (MsFlags::MS_RDONLY, Some("ro"), 0x1),
+        (MsFlags::MS_NOSUID, None, 0x2),
+        (MsFlags::MS_NODEV, None, 0x4),
+        (MsFlags::MS_NOEXEC, None, 0x8),
+        (MsFlags::MS_NOATIME, None, 0x10),
+        (MsFlags::MS_NODIRATIME, None, 0x80),
+        (MsFlags::MS_RELATIME, None, 0),
+        (MsFlags::MS_SYNCHRONOUS, Some("sync"), 0),
+        (MsFlags::MS_DIRSYNC, Some("dirsync"), 0),
+        (MsFlags::MS_LAZYTIME, Some("lazytime"), 0),
+    ];
+
+    let mut params = Vec::new();
+    let mut attrs = 0;
+    let mut unset = flags;
+    for (flag, key, attr) in FLAGS {
+        if flags.contains(flag) {
+            params.extend(key.map(|key| (key, None)));
+            attrs |= attr;
+            unset.remove(flag);
         }
     }
+    if !unset.is_empty() {
+        return Err(Errno::EINVAL);
+    }
+    // Pass the parameters in mount(2)'s order, and split `opts` the way the kernel splits
+    // mount(2)'s data.
+    if !subtype.is_empty() {
+        params.push(("subtype", Some(subtype)));
+    }
+    params.push(("source", Some(fsname)));
+    params.extend(opts.split(',').map(|opt| match opt.split_once('=') {
+        Some((key, value)) => (key, Some(value)),
+        None => (opt, None),
+    }));
+    let cstr = |s: &[u8]| CString::new(s).map_err(|_| Errno::EINVAL);
+    let target = cstr(mountpoint.as_os_str().as_bytes())?;
+
+    // SAFETY: the file system name is a C string.
+    let fs =
+        owned_fd(unsafe { libc::syscall(libc::SYS_fsopen, b"fuse\0".as_ptr(), FSOPEN_CLOEXEC) })?;
+    let fsconfig = |cmd: c_uint, key: Option<&CStr>, value: Option<&CStr>| {
+        let ptr = |s: Option<&CStr>| s.map_or(std::ptr::null(), CStr::as_ptr);
+        // SAFETY: the strings outlive the call.
+        Errno::result(unsafe {
+            libc::syscall(
+                libc::SYS_fsconfig,
+                fs.as_raw_fd(),
+                cmd,
+                ptr(key),
+                ptr(value),
+                0,
+            )
+        })
+    };
+    for (key, value) in params {
+        let value = value.map(|value| cstr(value.as_bytes())).transpose()?;
+        let cmd = match value {
+            Some(_) => FSCONFIG_SET_STRING,
+            None => FSCONFIG_SET_FLAG,
+        };
+        fsconfig(cmd, Some(&cstr(key.as_bytes())?), value.as_deref())?;
+    }
+    fsconfig(FSCONFIG_CMD_CREATE, None, None)?;
+    // SAFETY: the arguments are plain integers.
+    let mnt = owned_fd(unsafe {
+        libc::syscall(libc::SYS_fsmount, fs.as_raw_fd(), FSMOUNT_CLOEXEC, attrs)
+    })?;
+
+    // Follow a symlink at the mountpoint, like mount(2).
+    in_mntns(target_mntns, || {
+        // SAFETY: the paths are C strings that outlive the call.
+        Errno::result(unsafe {
+            libc::syscall(
+                libc::SYS_move_mount,
+                mnt.as_raw_fd(),
+                b"\0".as_ptr(),
+                libc::AT_FDCWD,
+                target.as_ptr(),
+                MOVE_MOUNT_F_EMPTY_PATH | MOVE_MOUNT_T_SYMLINKS,
+            )
+        })
+        .map(drop)
+    })
+}
+
+/// Run `f` on a new thread in the mount namespace of process `pid`, leaving the calling thread in
+/// its own. Without `pid`, run it on the calling thread.
+fn in_mntns<T: Send>(
+    pid: Option<libc::pid_t>,
+    f: impl FnOnce() -> nix::Result<T> + Send,
+) -> nix::Result<T> {
+    let Some(pid) = pid else {
+        return f();
+    };
+    let ns = nix::fcntl::open(
+        format!("/proc/{pid}/ns/mnt").as_str(),
+        OFlag::O_RDONLY | OFlag::O_CLOEXEC,
+        Mode::empty(),
+    )?;
+    std::thread::scope(|s| {
+        std::thread::Builder::new()
+            .spawn_scoped(s, || {
+                // setns() refuses a thread that shares its root and working directory.
+                unshare(CloneFlags::CLONE_FS)?;
+                setns(&ns, CloneFlags::CLONE_NEWNS)?;
+                f()
+            })
+            .map_err(|e| Errno::from_raw(e.raw_os_error().unwrap_or(libc::EAGAIN)))?
+            .join()
+            .unwrap_or_else(|e| std::panic::resume_unwind(e))
+    })
 }
 
 fn msflags_to_string(flags: MsFlags) -> String {
@@ -898,30 +1072,28 @@ fn fuse_kern_umount(
     fuse_lazy_umount(mountpoint, fusermount, target_mntns)
 }
 
-/// Detach a fuse file system from the mount tree. Fall back to fusermount if umount2() fails
-/// with EPERM.
-///
-/// umount2() acts in the caller's mount namespace. For a file system mounted in the namespace
-/// of `target_mntns`, nsenter and fusermount unmount it there, the way they mounted it.
+/// Detach a fuse file system from the mount tree, in the mount namespace of `target_mntns` if
+/// set. Fall back to fusermount if umount2() fails with EPERM, or fails for any reason in that
+/// namespace.
 fn fuse_lazy_umount(
     mountpoint: &Path,
     fusermount: &str,
     target_mntns: Option<libc::pid_t>,
 ) -> Result<()> {
-    if target_mntns.is_none() {
-        // Like fusermount, don't follow a symlink that replaced the mountpoint.
-        match umount2(mountpoint, MntFlags::MNT_DETACH | MntFlags::UMOUNT_NOFOLLOW) {
-            Ok(()) => return Ok(()),
-            Err(Errno::EPERM) => {}
-            Err(e) => {
-                return Err(SessionFailure(format!(
-                    "failed to umount {}: {e}",
-                    mountpoint.display()
-                )))
-            }
+    // Like fusermount, don't follow a symlink that replaced the mountpoint.
+    let umount = || umount2(mountpoint, MntFlags::MNT_DETACH | MntFlags::UMOUNT_NOFOLLOW);
+    match in_mntns(target_mntns, umount) {
+        Ok(()) => Ok(()),
+        // As before, fusermount unmounts without the privileges for umount2(). In another mntns,
+        // it takes over on any error.
+        Err(e) if e == Errno::EPERM || target_mntns.is_some() => {
+            fuse_fusermount_umount(mountpoint, fusermount, target_mntns)
         }
+        Err(e) => Err(SessionFailure(format!(
+            "failed to umount {}: {e}",
+            mountpoint.display()
+        ))),
     }
-    fuse_fusermount_umount(mountpoint, fusermount, target_mntns)
 }
 
 /// Build a fusermount command. With `target_mntns` set, it runs through nsenter in the mount
@@ -1092,6 +1264,193 @@ mod tests {
         // torn down; the timeout guards against a hang.
         assert_eq!(rx.recv_timeout(std::time::Duration::from_secs(5)), Ok(true));
         thread.join().unwrap();
+    }
+
+    /// Run `f` on a new thread on which `syscall` fails with `errno`.
+    fn without_syscall<T: Send>(
+        syscall: libc::c_long,
+        errno: Errno,
+        f: impl FnOnce() -> T + Send,
+    ) -> T {
+        let bpf = |code: u32, jf: u8, k: u32| libc::sock_filter {
+            code: code as u16,
+            jt: 0,
+            jf,
+            k,
+        };
+        let mut filter = [
+            // Load seccomp_data.nr.
+            bpf(libc::BPF_LD | libc::BPF_W | libc::BPF_ABS, 0, 0),
+            bpf(
+                libc::BPF_JMP | libc::BPF_JEQ | libc::BPF_K,
+                1,
+                syscall as u32,
+            ),
+            bpf(libc::BPF_RET, 0, libc::SECCOMP_RET_ERRNO | errno as u32),
+            bpf(libc::BPF_RET, 0, libc::SECCOMP_RET_ALLOW),
+        ];
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                let prog = libc::sock_fprog {
+                    len: filter.len() as u16,
+                    filter: filter.as_mut_ptr(),
+                };
+                // SAFETY: `prog` outlives the calls, and the filter binds only this thread.
+                unsafe {
+                    assert_eq!(libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0), 0);
+                    assert_eq!(
+                        libc::prctl(libc::PR_SET_SECCOMP, libc::SECCOMP_MODE_FILTER, &prog),
+                        0
+                    );
+                }
+                f()
+            })
+            .join()
+            .unwrap()
+        })
+    }
+
+    /// The last line of /proc/`pid`/mountinfo for `mountpoint`, without the fields that differ
+    /// between two mounts with the same options: the mount IDs, the device number and the IDs
+    /// of the peer groups.
+    fn mountinfo(pid: &str, mountpoint: &Path) -> Option<String> {
+        let info = std::fs::read_to_string(format!("/proc/{pid}/mountinfo")).unwrap();
+        let mountpoint = mountpoint.to_str();
+        let line = info
+            .lines()
+            .rev()
+            .find(|line| line.split(' ').nth(4) == mountpoint)?;
+        let fields: Vec<&str> = line
+            .split(' ')
+            .skip(3)
+            .map(|f| f.split(':').next().unwrap())
+            .collect();
+        Some(fields.join(" "))
+    }
+
+    /// fsmount() mounts with the options that mount(2) mounts with.
+    #[test]
+    fn test_fsmount_matches_mount() {
+        if unsafe { libc::geteuid() } != 0 {
+            eprintln!("not root, skipping");
+            return;
+        }
+        let dir = TempDir::new().unwrap();
+        let other_flags = MsFlags::MS_NOEXEC
+            | MsFlags::MS_NODIRATIME
+            | MsFlags::MS_RELATIME
+            | MsFlags::MS_SYNCHRONOUS
+            | MsFlags::MS_DIRSYNC
+            | MsFlags::MS_LAZYTIME;
+        // readonly, allow_other, subtype, mount flags
+        let configs = [
+            (false, true, "bar", None),
+            (true, false, "", None),
+            (false, true, "bar", Some(other_flags)),
+        ];
+        for (readonly, allow_other, subtype, flags) in configs {
+            // Failing mount(2) leaves fsmount(), and failing fsopen() leaves mount(2).
+            let [new, old] = [libc::SYS_mount, libc::SYS_fsopen].map(|syscall| {
+                let mut se = FuseSession::new(dir.as_path(), "foo", subtype, readonly).unwrap();
+                se.set_allow_other(allow_other);
+                if let Some(flags) = flags {
+                    se.set_mount_flags(flags);
+                }
+                without_syscall(syscall, Errno::ENOSYS, || se.mount()).unwrap();
+                let line = mountinfo("self", se.mountpoint()).unwrap();
+                se.umount().unwrap();
+                line
+            });
+            assert_eq!(new, old);
+        }
+    }
+
+    /// Where fsmount() fails, at the start or the end, mount() falls back to mount(2).
+    #[test]
+    fn test_fsmount_fallback() {
+        if unsafe { libc::geteuid() } != 0 {
+            eprintln!("not root, skipping");
+            return;
+        }
+        let dir = TempDir::new().unwrap();
+        for (syscall, errno) in [
+            (libc::SYS_fsopen, Errno::ENOSYS),
+            (libc::SYS_move_mount, Errno::EPERM),
+        ] {
+            let mut se = FuseSession::new(dir.as_path(), "foo", "bar", false).unwrap();
+            without_syscall(syscall, errno, || se.mount()).unwrap();
+            assert!(mountinfo("self", se.mountpoint()).is_some());
+            // The INIT request waits on the session's fd.
+            let mut fds = [PollFd::new(
+                se.get_fuse_file().unwrap().as_fd(),
+                PollFlags::POLLIN,
+            )];
+            assert_eq!(poll(&mut fds, PollTimeout::from(0u16)), Ok(1));
+            assert_eq!(fds[0].revents(), Some(PollFlags::POLLIN));
+            se.umount().unwrap();
+        }
+    }
+
+    /// With set_target_mntns(), the session mounts and unmounts in the target's mount namespace,
+    /// and the calling thread stays in its own.
+    #[test]
+    fn test_fsmount_target_mntns() {
+        use std::os::unix::process::CommandExt;
+
+        if unsafe { libc::geteuid() } != 0 {
+            eprintln!("not root, skipping");
+            return;
+        }
+        let mut cmd = std::process::Command::new("sleep");
+        cmd.arg("60");
+        // SAFETY: the closure calls only unshare() and mount(), which are async-signal-safe,
+        // and nix passes the short path without allocating.
+        unsafe {
+            cmd.pre_exec(|| {
+                unshare(CloneFlags::CLONE_NEWNS)?;
+                // Keep the mounts of the new namespace out of this one.
+                mount(
+                    None::<&str>,
+                    "/",
+                    None::<&str>,
+                    MsFlags::MS_REC | MsFlags::MS_PRIVATE,
+                    None::<&str>,
+                )?;
+                Ok(())
+            });
+        }
+        let mut child = cmd.spawn().unwrap();
+        let pid = child.id().to_string();
+
+        let dir = TempDir::new().unwrap();
+        // Failing mount(2) leaves fsmount(), and failing fsopen() leaves mount(2). Both run on a
+        // helper thread.
+        let results = [libc::SYS_mount, libc::SYS_fsopen].map(|syscall| {
+            let mut se = FuseSession::new(dir.as_path(), "foo", "bar", false).unwrap();
+            se.set_target_mntns(Some(child.id() as libc::pid_t));
+            // Make the fallback through nsenter and fusermount fail.
+            se.set_fusermount("/nonexistent");
+            let (mounted, same_ns) = without_syscall(syscall, Errno::ENOSYS, || {
+                let ns = || std::fs::read_link("/proc/thread-self/ns/mnt").unwrap();
+                let before = ns();
+                (se.mount().is_ok(), ns() == before)
+            });
+            let there = mountinfo(&pid, se.mountpoint());
+            let here = mountinfo("self", se.mountpoint());
+            let unmounted = se.umount().is_ok();
+            let after = mountinfo(&pid, se.mountpoint());
+            (mounted, same_ns, there, here, unmounted, after)
+        });
+        let _ = child.kill();
+        let _ = child.wait();
+
+        for (mounted, same_ns, there, here, unmounted, after) in results {
+            assert!(mounted && same_ns);
+            assert!(there.unwrap().contains(" - fuse.bar foo "));
+            assert_eq!(here, None);
+            assert!(unmounted);
+            assert_eq!(after, None);
+        }
     }
 }
 
