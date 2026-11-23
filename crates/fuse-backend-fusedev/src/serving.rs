@@ -7,18 +7,23 @@
 //! A *serving layer* owns a mounted [`FuseSession`], drives it with worker
 //! threads and turns [`Drop`] into teardown: stop accepting new requests,
 //! let in-flight requests finish, unmount the session and join all
-//! workers. Three implementations share that shape:
+//! workers. These implementations share that shape:
 //!
 //! | implementation       | handler model        | transport            |
 //! |----------------------|----------------------|----------------------|
 //! | [`SyncFuseServing`]  | `F: FileSystem`      | classic `/dev/fuse`  |
 //! | `AsyncFuseServing`   | `F: AsyncFileSystem` | classic `/dev/fuse`  |
 //! | `UringFuseServing`   | `F: FileSystem`      | FUSE-over-io_uring   |
+//! | (`new_async()`)      | `F: AsyncFileSystem` | FUSE-over-io_uring   |
 //!
-//! The axes a serving layer owns are the *transport* and the *handler
-//! model* — both fixed at the type level — plus the *worker count*, a
-//! field of every serving configuration. Two knobs that look like serving
-//! concerns deliberately are not:
+//! `UringFuseServing::new_async()` waits at most 10 seconds for in-flight
+//! requests, and leaks the ones that don't finish with their ring entries.
+//!
+//! A serving layer owns the *transport* and the *handler model*, which its
+//! type fixes, and the *worker count*, a field of every serving
+//! configuration. `UringFuseServing` picks its handler model with the
+//! constructor instead. Two knobs that look like serving concerns
+//! deliberately are not:
 //!
 //! - *blocking vs non-blocking reception* is a configuration of the
 //!   classic transport ([`SyncServingConfig::blocking`]): both reception
@@ -48,8 +53,9 @@
 //!   (`AsyncFileSystem`) decouple the request concurrency from the
 //!   worker count.
 //!
-//! `AsyncFuseServing` needs the `async-io` feature and `UringFuseServing`
-//! the `uring` feature; [`SyncFuseServing`] is always available.
+//! `AsyncFuseServing` needs the `async-io` feature, `UringFuseServing` the
+//! `uring` feature, and `UringFuseServing::new_async()` both;
+//! [`SyncFuseServing`] is always available.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
