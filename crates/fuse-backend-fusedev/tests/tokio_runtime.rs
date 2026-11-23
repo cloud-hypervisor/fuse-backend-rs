@@ -28,7 +28,7 @@ mod tokio_runtime {
     use fuse_backend_core::api::server::Server;
     use fuse_backend_core::async_runtime::{self, RuntimeType};
     use fuse_backend_fusedev::{
-        FuseDevTask, FuseDevWriter, FuseSession, SyncFuseServing, SyncServingConfig,
+        FuseDevTask, FuseDevWriter, FuseSession, StopSignal, SyncFuseServing, SyncServingConfig,
     };
     use fuse_backend_passthrough::{Config, PassthroughFs};
     use tokio::sync::{oneshot, Semaphore};
@@ -109,8 +109,10 @@ mod tokio_runtime {
         assert_eq!(read.unwrap().unwrap(), b"served without tokio");
     }
 
-    #[test]
-    fn test_fuse_dev_task_stops_while_idle() {
+    /// Serve a mount with `tasks` `FuseDevTask`s on one tokio runtime, and stop them once idle,
+    /// while the connection stays up. A bare flag makes them check it every 100ms. A task with
+    /// a `StopSignal` has no timer, so it returns only if the signal wakes it.
+    fn stop_idle_tasks(tasks: usize, use_signal: bool) {
         async_runtime::set_runtime_type(RuntimeType::Tokio).unwrap();
 
         let src = TempDir::new().unwrap();
@@ -127,29 +129,48 @@ mod tokio_runtime {
         let Some(mut se) = mount(mnt.as_path()) else {
             return;
         };
-        let file = se.clone_fuse_file().unwrap();
+        let files: Vec<File> = (0..tasks).map(|_| se.clone_fuse_file().unwrap()).collect();
         let buf_size = se.bufsize();
 
-        let state = Arc::new(AtomicBool::new(false));
-        let task_state = state.clone();
+        let flag = Arc::new(AtomicBool::new(false));
+        let signal = use_signal.then(|| StopSignal::new(flag.clone()).unwrap());
+        let task_signal = signal.clone().unwrap_or_else(|| flag.clone().into());
         let (tx, rx) = channel();
         let handle = thread::spawn(move || {
             let rt = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
                 .unwrap();
-            let mut task = FuseDevTask::new(buf_size, file, server, task_state);
-            rt.block_on(task.poll_handler());
+            let mut tasks: Vec<_> = files
+                .into_iter()
+                .map(|file| FuseDevTask::new(buf_size, file, server.clone(), task_signal.clone()))
+                .collect();
+            rt.block_on(futures_util::future::join_all(
+                tasks.iter_mut().map(|task| task.poll_handler()),
+            ));
             tx.send(()).unwrap();
         });
 
         std::fs::read_dir(mnt.as_path()).unwrap().for_each(drop);
-        // The connection stays up, so only the state flag can stop the idle task.
-        state.store(true, Ordering::Release);
+        match signal {
+            Some(signal) => signal.stop(),
+            None => flag.store(true, Ordering::Release),
+        }
         let stopped = rx.recv_timeout(Duration::from_secs(5));
         se.umount().unwrap();
         handle.join().unwrap();
-        assert!(stopped.is_ok(), "the idle task ignored its state flag");
+        assert!(stopped.is_ok(), "the idle tasks didn't stop");
+    }
+
+    #[test]
+    fn test_fuse_dev_task_stops_while_idle() {
+        stop_idle_tasks(1, false);
+    }
+
+    // Two tasks on one runtime share the signal.
+    #[test]
+    fn test_fuse_dev_task_stop_signal() {
+        stop_idle_tasks(2, true);
     }
 
     #[test]
