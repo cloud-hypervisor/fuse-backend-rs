@@ -497,6 +497,12 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
             }
             _ => {}
         };
+        // Writes go to the host file at their own offsets, and no per-file state needs them in
+        // order, so the kernel may send direct writes to one file concurrently.
+        opts.set(
+            OpenOptions::PARALLEL_DIRECT_WRITES,
+            opts.contains(OpenOptions::DIRECT_IO),
+        );
         // A passthrough open gets no other option. The kernel fails one with `KEEP_CACHE`, and
         // the backing file has its own page cache anyway. `DIRECT_IO` would send reads and writes
         // through the daemon. The kernel opens the backing file with the client's open flags, so
@@ -1088,7 +1094,12 @@ impl<S: BitmapSlice + Send + Sync> FileSystem for PassthroughFs<S> {
             CachePolicy::Always => opts |= OpenOptions::KEEP_CACHE,
             _ => {}
         };
-        // Like in `do_open()`, a passthrough open gets no other option.
+        // Like in `do_open()`, direct writes may run concurrently, and a passthrough open gets no
+        // other option.
+        opts.set(
+            OpenOptions::PARALLEL_DIRECT_WRITES,
+            opts.contains(OpenOptions::DIRECT_IO),
+        );
         if backing_id.is_some() {
             opts = OpenOptions::PASSTHROUGH;
         }

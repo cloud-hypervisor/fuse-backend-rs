@@ -96,6 +96,9 @@ const FOPEN_CACHE_DIR: u32 = 8;
 /// the file is stream-like (no file position at all)
 const FOPEN_STREAM: u32 = 16;
 
+/// Allow concurrent direct writes on the same inode (protocol 7.38).
+const FOPEN_PARALLEL_DIRECT_WRITES: u32 = 1 << 6;
+
 /// Pass reads, writes and mmap through to the backing file.
 const FOPEN_PASSTHROUGH: u32 = 1 << 7;
 /// Serve reads and writes of this open file with FUSE-over-io_uring
@@ -117,6 +120,10 @@ bitflags! {
         const CACHE_DIR = FOPEN_CACHE_DIR;
         /// the file is stream-like (no file position at all)
         const STREAM = FOPEN_STREAM;
+        /// Let the kernel send direct writes to this file concurrently, under a shared inode
+        /// lock. Appends and writes past the end of the file still take it exclusively. The
+        /// kernel ignores the flag without `DIRECT_IO`.
+        const PARALLEL_DIRECT_WRITES = FOPEN_PARALLEL_DIRECT_WRITES;
         /// Pass reads, writes and mmap through to the backing file whose id is returned along
         /// with this flag. Requires `FsOptions::PASSTHROUGH`.
         const PASSTHROUGH = FOPEN_PASSTHROUGH;
