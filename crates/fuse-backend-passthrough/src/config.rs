@@ -221,6 +221,16 @@ pub struct Config {
     ///
     /// The default is `false`.
     pub uring_zero_copy: bool,
+
+    /// Negotiate `FsOptions::ALLOW_IDMAP` on Linux when the file system is mounted on its own,
+    /// so that it can be mounted idmapped. `PassthroughFs` uses the ids of a request only to
+    /// create inodes and to answer `access`, which the kernel doesn't send with
+    /// `default_permissions`, so `FUSE_INVALID_UIDGID` doesn't reach it.
+    ///
+    /// Behind a `Vfs` the flag comes from `VfsOptions::out_opts` instead.
+    ///
+    /// The default value for this option is `false`.
+    pub allow_idmap: bool,
 }
 
 impl Default for Config {
@@ -247,6 +257,7 @@ impl Default for Config {
             allow_direct_io: true,
             allow_mmap: false,
             uring_zero_copy: false,
+            allow_idmap: false,
         }
     }
 }

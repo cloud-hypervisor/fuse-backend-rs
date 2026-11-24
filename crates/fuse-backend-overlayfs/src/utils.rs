@@ -9,6 +9,10 @@ pub(super) fn is_dir(st: stat64) -> bool {
     st.st_mode & libc::S_IFMT == libc::S_IFDIR
 }
 
+pub(super) fn is_symlink(st: stat64) -> bool {
+    st.st_mode & libc::S_IFMT == libc::S_IFLNK
+}
+
 pub(super) fn to_cstring(name: &str) -> Result<CString> {
     CString::new(name).map_err(|e| Error::new(io::ErrorKind::InvalidData, e))
 }
