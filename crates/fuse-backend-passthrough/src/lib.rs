@@ -211,6 +211,9 @@ struct HandleData {
     open_flags: RwLock<u32>,
     /// Whether the handle holds a reference to its inode's backing id.
     has_backing_id: bool,
+    /// Keeps native asynchronous IO and O_DIRECT requests on `file` apart.
+    #[cfg(all(feature = "async-io", target_os = "linux"))]
+    io_gate: async_io::IoGate,
 }
 
 impl HandleData {
@@ -220,6 +223,8 @@ impl HandleData {
             file,
             open_flags: RwLock::new(flags),
             has_backing_id,
+            #[cfg(all(feature = "async-io", target_os = "linux"))]
+            io_gate: Default::default(),
         }
     }
 
