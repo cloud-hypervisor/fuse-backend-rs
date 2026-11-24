@@ -289,6 +289,7 @@ fn op_args(opcode: u32) -> Option<(usize, bool)> {
         Opcode::Rename2 => (16, false),                      // Rename2In
         Opcode::Lseek => (24, true),                         // LseekIn
         Opcode::CopyFileRange => (56, true),                 // CopyFileRangeIn
+        Opcode::Syncfs => (8, false),                        // SyncfsIn
         // SETUPMAPPING/REMOVEMAPPING only exist on the virtiofs DAX window
         // path, never on /dev/fuse. Opcode::from() maps the numbers without
         // a variant to MaxOpcode and never returns the byte-swapped INIT
@@ -2208,7 +2209,7 @@ mod tests {
         AccessIn, AttrOut, BatchForgetIn, BmapIn, CopyFileRangeIn, CreateIn, EntryOut, FallocateIn,
         FlushIn, ForgetIn, FsyncIn, GetattrIn, GetxattrIn, InHeader, InitIn, InterruptIn, IoctlIn,
         LinkIn, LkIn, LseekIn, MkdirIn, MknodIn, Opcode, OpenIn, OutHeader, PollIn, ReadIn,
-        ReleaseIn, Rename2In, RenameIn, SetattrIn, SetxattrIn, WriteIn, ROOT_ID,
+        ReleaseIn, Rename2In, RenameIn, SetattrIn, SetxattrIn, SyncfsIn, WriteIn, ROOT_ID,
     };
     use fuse_backend_core::api::filesystem::FsOptions;
     use fuse_backend_passthrough::{Config, PassthroughFs};
@@ -2412,6 +2413,7 @@ mod tests {
                 Opcode::CopyFileRange as u32,
                 std::mem::size_of::<CopyFileRangeIn>(),
             ),
+            (Opcode::Syncfs as u32, std::mem::size_of::<SyncfsIn>()),
         ];
         for &(op, len) in expected {
             assert_eq!(op_args(op).map(|a| a.0), Some(len), "opcode {}", op);
@@ -2446,6 +2448,7 @@ mod tests {
             Opcode::BatchForget,
             Opcode::Fallocate,
             Opcode::Rename2,
+            Opcode::Syncfs,
         ];
         for &(op, _) in expected {
             let has_out_args = !no_out_args.iter().any(|&o| o as u32 == op);

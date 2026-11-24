@@ -193,6 +193,9 @@ pub struct VfsOptions {
     /// Add `FsOptions::PASSTHROUGH` for kernel passthrough. If the kernel offers it, init()
     /// sets `no_writeback` and clears `no_open` for all mounts, because passthrough needs open
     /// requests and no writeback cache.
+    ///
+    /// The default set leaves out `FsOptions::HAS_SYNCFS`, because once it is negotiated every
+    /// `sync(2)` on the system waits for the server. Add it to have `syncfs(2)` reach the mounts.
     pub out_opts: FsOptions,
     /// Declaration of ID mapping, in the format (internal ID, external ID, range).
     /// For example, (0, 1, 65536) represents mapping the external UID/GID range of `1~65536`
@@ -1481,6 +1484,78 @@ mod tests {
         }
     }
 
+    // Answers syncfs on its root with `errno`, or success for 0, and counts the calls.
+    struct SyncFs {
+        errno: i32,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+    impl FileSystem for SyncFs {
+        type Inode = u64;
+        type Handle = u64;
+        fn syncfs(&self, _: &Context, inode: Self::Inode) -> Result<()> {
+            assert_eq!(inode, 1);
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            match self.errno {
+                0 => Ok(()),
+                errno => Err(Error::from_raw_os_error(errno)),
+            }
+        }
+    }
+    #[cfg(feature = "async-io")]
+    impl AsyncFileSystem for SyncFs {}
+    impl BackendFileSystem for SyncFs {
+        fn mount(&self) -> Result<(Entry, u64)> {
+            Ok((
+                Entry {
+                    inode: 1,
+                    ..Default::default()
+                },
+                0,
+            ))
+        }
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+    }
+
+    #[test]
+    fn test_vfs_syncfs() {
+        let ctx = Context::default();
+        let calls = |vfs: &Vfs, idx: VfsIndex| {
+            let fs = vfs.get_fs_by_idx(idx).unwrap();
+            let fs = fs.as_any().downcast_ref::<SyncFs>().unwrap();
+            fs.calls.load(Ordering::Relaxed)
+        };
+        let errno = |res: Result<()>| res.err().and_then(|e| e.raw_os_error());
+        let sync_fs = |errno| SyncFs {
+            errno,
+            calls: Default::default(),
+        };
+
+        // With no backend there is nothing to sync.
+        let vfs = Vfs::default();
+        assert!(vfs.syncfs(&ctx, ROOT_ID.into()).is_ok());
+
+        // ENOSYS only when every backend answers it.
+        for (errnos, expected) in [
+            ([libc::ENOSYS, libc::ENOSYS], Some(libc::ENOSYS)),
+            ([libc::ENOSYS, 0], None),
+            ([0, libc::EIO], Some(libc::EIO)),
+        ] {
+            let vfs = Vfs::default();
+            let a = vfs.mount(Box::new(sync_fs(errnos[0])), "/a").unwrap();
+            let b = vfs.mount(Box::new(sync_fs(errnos[1])), "/b").unwrap();
+            assert_eq!(errno(vfs.syncfs(&ctx, ROOT_ID.into())), expected);
+            assert_eq!((calls(&vfs, a), calls(&vfs, b)), (1, 1));
+        }
+
+        // A backend mounted on the root gets it too.
+        let vfs = Vfs::default();
+        let root = vfs.mount(Box::new(sync_fs(0)), "/").unwrap();
+        assert!(vfs.syncfs(&ctx, ROOT_ID.into()).is_ok());
+        assert_eq!(calls(&vfs, root), 1);
+    }
+
     #[test]
     fn test_vfs_init() {
         let vfs = Vfs::default();
@@ -1488,6 +1563,8 @@ mod tests {
 
         let opts = vfs.opts.load();
         let out_opts = opts.out_opts;
+        // SYNCFS makes every sync(2) wait for the server, so it is opt-in.
+        assert!(!out_opts.contains(FsOptions::HAS_SYNCFS));
 
         assert!(opts.no_open);
         assert!(opts.no_opendir);
