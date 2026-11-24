@@ -1,9 +1,10 @@
 # fuse-backend-fusedev
 
 The **/dev/fuse** transport for FUSE servers: it mounts a filesystem through the
-kernel FUSE device and serves requests over `FuseSession`/`FuseChannel`. It also
-carries the experimental **FUSE-over-io_uring** transport (`uring`) and the
-macOS **macFUSE / fuse-t** transports.
+kernel FUSE device and serves requests over `FuseSession`/`FuseChannel`, on
+Linux and on FreeBSD (fusefs(5), with `SyncFuseServing`). It also carries the
+experimental **FUSE-over-io_uring** transport (`uring`) and the macOS
+**macFUSE / fuse-t** transports.
 
 Built on [`fuse-backend-core`], which it enables with core's `fusedev` cfg. It
 ships no filesystem driver of its own; the umbrella [`fuse-backend-rs`] crate

@@ -55,6 +55,11 @@ mod async_serving;
 #[cfg(all(target_os = "linux", feature = "async-io"))]
 pub use async_serving::*;
 
+#[cfg(target_os = "freebsd")]
+mod freebsd_session;
+#[cfg(target_os = "freebsd")]
+pub use freebsd_session::*;
+
 #[cfg(all(target_os = "macos", not(feature = "fuse-t")))]
 mod macos_session;
 #[cfg(all(target_os = "macos", not(feature = "fuse-t")))]
@@ -69,11 +74,10 @@ pub use fuse_t_session::*;
 // io_uring serving implementations live with their transports.
 //
 // The serving layer drives a session, so it only exists where a session
-// module does (Linux and macOS for now; a FreeBSD session module is future
-// work on top of the nix 0.31 upgrade).
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+// module does.
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "freebsd"))]
 mod serving;
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "freebsd"))]
 pub use serving::*;
 
 #[cfg(all(target_os = "linux", feature = "uring"))]
@@ -567,11 +571,11 @@ pub trait FuseSessionExt {
 /// Abstraction over the fusedev channels that receive requests from `/dev/fuse`.
 ///
 /// Every fusedev channel exposes an inherent `get_request()` entry point: the
-/// epoll-based [`FuseChannel`] on Linux, the blocking-read [`FuseChannel`] on
-/// macOS and fuse-t, and Linux's `BlockingFuseChannel`. This trait names that
-/// shared operation `next_request()`, forwarding to each channel's inherent
-/// method, so a service loop can be written once, generic over the concrete
-/// channel type, instead of once per channel.
+/// epoll-based [`FuseChannel`] on Linux, the poll-based one on FreeBSD, the
+/// blocking-read one on macOS and fuse-t, and Linux's `BlockingFuseChannel`.
+/// This trait names that shared operation `next_request()`, forwarding to each
+/// channel's inherent method, so a service loop can be written once, generic
+/// over the concrete channel type, instead of once per channel.
 ///
 /// The trait method is deliberately named differently from the inherent
 /// `get_request()`: the distinct name keeps each forwarding call unambiguous
