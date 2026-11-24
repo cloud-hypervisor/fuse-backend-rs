@@ -320,6 +320,92 @@ mod fusedev_tests {
     }
 
     #[test]
+    #[ignore] // it depends on privileged mode to pass through /dev/fuse, and takes 15 to 30 s
+    fn integration_test_request_timeout() -> Result<()> {
+        use fuse_backend_rs::abi::fuse_abi::stat64;
+        use fuse_backend_rs::api::filesystem::{Context, Entry, FileSystem};
+        use fuse_backend_rs::api::server::Server;
+        use fuse_backend_rs::transport::{FuseSession, SyncFuseServing, SyncServingConfig};
+        use std::ffi::CStr;
+        use std::sync::{mpsc, Arc, Mutex};
+        use std::time::{Duration, Instant};
+
+        // A lookup that hangs past the request timeout gets the connection aborted.
+        if !running_as_root() {
+            eprintln!("skipping integration_test_request_timeout: not running as root");
+            return Ok(());
+        }
+        if !kernel_at_least(6, 14) {
+            eprintln!(
+                "skipping integration_test_request_timeout: kernel {} has no request timeouts",
+                kernel_release()
+            );
+            return Ok(());
+        }
+
+        // Answers GETATTR on the root and hangs in LOOKUP until the test is done.
+        struct HangFs(Mutex<mpsc::Receiver<()>>);
+        impl FileSystem for HangFs {
+            type Inode = u64;
+            type Handle = u64;
+
+            fn lookup(&self, _: &Context, _: u64, _: &CStr) -> std::io::Result<Entry> {
+                let _ = self
+                    .0
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(Duration::from_secs(120));
+                Err(std::io::Error::from_raw_os_error(libc::ENOENT))
+            }
+
+            fn getattr(
+                &self,
+                _: &Context,
+                inode: u64,
+                _: Option<u64>,
+            ) -> std::io::Result<(stat64, Duration)> {
+                // SAFETY: `stat64` is plain old data, so all zeroes is a valid value.
+                let mut st: stat64 = unsafe { std::mem::zeroed() };
+                st.st_ino = inode;
+                st.st_mode = libc::S_IFDIR | 0o755;
+                st.st_nlink = 2;
+                Ok((st, Duration::from_secs(60)))
+            }
+        }
+
+        let (done, rx) = mpsc::channel();
+        let server = Arc::new(Server::new(HangFs(Mutex::new(rx))));
+        // The kernel raises this to 15 s.
+        server.set_request_timeout(1);
+        let mnt_dir = TempDir::new().unwrap();
+        let mut se = FuseSession::new(mnt_dir.as_path(), "timeout", "", false).unwrap();
+        se.mount().unwrap();
+        let serving = SyncFuseServing::new(se, server, SyncServingConfig::default()).unwrap();
+
+        let start = Instant::now();
+        let err = std::fs::metadata(mnt_dir.as_path().join("hang")).unwrap_err();
+        let elapsed = start.elapsed();
+        done.send(()).unwrap();
+        drop(serving);
+        // The session doesn't unmount an aborted connection.
+        let _ = nix::mount::umount2(mnt_dir.as_path(), nix::mount::MntFlags::MNT_DETACH);
+        assert!(
+            matches!(
+                err.raw_os_error(),
+                Some(libc::ECONNABORTED | libc::ENOTCONN)
+            ),
+            "{}",
+            err
+        );
+        assert!(
+            elapsed >= Duration::from_secs(15) && elapsed < Duration::from_secs(40),
+            "aborted after {:?}",
+            elapsed
+        );
+        Ok(())
+    }
+
+    #[test]
     #[ignore] // it depends on privileged mode to pass through /dev/fuse
     fn integration_test_direct_io_shared_mmap() -> Result<()> {
         // An O_DIRECT open of a file on the mount gets DIRECT_IO, and the kernel fails a shared
