@@ -21,7 +21,7 @@
   arrives (`serving` is now gated to the OSes that have one, and the
   Linux-only `mio`/`vmm-sys-util` deps are target-gated), proven by new
   `cargo build -p fuse-backend-fusedev` rows (default and `async-io`) in
-  `make check-freebsd`. 0.32 is deliberately not taken (released days
+  `gmake check-freebsd`. 0.32 is deliberately not taken (released days
   earlier, its accept/accept4 fd-type breakage buys nothing here).
   Related cleanup: the macFUSE session's few CoreFoundation declarations
   (`CFStringCreateWithBytes`/`CFURLCreateWithFileSystemPath`/`CFRelease`)
@@ -51,12 +51,12 @@
   wire protocol — bridging the libc spellings (`stat`/`preadv` instead of
   the glibc LFS-64 names, `u16` `mode_t`, `ENOATTR` for a missing xattr,
   a literal `UIO_MAXIOV`). `Vfs` advertises the Linux capability set there
-  (the negotiation clamps it to what the kernel offered), and a Cirrus CI
-  task — GitHub Actions has no FreeBSD runner — runs `make check-freebsd`,
-  so `fuse-backend-core` and `fuse-backend-vfs` build and pass their unit
-  tests on a real FreeBSD VM. The transport and the filesystem drivers
-  stay FreeBSD-unbuildable (`nix` 0.24 does not compile there), and nothing
-  here claims runtime behavior against a FreeBSD kernel yet.
+  (the negotiation clamps it to what the kernel offered), and a GitHub
+  Actions job runs `gmake check-freebsd`, so `fuse-backend-core` and
+  `fuse-backend-vfs` build and pass their unit tests on a real FreeBSD
+  VM. The transport and the filesystem drivers stay FreeBSD-unbuildable
+  (`nix` 0.24 does not compile there), and nothing here claims runtime
+  behavior against a FreeBSD kernel yet.
 
 - [303](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/303): Fill in the macOS twin of the passthrough driver, turning the
   PR #182 prototype (akitaSummer's macOS port) into a working mount on top of
@@ -224,6 +224,8 @@
   took.
 
 ### Changed
+- [339](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/339): `fuse-backend-core` no longer enables vm-memory's unused `backend-mmap` feature,
+  which doesn't build on FreeBSD. A crate that uses vm-memory's mmap types has to enable it itself.
 - [325](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/325): The `fuse-backend-fusedev` `uring` transport uses io-uring 0.6 instead of 0.5,
   and depends on it only on Linux.
 - [324](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/324): `fuse-backend-core` uses bitflags 2 instead of 1. The flag types (`FsOptions`,

@@ -1,3 +1,4 @@
+# This is a GNU makefile. On FreeBSD, run gmake.
 current_dir := $(shell dirname $(realpath $(firstword $(MAKEFILE_LIST))))
 CARGO ?= $(shell which cargo)
 
