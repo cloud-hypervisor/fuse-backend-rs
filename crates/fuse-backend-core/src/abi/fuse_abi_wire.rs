@@ -721,6 +721,83 @@ impl From<Attr> for stat64 {
     }
 }
 
+/// `Statx::mask` bits of the fields that `stat64` has (`STATX_BASIC_STATS`).
+pub const STATX_BASIC_STATS: u32 = 0x7ff;
+
+/// `Statx::mask` bit of the birth time (`STATX_BTIME`).
+pub const STATX_BTIME: u32 = 0x800;
+
+/// A timestamp in `Statx`.
+#[repr(C)]
+#[derive(Debug, Default, Copy, Clone, PartialEq, Eq)]
+pub struct SxTime {
+    pub tv_sec: i64,
+    pub tv_nsec: u32,
+    pub reserved: i32,
+}
+unsafe impl ByteValued for SxTime {}
+
+/// The attributes of a file as `statx(2)` returns them (protocol 7.39). `mask` has the
+/// `STATX_*` bits of the fields that are valid.
+#[repr(C)]
+#[derive(Debug, Default, Copy, Clone, PartialEq, Eq)]
+pub struct Statx {
+    pub mask: u32,
+    pub blksize: u32,
+    pub attributes: u64,
+    pub nlink: u32,
+    pub uid: u32,
+    pub gid: u32,
+    pub mode: u16,
+    pub spare0: [u16; 1],
+    pub ino: u64,
+    pub size: u64,
+    pub blocks: u64,
+    pub attributes_mask: u64,
+    pub atime: SxTime,
+    pub btime: SxTime,
+    pub ctime: SxTime,
+    pub mtime: SxTime,
+    pub rdev_major: u32,
+    pub rdev_minor: u32,
+    pub dev_major: u32,
+    pub dev_minor: u32,
+    pub spare2: [u64; 14],
+}
+unsafe impl ByteValued for Statx {}
+
+impl From<stat64> for Statx {
+    /// The basic fields, without the birth time.
+    // The stat64 field types differ between targets, so some casts are no-ops on some of them.
+    #[allow(clippy::unnecessary_cast)]
+    fn from(st: stat64) -> Statx {
+        let time = |sec: i64, nsec: i64| SxTime {
+            tv_sec: sec,
+            tv_nsec: nsec as u32,
+            reserved: 0,
+        };
+        Statx {
+            mask: STATX_BASIC_STATS,
+            blksize: st.st_blksize as u32,
+            nlink: st.st_nlink as u32,
+            uid: st.st_uid,
+            gid: st.st_gid,
+            mode: st.st_mode as u16,
+            ino: st.st_ino,
+            size: st.st_size as u64,
+            blocks: st.st_blocks as u64,
+            atime: time(st.st_atime as i64, st.st_atime_nsec as i64),
+            ctime: time(st.st_ctime as i64, st.st_ctime_nsec as i64),
+            mtime: time(st.st_mtime as i64, st.st_mtime_nsec as i64),
+            rdev_major: libc::major(st.st_rdev) as u32,
+            rdev_minor: libc::minor(st.st_rdev) as u32,
+            dev_major: libc::major(st.st_dev) as u32,
+            dev_minor: libc::minor(st.st_dev) as u32,
+            ..Default::default()
+        }
+    }
+}
+
 #[repr(C)]
 #[derive(Debug, Default, Copy, Clone)]
 pub struct Kstatfs {
@@ -813,7 +890,8 @@ pub enum Opcode {
     CopyFileRange = 47,
     SetupMapping = 48,
     RemoveMapping = 49,
-    MaxOpcode = 50,
+    Statx = 52,
+    MaxOpcode = 53,
 
     /* Reserved opcodes: helpful to detect structure endian-ness in case of e.g. virtiofs */
     CuseInitBswapReserved = 1_048_576, /* CUSE_INIT << 8 */
@@ -874,6 +952,7 @@ impl From<u32> for Opcode {
             47 => Opcode::CopyFileRange,
             48 => Opcode::SetupMapping,
             49 => Opcode::RemoveMapping,
+            52 => Opcode::Statx,
             _ => Opcode::MaxOpcode,
         }
     }
@@ -950,6 +1029,28 @@ pub struct AttrOut {
     pub attr: Attr,
 }
 unsafe impl ByteValued for AttrOut {}
+
+#[repr(C)]
+#[derive(Debug, Default, Copy, Clone)]
+pub struct StatxIn {
+    pub getattr_flags: u32,
+    pub reserved: u32,
+    pub fh: u64,
+    pub sx_flags: u32,
+    pub sx_mask: u32,
+}
+unsafe impl ByteValued for StatxIn {}
+
+#[repr(C)]
+#[derive(Debug, Default, Copy, Clone)]
+pub struct StatxOut {
+    pub attr_valid: u64, /* Cache timeout for the attributes */
+    pub attr_valid_nsec: u32,
+    pub flags: u32,
+    pub spare: [u64; 2],
+    pub stat: Statx,
+}
+unsafe impl ByteValued for StatxOut {}
 
 #[repr(C)]
 #[derive(Debug, Default, Copy, Clone)]
@@ -1523,6 +1624,33 @@ mod tests {
     }
 
     #[test]
+    fn test_statx_abi() {
+        assert_eq!(std::mem::size_of::<SxTime>(), 16);
+        assert_eq!(std::mem::size_of::<Statx>(), 256);
+        assert_eq!(std::mem::offset_of!(Statx, atime), 64);
+        assert_eq!(std::mem::offset_of!(Statx, btime), 80);
+        assert_eq!(std::mem::offset_of!(Statx, rdev_major), 128);
+        assert_eq!(std::mem::size_of::<StatxIn>(), 24);
+        assert_eq!(std::mem::size_of::<StatxOut>(), 288);
+        assert_eq!(std::mem::offset_of!(StatxOut, stat), 32);
+
+        // Safe because stat64 is plain old data.
+        let mut st: stat64 = unsafe { mem::zeroed() };
+        st.st_ino = 7;
+        st.st_mode = 0o100640;
+        st.st_size = 4096;
+        st.st_mtime = 1_700_000_000;
+        st.st_mtime_nsec = 5;
+        st.st_rdev = libc::makedev(8, 300);
+        let sx = Statx::from(st);
+        assert_eq!(sx.mask, STATX_BASIC_STATS);
+        assert_eq!((sx.ino, sx.mode, sx.size), (7, 0o100640, 4096));
+        assert_eq!((sx.mtime.tv_sec, sx.mtime.tv_nsec), (1_700_000_000, 5));
+        assert_eq!((sx.rdev_major, sx.rdev_minor), (8, 300));
+        assert_eq!(sx.btime, SxTime::default());
+    }
+
+    #[test]
     fn test_passthrough_abi() {
         assert_eq!(std::mem::offset_of!(OpenOut, passthrough), 12);
         assert_eq!(std::mem::offset_of!(InitOut, flags2), 32);
@@ -1609,6 +1737,7 @@ mod tests {
             Opcode::CopyFileRange,
             Opcode::SetupMapping,
             Opcode::RemoveMapping,
+            Opcode::Statx,
         ];
         for op in valid {
             assert_eq!(Opcode::from(op as u32) as u32, op as u32);

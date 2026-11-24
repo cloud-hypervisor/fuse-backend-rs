@@ -182,6 +182,29 @@ impl FileSystem for Vfs {
         }
     }
 
+    // The pseudo file system and backends without statx() answer with getattr(), so that they
+    // don't turn STATX off for the whole connection.
+    fn statx(
+        &self,
+        ctx: &Context,
+        inode: VfsInode,
+        handle: Option<VfsHandle>,
+        flags: u32,
+        mask: u32,
+    ) -> Result<(Statx, Duration)> {
+        match self.get_real_rootfs(inode)? {
+            (Left(fs), idata) => fs
+                .getattr(ctx, idata.ino(), handle)
+                .map(|(attr, duration)| (attr.into(), duration)),
+            (Right(fs), idata) => match fs.statx(ctx, idata.ino(), handle, flags, mask) {
+                Err(e) if e.raw_os_error() == Some(libc::ENOSYS) => fs
+                    .getattr(ctx, idata.ino(), handle)
+                    .map(|(attr, duration)| (self.convert_attr(idata, attr).into(), duration)),
+                res => res.map(|(sx, duration)| (self.convert_statx(idata, sx), duration)),
+            },
+        }
+    }
+
     fn setattr(
         &self,
         ctx: &Context,

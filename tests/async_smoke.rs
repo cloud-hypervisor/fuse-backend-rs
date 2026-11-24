@@ -55,6 +55,15 @@ mod fusedev_async_tests {
 
     static LOGGER: StdoutLogger = StdoutLogger;
 
+    /// Linux sends FUSE_STATX since 6.6.
+    fn kernel_sends_statx() -> bool {
+        let release = std::fs::read_to_string("/proc/sys/kernel/osrelease").unwrap_or_default();
+        let mut fields = release
+            .split('.')
+            .map(|f| f.trim().parse::<u32>().unwrap_or(0));
+        (fields.next().unwrap_or(0), fields.next().unwrap_or(0)) >= (6, 6)
+    }
+
     /// Mount a `PassthroughFs` through the async path (`FuseDevTask` driven
     /// by the async runtime), perform real file IO against the mountpoint,
     /// and check the results in the backing directory.
@@ -146,6 +155,15 @@ mod fusedev_async_tests {
 
                 // Read back through the mount: lookup/open/read/release
                 assert_eq!(std::fs::read(&mnt_file).unwrap(), data);
+
+                // statx(2) with the birth time sends FUSE_STATX.
+                if kernel_sends_statx() {
+                    let src_md = std::fs::metadata(src_path.join("file.txt")).unwrap();
+                    if let Ok(btime) = src_md.created() {
+                        let created = std::fs::metadata(&mnt_file).unwrap().created();
+                        assert_eq!(created.unwrap(), btime);
+                    }
+                }
 
                 // Append to exercise writes on an existing handle.
                 let mut f = std::fs::OpenOptions::new()

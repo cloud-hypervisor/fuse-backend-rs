@@ -50,7 +50,7 @@ use async_trait::async_trait;
 
 use super::*;
 use fuse_backend_core::abi::fuse_abi::{
-    stat64, CreateIn, Opcode, OpenOptions, SetattrValid, WRITE_KILL_PRIV,
+    stat64, CreateIn, Opcode, OpenOptions, SetattrValid, Statx, WRITE_KILL_PRIV,
 };
 use fuse_backend_core::api::filesystem::{
     AsyncFileSystem, AsyncZeroCopyReader, AsyncZeroCopyWriter, Context, FileSystem, GetxattrReply,
@@ -795,6 +795,23 @@ impl<S: BitmapSlice + Send + Sync + 'static> AsyncFileSystem for PassthroughFs<S
             [],
             self.getattr(ctx, inode, handle),
             move |fs: Arc<Self>, ctx: Context| fs.getattr(&ctx, inode, handle)
+        )
+    }
+
+    async fn async_statx(
+        &self,
+        ctx: &Context,
+        inode: <Self as FileSystem>::Inode,
+        handle: Option<<Self as FileSystem>::Handle>,
+        flags: u32,
+        mask: u32,
+    ) -> io::Result<(Statx, Duration)> {
+        async_relay!(
+            self,
+            ctx,
+            [],
+            self.statx(ctx, inode, handle, flags, mask),
+            move |fs: Arc<Self>, ctx: Context| fs.statx(&ctx, inode, handle, flags, mask)
         )
     }
 

@@ -106,43 +106,91 @@ unsafe fn do_statx(
     libc::syscall(libc::SYS_statx, dirfd, pathname, flags, mask, statxbuf) as libc::c_int
 }
 
-/// Execute `statx()` to get extended status with mount id.
-pub fn statx(dir: &impl AsRawFd, path: Option<&CStr>) -> io::Result<StatExt> {
-    let mut stx_ui = MaybeUninit::<statx_st>::zeroed();
-
-    // Safe because this is a constant value and a valid C string.
-    let path = path.unwrap_or_else(|| unsafe { CStr::from_bytes_with_nul_unchecked(EMPTY_CSTR) });
-
-    // Safe because the kernel will only write data in `stx_ui` and we
-    // check the return value.
+/// Execute `statx()` on `path` relative to `dir`, without following a final symlink. An empty
+/// `path` means `dir` itself.
+fn statx_raw(
+    dir: &impl AsRawFd,
+    path: &CStr,
+    flags: libc::c_int,
+    mask: libc::c_uint,
+) -> io::Result<statx_st> {
+    let mut stx = MaybeUninit::<statx_st>::zeroed();
+    // Safe because the kernel will only write data in `stx` and we check the return value.
     let res = unsafe {
         do_statx(
             dir.as_raw_fd(),
             path.as_ptr(),
-            libc::AT_EMPTY_PATH | libc::AT_SYMLINK_NOFOLLOW,
-            STATX_BASIC_STATS | STATX_MNT_ID,
-            stx_ui.as_mut_ptr(),
+            flags | libc::AT_EMPTY_PATH | libc::AT_SYMLINK_NOFOLLOW,
+            mask,
+            stx.as_mut_ptr(),
         )
     };
-    if res >= 0 {
-        // Safe because we are only going to use the SafeStatXAccess
-        // trait methods
-        let stx = unsafe { stx_ui.assume_init() };
-
-        // if `statx()` doesn't provide the mount id (before kernel 5.8),
-        // let's try `name_to_handle_at()`, if everything fails just use 0
-        let mnt_id = stx
-            .mount_id()
-            .or_else(|| get_mount_id(dir, path))
-            .unwrap_or(0);
-        let st = stx
-            .stat64()
-            .ok_or_else(|| io::Error::from_raw_os_error(libc::ENOSYS))?;
-
-        Ok(StatExt { st, mnt_id })
-    } else {
-        Err(io::Error::last_os_error())
+    if res < 0 {
+        return Err(io::Error::last_os_error());
     }
+    // Safe because the struct was zeroed and the kernel filled it in.
+    Ok(unsafe { stx.assume_init() })
+}
+
+/// Execute `statx()` to get extended status with mount id.
+pub fn statx(dir: &impl AsRawFd, path: Option<&CStr>) -> io::Result<StatExt> {
+    // Safe because this is a constant value and a valid C string.
+    let path = path.unwrap_or_else(|| unsafe { CStr::from_bytes_with_nul_unchecked(EMPTY_CSTR) });
+    let stx = statx_raw(dir, path, 0, STATX_BASIC_STATS | STATX_MNT_ID)?;
+
+    // if `statx()` doesn't provide the mount id (before kernel 5.8),
+    // let's try `name_to_handle_at()`, if everything fails just use 0
+    let mnt_id = stx
+        .mount_id()
+        .or_else(|| get_mount_id(dir, path))
+        .unwrap_or(0);
+    let st = stx
+        .stat64()
+        .ok_or_else(|| io::Error::from_raw_os_error(libc::ENOSYS))?;
+
+    Ok(StatExt { st, mnt_id })
+}
+
+/// Execute `statx()` on `file` for a FUSE STATX reply. It passes on the `AT_STATX_*` sync type
+/// in `flags`, and asks for the basic fields plus the birth time if `mask` has it. `fuse::Statx`
+/// has mask bits for no other fields.
+pub fn fuse_statx(file: &impl AsRawFd, flags: u32, mask: u32) -> io::Result<fuse::Statx> {
+    // Safe because this is a constant value and a valid C string.
+    let path = unsafe { CStr::from_bytes_with_nul_unchecked(EMPTY_CSTR) };
+    let stx = statx_raw(
+        file,
+        path,
+        flags as libc::c_int & libc::AT_STATX_SYNC_TYPE,
+        STATX_BASIC_STATS | (mask & fuse::STATX_BTIME),
+    )?;
+
+    let time = |tv_sec: i64, tv_nsec: u32| fuse::SxTime {
+        tv_sec,
+        tv_nsec,
+        reserved: 0,
+    };
+    Ok(fuse::Statx {
+        mask: stx.stx_mask & (fuse::STATX_BASIC_STATS | fuse::STATX_BTIME),
+        blksize: stx.stx_blksize,
+        attributes: stx.stx_attributes,
+        nlink: stx.stx_nlink,
+        uid: stx.stx_uid,
+        gid: stx.stx_gid,
+        mode: stx.stx_mode,
+        ino: stx.stx_ino,
+        size: stx.stx_size,
+        blocks: stx.stx_blocks,
+        attributes_mask: stx.stx_attributes_mask,
+        atime: time(stx.stx_atime.tv_sec, stx.stx_atime.tv_nsec),
+        btime: time(stx.stx_btime.tv_sec, stx.stx_btime.tv_nsec),
+        ctime: time(stx.stx_ctime.tv_sec, stx.stx_ctime.tv_nsec),
+        mtime: time(stx.stx_mtime.tv_sec, stx.stx_mtime.tv_nsec),
+        rdev_major: stx.stx_rdev_major,
+        rdev_minor: stx.stx_rdev_minor,
+        dev_major: stx.stx_dev_major,
+        dev_minor: stx.stx_dev_minor,
+        ..Default::default()
+    })
 }
 
 #[cfg(test)]

@@ -44,6 +44,11 @@
   permission bits, owner and group of the directories `Vfs` serves itself: its root while no file
   system is mounted at `/`, and the directories on the path to each mount point. The defaults
   keep today's root-owned `0777` ([#148](https://github.com/cloud-hypervisor/fuse-backend-rs/issues/148)).
+- [334](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/334): `FileSystem::statx()` and `AsyncFileSystem::async_statx()` serve `FUSE_STATX`
+  (protocol 7.39, Linux 6.6), which the kernel sends when `statx(2)` asks for the birth time.
+  Both default to `ENOSYS`, after which the kernel uses `GETATTR` for the rest of the connection.
+  `Vfs` passes them on, and answers with `getattr()` for the pseudo file system and for backends
+  without `statx()`. `PassthroughFs` serves them with the host `statx()` on Linux.
 - [304](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/304): Give FreeBSD a verification path. The Linux wire-format ABI
   body moves out of `fuse_abi_linux.rs` into a shared `fuse_abi_wire.rs`
   (each per-OS prelude re-exports the libc names the body uses), and a new

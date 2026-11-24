@@ -15,7 +15,7 @@ use super::{
     Context, DirEntry, Entry, FileSystem, GetxattrReply, ListxattrReply, ZeroCopyReader,
     ZeroCopyWriter,
 };
-use crate::abi::fuse_abi::{stat64, statvfs64, CreateIn, OpenOptions, SetattrValid};
+use crate::abi::fuse_abi::{stat64, statvfs64, CreateIn, OpenOptions, SetattrValid, Statx};
 use crate::file_traits::AsyncFileReadWriteVolatile;
 
 /// A trait for directly copying data from the fuse transport into a `File` without first storing it
@@ -143,6 +143,25 @@ pub trait AsyncFileSystem: FileSystem {
         Self: 'async_trait,
     {
         Box::pin(std::future::ready(self.getattr(ctx, inode, handle)))
+    }
+
+    /// Get attributes for a file / directory like `statx(2)`. See `FileSystem::statx()`.
+    fn async_statx<'a, 'b, 'async_trait>(
+        &'a self,
+        ctx: &'b Context,
+        inode: Self::Inode,
+        handle: Option<Self::Handle>,
+        flags: u32,
+        mask: u32,
+    ) -> Pin<StatxFuture<'async_trait>>
+    where
+        'a: 'async_trait,
+        'b: 'async_trait,
+        Self: 'async_trait,
+    {
+        Box::pin(std::future::ready(
+            self.statx(ctx, inode, handle, flags, mask),
+        ))
     }
 
     /// Set attributes for a file / directory.
@@ -1041,6 +1060,8 @@ pub trait AsyncFileSystem: FileSystem {
 
 type AttrFuture<'async_trait> =
     Box<dyn Future<Output = io::Result<(stat64, Duration)>> + Send + 'async_trait>;
+type StatxFuture<'async_trait> =
+    Box<dyn Future<Output = io::Result<(Statx, Duration)>> + Send + 'async_trait>;
 type OpenFuture<'async_trait, H> = Box<
     dyn Future<Output = io::Result<(Option<H>, OpenOptions, Option<u32>)>> + Send + 'async_trait,
 >;
@@ -1080,6 +1101,22 @@ impl<FS: AsyncFileSystem> AsyncFileSystem for Arc<FS> {
         Self: 'async_trait,
     {
         self.deref().async_getattr(ctx, inode, handle)
+    }
+
+    fn async_statx<'a, 'b, 'async_trait>(
+        &'a self,
+        ctx: &'b Context,
+        inode: Self::Inode,
+        handle: Option<Self::Handle>,
+        flags: u32,
+        mask: u32,
+    ) -> Pin<StatxFuture<'async_trait>>
+    where
+        'a: 'async_trait,
+        'b: 'async_trait,
+        Self: 'async_trait,
+    {
+        self.deref().async_statx(ctx, inode, handle, flags, mask)
     }
 
     fn async_setattr<'a, 'b, 'async_trait>(
