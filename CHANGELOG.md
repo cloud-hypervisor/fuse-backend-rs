@@ -224,6 +224,9 @@
   took.
 
 ### Changed
+- [326](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/326): `fuse-backend-core` uses tokio-uring 0.5 and io-uring 0.6 instead of 0.4 and 0.5.
+  Dropping an `async_file::File` that owns its descriptor closes it with `close(2)` instead of an
+  io_uring close operation.
 - [325](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/325): The `fuse-backend-fusedev` `uring` transport uses io-uring 0.6 instead of 0.5,
   and depends on it only on Linux.
 - [324](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/324): `fuse-backend-core` uses bitflags 2 instead of 1. The flag types (`FsOptions`,
