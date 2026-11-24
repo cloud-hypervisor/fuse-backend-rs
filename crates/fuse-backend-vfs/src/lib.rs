@@ -193,6 +193,10 @@ pub struct VfsOptions {
     /// Add `FsOptions::PASSTHROUGH` for kernel passthrough. If the kernel offers it, init()
     /// sets `no_writeback` and clears `no_open` for all mounts, because passthrough needs open
     /// requests and no writeback cache.
+    ///
+    /// Add `FsOptions::SUBMOUNTS` to mark the root of each mounted file system with
+    /// `ATTR_SUBMOUNT`, so the kernel mounts it as a submount with its own `st_dev`. Only
+    /// virtio-fs offers it, since Linux 5.10.
     pub out_opts: FsOptions,
     /// Declaration of ID mapping, in the format (internal ID, external ID, range).
     /// For example, (0, 1, 65536) represents mapping the external UID/GID range of `1~65536`
@@ -357,7 +361,7 @@ impl Vfs {
     fn insert_mount_locked(
         &self,
         fs: BackFileSystem,
-        mut entry: Entry,
+        entry: Entry,
         fs_idx: VfsIndex,
         path: &str,
     ) -> Result<()> {
@@ -368,8 +372,9 @@ impl Vfs {
         let mut mountpoints = self.mountpoints.load().deref().deref().clone();
         let inode = self.root.mount(path)?;
         let real_root_ino = entry.inode;
-
-        self.convert_entry(fs_idx, entry.inode, &mut entry)?;
+        // Store the entry as the file system returned it, and only check that its inode fits.
+        // mount_root_entry() converts it for each reply.
+        self.convert_inode(fs_idx, real_root_ino)?;
 
         // Over mount would invalidate previous superblock inodes.
         if let Some(mnt) = mountpoints.get(&inode) {
@@ -423,8 +428,8 @@ impl Vfs {
             })?;
         }
         let index = self.allocate_fs_idx().map_err(VfsError::FsIndex)?;
-        // Store per-mount id_mapping before insert_mount_locked so that
-        // convert_entry during insertion can use it.
+        // Store the per-mount id_mapping before insert_mount_locked() publishes the
+        // mount, so that no reply about it goes out unmapped.
         if id_mapping.is_some() {
             let mut mappings = self.mount_id_mappings.load().deref().deref().clone();
             mappings[index as usize] = id_mapping;
@@ -609,8 +614,41 @@ impl Vfs {
                 entry.attr.st_uid = remap_id(entry.attr.st_uid, internal_id, external_id, range);
                 entry.attr.st_gid = remap_id(entry.attr.st_gid, internal_id, external_id, range);
             }
+            self.submount_entry(entry);
             *entry
         })
+    }
+
+    /// Clears `ATTR_SUBMOUNT` from `entry` unless the kernel negotiated `FsOptions::SUBMOUNTS`.
+    /// The kernel acts on the flag whenever it offers `FsOptions::SUBMOUNTS`, even if the INIT
+    /// reply didn't take it.
+    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+    fn submount_entry(&self, entry: &mut Entry) {
+        if entry.attr_flags & ATTR_SUBMOUNT == 0 {
+            return;
+        }
+        if self.opts.load().out_opts.contains(FsOptions::SUBMOUNTS) {
+            // fuse_iget() gives an automount point generation 0, and the kernel drops its dentry
+            // when a reply carries another one.
+            entry.generation = 0;
+        } else {
+            entry.attr_flags &= !ATTR_SUBMOUNT;
+        }
+    }
+
+    /// macFUSE has no submounts, and its `fuse_attr.flags` holds chflags(2) flags.
+    #[cfg(target_os = "macos")]
+    fn submount_entry(&self, _entry: &mut Entry) {}
+
+    /// The root entry of the file system mounted at `mnt`, marked as a submount and converted
+    /// for a reply.
+    fn mount_root_entry(&self, mnt: &MountPointData) -> Result<Entry> {
+        let mut entry = mnt.root_entry;
+        #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+        {
+            entry.attr_flags |= ATTR_SUBMOUNT;
+        }
+        self.convert_entry(mnt.fs_idx, mnt.ino, &mut entry)
     }
 
     /// If id_mapping is enabled, remap the uid/gid in attributes.
@@ -788,8 +826,7 @@ impl Vfs {
         match self.mountpoints.load().get(&entry.inode) {
             Some(mnt) => {
                 // cross mountpoint, return mount root entry
-                entry = mnt.root_entry;
-                self.convert_entry(mnt.fs_idx, mnt.ino, &mut entry)?;
+                entry = self.mount_root_entry(mnt)?;
                 trace!(
                     "vfs lookup cross mountpoint, return new mount fs_idx {} inode 0x{:x} fuse inode 0x{:x}, attr inode 0x{:x}",
                     mnt.fs_idx,
@@ -859,8 +896,8 @@ impl Vfs {
                 match self.mountpoints.load().get(&dir_entry.ino) {
                     Some(mnt) => {
                         // cross mountpoint, return mount root entry
-                        dir_entry.ino = self.convert_inode(mnt.fs_idx, mnt.ino)?;
-                        entry = mnt.root_entry;
+                        entry = self.mount_root_entry(mnt)?;
+                        dir_entry.ino = entry.inode;
                     }
                     None => {
                         dir_entry.ino = self.convert_inode(idata.fs_idx(), dir_entry.ino)?;
@@ -1695,6 +1732,24 @@ mod tests {
     }
 
     #[test]
+    fn test_mount_root_is_remapped_once() {
+        // With overlapping ranges, a second remap would turn uid 1 into 2.
+        let vfs = Vfs::new(VfsOptions::default());
+        vfs.mount_with_id_mapping(Box::new(FakeFileSystemOne {}), "/x", Some((0, 1, 65536)))
+            .unwrap();
+        let ctx = Context::new();
+        let x = CString::new("x").unwrap();
+        assert_eq!(vfs.lookup(&ctx, ROOT_ID.into(), &x).unwrap().attr.st_uid, 1);
+        let mut uids = Vec::new();
+        vfs.readdirplus(&ctx, ROOT_ID.into(), 0, 4096, 0, &mut |_, entry| {
+            uids.push(entry.attr.st_uid);
+            Ok(1)
+        })
+        .unwrap();
+        assert_eq!(uids, [1]);
+    }
+
+    #[test]
     fn test_per_mount_id_mapping() {
         // No global id_mapping — per-mount mappings are independent.
         let vfs = Vfs::new(VfsOptions::default());
@@ -1829,6 +1884,49 @@ mod tests {
             .getattr(&ctx, VfsInode(0x100_0000_0000_0001), None)
             .unwrap();
         assert_eq!(stat.st_ino, 0x100_0000_0000_0001);
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+    #[test]
+    fn test_submounts() {
+        let ctx = Context::new();
+        let x = CString::new("x").unwrap();
+        let (sub, none) = (FsOptions::SUBMOUNTS, FsOptions::empty());
+        // What out_opts asks for, what the kernel offers, and whether the root of the mount at
+        // /x gets ATTR_SUBMOUNT.
+        for (wanted, offered, marked) in [(sub, sub, true), (sub, none, false), (none, sub, false)]
+        {
+            let mut opts = VfsOptions::default();
+            opts.out_opts.insert(wanted);
+            let vfs = Vfs::new(opts);
+            let idx = vfs.mount(Box::new(FakeFileSystemOne {}), "/x").unwrap();
+            vfs.init(offered).unwrap();
+
+            // A marked root has generation 0, like the automount point the kernel makes for it.
+            let root = vfs.lookup(&ctx, ROOT_ID.into(), &x).unwrap();
+            let expected = if marked {
+                (ATTR_SUBMOUNT, 0)
+            } else {
+                (0, vfs.generation(idx))
+            };
+            assert_eq!((root.attr_flags, root.generation), expected);
+            let mut listed = Vec::new();
+            vfs.readdirplus(&ctx, ROOT_ID.into(), 0, 4096, 0, &mut |_, entry| {
+                listed.push((entry.inode, entry.attr_flags, entry.generation));
+                Ok(1)
+            })
+            .unwrap();
+            assert_eq!(listed, [(root.inode, expected.0, expected.1)]);
+
+            // Below the mount root, a file system's own ATTR_SUBMOUNT needs the same
+            // negotiation.
+            let mut entry = Entry {
+                attr_flags: ATTR_SUBMOUNT,
+                ..Default::default()
+            };
+            vfs.convert_entry(idx, 2, &mut entry).unwrap();
+            assert_eq!((entry.attr_flags, entry.generation), expected);
+        }
     }
 
     #[test]

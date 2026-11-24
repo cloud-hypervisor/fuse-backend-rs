@@ -1237,15 +1237,7 @@ impl<F: FileSystem + Sync> Server<F> {
 
         match self.fs.create(ctx.context(), ctx.nodeid(), name, args) {
             Ok((entry, handle, opts, passthrough)) => {
-                let entry_out = EntryOut {
-                    nodeid: entry.inode,
-                    generation: entry.generation,
-                    entry_valid: entry.entry_timeout.as_secs(),
-                    attr_valid: entry.attr_timeout.as_secs(),
-                    entry_valid_nsec: entry.entry_timeout.subsec_nanos(),
-                    attr_valid_nsec: entry.attr_timeout.subsec_nanos(),
-                    attr: entry.attr.into(),
-                };
+                let entry_out = EntryOut::from(entry);
 
                 let open_out = OpenOut {
                     fh: handle.map(Into::into).unwrap_or(0),
@@ -2147,6 +2139,155 @@ mod tests {
         server.handle_message(reader, writer, None, None).unwrap();
         let out = OutHeader::from_slice(&write_buf[..size_of::<OutHeader>()]).unwrap();
         assert_eq!(out.unique, unique);
+    }
+
+    #[test]
+    fn test_server_replies_keep_attr_flags() {
+        use crate::api::filesystem::Context;
+        use std::ffi::CStr;
+
+        /// Answers every request that returns an entry with one that has `ATTR_SUBMOUNT` set.
+        struct SubmountFs;
+
+        impl SubmountFs {
+            fn entry() -> io::Result<Entry> {
+                Ok(Entry {
+                    inode: 2,
+                    attr_flags: ATTR_SUBMOUNT,
+                    ..Default::default()
+                })
+            }
+        }
+
+        #[allow(unused_variables)]
+        impl FileSystem for SubmountFs {
+            type Inode = u64;
+            type Handle = u64;
+
+            fn lookup(&self, ctx: &Context, parent: u64, name: &CStr) -> io::Result<Entry> {
+                Self::entry()
+            }
+
+            fn symlink(
+                &self,
+                ctx: &Context,
+                linkname: &CStr,
+                parent: u64,
+                name: &CStr,
+            ) -> io::Result<Entry> {
+                Self::entry()
+            }
+
+            fn mknod(
+                &self,
+                ctx: &Context,
+                inode: u64,
+                name: &CStr,
+                mode: u32,
+                rdev: u32,
+                umask: u32,
+            ) -> io::Result<Entry> {
+                Self::entry()
+            }
+
+            fn mkdir(
+                &self,
+                ctx: &Context,
+                parent: u64,
+                name: &CStr,
+                mode: u32,
+                umask: u32,
+            ) -> io::Result<Entry> {
+                Self::entry()
+            }
+
+            fn link(
+                &self,
+                ctx: &Context,
+                inode: u64,
+                newparent: u64,
+                newname: &CStr,
+            ) -> io::Result<Entry> {
+                Self::entry()
+            }
+
+            fn create(
+                &self,
+                ctx: &Context,
+                parent: u64,
+                name: &CStr,
+                args: CreateIn,
+            ) -> io::Result<(Entry, Option<u64>, OpenOptions, Option<u32>)> {
+                Ok((Self::entry()?, None, OpenOptions::empty(), None))
+            }
+
+            fn readdirplus(
+                &self,
+                ctx: &Context,
+                inode: u64,
+                handle: u64,
+                size: u32,
+                offset: u64,
+                add_entry: &mut dyn FnMut(DirEntry, Entry) -> io::Result<usize>,
+            ) -> io::Result<()> {
+                if offset == 0 {
+                    let dir_entry = DirEntry {
+                        ino: 2,
+                        offset: 1,
+                        type_: libc::DT_DIR as u32,
+                        name: b"a",
+                    };
+                    add_entry(dir_entry, Self::entry()?)?;
+                }
+                Ok(())
+            }
+        }
+
+        let server = Server::new(SubmountFs);
+        let name: &[u8] = b"a\0";
+        let read_in = ReadIn {
+            size: 1024,
+            ..Default::default()
+        };
+        for (opcode, body) in [
+            (Opcode::Lookup, name.to_vec()),
+            (Opcode::Symlink, [name, b"t\0"].concat()),
+            (
+                Opcode::Mknod,
+                [MknodIn::default().as_slice(), name].concat(),
+            ),
+            (
+                Opcode::Mkdir,
+                [MkdirIn::default().as_slice(), name].concat(),
+            ),
+            (
+                Opcode::Link,
+                [LinkIn { oldnodeid: 2 }.as_slice(), name].concat(),
+            ),
+            (
+                Opcode::Create,
+                [CreateIn::default().as_slice(), name].concat(),
+            ),
+            // A READDIRPLUS reply starts with the entry of the first dirent.
+            (Opcode::Readdirplus, read_in.as_slice().to_vec()),
+        ] {
+            let header = InHeader {
+                len: (size_of::<InHeader>() + body.len()) as u32,
+                opcode: opcode as u32,
+                unique: 1,
+                nodeid: ROOT_ID,
+                ..Default::default()
+            };
+            let mut read_buf = [header.as_slice(), &body].concat();
+            let mut write_buf = [0u8; 4096];
+            let reader = Reader::<()>::from_slice(&mut read_buf);
+            let writer = TestWriter::new(&mut write_buf);
+            server.handle_message(reader, writer, None, None).unwrap();
+            let (out, reply) = write_buf.split_at(size_of::<OutHeader>());
+            assert_eq!(OutHeader::from_slice(out).unwrap().error, 0, "{:?}", opcode);
+            let entry = EntryOut::from_slice(&reply[..size_of::<EntryOut>()]).unwrap();
+            assert_eq!(entry.attr.flags, ATTR_SUBMOUNT, "{:?}", opcode);
+        }
     }
 
     #[cfg(target_os = "linux")]
