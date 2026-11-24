@@ -358,6 +358,15 @@
 - [NNN](link): With `allow_direct_io` off, a create with O_DIRECT no longer opens the new host
   file with O_DIRECT, which made buffered IO on it fail with EINVAL. `PassthroughFs::create()`
   now builds the host open flags with the same helper as `open_inode()`.
+- [385](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/385): tokio-uring doesn't cancel an IO whose future is dropped, so the kernel went on
+  reading or writing buffers that their owner had freed or reused. `FuseDevTask` now reads
+  requests into buffers that the read owns, with the new `async_file::File::async_read_owned_at()`,
+  and runs each request in the new `async_file::TrackedRequest`. When `poll_handler()` is
+  dropped, for example in a `select!` on shutdown, it leaks the requests with IO into their
+  buffers in flight, and it also leaks a request that completes with such IO in flight.
+  `FuseDevTask::leaked_requests()` counts them. Any other drop of an io_uring IO on a borrowed
+  buffer through `async_file::File` now aborts the process, for example when a handler gives up
+  on its own copy or panics while the copy is in flight.
 - [347](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/347): `Vfs` forwards COPY_FILE_RANGE to the mounted file system that holds both
   files, so a `PassthroughFs` behind a `Vfs` copies on the host. `Vfs` answered ENOSYS, on
   which the kernel stops sending COPY_FILE_RANGE on the connection and falls back to a

@@ -482,6 +482,10 @@ mod async_io {
     /// The asynchronous IO framework provided by [tokio-uring](https://docs.rs/tokio-uring/latest/tokio_uring/)
     /// needs to take ownership of data buffers during asynchronous IO operations.
     /// The [AsyncFileReadWriteVolatile] trait is designed to support io-uring based asynchronous IO.
+    ///
+    /// The buffers point into memory that the caller frees or reuses once the future completes or
+    /// is dropped, so an implementation must not touch them after that. See [File] for how its
+    /// io_uring IO keeps to that.
     #[async_trait::async_trait(?Send)]
     pub trait AsyncFileReadWriteVolatile {
         /// Read bytes from this file at `offset` into the given slice in asynchronous mode.
