@@ -22,6 +22,15 @@ use crate::abi::fuse_abi::{
     SetattrIn, SetattrValid, SetxattrIn, WriteIn, WriteOut, FATTR_FH, GETATTR_FH,
     KERNEL_MINOR_VERSION_LOOKUP_NEGATIVE_ENTRY_ZERO, READ_LOCKOWNER, WRITE_CACHE, WRITE_LOCKOWNER,
 };
+#[cfg(feature = "fusedev")]
+use crate::abi::fuse_abi::{
+    NotifyDeleteOut, NotifyInvalEntryOut, NotifyInvalInodeOut, NotifyOpcode, NotifyStoreOut,
+    Notify_Retrieve_Out,
+};
+#[cfg(all(feature = "fusedev", target_os = "linux"))]
+use crate::abi::fuse_abi::{NotifyPruneOut, EXPIRE_ONLY};
+#[cfg(feature = "fusedev")]
+use crate::api::filesystem::FileSystem;
 use crate::api::filesystem::FsCacheReqHandler;
 use crate::api::filesystem::{
     AsyncFileSystem, AsyncZeroCopyReader, AsyncZeroCopyWriter, DirEntry, Entry, ZeroCopyReader,
@@ -1049,6 +1058,180 @@ impl<F: AsyncFileSystem + Sync> Server<F> {
             Ok(()) => ctx.async_reply_ok(None::<u8>, None).await,
             Err(e) => ctx.async_reply_error(e).await,
         }
+    }
+}
+
+/// The async variants of the notification helpers, which write through the async methods of the
+/// writer.
+///
+/// They send the same messages as the sync helpers, whose docs describe each notification. A
+/// `FuseDevWriter` blocks the thread until the kernel takes the message, and some notifications
+/// wait for locks that requests in flight hold. So don't await these on a runtime that serves
+/// requests.
+#[cfg(feature = "fusedev")]
+impl<F: FileSystem + Sync> Server<F> {
+    /// Send the notification `code` with the body `parts` through `w`.
+    async fn async_notify<W: Writer>(
+        mut w: W,
+        code: NotifyOpcode,
+        parts: &[&[u8]],
+    ) -> Result<usize> {
+        let header = Self::notify_header(code, parts)?;
+        let mut buffer_writer = w.split_at(0).map_err(Error::FailedToSplitWriter)?;
+        buffer_writer
+            .async_write_all(header.as_slice())
+            .await
+            .map_err(Error::FailedToWrite)?;
+        for part in parts {
+            buffer_writer
+                .async_write_all(part)
+                .await
+                .map_err(Error::FailedToWrite)?;
+        }
+        buffer_writer
+            .async_commit(None)
+            .await
+            .map_err(Error::InvalidMessage)
+    }
+
+    async fn async_notify_entry<W: Writer>(
+        w: W,
+        parent: u64,
+        name: &CStr,
+        flags: u32,
+    ) -> Result<usize> {
+        let entry = NotifyInvalEntryOut {
+            parent,
+            namelen: name.to_bytes().len() as u32,
+            flags,
+        };
+        Self::async_notify(
+            w,
+            NotifyOpcode::InvalEntry,
+            &[entry.as_slice(), name.to_bytes_with_nul()],
+        )
+        .await
+    }
+
+    /// The async variant of `notify_inval_entry()`.
+    pub async fn async_notify_inval_entry<W: Writer>(
+        &self,
+        w: W,
+        parent: u64,
+        name: &CStr,
+    ) -> Result<usize> {
+        Self::async_notify_entry(w, parent, name, 0).await
+    }
+
+    /// The async variant of `notify_expire_entry()`.
+    #[cfg(target_os = "linux")]
+    pub async fn async_notify_expire_entry<W: Writer>(
+        &self,
+        w: W,
+        parent: u64,
+        name: &CStr,
+    ) -> Result<usize> {
+        self.check_expire_only()?;
+        Self::async_notify_entry(w, parent, name, EXPIRE_ONLY).await
+    }
+
+    /// The async variant of `notify_delete()`.
+    pub async fn async_notify_delete<W: Writer>(
+        &self,
+        w: W,
+        parent: u64,
+        child: u64,
+        name: &CStr,
+    ) -> Result<usize> {
+        let delete = NotifyDeleteOut {
+            parent,
+            child,
+            namelen: name.to_bytes().len() as u32,
+            padding: 0,
+        };
+        Self::async_notify(
+            w,
+            NotifyOpcode::Delete,
+            &[delete.as_slice(), name.to_bytes_with_nul()],
+        )
+        .await
+    }
+
+    /// The async variant of `notify_inval_inode()`.
+    pub async fn async_notify_inval_inode<W: Writer>(
+        &self,
+        w: W,
+        ino: u64,
+        off: u64,
+        len: u64,
+    ) -> Result<usize> {
+        let inode = NotifyInvalInodeOut {
+            ino,
+            off: off as i64,
+            len: len as i64,
+        };
+        Self::async_notify(w, NotifyOpcode::InvalInode, &[inode.as_slice()]).await
+    }
+
+    /// The async variant of `notify_store()`.
+    pub async fn async_notify_store<W: Writer>(
+        &self,
+        w: W,
+        ino: u64,
+        offset: u64,
+        data: &[u8],
+    ) -> Result<usize> {
+        let store = NotifyStoreOut {
+            nodeid: ino,
+            offset,
+            size: data.len() as u32,
+            padding: 0,
+        };
+        Self::async_notify(w, NotifyOpcode::Store, &[store.as_slice(), data]).await
+    }
+
+    /// The async variant of `notify_retrieve()`.
+    pub async fn async_notify_retrieve<W: Writer>(
+        &self,
+        w: W,
+        unique: u64,
+        ino: u64,
+        offset: u64,
+        size: u32,
+    ) -> Result<usize> {
+        let retrieve = Notify_Retrieve_Out {
+            notify_unique: unique,
+            nodeid: ino,
+            offset,
+            size,
+            padding: 0,
+        };
+        Self::async_notify(w, NotifyOpcode::Retrieve, &[retrieve.as_slice()]).await
+    }
+
+    /// The async variant of `notify_resend()`.
+    pub async fn async_notify_resend<W: Writer>(&self, w: W) -> Result<()> {
+        Self::async_notify(w, NotifyOpcode::Resend, &[])
+            .await
+            .map(|_| ())
+    }
+
+    /// The async variant of `notify_increment_epoch()`.
+    #[cfg(target_os = "linux")]
+    pub async fn async_notify_increment_epoch<W: Writer>(&self, w: W) -> Result<usize> {
+        Self::async_notify(w, NotifyOpcode::IncEpoch, &[]).await
+    }
+
+    /// The async variant of `notify_prune()`.
+    #[cfg(target_os = "linux")]
+    pub async fn async_notify_prune<W: Writer>(&self, w: W, inodes: &[u64]) -> Result<usize> {
+        let prune = NotifyPruneOut {
+            count: inodes.len() as u32,
+            padding: 0,
+            spare: 0,
+        };
+        let ids: Vec<u8> = inodes.iter().flat_map(|ino| ino.to_ne_bytes()).collect();
+        Self::async_notify(w, NotifyOpcode::Prune, &[prune.as_slice(), &ids]).await
     }
 }
 
@@ -2475,7 +2658,7 @@ mod tests {
 
     #[test]
     fn test_async_server_doesnt_reply_to_notify_reply() {
-        // BackingFs fails notify_reply() with ENOSYS.
+        // The request lacks its NotifyRetrieveIn, so it fails to decode.
         let header = InHeader {
             len: size_of::<InHeader>() as u32,
             opcode: Opcode::NotifyReply as u32,
@@ -2491,7 +2674,7 @@ mod tests {
             let writer = TestWriter::new(&mut write_buf);
             unsafe { server.async_handle_message(reader, writer, None, None) }.await
         });
-        assert!(matches!(res, Err(Error::InvalidMessage(_))));
+        assert!(matches!(res, Err(Error::DecodeMessage(_))));
         assert!(write_buf.iter().all(|&b| b == 0));
     }
 
@@ -2559,5 +2742,155 @@ mod tests {
             };
             check_oversized(opcode, res, &reply);
         }
+    }
+
+    /// Check that the notification helper `send` and its async twin `async_send` write the
+    /// notification `code` with `body` into a `TestWriter`.
+    #[cfg(feature = "fusedev")]
+    fn assert_notifies<T>(
+        code: NotifyOpcode,
+        body: &[&[u8]],
+        send: impl FnOnce(TestWriter<'_>) -> Result<T>,
+        async_send: impl AsyncFnOnce(TestWriter<'_>) -> Result<T>,
+    ) {
+        let body = body.concat();
+        let header = OutHeader {
+            len: (size_of::<OutHeader>() + body.len()) as u32,
+            error: code as i32,
+            unique: 0,
+        };
+        // The message, then the zeroes the writer left alone.
+        let mut expected = [0u8; 128];
+        expected[..size_of::<OutHeader>()].copy_from_slice(header.as_slice());
+        expected[size_of::<OutHeader>()..header.len as usize].copy_from_slice(&body);
+        let mut buf = [0u8; 128];
+        send(TestWriter::new(&mut buf)).unwrap();
+        assert_eq!(buf, expected);
+        let mut buf = [0u8; 128];
+        async_runtime::block_on(async_send(TestWriter::new(&mut buf))).unwrap();
+        assert_eq!(buf, expected);
+    }
+
+    #[test]
+    #[cfg(feature = "fusedev")]
+    fn test_async_notify() {
+        let server = Server::new(BackingFs);
+        let name = CStr::from_bytes_with_nul(b"name\0").unwrap();
+
+        // parent, namelen, flags, then the name.
+        assert_notifies(
+            NotifyOpcode::InvalEntry,
+            &[&1u64.to_ne_bytes(), &4u32.to_ne_bytes(), &[0; 4], b"name\0"],
+            |w| server.notify_inval_entry(w, 1, name),
+            async |w| server.async_notify_inval_entry(w, 1, name).await,
+        );
+        // parent, child, namelen, padding, then the name.
+        assert_notifies(
+            NotifyOpcode::Delete,
+            &[
+                &1u64.to_ne_bytes(),
+                &2u64.to_ne_bytes(),
+                &4u32.to_ne_bytes(),
+                &[0; 4],
+                b"name\0",
+            ],
+            |w| server.notify_delete(w, 1, 2, name),
+            async |w| server.async_notify_delete(w, 1, 2, name).await,
+        );
+        // ino, offset, length.
+        assert_notifies(
+            NotifyOpcode::InvalInode,
+            &[
+                &2u64.to_ne_bytes(),
+                &4096u64.to_ne_bytes(),
+                &8192u64.to_ne_bytes(),
+            ],
+            |w| server.notify_inval_inode(w, 2, 4096, 8192),
+            async |w| server.async_notify_inval_inode(w, 2, 4096, 8192).await,
+        );
+        // ino, offset, size, padding, then the data.
+        assert_notifies(
+            NotifyOpcode::Store,
+            &[
+                &2u64.to_ne_bytes(),
+                &4096u64.to_ne_bytes(),
+                &4u32.to_ne_bytes(),
+                &[0; 4],
+                b"data",
+            ],
+            |w| server.notify_store(w, 2, 4096, b"data"),
+            async |w| server.async_notify_store(w, 2, 4096, b"data").await,
+        );
+        // unique, ino, offset, size, padding.
+        assert_notifies(
+            NotifyOpcode::Retrieve,
+            &[
+                &42u64.to_ne_bytes(),
+                &2u64.to_ne_bytes(),
+                &4096u64.to_ne_bytes(),
+                &8192u32.to_ne_bytes(),
+                &[0; 4],
+            ],
+            |w| server.notify_retrieve(w, 42, 2, 4096, 8192),
+            async |w| server.async_notify_retrieve(w, 42, 2, 4096, 8192).await,
+        );
+        assert_notifies(
+            NotifyOpcode::Resend,
+            &[],
+            |w| server.notify_resend(w),
+            async |w| server.async_notify_resend(w).await,
+        );
+    }
+
+    #[test]
+    #[cfg(all(feature = "fusedev", target_os = "linux"))]
+    fn test_async_notify_linux() {
+        let server = Server::new(BackingFs);
+        let name = CStr::from_bytes_with_nul(b"name\0").unwrap();
+
+        assert_notifies(
+            NotifyOpcode::IncEpoch,
+            &[],
+            |w| server.notify_increment_epoch(w),
+            async |w| server.async_notify_increment_epoch(w).await,
+        );
+        // count, padding, spare, then the inodes.
+        assert_notifies(
+            NotifyOpcode::Prune,
+            &[
+                &2u32.to_ne_bytes(),
+                &[0; 12],
+                &2u64.to_ne_bytes(),
+                &3u64.to_ne_bytes(),
+            ],
+            |w| server.notify_prune(w, &[2, 3]),
+            async |w| server.async_notify_prune(w, &[2, 3]).await,
+        );
+
+        let mut buf = [0u8; 64];
+        let res = async_runtime::block_on(server.async_notify_expire_entry(
+            TestWriter::new(&mut buf),
+            1,
+            name,
+        ));
+        match res {
+            Err(Error::EncodeMessage(e)) => assert_eq!(e.raw_os_error(), Some(libc::ENOSYS)),
+            other => panic!("unexpected result: {:?}", other),
+        }
+        assert!(buf.iter().all(|&b| b == 0));
+        let (version, options) = server.init_state();
+        server.restore_init(version, options | FsOptions::HAS_EXPIRE_ONLY);
+        // The flags are EXPIRE_ONLY.
+        assert_notifies(
+            NotifyOpcode::InvalEntry,
+            &[
+                &1u64.to_ne_bytes(),
+                &4u32.to_ne_bytes(),
+                &1u32.to_ne_bytes(),
+                b"name\0",
+            ],
+            |w| server.notify_expire_entry(w, 1, name),
+            async |w| server.async_notify_expire_entry(w, 1, name).await,
+        );
     }
 }

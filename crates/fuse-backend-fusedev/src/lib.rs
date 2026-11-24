@@ -735,50 +735,12 @@ mod async_io {
             }
         }
 
-        /// Commit all internal buffers of the writer and others.
-        ///
-        /// We need this because the lifetime of others is usually shorter than self.
+        /// Same as `commit()`.
         pub async fn async_commit(
             &mut self,
             other: Option<&FuseDevWriter<'a, S>>,
         ) -> io::Result<usize> {
-            if !self.buffered {
-                // In non-buffered mode, all data has been written to the fuse device
-                // synchronously by the write methods, so there's nothing to commit.
-                return Ok(0);
-            }
-            #[cfg(target_os = "linux")]
-            if let Some(n) = self.commit_spliced(other)? {
-                return Ok(n);
-            }
-
-            let o = other.map(|w| w.buf.written()).unwrap_or(&[]);
-            // SAFETY: the fd belongs to the session's fuse device file.
-            let fd = unsafe { BorrowedFd::borrow_raw(self.fd) };
-
-            let res = match (self.buf.position(), o.len()) {
-                (0, 0) => Ok(0),
-                (0, _) => nix::sys::uio::pwrite(fd, o, 0).map_err(|e| {
-                    error! {"fail to write to fuse device fd {}: {}", self.fd, e};
-                    io::Error::other(format!("{}", e))
-                }),
-                (_, 0) => nix::sys::uio::pwrite(fd, self.buf.written(), 0).map_err(|e| {
-                    error! {"fail to write to fuse device fd {}: {}", self.fd, e};
-                    io::Error::other(format!("{}", e))
-                }),
-                (_, _) => {
-                    let bufs = [IoSlice::new(self.buf.written()), IoSlice::new(o)];
-                    writev(fd, &bufs).map_err(|e| {
-                        error! {"fail to write to fuse device fd {}: {}", self.fd, e};
-                        io::Error::other(format!("{}", e))
-                    })
-                }
-            };
-
-            res.map_err(|e| {
-                error! {"fail to write to fuse device on commit: {}", e};
-                e
-            })
+            self.commit(other)
         }
     }
 }

@@ -1239,7 +1239,7 @@ unsafe impl ByteValued for NotifyInvalInodeOut {}
 pub struct NotifyInvalEntryOut {
     pub parent: u64,
     pub namelen: u32,
-    pub padding: u32,
+    pub flags: u32,
 }
 unsafe impl ByteValued for NotifyInvalEntryOut {}
 
