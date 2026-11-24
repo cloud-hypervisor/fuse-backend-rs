@@ -346,6 +346,22 @@ pub trait FileSystem {
         Err(io::Error::from_raw_os_error(libc::ENOSYS))
     }
 
+    /// Create and open an unnamed file in the directory `parent`, like `open(2)` with
+    /// `O_TMPFILE`.
+    ///
+    /// Like `create()`, but the file has no name and a link count of 0 until `link()` gives it
+    /// one, which the kernel allows unless `args.flags` has `O_EXCL`. If the file system returns
+    /// `ENOSYS`, the kernel fails this and every later `O_TMPFILE` open with `EOPNOTSUPP`.
+    #[allow(clippy::type_complexity)]
+    fn tmpfile(
+        &self,
+        ctx: &Context,
+        parent: Self::Inode,
+        args: CreateIn,
+    ) -> io::Result<(Entry, Option<Self::Handle>, OpenOptions, Option<u32>)> {
+        Err(io::Error::from_raw_os_error(libc::ENOSYS))
+    }
+
     /// Read data from a file.
     ///
     /// Returns `size` bytes of data starting from offset `off` from the file associated with
@@ -1088,6 +1104,15 @@ impl<FS: FileSystem> FileSystem for Arc<FS> {
         args: CreateIn,
     ) -> io::Result<(Entry, Option<Self::Handle>, OpenOptions, Option<u32>)> {
         self.deref().create(ctx, parent, name, args)
+    }
+
+    fn tmpfile(
+        &self,
+        ctx: &Context,
+        parent: Self::Inode,
+        args: CreateIn,
+    ) -> io::Result<(Entry, Option<Self::Handle>, OpenOptions, Option<u32>)> {
+        self.deref().tmpfile(ctx, parent, args)
     }
 
     fn read(

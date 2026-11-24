@@ -5,7 +5,7 @@ use std::io;
 
 use async_trait::async_trait;
 
-use super::sync_io::copy_file_range_error;
+use super::sync_io::{copy_file_range_error, tmpfile_error};
 use super::*;
 
 #[async_trait]
@@ -112,6 +112,32 @@ impl AsyncFileSystem for Vfs {
                     self.convert_backend_entry(idata, a).map(|a| (a, b, c, d))
                 }),
         }
+    }
+
+    async fn async_tmpfile(
+        &self,
+        ctx: &Context,
+        parent: <Self as FileSystem>::Inode,
+        args: CreateIn,
+    ) -> Result<(
+        Entry,
+        Option<<Self as FileSystem>::Handle>,
+        OpenOptions,
+        Option<u32>,
+    )> {
+        let ctx = self.ctx_for_mount(ctx, parent.fs_idx());
+
+        match self.get_real_rootfs(parent)? {
+            (Left(fs), idata) => fs.tmpfile(&ctx, idata.ino(), args),
+            (Right(fs), idata) => {
+                fs.async_tmpfile(&ctx, idata.ino(), args)
+                    .await
+                    .and_then(|(a, b, c, d)| {
+                        self.convert_backend_entry(idata, a).map(|a| (a, b, c, d))
+                    })
+            }
+        }
+        .map_err(tmpfile_error)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -785,6 +811,20 @@ mod tests {
             tokio::task::yield_now().await;
             Ok(len as u32)
         }
+
+        async fn async_tmpfile(
+            &self,
+            _ctx: &Context,
+            _parent: u64,
+            _args: CreateIn,
+        ) -> Result<(Entry, Option<u64>, OpenOptions, Option<u32>)> {
+            tokio::task::yield_now().await;
+            let entry = Entry {
+                inode: 5,
+                ..Default::default()
+            };
+            Ok((entry, Some(9), OpenOptions::empty(), None))
+        }
     }
 
     impl BackendFileSystem for AsyncDirFs {
@@ -943,6 +983,32 @@ mod tests {
                 .await
                 .unwrap_err();
             assert_eq!(err.raw_os_error(), Some(libc::EINVAL));
+        });
+        handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_vfs_async_tmpfile() {
+        let vfs = Vfs::new(VfsOptions::default());
+        vfs.mount(Box::new(AsyncDirFs), "/x").unwrap();
+        let one = vfs.mount(Box::new(FakeFileSystemOne {}), "/y").unwrap();
+        let ctx = Context::default();
+
+        let handle = tokio::spawn(async move {
+            let (entry, fh, _, _) = vfs
+                .async_tmpfile(&ctx, MOUNT_ROOT.into(), CreateIn::default())
+                .await
+                .unwrap();
+            assert_eq!((entry.inode, fh), (MOUNT_FILE, Some(9)));
+
+            // The pseudo fs and a backend without tmpfile() answer EOPNOTSUPP.
+            for parent in [ROOT_ID.into(), VfsInode::new(one, 1)] {
+                let err = vfs
+                    .async_tmpfile(&ctx, parent, CreateIn::default())
+                    .await
+                    .unwrap_err();
+                assert_eq!(err.raw_os_error(), Some(libc::EOPNOTSUPP));
+            }
         });
         handle.await.unwrap();
     }

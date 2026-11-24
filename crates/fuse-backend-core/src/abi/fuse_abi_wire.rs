@@ -813,7 +813,8 @@ pub enum Opcode {
     CopyFileRange = 47,
     SetupMapping = 48,
     RemoveMapping = 49,
-    MaxOpcode = 50,
+    Tmpfile = 51,
+    MaxOpcode = 52,
 
     /* Reserved opcodes: helpful to detect structure endian-ness in case of e.g. virtiofs */
     CuseInitBswapReserved = 1_048_576, /* CUSE_INIT << 8 */
@@ -874,6 +875,7 @@ impl From<u32> for Opcode {
             47 => Opcode::CopyFileRange,
             48 => Opcode::SetupMapping,
             49 => Opcode::RemoveMapping,
+            51 => Opcode::Tmpfile,
             _ => Opcode::MaxOpcode,
         }
     }
@@ -1609,6 +1611,7 @@ mod tests {
             Opcode::CopyFileRange,
             Opcode::SetupMapping,
             Opcode::RemoveMapping,
+            Opcode::Tmpfile,
         ];
         for op in valid {
             assert_eq!(Opcode::from(op as u32) as u32, op as u32);
@@ -1622,6 +1625,7 @@ mod tests {
         assert_eq!(Opcode::from(0) as u32, Opcode::MaxOpcode as u32);
         assert_eq!(Opcode::from(7) as u32, Opcode::MaxOpcode as u32);
         assert_eq!(Opcode::from(19) as u32, Opcode::MaxOpcode as u32);
+        assert_eq!(Opcode::from(50) as u32, Opcode::MaxOpcode as u32);
         assert_eq!(
             Opcode::from(Opcode::MaxOpcode as u32) as u32,
             Opcode::MaxOpcode as u32
