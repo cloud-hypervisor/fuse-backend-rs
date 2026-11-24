@@ -1,5 +1,14 @@
 name: Rust
 
+# NOTE (2026-11-24): every workflow in this repository currently fails at the
+# "Getting action download info" stage, because the Actions permissions policy
+# now only allows actions from repositories owned by cloud-hypervisor, which
+# excludes actions/checkout and every other third-party action used here. This
+# is a settings-level change, not a code change: no workflow file changed
+# between the last green runs (2026-11-23) and the first red ones (2026-11-24).
+# See the pull request that adds this comment for the full diagnosis and the
+# settings/audit-log trail.
+
 on:
   push:
     branches: '*'
