@@ -224,6 +224,9 @@
   took.
 
 ### Changed
+- [326](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/326): `fuse-backend-core` uses tokio-uring 0.5 and io-uring 0.6 instead of 0.4 and 0.5.
+  Dropping an `async_file::File` that owns its descriptor closes it with `close(2)` instead of an
+  io_uring close operation.
 - [325](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/325): The `fuse-backend-fusedev` `uring` transport uses io-uring 0.6 instead of 0.5,
   and depends on it only on Linux.
 - [324](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/324): `fuse-backend-core` uses bitflags 2 instead of 1. The flag types (`FsOptions`,
@@ -335,6 +338,10 @@
   and no code in the workspace relied on it.
 
 ### Fixed
+- [327](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/327): io_uring reads and writes on a descriptor from `async_file::File::borrow_fd()` no
+  longer leak 56 bytes each. `PassthroughFs` serves every async read and write that way. Such an
+  operation also keeps the descriptor's guard until the kernel completes it, even if its future is
+  dropped first.
 - [NNN](link): A `FuseDevTask` that keeps finding requests lets its runtime run. On tokio,
   `AsyncFd::ready()` takes none of the task's budget, and the read of a readable fuse fd doesn't
   wait, so a task that kept finding requests never returned to its runtime. The timers, IO and
