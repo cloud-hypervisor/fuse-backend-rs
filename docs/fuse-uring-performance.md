@@ -282,6 +282,100 @@ seconds, and the two settings alternated three times:
 Zero-copy saves the copy of the payload, which matters for large
 requests. At 128 KiB the two runs overlap.
 
+## Handing a connection over
+
+`UringFuseServing` can't hand its connection to another server the way a
+takeover with `Server::restore_init()` and `FUSE_NOTIFY_RESEND` does on
+`/dev/fuse`. `Server::restore_init()` fails with
+`ErrorKind::Unsupported` for the INIT state of a connection that
+negotiated `FUSE_OVER_IO_URING`. Where the connection has to outlive the
+server process, serve it from `/dev/fuse` and don't call
+`Server::set_uring()`. The rest of this section is what
+fs/fuse/dev_uring.c does in Linux 7.3 and, where it differs, in 6.14.
+
+The ring and its queues belong to the connection. 7.3 creates the ring
+at INIT (`fuse_uring_conn_init()`, from `fuse_chan_set_initialized()`),
+6.14 at the first REGISTER (`fuse_uring_create()`). A queue comes with
+the first command for it, and the kernel frees both only with the
+connection (`fuse_uring_destruct()`). On 7.3 a queue keeps the payload
+buffers of the server that set it up. A second
+`FUSE_IO_URING_CMD_ADD_QUEUE` fails with EEXIST
+(`fuse_uring_create_queue()`), and `ADD_BUFPOOL` fails with EINVAL on a
+queue that has a pool or whose entries brought their own buffers
+(`fuse_uring_add_bufpool()`). The kernel cuts pool buffers from the
+address the first server gave it (`fuse_uring_select_buffer()`), in the
+address space of the server whose entry gets the request, so a later
+server would have to map its pools at that address. Kernels before 7.3
+have neither command, and every entry brings its own payload buffer.
+
+An entry belongs to the io_uring command that registered or last
+committed it, and so to that ring and the thread that submitted the
+command. The kernel copies a request into the entry from that thread
+(`fuse_uring_send_in_task()` runs as task work of the command). Only the
+end of the ring or of the thread takes entries back. It cancels the
+commands of the entries that wait for a request
+(`io_uring_try_cancel_uring_cmd()` calls `fuse_uring_cancel()`). Since
+commit 198f45eeb9f7 ("fuse-uring: fix moving cancelled entry to
+ent_in_userspace list"), in 7.2, 7.1.4 and 6.18.39, the kernel frees
+those entries. Before, it parks them on the queue's `ent_in_userspace`
+list until the connection ends. An entry that holds a request keeps it.
+Another process can't commit it, because the commit reads the reply
+through the addresses of the old one. `FUSE_NOTIFY_RESEND` doesn't reach
+it either, because `fuse_chan_resend()` (`fuse_resend()` in 6.14) only
+requeues the requests read from `/dev/fuse` file descriptions.
+
+Once the old entries are gone, the connection stays on io_uring. Until
+every queue has an entry, the kernel holds new requests back
+(`fuse_block_alloc()`). Then it switches the input queue to the ring
+(`fuse_uring_do_register()` sets `ring->ready` and `fiq->ops`) and never
+back, and only FORGET and INTERRUPT still go through `/dev/fuse`.
+`fuse_uring_queue_fuse_req()` leaves a request that finds no entry on
+the queue's `fuse_req_queue`, and a new server that reads `/dev/fuse`
+would wait for it forever. A REGISTER on a queue that had entries before
+is allowed, because `fuse_uring_register()` reuses the queue, but it
+doesn't hand the new entry a waiting request. Only a commit on the same
+queue does (`fuse_uring_get_next_fuse_req()`). A failed REGISTER takes
+the connection off io_uring (`fuse_uring_cmd()` clears `io_uring`). On
+7.3 every later uring command then fails with EOPNOTSUPP, and once the
+ring is ready, requests still go to its queues.
+
+So a new server could register entries of its own on the queues, but the
+old one loses requests while it stops. While no server serves, the old
+server's entries are the only ones. A commit makes its entry the first
+one the queue hands a request to, and an entry takes requests until the
+kernel cancels its command, which happens only after the last fd and
+mapping of the ring are gone. A request copied into an entry after its
+worker last looked at the ring gets no reply until the connection ends,
+on every kernel. A request handed to the entry once the ring goes away
+fails with ECANCELED since commit bea4fe98204b ("fuse-uring: end
+fuse_req on io-uring cancel task work"), in 7.2, 7.1.4 and 6.18.39.
+Kernels without it complete the command with ECANCELED but leave the
+request in the entry without a reply. Kernels without commit
+3539b1467e94 ("io_uring: include dying ring in task_work "should cancel"
+state"), in 6.17 and 6.16.9, even copy the request in, because their
+task work stops only for a thread that exits.
+
+A prototype did that handoff. Its old workers served the requests their
+commits fetched, closed their rings, and waited for the kernel to free
+them. The new server registered on the queues, mapped the pools at the
+old address, and sent a STATFS from each CPU to get the waiting requests
+out. It handed a PassthroughFs connection to a new server in the same
+process 20 times per run, while threads read a file on the mount with
+O_DIRECT, one read at a time each. In 35 of 36 runs, on Linux 7.3.1 with
+96 CPUs and in 4-CPU VMs with 7.3.4 and 6.18.63, every reader lost a
+read: most reads got no reply until the connection ended, and some
+failed with ECANCELED. A client that sends its next request right after
+a reply sends one while the workers close their rings. Without traffic,
+the prototype lost nothing, but a server can't rely on quiet clients.
+
+A lossless handoff needs the kernel to retire an entry without losing a
+request: a commit that doesn't fetch, or another way to quiesce a queue,
+or a cancel on ring close that requeues the entry's request instead of
+failing it (`fuse_uring_cancel()`, `fuse_uring_send_in_task()`). A
+REGISTER that hands out waiting requests (`fuse_uring_do_register()`)
+and a `FUSE_NOTIFY_RESEND` that covers the ring queues
+(`fuse_chan_resend()`) would make the rest work.
+
 ## Implementation Notes
 
 ### Current State
@@ -293,6 +387,7 @@ and uses the buffer pools of protocol 7.46 (kernel 7.3) when the kernel has them
 - Per-CPU queue model with configurable entries_per_queue
 - Buffer pools with configurable bufs_per_queue, see "Buffer pools" above
 - Zero-copy for opens that ask for it, see "Zero-copy" above
+- No handoff to another server, see "Handing a connection over" above
 - Fallback to classic `/dev/fuse` for notifications/interrupts
 
 ### Future Work
