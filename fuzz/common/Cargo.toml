@@ -1,0 +1,11 @@
+[package]
+name = "common"
+version = "0.0.0"
+description = "The fuzz harness, shared by the fuzz targets and the tests that replay their inputs"
+edition = "2021"
+publish = false
+
+[dependencies]
+fuse-backend-core = { path = "../../crates/fuse-backend-core", features = ["async-io", "virtiofs"] }
+libc = "0.2.68"
+vm-memory = "=0.17.1"

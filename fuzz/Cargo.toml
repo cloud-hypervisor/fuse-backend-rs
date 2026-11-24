@@ -1,0 +1,31 @@
+[package]
+name = "fuse-backend-rs-fuzz"
+version = "0.0.0"
+description = "Fuzz targets for the fuse-backend-rs request server"
+edition = "2021"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+# Keep the fuzz crates out of the main workspace, which builds on stable.
+[workspace]
+members = ["common"]
+
+[dependencies]
+common = { path = "common" }
+libfuzzer-sys = "0.4"
+
+[[bin]]
+name = "server"
+path = "fuzz_targets/server.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "async_server"
+path = "fuzz_targets/async_server.rs"
+test = false
+doc = false
+bench = false

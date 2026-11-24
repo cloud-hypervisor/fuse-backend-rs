@@ -44,6 +44,13 @@
   permission bits, owner and group of the directories `Vfs` serves itself: its root while no file
   system is mounted at `/`, and the directories on the path to each mount point. The defaults
   keep today's root-owned `0777` ([#148](https://github.com/cloud-hypervisor/fuse-backend-rs/issues/148)).
+- [332](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/332): Fuzz the request server. The `server` and `async_server` targets under `fuzz/`
+  feed arbitrary requests to `handle_message()` and `async_handle_message()`. They check that
+  the server doesn't panic, that a request taking no reply gets none, and that every other
+  request gets exactly one well formed reply. The harness lives in the `fuzz/common` crate,
+  whose tests check the seeds, replay the inputs in `fuzz/regressions` and run a short mutation
+  loop on stable. A new `Fuzz` CI job runs those tests, and on pull requests also runs each
+  target for five minutes on nightly.
 - [304](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/304): Give FreeBSD a verification path. The Linux wire-format ABI
   body moves out of `fuse_abi_linux.rs` into a shared `fuse_abi_wire.rs`
   (each per-OS prelude re-exports the libc names the body uses), and a new
