@@ -44,6 +44,15 @@
   permission bits, owner and group of the directories `Vfs` serves itself: its root while no file
   system is mounted at `/`, and the directories on the path to each mount point. The defaults
   keep today's root-owned `0777` ([#148](https://github.com/cloud-hypervisor/fuse-backend-rs/issues/148)).
+- [373](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/373): `FuseSession::set_splice_write()` applies to
+  `AsyncFuseServing` too, and `FuseDevTask::set_splice_write()` turns it on
+  for a task made by hand. Each request buffer creates two pipes on its first
+  splice and keeps them, so a worker can hold `max_inflight` pairs against
+  `pipe-user-pages-soft`, up to 128 pages each for READs of 128 KiB.
+  `AsyncZeroCopyWriter::async_write_from()` splices on the tokio runtime,
+  where the read it replaces blocks the runtime thread too, and reads with
+  io_uring on tokio-uring. `AsyncFileReadWriteVolatile::raw_fd()` gives the
+  transport the file descriptor.
 - [304](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/304): Give FreeBSD a verification path. The Linux wire-format ABI
   body moves out of `fuse_abi_linux.rs` into a shared `fuse_abi_wire.rs`
   (each per-OS prelude re-exports the libc names the body uses), and a new

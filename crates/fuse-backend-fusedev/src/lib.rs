@@ -293,7 +293,7 @@ impl<'a, S: BitmapSlice> FuseDevWriter<'a, S> {
         off: u64,
     ) -> io::Result<usize> {
         #[cfg(target_os = "linux")]
-        if let Some(n) = self.splice_from_at(&src, count, off) {
+        if let Some(n) = self.splice_from_at(|| src.raw_fd(), count, off) {
             return Ok(n);
         }
         self.check_available_space(count)?;
@@ -348,12 +348,13 @@ impl<'a, S: BitmapSlice> FuseDevWriter<'a, S> {
         self.buf.check_available_space(sz)
     }
 
-    /// Splice the data of a READ reply into the data pipe, see `write_from_at()`.
-    /// Returns `None` if it has to be copied instead.
+    /// Splice the data of a READ reply from the file descriptor that `fd`
+    /// returns into the data pipe, see `write_from_at()`. Returns `None` if
+    /// it has to be copied instead.
     #[cfg(target_os = "linux")]
-    fn splice_from_at<F: FileReadWriteVolatile>(
+    fn splice_from_at(
         &mut self,
-        src: &F,
+        fd: impl FnOnce() -> Option<RawFd>,
         count: usize,
         off: u64,
     ) -> Option<usize> {
@@ -362,7 +363,7 @@ impl<'a, S: BitmapSlice> FuseDevWriter<'a, S> {
             return None;
         }
         let pipes = self.splice.filter(|p| p.enabled())?;
-        let n = pipes.splice_in(src.raw_fd()?, off, count)?;
+        let n = pipes.splice_in(fd()?, off, count)?;
         self.spliced = n;
         Some(n)
     }
@@ -596,6 +597,8 @@ pub trait FuseChannelExt {
 #[cfg(feature = "async-io")]
 mod async_io {
     use super::*;
+    #[cfg(target_os = "linux")]
+    use fuse_backend_core::async_runtime;
     use fuse_backend_core::file_buf::FileVolatileBuf;
     use fuse_backend_core::file_traits::AsyncFileReadWriteVolatile;
 
@@ -700,12 +703,23 @@ mod async_io {
         /// Write data from a File at offset `off` to the writer in asynchronous mode.
         ///
         /// Return the number of bytes written to the writer.
+        ///
+        /// On Linux, a writer that splices, see `write_from_at()`, also splices here on a
+        /// runtime whose file IO blocks the thread, from any `src` with a `raw_fd()`. The
+        /// splice waits for the file's data on this thread, even if `src` would read
+        /// elsewhere. With io_uring the read doesn't block the thread, so the writer reads.
         pub async fn async_write_from_at<F: AsyncFileReadWriteVolatile + ?Sized>(
             &mut self,
             src: &F,
             count: usize,
             off: u64,
         ) -> io::Result<usize> {
+            #[cfg(target_os = "linux")]
+            if async_runtime::runtime_type().file_io_blocks() {
+                if let Some(n) = self.splice_from_at(|| src.raw_fd(), count, off) {
+                    return Ok(n);
+                }
+            }
             self.check_available_space(count)?;
 
             // Continue at the writer's current position, like the synchronous
@@ -1273,7 +1287,7 @@ mod tests {
         fn writer_splices_read_reply() {
             let dev = TempFile::new().unwrap();
             let (mut src, data) = source(0x9000);
-            let pipes = SplicePipes::new().unwrap();
+            let pipes = SplicePipes::new();
 
             // A range that starts and ends in the middle of a page.
             let (n, copied) = reply(&dev, &pipes, &mut src, 0x5000, 123);
@@ -1291,23 +1305,39 @@ mod tests {
 
         #[test]
         fn writer_splices_after_written_data() {
-            let dev = TempFile::new().unwrap();
             let (mut src, data) = source(0x3000);
-            let pipes = SplicePipes::new().unwrap();
+            reply_around(
+                &data,
+                true,
+                |d| d.write_from_at(&mut src, 0x2000, 7),
+                |w, d| w.commit(Some(d)),
+            );
+        }
 
-            // Data written before the spliced data goes into the pipe with the
-            // header, and data written after it moves the spliced data into the
-            // buffer.
+        /// Send replies of "pre", then the 0x2000 bytes of `data` from offset 7 that
+        /// `write_from` writes, then nothing or "post", and commit each with `commit`.
+        /// Data before the spliced data goes into the pipe with the header, and data
+        /// after it moves the spliced data into the buffer. `splices` says whether
+        /// `write_from` splices.
+        fn reply_around(
+            data: &[u8],
+            splices: bool,
+            mut write_from: impl FnMut(&mut FuseDevWriter<'_>) -> io::Result<usize>,
+            commit: impl for<'a> Fn(&mut FuseDevWriter<'a>, &FuseDevWriter<'a>) -> io::Result<usize>,
+        ) {
+            let dev = TempFile::new().unwrap();
+            let pipes = SplicePipes::new();
             for post in [&b""[..], b"post"] {
                 let mut buf = vec![0u8; 0x10000];
                 let (mut w, mut d) = writers(dev.as_file(), &mut buf, &pipes);
                 d.write_all(b"pre").unwrap();
-                assert_eq!(d.write_from_at(&mut src, 0x2000, 7).unwrap(), 0x2000);
+                assert_eq!(write_from(&mut d).unwrap(), 0x2000);
                 d.write_all(post).unwrap();
                 assert_eq!(d.bytes_written(), 0x2003 + post.len());
                 w.write_all(&HEADER).unwrap();
-                w.commit(Some(&d)).unwrap();
-                assert_eq!(buf[19..].iter().any(|&b| b != 0), !post.is_empty());
+                commit(&mut w, &d).unwrap();
+                let copied = buf[19..].iter().any(|&b| b != 0);
+                assert_eq!(copied, !splices || !post.is_empty());
                 let want = [&HEADER[..], b"pre", &data[7..0x2007], post].concat();
                 assert_eq!(sent(&dev), want);
             }
@@ -1317,7 +1347,7 @@ mod tests {
         fn writer_drops_unsent_spliced_data() {
             let dev = TempFile::new().unwrap();
             let (mut src, data) = source(0x3000);
-            let pipes = SplicePipes::new().unwrap();
+            let pipes = SplicePipes::new();
 
             // A reply that fails after the data was spliced sends only its header.
             let mut buf = vec![0u8; 0x10000];
@@ -1344,7 +1374,7 @@ mod tests {
                 .open(dev.as_path())
                 .unwrap();
             let (mut src, data) = source(0x3000);
-            let pipes = SplicePipes::new().unwrap();
+            let pipes = SplicePipes::new();
 
             let mut buf = vec![0u8; 0x10000];
             let (mut w, mut d) = writers(&append, &mut buf, &pipes);
@@ -1398,7 +1428,7 @@ mod tests {
         fn writer_copies_when_splice_fails() {
             let dev = TempFile::new().unwrap();
             let (mut src, data) = source(0x3000);
-            let pipes = SplicePipes::new().unwrap();
+            let pipes = SplicePipes::new();
             let mut file = Unspliceable {
                 file: src.try_clone().unwrap(),
                 sock: UnixStream::pair().unwrap().0,
@@ -1415,6 +1445,24 @@ mod tests {
             assert_eq!(sent(&dev), [&HEADER[..], &data[..0x1000]].concat());
             assert_eq!(file.fd_calls.get(), 1);
             assert_eq!(reply(&dev, &pipes, &mut src, 0x1000, 0), (0x1000, true));
+        }
+
+        #[cfg(feature = "async-io")]
+        #[test]
+        fn async_writer_splices_where_reads_block() {
+            use fuse_backend_core::async_file::File as AsyncFile;
+            use fuse_backend_core::async_runtime::{self, block_on};
+
+            let (src, data) = source(0x3000);
+            let src = AsyncFile::borrow_fd(src.as_raw_fd(), std::sync::Arc::new(src));
+            // With io_uring the writer reads.
+            let splices = async_runtime::runtime_type().file_io_blocks();
+            reply_around(
+                &data,
+                splices,
+                |d| block_on(d.async_write_from_at(&src, 0x2000, 7)),
+                |w, d| block_on(w.async_commit(Some(d))),
+            );
         }
     }
 

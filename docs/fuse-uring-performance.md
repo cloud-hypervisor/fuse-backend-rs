@@ -282,6 +282,63 @@ seconds, and the two settings alternated three times:
 Zero-copy saves the copy of the payload, which matters for large
 requests. At 128 KiB the two runs overlap.
 
+## Splicing READ replies on /dev/fuse
+
+The classic `/dev/fuse` transport can send a READ reply with `splice(2)`
+when the file system hands it the data in a file with a descriptor, see
+`FuseSession::set_splice_write()`. The kernel then copies the data once,
+from the file's pages into the FUSE request, instead of the server reading
+it into its reply buffer first. `AsyncFuseServing` splices in
+`ZeroCopyWriter::write_from()` on both runtimes, and in
+`AsyncZeroCopyWriter::async_write_from()` only on tokio, where the read it
+replaces blocks the runtime thread too. `PassthroughFs` serves page-cache
+hits with an inline `RWF_NOWAIT` read that copies, so it splices only the
+READs that this read can't serve: cache misses, and files on tmpfs, which
+has no `RWF_NOWAIT`.
+
+Throughput and daemon CPU time per GiB of `AsyncFuseServing` with 4
+workers and `PassthroughFs` with `cache=never`, serving 4 files of 1 GiB
+from a tmpfs as root on Linux 7.3.1 on a 96-core machine. fio ran 4 jobs
+with psync for 10 seconds, and the table shows medians of three runs. With
+the thread pool, `PassthroughFs` reads tmpfs on a pool thread into a
+buffer of its own, so its READs still copy. On tokio-uring
+`PassthroughFs` reads through the ring, so they copy too. `PassthroughFs`
+doesn't ask for `FsOptions::MAX_PAGES`, so the kernel splits the reads of
+1 MiB into READs of 128 KiB.
+
+| Runtime | Workload | Copy | Splice |
+|---------|----------|------|--------|
+| tokio | 128 KiB sequential | 7230 MiB/s, 344 ms/GiB | 8086 MiB/s, 269 ms/GiB |
+| tokio | 1 MiB sequential | 7384 MiB/s, 343 ms/GiB | 8285 MiB/s, 269 ms/GiB |
+| tokio | 4 KiB random | 1183 MiB/s, 3120 ms/GiB | 1182 MiB/s, 3132 ms/GiB |
+| tokio, thread pool | 128 KiB sequential | 5037 MiB/s, 589 ms/GiB | 5092 MiB/s, 577 ms/GiB |
+| tokio-uring | 128 KiB sequential | 6150 MiB/s, 392 ms/GiB | 6235 MiB/s, 380 ms/GiB |
+
+A build that also splices in `async_write_from()` on tokio-uring read
+128 KiB at 8148 MiB/s and 256 ms/GiB in the same setup, against 6186 MiB/s
+and 372 ms/GiB copying. io_uring hands reads of files without
+`FMODE_NOWAIT`, such as tmpfs files, to its worker threads, and the splice
+avoids that. But `splice(2)` has no `RWF_NOWAIT`. It waits for uncached
+data on the runtime thread, and the other requests of the worker wait with
+it.
+
+Cold reads show that. 4 workers served 16 files of 1 GiB on XFS, on two
+striped gp3 volumes, after `echo 3 > /proc/sys/vm/drop_caches`. 16 fio jobs
+read every 128 KiB block of the files once, at random, with psync. The
+table shows medians of three runs. The splice row of tokio-uring comes from
+the build above. With the splice, each worker waits for one read at a time,
+as on tokio. Read directly with `O_DIRECT`, the volumes take about 1 ms
+per read of 128 KiB and give 500 MiB/s to 4 jobs and 1988 MiB/s to 16.
+Readahead on the files brings some blocks in before fio asks for them, so
+the reads through FUSE go faster than that.
+
+| Runtime | READs | MiB/s | p99 |
+|---------|-------|-------|-----|
+| tokio-uring | io_uring reads | 3032 | 2212 µs |
+| tokio-uring | splice | 877 | 4686 µs |
+| tokio | splice | 879 | 4620 µs |
+| tokio | `preadv()` | 871 | 4751 µs |
+
 ## Implementation Notes
 
 ### Current State
