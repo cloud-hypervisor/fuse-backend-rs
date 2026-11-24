@@ -28,7 +28,8 @@ mod fusedev_tests {
     use fuse_backend_rs::abi::fuse_abi::{InHeader, Opcode, OutHeader};
     use fuse_backend_rs::api::server::{MetricsHook, Server};
     use fuse_backend_rs::api::{Vfs, VfsOptions};
-    use fuse_backend_rs::passthrough::{Config, PassthroughFs};
+    use fuse_backend_rs::overlayfs::{self, BoxedLayer, OverlayFs};
+    use fuse_backend_rs::passthrough::{self, Config, PassthroughFs};
     use fuse_backend_rs::transport::FuseSession;
     use nix::mount::MsFlags;
     use nix::sys::mman::{mmap, munmap, MapFlags, ProtFlags};
@@ -224,73 +225,59 @@ mod fusedev_tests {
         Ok(())
     }
 
-    #[test]
-    #[ignore] // it depends on privileged mode to pass through /dev/fuse
-    fn integration_test_create_supp_group() -> Result<()> {
-        // End-to-end test for FUSE_CREATE_SUPP_GROUP: an unprivileged
-        // process creates a file through the FUSE mount inside a setgid
-        // directory whose group is only in the creator's supplementary
-        // groups.  The kernel (>= 6.3) sends that group in a
-        // FUSE_EXT_GROUPS extension, and the server must temporarily
-        // adopt it, so that the create succeeds and the new file inherits
-        // the group of the setgid directory.  Without the extension the
-        // server-side create fails with EACCES, since the server adopts
-        // the creator's credentials, which lack the directory's group.
-        //
-        // It needs root (CAP_SETGID/CAP_CHOWN) and a kernel >= 6.3, both
-        // of which the GitHub CI runners provide.
+    // Group of the setgid directory in the FUSE_CREATE_SUPP_GROUP tests, used
+    // as a supplementary group of the unprivileged creator.  It must not be a
+    // group of the daemon itself, otherwise the create would succeed without
+    // the extension.
+    const SUPP_GID: libc::gid_t = 12345;
+
+    /// Whether the FUSE_CREATE_SUPP_GROUP test `name` can run here.  It needs
+    /// root (CAP_SETGID/CAP_CHOWN) and a kernel >= 6.3, both of which the
+    /// GitHub CI runners provide.
+    fn can_test_create_supp_group(name: &str) -> bool {
         if !running_as_root() {
-            eprintln!("skipping integration_test_create_supp_group: not running as root");
-            return Ok(());
+            eprintln!("skipping {}: not running as root", name);
+            return false;
         }
         if !kernel_at_least(6, 3) {
             eprintln!(
-                "skipping integration_test_create_supp_group: kernel {} does not support FUSE_CREATE_SUPP_GROUP (needs >= 6.3)",
+                "skipping {}: kernel {} does not support FUSE_CREATE_SUPP_GROUP (needs >= 6.3)",
+                name,
                 kernel_release()
             );
-            return Ok(());
+            return false;
         }
+        true
+    }
 
-        // Group of the setgid directory, used as a supplementary group of
-        // the unprivileged creator.  It must not be a group of the daemon
-        // itself, otherwise the create would succeed without the extension.
-        let gid: libc::gid_t = 12345;
-        // An unprivileged uid whose primary group differs from `gid`.
-        let uid: libc::uid_t = 65534;
-
-        let src_dir = TempDir::new().unwrap();
-        let mnt_dir = TempDir::new().unwrap();
-        let src = src_dir.as_path().to_str().unwrap().to_string();
-        let mnt = mnt_dir.as_path().to_str().unwrap().to_string();
-
-        // Setgid directory owned by root:`gid` with mode 2770: only group
-        // members may create entries in it.
-        let setgid_dir = src_dir.as_path().join("setgid-dir");
+    /// Creates `root/setgid-dir`, a setgid directory owned by root:SUPP_GID
+    /// with mode 2770, so only group members may create entries in it, and
+    /// lets the unprivileged creator traverse `root`.
+    fn make_setgid_dir(root: &Path) {
+        let setgid_dir = root.join("setgid-dir");
         std::fs::create_dir(&setgid_dir).unwrap();
         let setgid_dir_c = CString::new(setgid_dir.as_os_str().as_bytes()).unwrap();
         assert_eq!(
-            unsafe { libc::chown(setgid_dir_c.as_ptr(), 0, gid) },
+            unsafe { libc::chown(setgid_dir_c.as_ptr(), 0, SUPP_GID) },
             0,
             "failed to chown the setgid directory"
         );
         std::fs::set_permissions(&setgid_dir, std::fs::Permissions::from_mode(0o2770)).unwrap();
-        // Let the unprivileged creator traverse the mount root.
-        std::fs::set_permissions(src_dir.as_path(), std::fs::Permissions::from_mode(0o755))
-            .unwrap();
+        std::fs::set_permissions(root, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
 
-        let mut daemon = passthroughfs::Daemon::new(&src, &mnt, 1).unwrap();
-        daemon.mount().unwrap();
-
-        // The creator has `gid` as its only supplementary group and nobody's
-        // uid and primary gid, and creates a file in the setgid directory
-        // through the FUSE mount.
+    /// Creates `mnt/setgid-dir/file` as nobody, with SUPP_GID as its only
+    /// supplementary group, and checks that the create succeeds.
+    fn create_as_supp_group_member(mnt: &str) {
+        // nobody's primary group differs from SUPP_GID.
+        let uid: libc::uid_t = 65534;
         let mut cmd = Command::new("touch");
         cmd.arg(format!("{}/setgid-dir/file", mnt));
         unsafe {
             cmd.pre_exec(move || {
-                // Add `gid` to the supplementary groups while the process
+                // Add SUPP_GID to the supplementary groups while the process
                 // still has CAP_SETGID, then drop all privileges.
-                let groups = [gid];
+                let groups = [SUPP_GID];
                 if libc::setgroups(1, groups.as_ptr()) < 0 {
                     return Err(std::io::Error::last_os_error());
                 }
@@ -309,11 +296,82 @@ mod fusedev_tests {
             "create through the FUSE mount failed: {}",
             status
         );
+    }
+
+    #[test]
+    #[ignore] // it depends on privileged mode to pass through /dev/fuse
+    fn integration_test_create_supp_group() -> Result<()> {
+        // End-to-end test for FUSE_CREATE_SUPP_GROUP: an unprivileged
+        // process creates a file through the FUSE mount inside a setgid
+        // directory whose group is only in the creator's supplementary
+        // groups.  The kernel (>= 6.3) sends that group in a
+        // FUSE_EXT_GROUPS extension, and the server must temporarily
+        // adopt it, so that the create succeeds and the new file inherits
+        // the group of the setgid directory.  Without the extension the
+        // server-side create fails with EACCES, since the server adopts
+        // the creator's credentials, which lack the directory's group.
+        if !can_test_create_supp_group("integration_test_create_supp_group") {
+            return Ok(());
+        }
+
+        let src_dir = TempDir::new().unwrap();
+        let mnt_dir = TempDir::new().unwrap();
+        let src = src_dir.as_path().to_str().unwrap().to_string();
+        let mnt = mnt_dir.as_path().to_str().unwrap().to_string();
+        make_setgid_dir(src_dir.as_path());
+
+        let mut daemon = passthroughfs::Daemon::new(&src, &mnt, 1).unwrap();
+        daemon.mount().unwrap();
+        create_as_supp_group_member(&mnt);
 
         // The file must have been created on the source side with the group
         // of the setgid directory.
         let md = std::fs::metadata(src_dir.as_path().join("setgid-dir/file")).unwrap();
-        assert_eq!(md.gid(), gid);
+        assert_eq!(md.gid(), SUPP_GID);
+
+        daemon.umount().unwrap();
+        Ok(())
+    }
+
+    #[test]
+    #[ignore] // it depends on privileged mode to pass through /dev/fuse
+    fn integration_test_overlay_create_supp_group() -> Result<()> {
+        // integration_test_create_supp_group on a standalone OverlayFs,
+        // which has to negotiate FUSE_CREATE_SUPP_GROUP itself instead of
+        // relying on a Vfs.  The setgid directory is in the upper layer, so
+        // the create needs no copy-up.
+        if !can_test_create_supp_group("integration_test_overlay_create_supp_group") {
+            return Ok(());
+        }
+
+        let upper_dir = TempDir::new().unwrap();
+        let lower_dir = TempDir::new().unwrap();
+        let mnt_dir = TempDir::new().unwrap();
+        let mnt = mnt_dir.as_path().to_str().unwrap().to_string();
+        make_setgid_dir(upper_dir.as_path());
+
+        let layer = |dir: &TempDir| -> Arc<BoxedLayer> {
+            let fs = PassthroughFs::<()>::new(passthrough::Config {
+                root_dir: dir.as_path().to_str().unwrap().to_string(),
+                xattr: true,
+                ..Default::default()
+            })
+            .unwrap();
+            fs.import().unwrap();
+            Arc::new(Box::new(fs))
+        };
+        let config = overlayfs::config::Config {
+            do_import: true,
+            ..Default::default()
+        };
+        let fs = OverlayFs::new(Some(layer(&upper_dir)), vec![layer(&lower_dir)], config)?;
+
+        let mut daemon = passthroughfs::Daemon::with_fs(fs, &mnt, 1);
+        daemon.mount().unwrap();
+        create_as_supp_group_member(&mnt);
+
+        let md = std::fs::metadata(upper_dir.as_path().join("setgid-dir/file")).unwrap();
+        assert_eq!(md.gid(), SUPP_GID);
 
         daemon.umount().unwrap();
         Ok(())
