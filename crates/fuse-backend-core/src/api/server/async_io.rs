@@ -825,9 +825,7 @@ impl<F: AsyncFileSystem + Sync> Server<F> {
         &self,
         ctx: &mut SrvContext<'_, F, S, W>,
     ) -> Result<usize> {
-        let SetxattrIn { size, flags } = ctx.r.read_obj().map_err(Error::DecodeMessage)?;
-        let buf =
-            ServerUtil::get_message_body(&mut ctx.r, &ctx.in_header, size_of::<SetxattrIn>())?;
+        let (SetxattrIn { size, flags }, buf) = self.read_setxattr(ctx)?;
 
         let (name, value) = split_setxattr_body(&buf, size)?;
         let name = Self::parse_name(name)?;
@@ -1187,7 +1185,7 @@ impl<'a, F: AsyncFileSystem, S: BitmapSlice, W: Writer> SrvContext<'a, F, S, W> 
 #[cfg(test)]
 mod tests {
     use std::ffi::CStr;
-    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::{AtomicU32, AtomicUsize};
 
     use super::super::test_util::{
         check_malformed, check_oversized, oversized_request, request, request_bodies, request_for,
@@ -1490,6 +1488,8 @@ mod tests {
     struct DirFs {
         sync_calls: AtomicUsize,
         async_calls: AtomicUsize,
+        /// `ctx.setxattr_flags` of the last `async_setxattr()`.
+        setxattr_flags: AtomicU32,
     }
 
     impl DirFs {
@@ -1862,12 +1862,14 @@ mod tests {
 
         async fn async_setxattr(
             &self,
-            _ctx: &Context,
+            ctx: &Context,
             _inode: u64,
             name: &CStr,
             value: &[u8],
             _flags: u32,
         ) -> io::Result<()> {
+            self.setxattr_flags
+                .store(ctx.setxattr_flags, Ordering::Relaxed);
             self.async_call().await;
             check_setxattr(name, value)
         }
@@ -2077,6 +2079,39 @@ mod tests {
         let reply = serve(&server, Opcode::Releasedir, 1, release_in).await;
         assert_eq!(server.fs.calls(), (3, 3));
         assert_eq!(reply_error(&reply), -libc::EBADF);
+    }
+
+    // macFUSE gives the INIT bit of SETXATTR_EXT another meaning.
+    #[cfg(not(target_os = "macos"))]
+    #[tokio::test]
+    async fn test_async_setxattr_ext() {
+        use crate::abi::fuse_abi::{SetxattrIn2, SETXATTR_ACL_KILL_SGID};
+
+        let server = Server::new(DirFs::default());
+        let (version, _) = server.init_state();
+        server.restore_init(version, FsOptions::SETXATTR_EXT);
+        let setxattr_in = SetxattrIn {
+            size: XATTR_VALUE.len() as u32,
+            flags: 0,
+        };
+        let body = [
+            setxattr_in.as_slice(),
+            SetxattrIn2 {
+                setxattr_flags: SETXATTR_ACL_KILL_SGID,
+                padding: 0,
+            }
+            .as_slice(),
+            b"user.a\0",
+            XATTR_VALUE,
+        ]
+        .concat();
+        let reply = serve_bytes(&server, Opcode::Setxattr, 2, &body).await;
+        assert_eq!(reply_error(&reply), 0);
+        assert_eq!(server.fs.calls(), (1, 1));
+        assert_eq!(
+            server.fs.setxattr_flags.load(Ordering::Relaxed),
+            SETXATTR_ACL_KILL_SGID
+        );
     }
 
     #[tokio::test]

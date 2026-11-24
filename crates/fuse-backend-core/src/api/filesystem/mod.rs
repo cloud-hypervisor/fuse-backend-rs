@@ -577,6 +577,11 @@ pub struct Context {
     /// in setgid directories get the correct group ownership.
     pub supp_gid: Option<libc::gid_t>,
 
+    /// The `SetxattrIn2` flags of a setxattr request, such as `SETXATTR_ACL_KILL_SGID`.
+    ///
+    /// Zero unless the kernel negotiated `FsOptions::SETXATTR_EXT`.
+    pub setxattr_flags: u32,
+
     /// Supplementary groups of the calling process.
     ///
     /// When set, these groups are used directly instead of reading from
@@ -603,6 +608,7 @@ impl From<&fuse::InHeader> for Context {
             gid: source.gid,
             pid: source.pid as i32,
             supp_gid: None,
+            setxattr_flags: 0,
             supplementary_groups: None,
         }
     }

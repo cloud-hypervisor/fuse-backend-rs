@@ -222,6 +222,9 @@ const SUBMOUNTS: u64 = 0x800_0000;
 // Filesystem responsible for clearing security.capability xattr and setuid/setgid bits.
 const HANDLE_KILLPRIV_V2: u64 = 0x1000_0000;
 
+// The kernel sends the extended fuse_setxattr_in (protocol 7.33)
+const SETXATTR_EXT: u64 = 0x2000_0000;
+
 // This flag indicates whether the fuse_init_in is extended
 const INIT_EXT: u64 = 0x4000_0000;
 
@@ -499,6 +502,10 @@ bitflags! {
 
         /// Indicates the kernel support fuse fd passthrough.
         const FD_PASSTHROUGH = FD_PASSTHROUGH;
+
+        /// The kernel sends setxattr requests with `SetxattrIn2`, and the server passes its flags
+        /// to the file system in `Context::setxattr_flags`.
+        const SETXATTR_EXT = SETXATTR_EXT;
 
         /// The fuse_init_in is extended.
         const INIT_EXT = INIT_EXT;
@@ -1144,6 +1151,18 @@ pub struct SetxattrIn {
     pub flags: u32,
 }
 unsafe impl ByteValued for SetxattrIn {}
+
+/// Clear the set-group-ID bit when setting `system.posix_acl_access`.
+pub const SETXATTR_ACL_KILL_SGID: u32 = 1 << 0;
+
+/// Comes after `SetxattrIn` when the connection negotiated `FsOptions::SETXATTR_EXT`.
+#[repr(C)]
+#[derive(Debug, Default, Copy, Clone)]
+pub struct SetxattrIn2 {
+    pub setxattr_flags: u32,
+    pub padding: u32,
+}
+unsafe impl ByteValued for SetxattrIn2 {}
 
 #[repr(C)]
 #[derive(Debug, Default, Copy, Clone)]
