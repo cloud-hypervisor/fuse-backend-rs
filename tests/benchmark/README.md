@@ -57,7 +57,8 @@ fuse channel each; the daemon's `--sync-blocking` flag switches them to
 blocking channels cloned with `FUSE_DEV_IOC_CLONE`), async mode (N
 asynchronous workers through `AsyncFuseServing`, each with
 its own `/dev/fuse` file description and async runtime, tokio-uring when
-io_uring is available), pool mode (the async mode with
+io_uring is available; the daemon's `--async-block-idle` flag turns on
+`AsyncServingConfig::block_while_idle`), pool mode (the async mode with
 `PassthroughFs::enable_async_thread_pool()`), uring mode (the experimental
 FUSE-over-io_uring transport, requires kernel 6.14+ and is skipped
 otherwise), nowriteback mode (the sync daemon with the FUSE writeback
