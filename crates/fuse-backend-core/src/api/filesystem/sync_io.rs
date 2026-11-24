@@ -923,7 +923,13 @@ pub trait FileSystem {
         Err(io::Error::from_raw_os_error(libc::ENOSYS))
     }
 
-    /// Poll a file's events
+    /// Poll a file's events.
+    ///
+    /// Return which of the poll(2) `events` are ready. With `POLL_SCHEDULE_NOTIFY` in `flags`, a
+    /// caller waits for the file, so keep `khandle` and pass it to `Server::notify_poll_wakeup()`
+    /// once an event is ready. If this fails with `ENOSYS`, the kernel stops polling the files of
+    /// the connection and reports them as always ready for reading and writing. Any other error
+    /// makes poll(2) report `POLLERR`.
     fn poll(
         &self,
         ctx: &Context,
