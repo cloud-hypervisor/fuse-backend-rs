@@ -783,6 +783,21 @@ pub trait AsyncFileSystem: FileSystem {
         Box::pin(std::future::ready(self.statfs(ctx, inode)))
     }
 
+    /// Write the file system that contains `inode` to stable storage, like
+    /// `FileSystem::syncfs()`. The default calls `syncfs()`.
+    fn async_syncfs<'a, 'b, 'async_trait>(
+        &'a self,
+        ctx: &'b Context,
+        inode: Self::Inode,
+    ) -> Pin<Box<dyn Future<Output = io::Result<()>> + Send + 'async_trait>>
+    where
+        'a: 'async_trait,
+        'b: 'async_trait,
+        Self: 'async_trait,
+    {
+        Box::pin(std::future::ready(self.syncfs(ctx, inode)))
+    }
+
     /// Release an open file, like `FileSystem::release()`. The default calls `release()`.
     #[allow(clippy::too_many_arguments)]
     fn async_release<'a, 'b, 'async_trait>(
@@ -1441,6 +1456,19 @@ impl<FS: AsyncFileSystem> AsyncFileSystem for Arc<FS> {
         Self: 'async_trait,
     {
         self.deref().async_statfs(ctx, inode)
+    }
+
+    fn async_syncfs<'a, 'b, 'async_trait>(
+        &'a self,
+        ctx: &'b Context,
+        inode: Self::Inode,
+    ) -> Pin<Box<dyn Future<Output = io::Result<()>> + Send + 'async_trait>>
+    where
+        'a: 'async_trait,
+        'b: 'async_trait,
+        Self: 'async_trait,
+    {
+        self.deref().async_syncfs(ctx, inode)
     }
 
     #[allow(clippy::too_many_arguments)]

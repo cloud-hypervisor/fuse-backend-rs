@@ -2946,4 +2946,59 @@ mod tests {
 
         fs.releasedir(&ctx, dir, 0, handle).unwrap();
     }
+
+    // A layer that answers syncfs on its root with `errno`, or success for None, and counts
+    // the calls.
+    struct SyncfsLayer {
+        errno: Option<i32>,
+        calls: Arc<AtomicU64>,
+    }
+    impl FileSystem for SyncfsLayer {
+        type Inode = Inode;
+        type Handle = Handle;
+        fn syncfs(&self, _: &Context, inode: Inode) -> Result<()> {
+            assert_eq!(inode, self.root_inode());
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            self.errno.map(Error::from_raw_os_error).map_or(Ok(()), Err)
+        }
+    }
+    impl Layer for SyncfsLayer {
+        fn root_inode(&self) -> Inode {
+            7
+        }
+    }
+
+    // SYNCFS syncs the upper layer and none of the lower ones, and answers what the upper layer
+    // answered. Without an upper layer there is nothing to sync.
+    #[test]
+    fn test_syncfs() {
+        let layer = |errno| {
+            let calls = Arc::new(AtomicU64::new(0));
+            let layer: Arc<BoxedLayer> = Arc::new(Box::new(SyncfsLayer {
+                errno,
+                calls: calls.clone(),
+            }));
+            (layer, calls)
+        };
+        let errno = |res: Result<()>| res.err().and_then(|e| e.raw_os_error());
+
+        for upper_errno in [None, Some(libc::ENOSYS), Some(libc::EIO)] {
+            let (upper, upper_calls) = layer(upper_errno);
+            let (lower, lower_calls) = layer(None);
+            let fs = OverlayFs::new(Some(upper), vec![lower], Config::default()).unwrap();
+            let res = fs.syncfs(&Context::default(), FUSE_ROOT_ID);
+            assert_eq!(errno(res), upper_errno);
+            assert_eq!(upper_calls.load(Ordering::Relaxed), 1);
+            assert_eq!(lower_calls.load(Ordering::Relaxed), 0);
+        }
+
+        let (lower, lower_calls) = layer(None);
+        let fs = OverlayFs::new(None, vec![lower], Config::default()).unwrap();
+        fs.syncfs(&Context::default(), FUSE_ROOT_ID).unwrap();
+        assert_eq!(lower_calls.load(Ordering::Relaxed), 0);
+
+        // A PassthroughFs upper layer calls syncfs(2) on its directory.
+        let (fs, _lower, _upper) = readdirplus_fs();
+        fs.syncfs(&Context::default(), FUSE_ROOT_ID).unwrap();
+    }
 }

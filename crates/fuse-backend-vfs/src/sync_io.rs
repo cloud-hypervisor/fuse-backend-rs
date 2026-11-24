@@ -54,6 +54,19 @@ pub(super) fn copy_file_range_error(e: Error) -> Error {
     }
 }
 
+/// The answer to a SYNCFS on the root, from the result of each backend. It is ENOSYS only if
+/// every backend answered ENOSYS, so that the kernel keeps sending SYNCFS otherwise.
+pub(super) fn syncfs_result(results: impl IntoIterator<Item = Result<()>>) -> Result<()> {
+    results
+        .into_iter()
+        .max_by_key(|res| match res {
+            Err(e) if e.raw_os_error() == Some(libc::ENOSYS) => 0,
+            Ok(()) => 1,
+            Err(_) => 2,
+        })
+        .unwrap_or(Ok(()))
+}
+
 impl FileSystem for Vfs {
     type Inode = VfsInode;
     type Handle = VfsHandle;
@@ -505,6 +518,17 @@ impl FileSystem for Vfs {
             (Left(fs), idata) => fs.statfs(ctx, idata.ino()),
             (Right(fs), idata) => fs.statfs(ctx, idata.ino()),
         }
+    }
+
+    fn syncfs(&self, ctx: &Context, inode: VfsInode) -> Result<()> {
+        if !inode.is_pseudo_fs() {
+            return self.get_fs_by_idx(inode.fs_idx())?.syncfs(ctx, inode.ino());
+        }
+        // The kernel sends this for the root, which holds every backend. Sync them all.
+        syncfs_result(self.mountpoints.load().values().map(|mnt| {
+            self.get_fs_by_idx(mnt.fs_idx)
+                .and_then(|fs| fs.syncfs(ctx, mnt.ino))
+        }))
     }
 
     fn setxattr(
