@@ -247,6 +247,26 @@
   `&dyn AsyncFileReadWriteVolatile` instead of going through the `Arc` forwarding impl, which
   boxed one more future per READ and WRITE. Overrides of `async_write_from_at()` add `+ ?Sized`
   to `F`. A 4 KiB READ through `Server::async_handle_message()` takes 25-35 ns (3-5%) less.
+- Without the thread pool, `PassthroughFs::async_write()` writes with `pwritev()` on tokio-uring
+  too, as it does on tokio. ext4 and tmpfs don't take buffered writes that can't block, so
+  io_uring handed every write to an io-wq thread. 4 KiB random writes through `/dev/fuse` with
+  4 async workers went from 861k-906k to 1073k-1078k IOPS. A write that waits on dirty page
+  throttling now stalls the worker, as in the sync server. Zero-copy writes over io_uring don't
+  change, and still pay for the io-wq thread on ext4 and tmpfs. For this,
+  `async_file::File::borrow_fd_blocking()` borrows a descriptor whose IO never uses io_uring.
+- With the thread pool on the tokio runtime, `PassthroughFs::async_write()` first tries
+  `pwritev2(RWF_NOWAIT)` on the runtime thread, like `async_read()` does with `preadv2()`, and
+  hands only a write that would block to the pool. On XFS that saves the copy and the pool
+  thread for most writes: 4 KiB random writes through `/dev/fuse` with 4 async workers went
+  from 2.34M to 2.48M IOPS, and the daemon used 12% less CPU time on them and 16% less on
+  1 MiB sequential writes. A handle whose file rejects non-blocking writes, on ext4 or tmpfs,
+  stops trying after the first.
+- `PassthroughFs::async_read()` stops trying `preadv2(RWF_NOWAIT)` on a handle once its file
+  rejects the flag with `EOPNOTSUPP`, as files on tmpfs, overlayfs and FUSE do. Without the
+  thread pool, it then reads them with `preadv()` on the runtime thread, also on tokio-uring,
+  where io_uring handed each such read to an io-wq thread. 4 KiB random reads through
+  `/dev/fuse` from tmpfs with 4 async workers went from 194k-196k to 314k IOPS. A read that
+  misses the cache of overlayfs or FUSE now stalls the worker, as in the sync server.
 - Bump the declared minimum supported Rust version (MSRV) from 1.80 to 1.86.
   Trait-object upcasting (stabilized in Rust 1.86) is required by the default
   `AsyncFileSystem` read/write handlers and by the passthrough O_DIRECT relay,
