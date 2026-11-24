@@ -934,7 +934,13 @@ impl<F: FileSystem + Sync> Server<F> {
                 let readahead = if cfg!(target_os = "macos") {
                     0
                 } else {
-                    max_readahead
+                    max_readahead.min(self.max_readahead.load(Ordering::Relaxed))
+                };
+                let max_background = self.max_background.load(Ordering::Relaxed);
+                let congestion_threshold = match self.congestion_threshold.load(Ordering::Relaxed) {
+                    0 => (max_background / 4 * 3).max(1),
+                    // libfuse lowers it the same way.
+                    threshold => threshold.min(max_background),
                 };
 
                 let enabled = capable & want;
@@ -963,8 +969,8 @@ impl<F: FileSystem + Sync> Server<F> {
                     minor: KERNEL_MINOR_VERSION,
                     max_readahead: readahead,
                     flags: enabled_flags as u32,
-                    max_background: u16::MAX,
-                    congestion_threshold: (u16::MAX / 4) * 3,
+                    max_background,
+                    congestion_threshold,
                     max_write: MIN_READ_BUFFER - BUFFER_HEADER_SIZE,
                     time_gran: 1, // nanoseconds
                     flags2: (enabled_flags >> 32) as u32,
@@ -2192,6 +2198,85 @@ mod tests {
         assert_ne!(out.flags as u64 & FsOptions::INIT_EXT.bits(), 0);
         assert_eq!((out.flags2 as u64) << 32, FsOptions::PASSTHROUGH.bits());
         assert_eq!(out.max_stack_depth, 2);
+    }
+
+    /// Answer an INIT request that offers `max_readahead` bytes and decode the reply.
+    fn init_reply(server: &Server<MockFS>, max_readahead: u32) -> InitOut {
+        let init_in = InitIn {
+            major: KERNEL_VERSION,
+            minor: KERNEL_MINOR_VERSION,
+            max_readahead,
+            flags: 0,
+        };
+        let mut read_buf = init_in.as_slice().to_vec();
+        let mut write_buf = [0u8; 4096];
+        let res = server
+            .init(
+                &mut prepare_srvcontext(&mut read_buf, &mut write_buf),
+                |_| {},
+            )
+            .unwrap();
+        // The macOS reply has only the first 24 bytes, which hold every field checked here.
+        let reply = &write_buf[size_of::<OutHeader>()..res];
+        let mut out = InitOut::default();
+        out.as_mut_slice()[..reply.len()].copy_from_slice(reply);
+        out
+    }
+
+    #[test]
+    fn test_server_init_background_limits() {
+        let server = Server::new(MockFS);
+        // The kernel ignores 0 and keeps its own defaults.
+        assert!(server.set_max_background(0).is_err());
+        assert!(server.set_congestion_threshold(0).is_err());
+
+        // The max_background and congestion_threshold set, and the pair in the reply.
+        for (max, threshold, expected) in [
+            (None, None, (u16::MAX, 49149)),
+            (Some(64), None, (64, 48)),
+            (Some(3), None, (3, 1)),
+            (None, Some(10), (u16::MAX, 10)),
+            (Some(64), Some(10), (64, 10)),
+            (Some(64), Some(100), (64, 64)),
+        ] {
+            let server = Server::new(MockFS);
+            if let Some(max) = max {
+                server.set_max_background(max).unwrap();
+            }
+            if let Some(threshold) = threshold {
+                server.set_congestion_threshold(threshold).unwrap();
+            }
+            let out = init_reply(&server, 0);
+            assert_eq!(
+                (out.max_background, out.congestion_threshold),
+                expected,
+                "max {:?} threshold {:?}",
+                max,
+                threshold
+            );
+        }
+    }
+
+    #[test]
+    fn test_server_init_max_readahead() {
+        // The readahead set, and the readahead in the reply when the kernel offers 128 KiB.
+        for (bytes, expected) in [
+            (None, 128 * 1024),
+            (Some(64 * 1024), 64 * 1024),
+            (Some(1024 * 1024), 128 * 1024),
+            (Some(0), 0),
+        ] {
+            let server = Server::new(MockFS);
+            if let Some(bytes) = bytes {
+                server.set_max_readahead(bytes);
+            }
+            let expected = if cfg!(target_os = "macos") {
+                0
+            } else {
+                expected
+            };
+            assert_eq!(init_reply(&server, 128 * 1024).max_readahead, expected);
+        }
     }
 
     #[cfg(all(target_os = "linux", feature = "fusedev-uring"))]
