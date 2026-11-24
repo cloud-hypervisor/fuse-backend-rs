@@ -813,7 +813,8 @@ pub enum Opcode {
     CopyFileRange = 47,
     SetupMapping = 48,
     RemoveMapping = 49,
-    MaxOpcode = 50,
+    Syncfs = 50,
+    MaxOpcode = 51,
 
     /* Reserved opcodes: helpful to detect structure endian-ness in case of e.g. virtiofs */
     CuseInitBswapReserved = 1_048_576, /* CUSE_INIT << 8 */
@@ -874,6 +875,7 @@ impl From<u32> for Opcode {
             47 => Opcode::CopyFileRange,
             48 => Opcode::SetupMapping,
             49 => Opcode::RemoveMapping,
+            50 => Opcode::Syncfs,
             _ => Opcode::MaxOpcode,
         }
     }
@@ -1136,6 +1138,13 @@ pub struct FsyncIn {
     pub padding: u32,
 }
 unsafe impl ByteValued for FsyncIn {}
+
+#[repr(C)]
+#[derive(Debug, Default, Copy, Clone)]
+pub struct SyncfsIn {
+    pub padding: u64,
+}
+unsafe impl ByteValued for SyncfsIn {}
 
 #[repr(C)]
 #[derive(Debug, Default, Copy, Clone)]
@@ -1609,6 +1618,7 @@ mod tests {
             Opcode::CopyFileRange,
             Opcode::SetupMapping,
             Opcode::RemoveMapping,
+            Opcode::Syncfs,
         ];
         for op in valid {
             assert_eq!(Opcode::from(op as u32) as u32, op as u32);
