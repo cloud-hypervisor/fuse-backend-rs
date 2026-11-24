@@ -669,6 +669,21 @@ impl FileSystem for Vfs {
         .map_err(copy_file_range_error)
     }
 
+    fn notify_reply(
+        &self,
+        ctx: &Context,
+        inode: VfsInode,
+        unique: u64,
+        offset: u64,
+        size: u32,
+        r: &mut dyn ZeroCopyReader,
+    ) {
+        // The pseudo file system has no regular files.
+        if let Ok((Right(fs), idata)) = self.get_real_rootfs(inode) {
+            fs.notify_reply(ctx, idata.ino(), unique, offset, size, r)
+        }
+    }
+
     #[inline]
     fn id_remap(&self, ctx: &mut Context) -> Result<()> {
         // Without an inode there is no way to identify the target mount, so

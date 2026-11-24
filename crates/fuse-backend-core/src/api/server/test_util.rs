@@ -77,6 +77,10 @@ pub(crate) fn request_bodies() -> Vec<(Opcode, Vec<u8>)> {
     }
     let batch_forget_in = BatchForgetIn { count: 1, dummy: 0 };
     let setxattr_in = SetxattrIn { size: 4, flags: 0 };
+    let notify_retrieve_in = NotifyRetrieveIn {
+        size: 4,
+        ..Default::default()
+    };
     vec![
         (Opcode::Lookup, b"name\0".to_vec()),
         (Opcode::Forget, body(ForgetIn::default(), &[])),
@@ -113,6 +117,7 @@ pub(crate) fn request_bodies() -> Vec<(Opcode, Vec<u8>)> {
         (Opcode::Bmap, body(BmapIn::default(), &[])),
         (Opcode::Ioctl, body(IoctlIn::default(), &[])),
         (Opcode::Poll, body(PollIn::default(), &[])),
+        (Opcode::NotifyReply, body(notify_retrieve_in, b"abcd")),
         (
             Opcode::BatchForget,
             body(batch_forget_in, ForgetOne::default().as_slice()),

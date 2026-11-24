@@ -261,6 +261,7 @@ impl Default for VfsOptions {
             | FsOptions::HANDLE_KILLPRIV_V2
             | FsOptions::CREATE_SUPP_GROUP
             | FsOptions::DIRECT_IO_ALLOW_MMAP
+            | FsOptions::HAS_EXPIRE_ONLY
             | FsOptions::PERFILE_DAX;
         #[cfg(target_os = "macos")]
         let out_opts = FsOptions::ASYNC_READ | FsOptions::BIG_WRITES | FsOptions::ATOMIC_O_TRUNC;
