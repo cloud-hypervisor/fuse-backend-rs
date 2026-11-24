@@ -9,10 +9,11 @@
 //! through the runtime's asynchronous file interface (io_uring when
 //! available), without going through the blocking synchronous handlers.
 //! Two classes of requests are exceptions and relayed to the synchronous
-//! handlers instead: O_DIRECT requests, whose alignment constraints the
-//! transport buffer can't satisfy (the synchronous handler stages them
-//! through a page-aligned bounce buffer), and WRITE_KILL_PRIV requests,
-//! whose CAP_FSETID handling must not span an `.await` point.
+//! handlers instead: O_DIRECT requests with `Config::allow_direct_io`, whose
+//! alignment constraints the transport buffer can't satisfy (the synchronous
+//! handler stages them through a page-aligned bounce buffer), and
+//! WRITE_KILL_PRIV requests, whose CAP_FSETID handling must not span an
+//! `.await` point.
 //!
 //! The remaining operations are relayed to the synchronous handlers, which
 //! execute blocking syscalls. By default they run inline in the context of
@@ -102,8 +103,9 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
     ///
     /// When enabled, `async_read()` and `async_write()` also use the pool for
     /// requests that would otherwise block the runtime thread. These are the
-    /// O_DIRECT and WRITE_KILL_PRIV requests, which they relay to the
-    /// synchronous handlers, and on the tokio runtime also READ cache misses
+    /// O_DIRECT requests with `Config::allow_direct_io` and the
+    /// WRITE_KILL_PRIV requests, which they relay to the synchronous
+    /// handlers, and on the tokio runtime also READ cache misses
     /// and every WRITE. On a file system without `RWF_NOWAIT`, such as tmpfs,
     /// overlayfs or FUSE, every READ counts as a cache miss. Pool threads
     /// can't access the transport buffers, so the data takes one more copy.
@@ -873,7 +875,8 @@ impl<S: BitmapSlice + Send + Sync + 'static> AsyncFileSystem for PassthroughFs<S
         _lock_owner: Option<u64>,
         flags: u32,
     ) -> io::Result<usize> {
-        // O_DIRECT requests go to the synchronous `do_read()`. The native
+        // With `allow_direct_io`, O_DIRECT requests go to the synchronous
+        // `do_read()`, because the host file has O_DIRECT too. The native
         // asynchronous path submits IO directly into the transport buffer,
         // whose payload offset right after the reply header doesn't satisfy
         // the alignment constraints of direct IO (buffer address, length and
@@ -885,7 +888,7 @@ impl<S: BitmapSlice + Send + Sync + 'static> AsyncFileSystem for PassthroughFs<S
         // into its page-aligned buffer without a bounce buffer, see
         // `read_on_pool()`, and otherwise the runtime thread.
         let data = self.get_data(handle, inode, libc::O_RDONLY)?;
-        if flags & (os_compat::O_DIRECT as u32) != 0 {
+        if self.is_direct_io(flags) {
             return match self.pool_fs() {
                 Some(fs) => Self::read_on_pool(fs, ctx, data, w, size, offset, flags).await,
                 None => self.do_read(&data, w, size, offset, flags, false),
@@ -946,9 +949,10 @@ impl<S: BitmapSlice + Send + Sync + 'static> AsyncFileSystem for PassthroughFs<S
         flags: u32,
         fuse_flags: u32,
     ) -> io::Result<usize> {
-        // O_DIRECT requests are relayed to the synchronous handler for the
-        // same alignment reason as `async_read()` above (`write_direct()`
-        // stages the payload through a page-aligned bounce buffer).
+        // With `allow_direct_io`, O_DIRECT requests are relayed to the
+        // synchronous handler for the same alignment reason as `async_read()`
+        // (`write_direct()` stages the payload through a page-aligned bounce
+        // buffer).
         // WRITE_KILL_PRIV requests are relayed too: the synchronous handler
         // drops CAP_FSETID around the underlying write and restores it right
         // after, whereas the native path would hold the capability-dropped
@@ -960,7 +964,7 @@ impl<S: BitmapSlice + Send + Sync + 'static> AsyncFileSystem for PassthroughFs<S
         // from its page-aligned buffer, which needs no bounce buffer, see
         // `write_on_pool()`. `do_write()` drops and restores CAP_FSETID on
         // the pool thread, with no `.await` in between.
-        let relay = flags & (os_compat::O_DIRECT as u32) != 0
+        let relay = self.is_direct_io(flags)
             || (self.killpriv_v2.load(Ordering::Relaxed) && fuse_flags & WRITE_KILL_PRIV != 0);
         if relay || async_runtime::runtime_type().file_io_blocks() {
             if let Some(fs) = self.pool_fs() {
@@ -1536,6 +1540,45 @@ mod tests {
         }
     }
 
+    /// A `MemReader` that records the calls of the zero-copy paths: `sync`
+    /// for `read_to()`, which the synchronous handlers use, and `async` for
+    /// `async_read_to()`, which the native path uses.
+    struct PayloadRecorder {
+        payload: MemReader,
+        events: Vec<&'static str>,
+    }
+
+    impl io::Read for PayloadRecorder {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            self.payload.read(buf)
+        }
+    }
+
+    impl ZeroCopyReader for PayloadRecorder {
+        fn read_to(
+            &mut self,
+            f: &mut dyn FileReadWriteVolatile,
+            count: usize,
+            off: u64,
+        ) -> io::Result<usize> {
+            self.events.push("sync");
+            self.payload.read_to(f, count, off)
+        }
+    }
+
+    #[async_trait(?Send)]
+    impl AsyncZeroCopyReader for PayloadRecorder {
+        async fn async_read_to(
+            &mut self,
+            f: Arc<dyn AsyncFileReadWriteVolatile>,
+            count: usize,
+            off: u64,
+        ) -> io::Result<usize> {
+            self.events.push("async");
+            self.payload.async_read_to(f, count, off).await
+        }
+    }
+
     fn prepare_async_fs() -> (PassthroughFs<()>, TempDir) {
         let source = TempDir::new().expect("Cannot create temporary directory.");
         let cfg = Config {
@@ -2049,15 +2092,83 @@ mod tests {
         }
     }
 
-    // O_DIRECT and WRITE_KILL_PRIV requests are relayed to the synchronous
-    // handlers (see `async_read()`/`async_write()`): the synchronous handler
-    // stages direct-IO payloads through a page-aligned bounce buffer, which
-    // the native asynchronous path can't -- its IO goes straight into the
-    // transport buffer, which alignment-enforcing filesystems reject with
-    // EINVAL. The relay must keep such requests working. O_DIRECT needs a
-    // backing filesystem that supports it; tmpfs (a common /tmp) rejects it
-    // at open() with EINVAL, so skip gracefully there rather than fail, to
-    // keep the test from being environment-dependent.
+    // Only a host file with O_DIRECT needs the relay. With allow_direct_io off
+    // the host file never gets O_DIRECT, so O_DIRECT requests take the native
+    // path like buffered ones.
+    #[test]
+    fn test_async_direct_io_not_allowed() {
+        const BLOCK: usize = 4096;
+
+        let (mut fs, _dir) = prepare_async_fs();
+        fs.cfg.allow_direct_io = false;
+        let ctx = prepare_context();
+        let name = CString::new("direct_file").unwrap();
+        let payload: Vec<u8> = (0..BLOCK).map(|i| (i % 251) as u8).collect();
+        let flags = (libc::O_RDWR | libc::O_DIRECT) as u32;
+
+        async_runtime::block_on(async {
+            let args = CreateIn {
+                flags: flags | libc::O_CREAT as u32,
+                mode: 0o600,
+                umask: 0,
+                fuse_flags: 0,
+            };
+            let (entry, handle, _opts, _) =
+                fs.async_create(&ctx, ROOT_ID, &name, args).await.unwrap();
+            let handle = handle.unwrap();
+
+            let mut r = PayloadRecorder {
+                payload: MemReader(payload.clone()),
+                events: Vec::new(),
+            };
+            let written = fs
+                .async_write(
+                    &ctx,
+                    entry.inode,
+                    handle,
+                    &mut r,
+                    BLOCK as u32,
+                    0,
+                    None,
+                    false,
+                    flags,
+                    0,
+                )
+                .await;
+            assert_eq!(r.events, ["async"]);
+            assert_eq!(written.unwrap(), BLOCK);
+
+            // With no inline budget, the native path misses and reads the
+            // file with `async_write_from()`.
+            let mut w = PathRecorder::new(&payload, 0);
+            let read = fs
+                .async_read(
+                    &ctx,
+                    entry.inode,
+                    handle,
+                    &mut w,
+                    BLOCK as u32,
+                    0,
+                    None,
+                    flags,
+                )
+                .await;
+            assert_eq!(w.events, [("inline-eagain", BLOCK, 0), ("async", BLOCK, 0)]);
+            assert_eq!(read.unwrap(), BLOCK);
+            assert_eq!(w.data, payload);
+        });
+    }
+
+    // With allow_direct_io, O_DIRECT requests are relayed to the synchronous
+    // handlers like WRITE_KILL_PRIV requests (see `async_read()` and
+    // `async_write()`): the synchronous handler stages direct-IO payloads
+    // through a page-aligned bounce buffer. The native asynchronous path
+    // can't, because its IO goes straight into the transport buffer, which
+    // alignment-enforcing filesystems reject with EINVAL. The relay must keep
+    // such requests working. O_DIRECT needs a backing filesystem that
+    // supports it; tmpfs (a common /tmp) rejects it at open() with EINVAL, so
+    // skip gracefully there rather than fail, to keep the test from being
+    // environment-dependent.
     #[test]
     fn test_async_direct_io_relayed() {
         const BLOCK: usize = 4096;
@@ -2105,7 +2216,10 @@ mod tests {
             // would submit IO straight into the transport buffer and fail
             // with EINVAL on alignment-enforcing filesystems.
             let payload: Vec<u8> = (0..BLOCK).map(|i| (i % 251) as u8).collect();
-            let mut r = MemReader(payload.clone());
+            let mut r = PayloadRecorder {
+                payload: MemReader(payload.clone()),
+                events: Vec::new(),
+            };
             let n = fs
                 .async_write(
                     &ctx,
@@ -2122,6 +2236,9 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(n, BLOCK);
+            // `write_direct()` copies the payload with `io::Read`, which the
+            // double doesn't record.
+            assert!(r.events.is_empty());
 
             // A direct-IO read: relayed to `read_direct()`. The double
             // records which path served it: neither the inline hybrid nor
