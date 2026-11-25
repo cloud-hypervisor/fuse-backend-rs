@@ -8,12 +8,24 @@ on:
 env:
   CARGO_TERM_COLOR: always
 
+# gh release create needs write access to the repository contents; the
+# default token permissions are not guaranteed to include it.
+permissions:
+  contents: write
+
 jobs:
   release:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v2
+        # Plain git instead of actions/checkout, which the Actions policy
+        # no longer allows; see the note at the top of rust.yml. The tag's
+        # commit is fetched by SHA, which GitHub supports.
+        run: |
+          git init "${GITHUB_WORKSPACE}"
+          git remote add origin "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}.git"
+          git fetch --depth=1 origin "${GITHUB_SHA}"
+          git checkout --progress --force FETCH_HEAD
       - name: Publish
         run: |
           sudo apt-get update && sudo apt-get install --yes sed
@@ -38,6 +50,11 @@ jobs:
           done
           cargo publish --token ${{ secrets.CRATES_IO_TOKEN }}
       - name: Release
-        uses: softprops/action-gh-release@v1
-        with:
-          generate_release_notes: true
+        # softprops/action-gh-release is not allowed by the Actions policy;
+        # the preinstalled gh CLI does the same. The release already exists
+        # when this job is re-run, so view-then-create keeps re-runs green.
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release view "${GITHUB_REF_NAME}" ||
+            gh release create "${GITHUB_REF_NAME}" --generate-notes

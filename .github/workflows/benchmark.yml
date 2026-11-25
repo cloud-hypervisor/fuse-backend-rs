@@ -56,22 +56,20 @@ jobs:
       matrix:
         threads: [1, 8]
     steps:
-    - uses: actions/checkout@v3
-      with:
-        # Full history so that the merge base can be checked out below for
-        # the A/B comparison (pull_request checkouts are shallow by default).
-        fetch-depth: 0
-    - name: Cache cargo
-      uses: Swatinem/rust-cache@v2.2.0
-      with:
-        cache-on-failure: true
-
+    - name: Checkout
+      # Plain git instead of actions/checkout, which the Actions policy no
+      # longer allows; see the note at the top of rust.yml. The baseline of
+      # the A/B comparison is fetched below by SHA, so no full history is
+      # needed here either.
+      run: |
+        git init "${GITHUB_WORKSPACE}"
+        git remote add origin "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}.git"
+        git fetch --depth=1 origin "${GITHUB_SHA}"
+        git checkout --progress --force FETCH_HEAD
     - name: Install Rust
-      uses: actions-rs/toolchain@v1
-      with:
-        profile: minimal
-        toolchain: stable
-        override: true
+      # rustup directly instead of actions-rs/toolchain, and no cargo cache:
+      # the policy allows no action that could restore one.
+      run: rustup toolchain install --profile minimal stable
 
     - name: Install tools
       run: |
@@ -82,10 +80,13 @@ jobs:
 
     - name: Check out the baseline variant
       if: github.event_name == 'pull_request'
-      uses: actions/checkout@v3
-      with:
-        ref: ${{ github.event.pull_request.base.sha }}
-        path: base-src
+      # Plain git instead of actions/checkout; the merge-base commit is
+      # fetched by SHA, which GitHub supports.
+      run: |
+        git init base-src
+        git -C base-src remote add origin "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}.git"
+        git -C base-src fetch --depth=1 origin "${{ github.event.pull_request.base.sha }}"
+        git -C base-src checkout --progress --force FETCH_HEAD
 
     - name: Build the baseline daemon
       if: github.event_name == 'pull_request'
@@ -269,8 +270,8 @@ jobs:
         {
             echo "## Benchmark results (${{ matrix.threads }} thread(s))"
             echo ""
-            echo "Single run on the merge target, no comparison. See the"
-            echo "artifacts for the raw fio results."
+            echo "Single run on the merge target, no comparison. The raw"
+            echo "fio results stay on the ephemeral runner."
             if [ -f "current-uring-${{ matrix.threads }}threads.json" ]; then
                 echo ""
                 echo "This runner's kernel supports FUSE_URING, so the run"
@@ -284,10 +285,8 @@ jobs:
             fi
         } >> "${GITHUB_STEP_SUMMARY}"
 
-    - name: Upload results
-      uses: actions/upload-artifact@v4
-      with:
-        name: bench-${{ matrix.threads }}threads
-        path: |
-          current-*.json
-          base-*.json
+    # The raw fio JSON results used to be uploaded through
+    # actions/upload-artifact, which the Actions policy no longer allows and
+    # which has no plain-command equivalent: the artifact upload endpoint is
+    # not part of the documented REST API. The collected and compared
+    # results stay available in the job summary above.

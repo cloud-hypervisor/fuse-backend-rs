@@ -1,13 +1,16 @@
 name: Rust
 
-# NOTE (2026-11-24): every workflow in this repository currently fails at the
-# "Getting action download info" stage, because the Actions permissions policy
-# now only allows actions from repositories owned by cloud-hypervisor, which
-# excludes actions/checkout and every other third-party action used here. This
-# is a settings-level change, not a code change: no workflow file changed
-# between the last green runs (2026-11-23) and the first red ones (2026-11-24).
-# See the pull request that adds this comment for the full diagnosis and the
-# settings/audit-log trail.
+# NOTE (2026-11-24): every workflow in this repository suddenly failed at
+# the "Getting action download info" stage, because the Actions permissions
+# policy was changed to only allow actions from repositories owned by
+# cloud-hypervisor, which excludes actions/checkout and every other third
+# party action used here. That is a settings-level change, not a code change:
+# no workflow file changed between the last green runs (2026-11-23) and the
+# first red ones (2026-11-24); see the pull request that rewrote the workflows
+# for the diagnosis and the audit-log trail. This workflow now uses no
+# actions at all, so it runs under any policy level: checkouts are plain git
+# fetches, toolchains come from rustup, and cargo-deny is downloaded from its
+# release page.
 
 on:
   push:
@@ -32,19 +35,21 @@ jobs:
       matrix:
         arch: [amd64, arm64, ppc64le, riscv64, s390x]
     steps:
-    - uses: actions/checkout@v3
-    - name: Cache cargo
-      uses: Swatinem/rust-cache@v2.2.0
-      with:
-        cache-on-failure: true
-        key: ${{ runner.os }}-cargo-${{ matrix.arch }}
-
+    - name: Checkout
+      # Plain git instead of actions/checkout, which the Actions policy no
+      # longer allows (see the note at the top of this file). The repository
+      # is public, so an anonymous fetch is enough; for pull_request events
+      # GITHUB_SHA is the merge commit, which GitHub allows fetching by SHA.
+      run: |
+        git init "${GITHUB_WORKSPACE}"
+        git remote add origin "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}.git"
+        git fetch --depth=1 origin "${GITHUB_SHA}"
+        git checkout --progress --force FETCH_HEAD
     - name: Install Rust
-      uses: actions-rs/toolchain@v1
-      with:
-        profile: minimal
-        toolchain: stable
-        override: true
+      # rustup directly instead of actions-rs/toolchain; the runner images
+      # already ship rustup. No cargo cache: the policy allows no action
+      # that could restore one, so every run re-resolves and re-downloads.
+      run: rustup toolchain install --profile minimal stable
 
     - name: build and check
       run: |
@@ -101,12 +106,12 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-    - uses: actions/checkout@v3
-    - name: Cache cargo
-      uses: Swatinem/rust-cache@v2.2.0
-      with:
-        cache-on-failure: true
-        key: ${{ runner.os }}-cargo-msrv
+    - name: Checkout
+      run: |
+        git init "${GITHUB_WORKSPACE}"
+        git remote add origin "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}.git"
+        git fetch --depth=1 origin "${GITHUB_SHA}"
+        git checkout --progress --force FETCH_HEAD
     - name: Read declared MSRV
       # Take the MSRV from the root manifest instead of pinning a second
       # copy here: a pin left behind by a later bump would quietly check a
@@ -118,11 +123,12 @@ jobs:
         msrv=$(sed -n 's/^rust-version = "\(.*\)"/\1/p' Cargo.toml | head -1)
         echo "version=$msrv" >> "$GITHUB_OUTPUT"
     - name: Install Rust
-      uses: actions-rs/toolchain@v1
-      with:
-        profile: minimal
-        toolchain: ${{ steps.msrv.outputs.version }}
-        override: true
+      # A partial version such as "1.86" is itself a rustup channel name,
+      # so installing and selecting it with the same string resolves to the
+      # same rustc release.
+      run: |
+        rustup toolchain install --profile minimal "${{ steps.msrv.outputs.version }}"
+        rustup default "${{ steps.msrv.outputs.version }}"
     - name: Check
       # No Cargo.lock is tracked, so dependencies are resolved fresh here.
       # The resolver's default (`allow`) keeps picking versions that need a
@@ -149,16 +155,16 @@ jobs:
           # against.
           wget https://github.com/macos-fuse-t/fuse-t/releases/download/1.2.9/fuse-t-macos-installer-1.2.9.pkg
           sudo installer -pkg fuse-t-macos-installer-1.2.9.pkg -target /
-      - uses: actions/checkout@v3
-      - name: Cache cargo
-        # Same action and settings as the Linux CI rows. The workspace's
-        # Cargo.lock is gitignored, so without a cache every run re-resolves
-        # and re-downloads the whole dependency tree from crates.io — a
-        # network path the cached Linux rows never take.
-        uses: Swatinem/rust-cache@v2.2.0
-        with:
-          cache-on-failure: true
-          key: ${{ runner.os }}-cargo
+      - name: Checkout
+        # Plain git instead of actions/checkout, which the Actions policy
+        # no longer allows; see the note at the top of rust.yml. No cargo
+        # cache either: the policy allows no action that could restore one,
+        # so every run re-resolves and re-downloads the dependency tree.
+        run: |
+          git init "${GITHUB_WORKSPACE}"
+          git remote add origin "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}.git"
+          git fetch --depth=1 origin "${GITHUB_SHA}"
+          git checkout --progress --force FETCH_HEAD
       - name: build and check
         run: |
           make smoke-macos
@@ -168,5 +174,18 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v3
-      - uses: EmbarkStudios/cargo-deny-action@v2
+      - name: Checkout
+        run: |
+          git init "${GITHUB_WORKSPACE}"
+          git remote add origin "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}.git"
+          git fetch --depth=1 origin "${GITHUB_SHA}"
+          git checkout --progress --force FETCH_HEAD
+      - name: Cargo Deny
+        # cargo-deny straight from its release tarball, pinned, instead of
+        # EmbarkStudios/cargo-deny-action, which the Actions policy no
+        # longer allows.
+        run: |
+          ver=0.22.1
+          curl -sSfL "https://github.com/EmbarkStudios/cargo-deny/releases/download/${ver}/cargo-deny-${ver}-x86_64-unknown-linux-musl.tar.gz" \
+            | tar -xz -C "${HOME}/.cargo/bin" --strip-components=1 "cargo-deny-${ver}-x86_64-unknown-linux-musl/cargo-deny"
+          cargo deny check

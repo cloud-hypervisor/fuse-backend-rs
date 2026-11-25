@@ -15,13 +15,19 @@ jobs:
     runs-on: ubuntu-latest
     steps:
     - name: Checkout
-      uses: actions/checkout@v4
+      # Plain git instead of actions/checkout, which the Actions policy no
+      # longer allows; see the note at the top of rust.yml. The repository is
+      # public, so an anonymous fetch is enough; for pull_request events
+      # GITHUB_SHA is the merge commit, which GitHub allows fetching by SHA.
+      run: |
+        git init "${GITHUB_WORKSPACE}"
+        git remote add origin "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}.git"
+        git fetch --depth=1 origin "${GITHUB_SHA}"
+        git checkout --progress --force FETCH_HEAD
     - name: Install Rust
-      uses: actions-rs/toolchain@v1
-      with:
-        profile: minimal
-        toolchain: stable
-        override: true
+      # rustup directly instead of actions-rs/toolchain; the runner images
+      # already ship rustup and default to the stable toolchain.
+      run: rustup toolchain install --profile minimal stable
     - name: Build passthrough binary
       run: |
         cargo build --release -p passthrough
@@ -35,13 +41,19 @@ jobs:
     runs-on: ubuntu-latest
     steps:
     - name: Checkout
-      uses: actions/checkout@v4
+      # Plain git instead of actions/checkout, which the Actions policy no
+      # longer allows; see the note at the top of rust.yml. The repository is
+      # public, so an anonymous fetch is enough; for pull_request events
+      # GITHUB_SHA is the merge commit, which GitHub allows fetching by SHA.
+      run: |
+        git init "${GITHUB_WORKSPACE}"
+        git remote add origin "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}.git"
+        git fetch --depth=1 origin "${GITHUB_SHA}"
+        git checkout --progress --force FETCH_HEAD
     - name: Install Rust
-      uses: actions-rs/toolchain@v1
-      with:
-        profile: minimal
-        toolchain: stable
-        override: true
+      # rustup directly instead of actions-rs/toolchain; the runner images
+      # already ship rustup and default to the stable toolchain.
+      run: rustup toolchain install --profile minimal stable
     - name: Build overlay binary
       run: |
         cargo build --release -p overlay
@@ -55,13 +67,19 @@ jobs:
     runs-on: ubuntu-latest
     steps:
     - name: Checkout
-      uses: actions/checkout@v4
+      # Plain git instead of actions/checkout, which the Actions policy no
+      # longer allows; see the note at the top of rust.yml. The repository is
+      # public, so an anonymous fetch is enough; for pull_request events
+      # GITHUB_SHA is the merge commit, which GitHub allows fetching by SHA.
+      run: |
+        git init "${GITHUB_WORKSPACE}"
+        git remote add origin "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}.git"
+        git fetch --depth=1 origin "${GITHUB_SHA}"
+        git checkout --progress --force FETCH_HEAD
     - name: Install Rust
-      uses: actions-rs/toolchain@v1
-      with:
-        profile: minimal
-        toolchain: stable
-        override: true
+      # rustup directly instead of actions-rs/toolchain; the runner images
+      # already ship rustup and default to the stable toolchain.
+      run: rustup toolchain install --profile minimal stable
     - name: Build overlay binary
       run: |
         cargo build --release -p overlay
@@ -75,13 +93,19 @@ jobs:
     runs-on: ubuntu-latest
     steps:
     - name: Checkout
-      uses: actions/checkout@v4
+      # Plain git instead of actions/checkout, which the Actions policy no
+      # longer allows; see the note at the top of rust.yml. The repository is
+      # public, so an anonymous fetch is enough; for pull_request events
+      # GITHUB_SHA is the merge commit, which GitHub allows fetching by SHA.
+      run: |
+        git init "${GITHUB_WORKSPACE}"
+        git remote add origin "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}.git"
+        git fetch --depth=1 origin "${GITHUB_SHA}"
+        git checkout --progress --force FETCH_HEAD
     - name: Install Rust
-      uses: actions-rs/toolchain@v1
-      with:
-        profile: minimal
-        toolchain: stable
-        override: true
+      # rustup directly instead of actions-rs/toolchain; the runner images
+      # already ship rustup and default to the stable toolchain.
+      run: rustup toolchain install --profile minimal stable
     # Nothing to install: the runner image ships fuse3, which provides
     # fusermount/fusermount3 and on Ubuntu 24.04 conflicts with fuse
     # (fuse3 Breaks: fuse), so the two packages can never coexist.
