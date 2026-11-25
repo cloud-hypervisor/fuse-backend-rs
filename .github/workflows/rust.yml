@@ -1,11 +1,29 @@
 name: Rust
 
 on:
+  # Runner budget (2026-11-25): pushes used to trigger the full 5-arch
+  # matrix on every branch, and the e2e suites in xfstests.yml used to
+  # run on every push and pull request too. Together that was ~10
+  # concurrent jobs per push, which saturated the shared org runner
+  # pool and got Actions disabled repo-wide. Pushes and pull requests
+  # now run only the always-on checks: the amd64 row of the matrix
+  # below, MSRV, Macos-CI and deny. The other arch rows run on the
+  # nightly schedule and on demand through the arch input.
   push:
-    branches: '*'
+    branches: [ master ]
   pull_request:
     branches: [ master ]
+  schedule:
+    # Full 5-arch matrix nightly at an off-peak hour (02:30 UTC);
+    # schedule events run the default branch's copy of this workflow.
+    - cron: '30 2 * * *'
   workflow_dispatch:
+    inputs:
+      arch:
+        description: 'Architecture to check (all = whole matrix)'
+        type: choice
+        options: [all, amd64, arm64, ppc64le, riscv64, s390x]
+        default: all
 
 env:
   CARGO_TERM_COLOR: always
@@ -14,6 +32,17 @@ env:
 jobs:
   CI:
     runs-on: ubuntu-latest
+    # Only the amd64 row runs on push/pull_request (see the runner
+    # budget note at the top of this file); the other rows run on the
+    # nightly schedule and on manual dispatch, where the arch input
+    # can narrow the matrix to a single architecture.
+    if: >-
+      (github.event_name == 'push' || github.event_name == 'pull_request')
+      && matrix.arch == 'amd64'
+      || github.event_name == 'schedule'
+      || (github.event_name == 'workflow_dispatch'
+      && (github.event.inputs.arch == 'all'
+      || github.event.inputs.arch == matrix.arch))
     # The smoke step mounts real FUSE filesystems; a hung request through
     # them never returns, and cargo's "over 60 seconds" notice does not abort
     # the test. Bound the job so a hang fails loudly instead of sitting for

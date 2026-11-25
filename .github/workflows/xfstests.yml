@@ -1,10 +1,23 @@
 name: xfstests
 
 on:
-  push:
-    branches: '*'
-  pull_request:
-    branches: [ master ]
+  # Runner budget (2026-11-25): these suites used to run on every push
+  # to every branch and on every pull request, which together with the
+  # arch matrix in rust.yml saturated the shared org runner pool (see
+  # the note there) and got Actions disabled repo-wide. They now run
+  # nightly and on demand; pull requests no longer run them, so branch
+  # protection must not list them as required checks.
+  workflow_dispatch:
+    inputs:
+      suite:
+        description: 'e2e suite to run'
+        type: choice
+        options: [all, xfstests-passthrough, xfstests-overlay, unionmount, hardlink]
+        default: all
+  schedule:
+    # Nightly, staggered after rust.yml's full-matrix run (03:10 UTC);
+    # schedule events run the default branch's copy of this workflow.
+    - cron: '10 3 * * *'
 
 env:
   CARGO_TERM_COLOR: always
@@ -13,6 +26,10 @@ env:
 jobs:
   xfstests_on_passthrough:
     runs-on: ubuntu-latest
+    if: >-
+      github.event_name == 'schedule'
+      || github.event.inputs.suite == 'all'
+      || github.event.inputs.suite == 'xfstests-passthrough'
     steps:
     - name: Checkout
       uses: actions/checkout@v4
@@ -33,6 +50,10 @@ jobs:
 
   xfstests_on_overlayfs:
     runs-on: ubuntu-latest
+    if: >-
+      github.event_name == 'schedule'
+      || github.event.inputs.suite == 'all'
+      || github.event.inputs.suite == 'xfstests-overlay'
     steps:
     - name: Checkout
       uses: actions/checkout@v4
@@ -53,6 +74,10 @@ jobs:
 
   unionmount_testsuite_on_overlayfs:
     runs-on: ubuntu-latest
+    if: >-
+      github.event_name == 'schedule'
+      || github.event.inputs.suite == 'all'
+      || github.event.inputs.suite == 'unionmount'
     steps:
     - name: Checkout
       uses: actions/checkout@v4
@@ -73,6 +98,10 @@ jobs:
 
   hardlink_e2e_on_overlayfs:
     runs-on: ubuntu-latest
+    if: >-
+      github.event_name == 'schedule'
+      || github.event.inputs.suite == 'all'
+      || github.event.inputs.suite == 'hardlink'
     steps:
     - name: Checkout
       uses: actions/checkout@v4
